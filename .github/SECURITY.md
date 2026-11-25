@@ -9,7 +9,7 @@ Please **do not open a public issue**. Report privately through GitHub:
 
 Include what you can of:
 
-- the component (`engine`, `transport`, `verify`) and version or commit;
+- the component (`engine`, `transport`, `verify` (run as `credentials verify`), `cli` and its `credentials serve` HTTP server) and version or commit;
 - what an attacker in which position (operator, caller, destination server, log store, network)
   can do, and what they gain;
 - a reproduction: a policy, a request or a test is ideal.
@@ -21,8 +21,8 @@ normally within 90 days. We credit reporters who wish to be credited.
 
 In scope: anything that lets a party get a secret value, a user key or a grant it should not
 have; use a record outside its signed policy; act without a confirmed log entry; or change
-the log without `verify` noticing. The parties and assumptions are in
-[docs/threat-model.md](docs/threat-model.md).
+the log without `credentials verify` noticing. The parties and assumptions are in
+[docs/threat-model.md](../docs/threat-model.md).
 
 Out of scope: the residual risks listed there (for example, attacks that need the node to run
 outside a TEE), and denial of service by the node operator.

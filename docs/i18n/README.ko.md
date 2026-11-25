@@ -1,9 +1,9 @@
 # credentials
 
 [![ci](https://github.com/BloubHQ/credentials/actions/workflows/ci.yml/badge.svg)](https://github.com/BloubHQ/credentials/actions/workflows/ci.yml)
-[![license](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+[![license](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](../../LICENSE)
 
-[English](README.md) | **한국어** | [简体中文](README.zh-CN.md) | [日本語](README.ja.md)
+[English](../../README.md) | **한국어** | [简体中文](README.zh-CN.md) | [日本語](README.ja.md)
 
 애플리케이션과 AI 에이전트가 자격 증명(credential)을 **보지** 않고도 **사용**할 수 있게 해 주는
 볼트 엔진입니다. 비밀 값이 정확히 어디로, 어떤 형태로 갈 수 있는지는 소유자의 기기가 서명한 정책으로
@@ -22,7 +22,7 @@ JWT 서명, TOTP, IMAP 로그인, 상호 TLS(mutual TLS), Ethereum 서명은 모
 
 > **상태: 0.x, 감사받지 않음.** 엔진은 테스트를 거쳤고 내부 검토도 받았지만, 외부 보안 감사는
 > 받지 않았으며 형식이 바뀔 수 있습니다. 프로덕션 비밀 값을 맡기기 전에
-> [위협 모델](docs/threat-model.md)을 읽어 보세요.
+> [위협 모델](../threat-model.md)을 읽어 보세요.
 
 ## 목차
 
@@ -103,28 +103,27 @@ cargo test --workspace
 GITHUB_TOKEN=ghp_... cargo run -p transport --example github_user
 ```
 
-[`github_user`](crates/transport/examples/github_user.rs) 예제는 모든 구성 요소를 한 프로세스에서
+[`github_user`](../../crates/transport/examples/github_user.rs) 예제는 모든 구성 요소를 한 프로세스에서
 실행합니다. 기기가 토큰을 레코드에 봉인하고, `GET https://api.github.com/user`만 허용하는 정책에
 서명한 뒤 노드에 grant를 줍니다. 애플리케이션이 호출에 서명하면, 노드는 로그를 남기고 토큰을 주입해
 TLS로 요청을 보낸 뒤 응답을 돌려줍니다. 코드로 보면 다음과 같습니다.
 
 ```rust
 // 소유자의 기기에서.
-let record = Record::seal(&user_key, "github", "me", device.sign_policy(policy)?, &values)?;
-let grant = device.grant(&user_key, &node.identity(), GrantTerms {
-    owner: "me".into(),
-    expires_ms: now + 600_000,
-    issued_ms: now,
-    pins: vec![RecordPin { record_id: "github".into(), generation: record.generation }],
-})?;
+let policy = device.sign_policy(policy)?;
+let record = Record::seal(&user_key, "github", "me", policy, &values)?;
+let terms = GrantTerms::new("me", Duration::from_secs(600)).pin(&record);
+let grant = device.grant(&user_key, &node.identity(), terms)?;
 
 // 노드에서.
 node.grant(&grant)?;
 
 // 애플리케이션에서: 레코드(암호문)와 자신의 호출자 키만 가지며, 토큰은 절대 갖지 않는다.
-let auth = app.authorize("example", &node.public_key(), &record, "github",
-                         &Payload::Http(Some(&request)), now)?;
-let response = node.http(&record, "github", &auth, Some(&request), &mut transport).result?;
+let body = Body::http(request);
+let call = app.sign_call("example", &node.public_key(), record, "github", body)?;
+
+// 노드에서: 로그를 쓰고, 토큰을 넣어 TLS로 보내고, 응답에 토큰이 없는지 검사한다.
+let outcome = node.run(&call, &mut TlsTransport::new());
 ```
 
 ## 정책
@@ -132,7 +131,7 @@ let response = node.http(&record, "github", &auth, Some(&request), &mut transpor
 정책은 레코드의 **필드(fields)**, 그 레코드를 쓸 수 있는 **호출자(callers)**, 그리고 호출자가 실행할 수
 있는 **operation(operations)** 을 정의합니다. 정책은 기기가 서명하며, 서명과 레코드 암호화가 모두
 정책에 묶여 있으므로 소유자 없이는 누구도 값이 가는 곳을 바꿀 수 없습니다. 전체 레퍼런스는
-[docs/policy.md](docs/policy.md)에 있습니다.
+[docs/policy.md](../policy.md)에 있습니다.
 
 ```json
 {
@@ -176,14 +175,15 @@ let response = node.http(&record, "github", &auth, Some(&request), &mut transpor
 분석합니다.
 
 - **오염(taint).** 비밀 값을 되돌릴 수 있는 형태로 담은 값은 *오염(tainted)* 된 것입니다. 인코딩은
-  오염을 유지하고, 해시, MAC, 서명, `len`은 오염을 제거합니다. 암호화는 비밀 키로 할 때만 오염을
-  제거합니다. 출력이 오염된 derivation은 거부합니다.
+  오염을 유지하고, 해시, MAC, 서명, `len`은 오염을 제거합니다. 단, 비밀 값만 해시한 값은 예외입니다. 키를 먼저 해시해서 쓰는 곳(긴 HMAC 키, Ed25519 시드)에서는 키와 같기 때문입니다. 비밀 필드를 키로 한 암호화는 키만
+  가립니다. 메시지, nonce, 데이터에 든 비밀 값은 오염된 채로 남습니다. 다른 operation이 같은 키로
+  고른 바이트를 암호화할 수 있기 때문입니다. 출력이 오염된 derivation은 거부합니다.
 - **오라클.** 비밀 값과, 호출자나 서버가 고르는 값은 결과가 비밀 값을 조금씩 드러내는 곳에서 만날 수
   없습니다: `replace`, `xor`, `json_set`의 키, 디코더, 숫자나 키 인자. `len(replace(key, $input, ""))`는
   거부합니다.
-- **추측 가능한 필드.** `guessable`로 표시한 필드(PIN, 비밀번호)는 추측을 대조해 볼 수 있는
-  derivation 출력(그 필드의 해시나 서명)에 도달할 수 없습니다. 단, 강한 비밀 키를 쓰는 keyed MAC이나
-  암호화가 이를 가리는 경우는 예외입니다.
+- **추측 가능한 필드.** derivation은 `guessable`로 표시한 필드(PIN, 비밀번호)에 `len`을 통해서만
+  의존할 수 있습니다. 그 필드의 해시, 서명, MAC, 암호문은 모두 호출자가 추측을 대조하는 데 쓸 수
+  있습니다.
 - **예산(budget).** operation 하나가 렌더링할 수 있는 양은 최대 128 MiB, PBKDF2 1,000,000 라운드,
   서명 32개입니다.
 
@@ -238,15 +238,15 @@ flowchart LR
 항목에는 누가 어떤 레코드를 언제, 어떤 호출자로, 어떤 operation에 썼는지가 나타납니다. 값이 **어디로**
 갔고 무엇이 전송되었는지(host, path, body 해시)는 소유자의 사용자 키로 봉인됩니다. 로그 저장소는 이를
 읽을 수 없고 소유자는 읽을 수 있습니다(`log::open_detail`, 또는
-`verify --owner alice --user-key key.txt`). 노드는 확정된 항목 없이는 절대 동작하지 않습니다. transport
+`credentials verify --owner alice --user-key key.txt`). 노드는 확정된 항목 없이는 절대 동작하지 않습니다. transport
 함수들은 `Confirmed`를 인자로 받는데, 이 값은 싱크가 `Ok`를 반환한 뒤 `Log::commit`만 만들 수 있습니다.
 싱크가 실패하면 로그는 조정(reconcile)될 때까지 멈춥니다.
 
 ```sh
-verify log.jsonl <node-public-key>                          # the whole chain
-verify log.jsonl <node-public-key> --head head.json         # must end at a signed checkpoint
-verify log.jsonl <node-public-key> --owner alice            # one owner's chain
-verify log.jsonl <node-public-key> --owner alice --user-key key.txt   # with the details
+credentials verify log.jsonl <node-public-key>                   # the whole chain
+credentials verify log.jsonl <node-public-key> --head head.json  # must end at a signed checkpoint
+credentials verify log.jsonl <node-public-key> --owner alice     # one owner's chain
+credentials verify log.jsonl <node-public-key> --owner alice --user-key key.txt   # with the details
 ```
 
 ## 노드 운영
@@ -271,7 +271,12 @@ verify log.jsonl <node-public-key> --owner alice --user-key key.txt   # with the
   저장소에는 없습니다.
 - **키와 재시작.** `NodeKey::to_bytes()`는 enclave에 봉인해 보관하세요. 재시작 후
   `Node::restore(key, sink, clock, entries)`가 체인을 이어 가고 레코드 하한(floor), 알려진 기기, 마지막
-  grant 시각을 복원합니다. 소유자는 grant를 다시 줍니다.
+  grant 시각을 복원합니다. 소유자는 grant를 다시 주며, 재시작 전에 발급되거나 서명된 것은 받지
+  않습니다. `Node::checkpoint()`는 운영자가 되돌릴 수 없는 곳(봉인 저장소, 단조 카운터)에 두고
+  `Node::restore_anchored`로 재시작하세요. 잘린 로그를 거부합니다.
+- **명령줄과 서버.** [`credentials`](../../crates/cli)로 키 생성, 정책 서명, 레코드 봉인, grant와 서명된
+  호출 생성을 할 수 있고, `credentials serve`는 내구성 있는 JSONL 로그와 함께 HTTP로 노드를
+  실행합니다.
 - **동시성.** 모든 메서드가 `&self`를 받으므로 노드 하나를 여러 스레드가 공유하면 됩니다. Transport
   I/O는 노드의 락 밖에서 실행됩니다.
 
@@ -324,7 +329,7 @@ ring의 대안으로 RustCrypto `rsa` 0.10도 측정했습니다. 서명 하나�
 
 ## 하지 않는 것
 
-아래는 빠진 코드가 아니라 설계상의 한계입니다. 각 항목은 [위협 모델](docs/threat-model.md)에서
+아래는 빠진 코드가 아니라 설계상의 한계입니다. 각 항목은 [위협 모델](../threat-model.md)에서
 설명합니다.
 
 - **이 저장소에는 TEE가 없습니다.** 여기서 노드는 평범한 프로세스이며, 증명은 플랫폼 통합의 몫입니다
@@ -347,9 +352,10 @@ ring의 대안으로 RustCrypto `rsa` 0.10도 측정했습니다. 서명 하나�
 
 | 크레이트 | |
 | --- | --- |
-| [`engine`](crates/engine) | 비밀 값, 정책, 템플릿, 레코드, grant, 호출자, 로그, 응답, 노드 |
-| [`transport`](crates/transport) | TLS transport (rustls), 그리고 엔드투엔드 예제 |
-| [`verify`](crates/verify) | 노드 로그를 검증하는 명령줄 도구 |
+| [`engine`](../../crates/engine) | 비밀 값, 정책, 템플릿, 레코드, grant, 호출자, 로그, 응답, 노드 |
+| [`transport`](../../crates/transport) | TLS transport (rustls), 그리고 엔드투엔드 예제 |
+| [`verify`](../../crates/verify) | 노드 로그 검증기, `credentials verify`로 실행 |
+| [`cli`](../../crates/cli) | `credentials` 도구: 키, 정책, 레코드, grant, 호출, 노드 서버 |
 
 ## 개발
 
@@ -359,13 +365,13 @@ cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace --locked
 ```
 
-최소 Rust 버전: 1.87. CI는 `cargo audit`, `cargo deny`, MSRV 빌드, 재현 가능 빌드 검사도 실행합니다.
-[CONTRIBUTING.md](CONTRIBUTING.md)를 참고하세요.
+최소 Rust 버전: 1.87. CI는 `cargo audit`, `cargo deny`, MSRV 테스트, 재현 가능 빌드 검사, 대상별 60초 퍼징도 실행합니다.
+[CONTRIBUTING.md](../../.github/CONTRIBUTING.md)를 참고하세요.
 
 ## 보안
 
-취약점은 [SECURITY.md](SECURITY.md)에 설명된 대로 비공개로 제보해 주세요.
+취약점은 [SECURITY.md](../../.github/SECURITY.md)에 설명된 대로 비공개로 제보해 주세요.
 
 ## 라이선스
 
-[Apache License 2.0](LICENSE).
+[Apache License 2.0](../../LICENSE).

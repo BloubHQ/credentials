@@ -1,9 +1,9 @@
 # credentials
 
 [![ci](https://github.com/BloubHQ/credentials/actions/workflows/ci.yml/badge.svg)](https://github.com/BloubHQ/credentials/actions/workflows/ci.yml)
-[![license](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+[![license](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](../../LICENSE)
 
-[English](README.md) | [한국어](README.ko.md) | **简体中文** | [日本語](README.ja.md)
+[English](../../README.md) | [한국어](README.ko.md) | **简体中文** | [日本語](README.ja.md)
 
 一个保险库（vault）引擎，让应用和 AI 智能体能够**使用**凭据，却永远**看不到**它。
 由所有者的设备通过一份签名的策略（policy）精确决定密钥可以去往何处、以何种形式出现。
@@ -21,7 +21,7 @@ TOTP、IMAP 登录、双向 TLS（mutual TLS）和以太坊签名，全都是策
 
 > **状态：0.x，未经审计。** 引擎已经过测试和内部评审，但尚未经过外部安全审计，其格式也可能变化。
 > 在用它保管生产环境的密钥之前，请先阅读
-> [威胁模型](docs/threat-model.md)。
+> [威胁模型](../threat-model.md)。
 
 ## 目录
 
@@ -101,35 +101,34 @@ cargo test --workspace
 GITHUB_TOKEN=ghp_... cargo run -p transport --example github_user
 ```
 
-[`github_user`](crates/transport/examples/github_user.rs) 示例在一个进程中运行所有部分：
+[`github_user`](../../crates/transport/examples/github_user.rs) 示例在一个进程中运行所有部分：
 设备把令牌封装进一条记录，签署一份只允许 `GET https://api.github.com/user` 的策略，
 并向节点授权；应用签署一次调用；节点写日志、注入令牌、通过 TLS 发送请求并返回响应。
 用代码表示：
 
 ```rust
 // 在所有者的设备上。
-let record = Record::seal(&user_key, "github", "me", device.sign_policy(policy)?, &values)?;
-let grant = device.grant(&user_key, &node.identity(), GrantTerms {
-    owner: "me".into(),
-    expires_ms: now + 600_000,
-    issued_ms: now,
-    pins: vec![RecordPin { record_id: "github".into(), generation: record.generation }],
-})?;
+let policy = device.sign_policy(policy)?;
+let record = Record::seal(&user_key, "github", "me", policy, &values)?;
+let terms = GrantTerms::new("me", Duration::from_secs(600)).pin(&record);
+let grant = device.grant(&user_key, &node.identity(), terms)?;
 
 // 在节点上。
 node.grant(&grant)?;
 
 // 在应用中：它持有记录（密文）和自己的调用方密钥，从不持有令牌。
-let auth = app.authorize("example", &node.public_key(), &record, "github",
-                         &Payload::Http(Some(&request)), now)?;
-let response = node.http(&record, "github", &auth, Some(&request), &mut transport).result?;
+let body = Body::http(request);
+let call = app.sign_call("example", &node.public_key(), record, "github", body)?;
+
+// 在节点上：写入日志，注入令牌，通过 TLS 发送，并检查响应中是否含有令牌。
+let outcome = node.run(&call, &mut TlsTransport::new());
 ```
 
 ## 策略
 
 策略列出一条记录的**字段**（fields）、可以使用它的**调用方**（callers），以及他们可以运行的
 **操作**（operations）。策略由设备签名；签名和记录的加密都绑定了它，因此没有所有者的参与，
-谁也无法改变一个值的去向。完整参考见 [docs/policy.md](docs/policy.md)。
+谁也无法改变一个值的去向。完整参考见 [docs/policy.md](../policy.md)。
 
 ```json
 {
@@ -172,13 +171,13 @@ let response = node.http(&record, "github", &auth, Some(&request), &mut transpor
 名称、变量、字符串字面量、函数调用和 `+`；没有分支或循环。在策略签名之前，每个模板都会被分析：
 
 - **污点（taint）。** 以可逆形式持有密钥的值是*被污染的*（tainted）。编码保留污点；
-  哈希、MAC、签名和 `len` 消除污点；加密只有在使用秘密密钥时才消除污点。
-  输出被污染的派生会被拒绝。
+  哈希、MAC、签名和 `len` 消除污点，但只对密钥本身做的哈希除外：在先哈希密钥再使用的地方（过长的 HMAC 密钥、Ed25519 种子），它与密钥等价。以秘密字段为密钥的加密只隐藏密钥本身：消息、nonce 或附加数据中的
+  密钥值仍然是被污染的，因为另一个操作可以用同一密钥加密选定的字节。输出被污染的派生会被拒绝。
 - **预言机（oracle）。** 密钥与调用方或服务器选择的值不得在结果会逐段泄露密钥的位置相遇：
   `replace`、`xor`、`json_set` 的键、解码器、数字参数或密钥参数中。
   `len(replace(key, $input, ""))` 会被拒绝。
-- **可猜测字段。** 标记为 `guessable` 的字段（PIN、密码）不得进入可用于验证猜测的派生输出
-  （它们的哈希或签名），除非有带密钥的 MAC 或使用强秘密密钥的加密将其隐藏。
+- **可猜测字段。** 派生只能通过 `len` 依赖标记为 `guessable` 的字段（PIN、密码）：
+  它的哈希、签名、MAC 或密文都能让调用方验证猜测。
 - **预算。** 一个操作最多可渲染 128 MiB、1,000,000 轮 PBKDF2 和 32 个签名。
 
 | 凭据 | 策略 |
@@ -230,15 +229,15 @@ flowchart LR
 
 条目显示了谁在何时、通过哪个调用方、为哪个操作使用了哪条记录。值**去往何处**以及发送了什么
 （主机、路径、正文哈希）则被封装给所有者的用户密钥：日志存储无法读取，所有者可以读取
-（`log::open_detail`，或 `verify --owner alice --user-key key.txt`）。没有已确认的条目，
+（`log::open_detail`，或 `credentials verify --owner alice --user-key key.txt`）。没有已确认的条目，
 节点绝不会行动：传输函数接受一个 `Confirmed`，而它只能由 `Log::commit` 在接收端返回 `Ok`
 之后生成。如果接收端失败，日志会停止，直到完成核对。
 
 ```sh
-verify log.jsonl <node-public-key>                          # the whole chain
-verify log.jsonl <node-public-key> --head head.json         # must end at a signed checkpoint
-verify log.jsonl <node-public-key> --owner alice            # one owner's chain
-verify log.jsonl <node-public-key> --owner alice --user-key key.txt   # with the details
+credentials verify log.jsonl <node-public-key>                   # the whole chain
+credentials verify log.jsonl <node-public-key> --head head.json  # must end at a signed checkpoint
+credentials verify log.jsonl <node-public-key> --owner alice     # one owner's chain
+credentials verify log.jsonl <node-public-key> --owner alice --user-key key.txt   # with the details
 ```
 
 ## 运行节点
@@ -262,7 +261,10 @@ verify log.jsonl <node-public-key> --owner alice --user-key key.txt   # with the
   report data；所有者在封装授权之前检查 quote 和该值。quote 的验证与平台相关，不在本仓库中。
 - **密钥与重启。** 将 `NodeKey::to_bytes()` 封装（seal）到 enclave 中保存。重启后，
   `Node::restore(key, sink, clock, entries)` 会延续链，并恢复记录下限、已知设备和最近的授权时间；
-  所有者需要重新授权。
+  所有者需要重新授权，重启前签发或签名的内容一律不被接受。请把 `Node::checkpoint()` 保存在运营方无法回滚的
+  地方（封装存储、单调计数器），并用 `Node::restore_anchored` 重启，它会拒绝被截断的日志。
+- **命令行与服务器。** [`credentials`](../../crates/cli) 可生成密钥、签署策略、封装记录、生成授权和签名调用；
+  `credentials serve` 通过 HTTP 运行节点，并使用持久的 JSONL 日志。
 - **并发。** 每个方法都接受 `&self`；可在线程之间共享一个节点。传输 I/O 在节点的锁之外运行。
 
 ## 它保证什么
@@ -310,7 +312,7 @@ verify log.jsonl <node-public-key> --owner alice --user-key key.txt   # with the
 
 ## 它不做什么
 
-这些是设计上的限制，而不是缺失的代码。[威胁模型](docs/threat-model.md)对每一项都有说明。
+这些是设计上的限制，而不是缺失的代码。[威胁模型](../threat-model.md)对每一项都有说明。
 
 - **本仓库中没有 TEE。** 这里的节点是一个普通进程；远程证明属于平台集成
   （见[运行节点](#运行节点)）。没有 TEE，运行节点的人就能读取其内存。
@@ -331,9 +333,10 @@ verify log.jsonl <node-public-key> --owner alice --user-key key.txt   # with the
 
 | Crate | |
 | --- | --- |
-| [`engine`](crates/engine) | 密钥、策略、模板、记录、授权、调用方、日志、响应、节点 |
-| [`transport`](crates/transport) | TLS 传输（rustls），以及一个端到端示例 |
-| [`verify`](crates/verify) | 节点日志的命令行验证器 |
+| [`engine`](../../crates/engine) | 密钥、策略、模板、记录、授权、调用方、日志、响应、节点 |
+| [`transport`](../../crates/transport) | TLS 传输（rustls），以及一个端到端示例 |
+| [`verify`](../../crates/verify) | 节点日志验证器，以 `credentials verify` 运行 |
+| [`cli`](../../crates/cli) | `credentials` 工具：密钥、策略、记录、授权、调用和节点服务器 |
 
 ## 开发
 
@@ -343,13 +346,13 @@ cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace --locked
 ```
 
-最低 Rust 版本：1.87。CI 还会运行 `cargo audit`、`cargo deny`、MSRV 构建和可复现构建检查。
-参见 [CONTRIBUTING.md](CONTRIBUTING.md)。
+最低 Rust 版本：1.87。CI 还会运行 `cargo audit`、`cargo deny`、MSRV 测试、可复现构建检查，以及每个目标 60 秒的模糊测试。
+参见 [CONTRIBUTING.md](../../.github/CONTRIBUTING.md)。
 
 ## 安全
 
-请按照 [SECURITY.md](SECURITY.md) 中的说明私下报告漏洞。
+请按照 [SECURITY.md](../../.github/SECURITY.md) 中的说明私下报告漏洞。
 
 ## 许可证
 
-[Apache License 2.0](LICENSE)。
+[Apache License 2.0](../../LICENSE)。

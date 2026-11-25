@@ -1,0 +1,9 @@
+# Every change needs a review from a maintainer. The later, more specific lines name the
+# security-sensitive paths explicitly, so they keep an owner if the default changes.
+*                       @deongdion
+
+# The engine: secrets, policies, the template analysis, the log.
+/crates/engine/src/**   @deongdion
+
+# CI, release and supply-chain configuration.
+/.github/**             @deongdion

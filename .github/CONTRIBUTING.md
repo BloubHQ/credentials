@@ -36,3 +36,21 @@ CI also runs on macOS and Windows, builds with the minimum Rust version (1.87), 
 
 Keep them focused, describe what changes and why, and say how you tested it. By contributing
 you agree that your contribution is licensed under the Apache License 2.0.
+
+## Sign-off
+
+Every commit must be signed off under the
+[Developer Certificate of Origin 1.1](https://developercertificate.org): by adding the line
+
+```text
+Signed-off-by: Your Name <you@example.com>
+```
+
+you certify that you wrote the change or otherwise have the right to submit it under the
+project's license. `git commit -s` adds the line for you, using your `user.name` and
+`user.email`; `git commit --amend -s` or `git rebase --signoff main` adds it to commits you
+already made.
+
+## Conduct
+
+Everyone taking part follows the [Code of Conduct](CODE_OF_CONDUCT.md).

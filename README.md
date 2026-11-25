@@ -3,7 +3,7 @@
 [![ci](https://github.com/BloubHQ/credentials/actions/workflows/ci.yml/badge.svg)](https://github.com/BloubHQ/credentials/actions/workflows/ci.yml)
 [![license](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
-**English** | [한국어](README.ko.md) | [简体中文](README.zh-CN.md) | [日本語](README.ja.md)
+**English** | [한국어](docs/i18n/README.ko.md) | [简体中文](docs/i18n/README.zh-CN.md) | [日本語](docs/i18n/README.ja.md)
 
 A vault engine that lets applications and AI agents **use** a credential without ever
 **seeing** it. The owner's device decides, in a signed policy, exactly where a secret may go
@@ -110,21 +110,20 @@ logs, injects the token, sends the request over TLS and returns the response. In
 
 ```rust
 // On the owner's device.
-let record = Record::seal(&user_key, "github", "me", device.sign_policy(policy)?, &values)?;
-let grant = device.grant(&user_key, &node.identity(), GrantTerms {
-    owner: "me".into(),
-    expires_ms: now + 600_000,
-    issued_ms: now,
-    pins: vec![RecordPin { record_id: "github".into(), generation: record.generation }],
-})?;
+let policy = device.sign_policy(policy)?;
+let record = Record::seal(&user_key, "github", "me", policy, &values)?;
+let terms = GrantTerms::new("me", Duration::from_secs(600)).pin(&record);
+let grant = device.grant(&user_key, &node.identity(), terms)?;
 
 // On the node.
 node.grant(&grant)?;
 
 // In the application: it holds the record (ciphertext) and its caller key, never the token.
-let auth = app.authorize("example", &node.public_key(), &record, "github",
-                         &Payload::Http(Some(&request)), now)?;
-let response = node.http(&record, "github", &auth, Some(&request), &mut transport).result?;
+let body = Body::http(request);
+let call = app.sign_call("example", &node.public_key(), record, "github", body)?;
+
+// On the node: log, inject the token, send over TLS, check the response for the token.
+let outcome = node.run(&call, &mut TlsTransport::new());
 ```
 
 ## Policies
@@ -176,14 +175,15 @@ has names, variables, string literals, function calls and `+`; no branches or lo
 policy is signed, every template is analysed:
 
 - **Taint.** A value that holds a secret in reversible form is *tainted*. Encodings keep taint;
-  hashes, MACs, signatures and `len` remove it; encryption removes it only under a secret key.
-  A derivation whose output is tainted is refused.
+  hashes, MACs, signatures and `len` remove it, except a hash of the secret alone, which is as good as the key where the key is hashed before use (a long HMAC key, an Ed25519 seed). Encryption under a secret field hides only the
+  key: a secret in its message, nonce or data stays tainted, because another operation could
+  encrypt chosen bytes under the same key. A derivation whose output is tainted is refused.
 - **Oracles.** A secret and a value the caller or server chooses may not meet where the result
   reveals the secret piece by piece: in `replace`, `xor`, the key of `json_set`, a decoder,
   a number or a key argument. `len(replace(key, $input, ""))` is refused.
-- **Guessable fields.** Fields marked `guessable` (PINs, passwords) may not reach a derivation
-  output that a guess can be checked against (a hash or signature of them), unless a keyed
-  MAC or encryption under a strong secret key hides them.
+- **Guessable fields.** A derivation may depend on a field marked `guessable` (PIN, password)
+  only through `len`: a hash, signature, MAC or encryption of it would let the caller check
+  guesses.
 - **Budgets.** One operation may render at most 128 MiB, 1,000,000 PBKDF2 rounds and 32
   signatures.
 
@@ -238,15 +238,15 @@ flowchart LR
 Entries show who used which record, when, by which caller and for which operation. **Where**
 the value went and what was sent (host, path, body hash) is sealed to the owner's user key:
 the log store cannot read it, the owner can (`log::open_detail`, or
-`verify --owner alice --user-key key.txt`). A node never acts without a confirmed entry: the
+`credentials verify --owner alice --user-key key.txt`). A node never acts without a confirmed entry: the
 transport functions take a `Confirmed` that only `Log::commit` can make, after the sink
 returned `Ok`. If the sink fails, the log halts until it is reconciled.
 
 ```sh
-verify log.jsonl <node-public-key>                          # the whole chain
-verify log.jsonl <node-public-key> --head head.json         # must end at a signed checkpoint
-verify log.jsonl <node-public-key> --owner alice            # one owner's chain
-verify log.jsonl <node-public-key> --owner alice --user-key key.txt   # with the details
+credentials verify log.jsonl <node-public-key>                   # the whole chain
+credentials verify log.jsonl <node-public-key> --head head.json  # must end at a signed checkpoint
+credentials verify log.jsonl <node-public-key> --owner alice     # one owner's chain
+credentials verify log.jsonl <node-public-key> --owner alice --user-key key.txt   # with the details
 ```
 
 ## Running a node
@@ -271,7 +271,13 @@ verify log.jsonl <node-public-key> --owner alice --user-key key.txt   # with the
   verification is platform-specific and not in this repository.
 - **Keys and restarts.** Keep `NodeKey::to_bytes()` sealed to the enclave. After a restart,
   `Node::restore(key, sink, clock, entries)` continues the chain and brings back record
-  floors, known devices and the last grant times; owners grant again.
+  floors, known devices and the last grant times; owners grant again, and nothing granted or
+  signed before the restart is accepted. Keep `Node::checkpoint()` where the operator cannot
+  roll it back (sealed storage, a monotonic counter) and restart with `Node::restore_anchored`,
+  which refuses a cut log.
+- **Command line and server.** [`credentials`](crates/cli) makes keys, signs policies, seals
+  records, makes grants and signed calls, and `credentials serve` runs a node over HTTP with a
+  durable JSONL log.
 - **Concurrency.** Every method takes `&self`; share one node between threads. Transport I/O
   runs outside the node's lock.
 
@@ -352,7 +358,8 @@ explains each.
 | --- | --- |
 | [`engine`](crates/engine) | Secrets, policies, templates, records, grants, callers, the log, responses, the node |
 | [`transport`](crates/transport) | TLS transport (rustls), and an end-to-end example |
-| [`verify`](crates/verify) | Command-line verifier of node logs |
+| [`verify`](crates/verify) | Verifier of node logs, run as `credentials verify` |
+| [`cli`](crates/cli) | The `credentials` tool: keys, policies, records, grants, calls, and a node server |
 
 ## Development
 
@@ -362,12 +369,12 @@ cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace --locked
 ```
 
-Minimum Rust: 1.87. CI also runs `cargo audit`, `cargo deny`, an MSRV build and a
-reproducible-build check. See [CONTRIBUTING.md](CONTRIBUTING.md).
+Minimum Rust: 1.87. CI also runs `cargo audit`, `cargo deny`, tests on the MSRV, a
+reproducible-build check and 60 seconds of fuzzing per target. See [CONTRIBUTING.md](.github/CONTRIBUTING.md).
 
 ## Security
 
-Please report vulnerabilities privately, as described in [SECURITY.md](SECURITY.md).
+Please report vulnerabilities privately, as described in [SECURITY.md](.github/SECURITY.md).
 
 ## License
 

@@ -1,6 +1,8 @@
 # Policy reference
 
-A policy is JSON. Unknown members are refused everywhere. A device signs it with
+A policy is JSON. Unknown members are refused everywhere, including next to a tag:
+`{"from": "caller", "path": "/x"}`, `{"from": "all", "junk": 1}` and
+`{"kind": "body", "junk": 1}` are errors, not the plain forms. A device signs it with
 `DeviceKey::sign_policy`, which also checks every rule below; an error names the place and
 the rule, for example `policy invalid at operations[0].steps[1].inject[2]: header must be a
 token, not reserved, and set once`. `Policy::summary()` prints a policy as one line per
@@ -15,7 +17,7 @@ Policy
     │             ├── request: caller | fixed
     │             ├── inject:  [Injection]  ≤16
     │             └── capture: [Capture]    ≤16
-    ├── stream  → script: [Exchange] ≤32
+    ├── stream  → script: [Exchange] 1–32
     └── derive  → template
 ```
 
@@ -33,7 +35,7 @@ Names (fields, callers, operations, temporaries, path parameters) are tokens: 1 
 | `name` | Token, unique in the policy. |
 | `secret` | A secret is tracked by the template analysis and searched for in responses. A public value (a user name, a client id) is not. |
 | `optional` | The record may lack it: a value an operation fills in later, such as an access token. |
-| `guessable` | Secret only. A value with few possibilities (PIN, password a person chose). A derivation may not return a hash or signature of it unless a keyed MAC or encryption under a strong secret key hides it. |
+| `guessable` | Secret only. A value with few possibilities (PIN, password a person chose). A derivation may depend on it only through `len`: a hash, MAC, signature or encryption of it lets a guess be checked. |
 
 A record holds at most 32 fields and 16 MiB in all.
 
@@ -67,10 +69,10 @@ to each log entry.
 
 | Member | Meaning |
 | --- | --- |
-| `destinations` | 1–32 hosts and ports. `*.example.com` matches exactly one label (`eu.example.com`, not `example.com` or `a.b.example.com`). Hosts are lowercase. |
+| `destinations` | 1–32 hosts and ports. `*.example.com` matches exactly one label (`eu.example.com`, not `example.com` or `a.b.example.com`); `*.` must be followed by at least two labels, so `*.com` is refused. Hosts are lowercase labels of `a–z 0–9 -` (at most 253 bytes), and the port is not 0. |
 | `methods` | Methods the caller may use. Required exactly when a step sends the caller's request. `GET HEAD POST PUT PATCH DELETE OPTIONS PROPFIND REPORT MKCOL COPY MOVE`. |
-| `paths` | Path prefixes the caller may use, matched at a segment boundary (`/v1/` allows `/v1/repos`, not `/v10`). Required exactly when a step sends the caller's request. |
-| `caller_headers` | Headers the caller may set (none by default). A header an injection sets cannot also be a caller header. |
+| `paths` | 1–32 path prefixes the caller may use, matched at a segment boundary (`/v1/` allows `/v1/repos`, not `/v10`). A prefix starts with `/` and holds no query (`?`) and no dot segment. Required exactly when a step sends the caller's request. |
+| `caller_headers` | Headers the caller may set (none by default), each a token. A header an injection sets cannot also be a caller header. |
 | `identity` | Optional client certificate for mutual TLS: two templates, handed to the transport only. |
 | `steps` | 1–8 steps, sent in order. Only the last response goes back to the caller. |
 
@@ -90,14 +92,15 @@ the method-override headers; the engine sends `Accept-Encoding: identity` and
 ```
 
 `request` is `{"from": "caller"}` (the default) or `{"from": "fixed", ...}`. A fixed request
-needs a `destination` unless the operation has exactly one concrete destination.
+needs a `destination` unless the operation has exactly one concrete destination. A caller
+request takes no other member.
 
 #### Injections
 
 | `target` | Effect |
 | --- | --- |
 | `{"kind": "header", "name": "Authorization"}` | Sets a header (once). |
-| `{"kind": "query", "name": "signature"}` | Appends a query parameter (the value is percent-encoded). |
+| `{"kind": "query", "name": "signature"}` | Appends a query parameter (the value is percent-encoded). The name must be a token. |
 | `{"kind": "path_param", "name": "token"}` | Replaces `{token}` in the path, which must hold it exactly once. |
 | `{"kind": "body"}` | Sets the body (at most one per step). |
 
@@ -141,7 +144,8 @@ response before the caller sees it.
  ]}
 ```
 
-The script runs on one TLS connection, then the caller's exchanges (at most 64, each a send
+The script holds 1 to 32 entries (`send` or `expect`); each `expect` reads until one of 1 to 8
+delimiters, each 1 to 256 bytes. The script runs on one TLS connection, then the caller's exchanges (at most 64, each a send
 and the delimiters to read until) run on it. Every read is redacted and searched before it is
 returned; an error stops the exchanges and is returned next to the reads that completed.
 Streams capture with `between` and `all` only.
@@ -186,22 +190,49 @@ Keys are raw bytes or PKCS#8 DER (PKCS#1 DER for RSA); use `pem(...)` to read a 
 
 Every template is analysed before the policy is signed. Each expression has four properties:
 
-| Property | Set by | Removed by |
-| --- | --- | --- |
-| *tainted*: holds a secret in reversible form | secret fields, secret temps | hashes, MACs, signatures, `totp`, `len`; encryption under a secret key |
-| *controlled*: chosen by the caller or the server | `$method` `$path` `$pathname` `$query` `$body` `$input`, captured values | — |
-| *secret key*: a strong secret, usable as a key | secret fields (not guessable), their hashes, MACs and decodings | anything else |
-| *guessable*: a guess can be checked against it | guessable fields | `len`; a MAC or encryption under a strong secret key |
+| Property | Set by | Kept through | Removed by |
+| --- | --- | --- | --- |
+| *tainted*: holds a secret in reversible form | secret fields (guessable or not), secret temps; a plain hash (`md5` `sha1` `sha256` `sha512` `keccak256`) of a tainted value with no controlled bytes in it | every function not listed as removing it, and `+` | a plain hash of a value that is also controlled; `hmac_*`, `pbkdf2_sha256`, `totp`, the signatures and `len`; encryption, only as rule 4 says |
+| *controlled*: chosen by the caller or the server | `$method` `$path` `$pathname` `$query` `$body` `$input`, captured values (temps) | everything | — |
+| *secret key*: a strong secret nobody else knows, usable as a key | a secret field that is not guessable | `b64decode` `b32decode` `hexdecode` `pem` `trim` of it | everything else, including hashes, MACs and `+`: a hash or MAC of a key is a new value some operation may hand back |
+| *guessable*: a guess can be checked against it | guessable fields | every function except `len`, and `+` | `len` |
+
+An argument is *mixed* when it is both tainted and controlled (a secret and chosen bytes in one
+value).
 
 Rules:
 
-1. A tainted, controlled argument (a secret mixed with chosen bytes) may not reach a
-   decoder, a number argument or a key argument.
-2. A tainted and a controlled value may not meet in `replace` or `xor`, or in the object or
-   key of `json_set`.
-3. Encryption under a secret key is tainted only if the nonce or AAD is tainted, or the
-   message mixes a secret and chosen bytes under a fixed nonce.
-4. A derivation's output may not be tainted or guessable.
+1. A mixed value may not reach a sensitive argument, where failing or not, or the result,
+   would tell the caller something about the secret:
+
+   | Function | Sensitive arguments |
+   | --- | --- |
+   | `b64decode` `b32decode` `hexdecode` `pctdecode` `pem` `canonical_query` `be16` `be32` | the input |
+   | `time(unix, format)` | both |
+   | `totp(seed, digits, period)` | `digits` and `period` |
+   | `pbkdf2_sha256(password, salt, rounds, length)` | `rounds` and `length` |
+   | `aes_gcm_encrypt(key, nonce12, ...)` `aes_cbc_encrypt(key, iv16, ...)` | the key and the nonce or IV |
+   | the signatures | the key |
+
+   A tainted value in one sensitive argument of `time`, `totp` or `pbkdf2_sha256` and a
+   controlled value in another are refused too: `time(secret, $input)` lets the caller pick
+   which digits of the secret come out.
+2. A tainted and a controlled value may not meet anywhere in `replace` or `xor`. In
+   `json_set(object, key, value)`, a tainted object or key may not meet a controlled value in
+   any argument (the value itself is only escaped and appended).
+3. A hash of secret bytes alone is as good as the secret wherever the secret is hashed
+   before use (an HMAC key longer than its block, an Ed25519 seed), so it stays tainted:
+   `hex(sha256(key))` is refused as a derivation output, `hex(sha256(key + $input))` is not.
+4. Encryption under a secret key hides only the key: the output is tainted when the nonce, the
+   message or the AAD is tainted. A secret in the message stays readable, because another
+   operation may encrypt chosen bytes under the same key and a chosen nonce and so give back
+   the keystream. Under a key that is not a secret key, the output is tainted when any
+   argument is.
+5. A derivation's output may not be tainted or guessable. Since only `len` removes
+   *guessable*, a derivation may depend on a guessable field only through `len`.
+
+A template that breaks rule 1 or 2 is refused wherever it appears; rule 5 applies to
+`derive` operations.
 
 ### Budgets
 

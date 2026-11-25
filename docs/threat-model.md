@@ -40,18 +40,23 @@ What the engine protects, against whom, under which assumptions, and what is lef
 | Operator changes where a value goes | Policy signed by a device and bound into the record's AEAD | `policy`, `record` |
 | Operator swaps in an older record (narrower policy undone, revoked token back) | Generations in the AEAD; node floors; pins in grants and `Node::pin`; unpinned records refused | `record`, `node` |
 | Operator reads a grant in transit | HPKE to the node's seal key; the key is bound to the attested identity | `grant` |
-| Operator replays a stored grant after a revocation | Issue time within ±5 min and newer than the owner's last grant or revocation (restored from the log) | `node` |
-| Operator grants its own key under an owner's name | A grant must come from a device the node knows for the owner, or carry the user key in force | `node` |
+| Operator replays a stored grant after a revocation | Issue time within ±5 min and newer than the owner's last grant, revocation or device change (restored from the log); after a restart, nothing issued before the node started is accepted | `node` |
+| Operator restarts the node with a cut log to forget revocations, devices and floors | Grants and calls made before the restart are refused, so stored ones cannot be replayed; `Node::restore_anchored` refuses a log shorter than the last checkpoint the platform kept out of the operator's reach | `node` |
+| Operator replays a caller's authorization after a restart (the nonce cache is in memory) | Authorizations dated before the node started are refused | `node` |
+| Operator grants its own key under an owner's name | Once an owner has a device, a grant must come from a device the node knows for the owner; the user key alone does not make a device known | `node` |
 | Operator revokes to deny service | Revocations need a known device's signature | `grant`, `node` |
+| A lost or sold device keeps acting for the owner | Another known device retires it (`DeviceKey::retire`); a retired device cannot come back by granting, even under a fresh device key with the same user key; only a new endorsement adds a device. Endorsements name the node and an issue time, so they cannot be replayed elsewhere or later | `keys`, `node` |
 | Operator acts without a log entry | Transport calls need a `Confirmed`, made only after the sink confirmed | `log`, `egress` |
-| Operator edits, reorders or cuts the log | Signed chain per node and per owner; signed checkpoints; `verify` | `log`, `verify` |
+| Operator edits, reorders or cuts the log | Signed chain per node and per owner; signed checkpoints; `credentials verify` | `log`, `verify` |
 | Log store reads where secrets were used | Use details sealed to the owner's user key | `log` |
 | Operator points DNS at its own server | TLS certificate checked for the signed host | `transport` |
 | Caller not in the policy, or replaying a call | Per-call Ed25519 signature over node, record generation, operation, request digest, time, nonce; nonce cache | `caller`, `node` |
-| Caller floods | Per-caller rate limit; render budgets; size limits on input, request, response, captures | `node`, `template`, `response` |
+| Anyone probes whether an owner has a grant or which record generation is current | Grant, pin and generation errors are given only after the policy and the caller's signature verify | `node` |
+| Anyone creates owners to grow the node's state | Owners are trusted on first use, so their number is capped (`MAX_OWNERS`) | `node` |
+| Caller floods | Per-caller rate limit; at most 100,000 calls per caller and owner in the 5-minute replay window, authorizations at most 60 s ahead of the clock, so no caller fills the shared replay cache; render budgets; size limits on input, request, response, captures | `node`, `template`, `response` |
 | Caller sends a request outside the operation | Host (one-label wildcards), method, path prefix at segment boundaries, header allowlist; dot segments, encoded separators and request-smuggling headers refused | `request` |
-| Caller builds an oracle in a derivation | Taint and oracle analysis at signing time | `template`, `policy` |
-| Caller brute-forces a PIN through a hash | `guessable` fields | `template` |
+| Caller builds an oracle in a derivation | Taint and oracle analysis at signing time. Encryption under a secret key hides only the key: another operation of the same policy could encrypt chosen bytes under it and a chosen nonce, so a secret in the message, nonce or data stays tainted. A hash or MAC of a secret is not a secret key, since some operation may hand it back; a plain hash of a secret alone stays tainted (it is the key of a long HMAC key or an Ed25519 seed); a secret and a chosen value may not meet across the number arguments of `time`, `totp` and `pbkdf2_sha256` | `template`, `policy` |
+| Caller brute-forces a PIN through a hash, MAC, signature or encryption | A derivation may depend on a `guessable` field only through `len` (a keyed MAC does not help: another operation could compute it on chosen input) | `template` |
 | Server echoes the secret | Captured secrets redacted; reflection search over raw, base64, percent, JSON, hex and decoded JSON strings; the response is dropped on a hit | `reflection`, `node` |
 | Server hides the echo in framing (chunks, encodings, ranges, folded headers) | Strict parsing: chunked joined, `Content-Encoding` other than identity, `206`, `Content-Range`, folded headers and duplicate lengths refused; `Accept-Encoding: identity` sent | `response`, `request` |
 | Server moves one secret into another field | A captured value holding another secret field is refused | `node` |
@@ -70,6 +75,10 @@ These remain by design; each is listed in the README.
 - **Server-chosen values.** A value captured from a server is known to that server.
 - **Low entropy without `guessable`.** The owner has to mark such fields.
 - **Trust on first use.** The first grant of an owner on a node decides its devices.
+- **Trusted clock.** Freshness of grants, revocations, endorsements and calls uses the node's clock. A clock set back behind the node's start makes the node refuse everything signed until it catches up; a clock set forward lets grants expire early. In a TEE the clock must come from a source the operator cannot set.
+- **Shared replay cache.** Each caller and owner may hold 100,000 of the 1,000,000 nonces; owners trusted on first use with many callers can still fill it at about 3,300 signed, logged calls per second, which stops calls for everyone until nonces expire (5 minutes).
+- **Rollback without an anchor.** `Node::restore` alone cannot tell a cut log from a whole one; replays stay refused, but forgotten floors and devices come back only from new grants. Keep checkpoints in sealed storage and use `Node::restore_anchored`.
+- **Connection slots of `credentials serve`.** Each client has 10 seconds to send a request and the server holds at most `--max-connections` (64) at once; a client that keeps reopening slow connections can make others get 503. Put the server behind a proxy that limits clients per address.
 - **Side channels.** Timing and size of responses are visible to the caller. The engine does
   not pad or delay.
 - **Availability.** The operator can always stop the node or the log; the engine fails closed.

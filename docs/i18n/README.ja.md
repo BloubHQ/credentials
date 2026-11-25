@@ -1,9 +1,9 @@
 # credentials
 
 [![ci](https://github.com/BloubHQ/credentials/actions/workflows/ci.yml/badge.svg)](https://github.com/BloubHQ/credentials/actions/workflows/ci.yml)
-[![license](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+[![license](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](../../LICENSE)
 
-[English](README.md) | [한국어](README.ko.md) | [简体中文](README.zh-CN.md) | **日本語**
+[English](../../README.md) | [한국어](README.ko.md) | [简体中文](README.zh-CN.md) | **日本語**
 
 アプリケーションや AI エージェントが、認証情報 (credential) を一度も**見る**ことなく**使える**
 ようにするボールトエンジンです。シークレットをどこへ、どの形で送ってよいかは、所有者のデバイスが
@@ -23,7 +23,7 @@ JWT 署名、TOTP、IMAP ログイン、mutual TLS (相互 TLS)、Ethereum 署�
 
 > **ステータス: 0.x、監査未実施。** エンジンはテスト済みで内部レビューも受けていますが、外部の
 > セキュリティ監査は受けておらず、フォーマットは変更される可能性があります。本番のシークレットを
-> 任せる前に [脅威モデル](docs/threat-model.md) を読んでください。
+> 任せる前に [脅威モデル](../threat-model.md) を読んでください。
 
 ## 目次
 
@@ -104,28 +104,27 @@ cargo test --workspace
 GITHUB_TOKEN=ghp_... cargo run -p transport --example github_user
 ```
 
-[`github_user`](crates/transport/examples/github_user.rs) の例は、すべての部品を 1 つのプロセスで
+[`github_user`](../../crates/transport/examples/github_user.rs) の例は、すべての部品を 1 つのプロセスで
 動かします。デバイスがトークンをレコードに封印し、`GET https://api.github.com/user` だけを許可する
 ポリシーに署名して、ノードにグラントを与えます。アプリケーションが呼び出しに署名し、ノードはログを
 記録してトークンを注入し、TLS でリクエストを送ってレスポンスを返します。コードでは次のとおりです。
 
 ```rust
 // 所有者のデバイス上で。
-let record = Record::seal(&user_key, "github", "me", device.sign_policy(policy)?, &values)?;
-let grant = device.grant(&user_key, &node.identity(), GrantTerms {
-    owner: "me".into(),
-    expires_ms: now + 600_000,
-    issued_ms: now,
-    pins: vec![RecordPin { record_id: "github".into(), generation: record.generation }],
-})?;
+let policy = device.sign_policy(policy)?;
+let record = Record::seal(&user_key, "github", "me", policy, &values)?;
+let terms = GrantTerms::new("me", Duration::from_secs(600)).pin(&record);
+let grant = device.grant(&user_key, &node.identity(), terms)?;
 
 // ノード上で。
 node.grant(&grant)?;
 
 // アプリケーション内: レコード (暗号文) と呼び出し元鍵を保持するが、トークンは決して持たない。
-let auth = app.authorize("example", &node.public_key(), &record, "github",
-                         &Payload::Http(Some(&request)), now)?;
-let response = node.http(&record, "github", &auth, Some(&request), &mut transport).result?;
+let body = Body::http(request);
+let call = app.sign_call("example", &node.public_key(), record, "github", body)?;
+
+// ノード上で: ログを書き、トークンを注入して TLS で送り、応答にトークンがないか確認する。
+let outcome = node.run(&call, &mut TlsTransport::new());
 ```
 
 ## ポリシー
@@ -133,7 +132,7 @@ let response = node.http(&record, "github", &auth, Some(&request), &mut transpor
 ポリシーは、レコードの **fields** (フィールド)、それを使える **callers** (呼び出し元)、彼らが実行
 できる **operations** (オペレーション) を定めます。ポリシーはデバイスが署名し、その署名とレコードの
 暗号化の両方に結び付けられるため、所有者抜きで値の行き先を変えることは誰にもできません。完全な
-リファレンスは [docs/policy.md](docs/policy.md) にあります。
+リファレンスは [docs/policy.md](../policy.md) にあります。
 
 ```json
 {
@@ -177,14 +176,15 @@ let response = node.http(&record, "github", &auth, Some(&request), &mut transpor
 すべてのテンプレートが解析されます。
 
 - **テイント (taint)。** シークレットを可逆な形で保持する値は *tainted* (汚染されている) です。
-  エンコードはテイントを保ちます。ハッシュ、MAC、署名、`len` はテイントを除去し、暗号化は秘密鍵の
-  もとでのみテイントを除去します。出力が tainted な導出は拒否されます。
+  エンコードはテイントを保ちます。ハッシュ、MAC、署名、`len` はテイントを除去します。ただし、シークレットだけのハッシュは例外です。鍵を先にハッシュして使う場所 (長い HMAC 鍵、Ed25519 シード) では鍵と同じだからです。シークレット
+  フィールドを鍵とする暗号化が隠すのは鍵だけです。メッセージ、nonce、データに含まれるシークレットは
+  tainted のままです。別のオペレーションが同じ鍵で選んだバイトを暗号化できるからです。出力が tainted な
+  導出は拒否されます。
 - **オラクル (oracle)。** シークレットと、呼び出し元またはサーバーが選ぶ値とは、結果からシークレットが
   少しずつ明らかになる場所で出会ってはなりません: `replace`、`xor`、`json_set` のキー、デコーダー、
   数値引数や鍵引数などです。`len(replace(key, $input, ""))` は拒否されます。
-- **推測可能なフィールド。** `guessable` と指定されたフィールド (PIN、パスワード) は、推測を照合できる
-  導出出力 (それらのハッシュや署名) に到達してはなりません。ただし、強い秘密鍵による鍵付き MAC や
-  暗号化がそれらを隠す場合は除きます。
+- **推測可能なフィールド。** 導出が `guessable` と指定されたフィールド (PIN、パスワード) に依存できるのは
+  `len` を通してだけです。そのハッシュ、署名、MAC、暗号文はどれも呼び出し元に推測を照合させてしまいます。
 - **予算 (budget)。** 1 つのオペレーションでレンダリングできるのは最大 128 MiB、PBKDF2 1,000,000
   ラウンド、32 署名までです。
 
@@ -239,15 +239,15 @@ flowchart LR
 エントリには、誰がどのレコードを、いつ、どの呼び出し元で、どのオペレーションに使ったかが記録されます。
 値が**どこへ**行き、何が送られたか (ホスト、パス、ボディのハッシュ) は所有者のユーザー鍵宛てに封印
 されます。ログストアはそれを読めませんが、所有者は読めます (`log::open_detail`、または
-`verify --owner alice --user-key key.txt`)。ノードは確定したエントリなしには決して動作しません。
+`credentials verify --owner alice --user-key key.txt`)。ノードは確定したエントリなしには決して動作しません。
 トランスポート関数は `Confirmed` を受け取り、これはシンクが `Ok` を返した後に `Log::commit` だけが
 生成できます。シンクが失敗すると、ログは整合が取れるまで停止します。
 
 ```sh
-verify log.jsonl <node-public-key>                          # the whole chain
-verify log.jsonl <node-public-key> --head head.json         # must end at a signed checkpoint
-verify log.jsonl <node-public-key> --owner alice            # one owner's chain
-verify log.jsonl <node-public-key> --owner alice --user-key key.txt   # with the details
+credentials verify log.jsonl <node-public-key>                   # the whole chain
+credentials verify log.jsonl <node-public-key> --head head.json  # must end at a signed checkpoint
+credentials verify log.jsonl <node-public-key> --owner alice     # one owner's chain
+credentials verify log.jsonl <node-public-key> --owner alice --user-key key.txt   # with the details
 ```
 
 ## ノードの運用
@@ -272,7 +272,12 @@ verify log.jsonl <node-public-key> --owner alice --user-key key.txt   # with the
   あり、このリポジトリには含まれません。
 - **鍵と再起動。** `NodeKey::to_bytes()` はエンクレーブに封印して保管してください。再起動後、
   `Node::restore(key, sink, clock, entries)` がチェーンを継続し、レコードの下限世代、既知のデバイス、
-  最後のグラント時刻を復元します。所有者はグラントを再度与えます。
+  最後のグラント時刻を復元します。所有者はグラントを再度与え、再起動前に発行・署名されたものは受け付けられません。
+  `Node::checkpoint()` は運用者が巻き戻せない場所 (封印ストレージ、単調カウンター) に保存し、
+  `Node::restore_anchored` で再起動してください。切り詰められたログを拒否します。
+- **コマンドラインとサーバー。** [`credentials`](../../crates/cli) で鍵の生成、ポリシーの署名、レコードの封印、
+  グラントと署名付き呼び出しの作成ができ、`credentials serve` は永続的な JSONL ログとともに HTTP でノードを
+  実行します。
 - **並行性。** すべてのメソッドは `&self` を取るので、1 つのノードをスレッド間で共有できます。
   トランスポートの I/O はノードのロックの外で実行されます。
 
@@ -325,7 +330,7 @@ ring の代替として RustCrypto `rsa` 0.10 も計測しました。署名 1 �
 ## しないこと
 
 これらは設計上の限界であり、未実装のコードではありません。それぞれの説明は
-[脅威モデル](docs/threat-model.md) にあります。
+[脅威モデル](../threat-model.md) にあります。
 
 - **このリポジトリに TEE は含まれません。** ここでのノードは普通のプロセスであり、アテステーションは
   プラットフォームとの統合です ([ノードの運用](#ノードの運用) を参照)。TEE がなければ、ノードを
@@ -349,9 +354,10 @@ ring の代替として RustCrypto `rsa` 0.10 も計測しました。署名 1 �
 
 | クレート | |
 | --- | --- |
-| [`engine`](crates/engine) | シークレット、ポリシー、テンプレート、レコード、グラント、呼び出し元、ログ、レスポンス、ノード |
-| [`transport`](crates/transport) | TLS トランスポート (rustls) とエンドツーエンドの例 |
-| [`verify`](crates/verify) | ノードログのコマンドライン検証ツール |
+| [`engine`](../../crates/engine) | シークレット、ポリシー、テンプレート、レコード、グラント、呼び出し元、ログ、レスポンス、ノード |
+| [`transport`](../../crates/transport) | TLS トランスポート (rustls) とエンドツーエンドの例 |
+| [`verify`](../../crates/verify) | ノードログの検証ツール。`credentials verify` として実行 |
+| [`cli`](../../crates/cli) | `credentials` ツール: 鍵、ポリシー、レコード、グラント、呼び出し、ノードサーバー |
 
 ## 開発
 
@@ -361,13 +367,13 @@ cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace --locked
 ```
 
-最小 Rust バージョン: 1.87。CI では `cargo audit`、`cargo deny`、MSRV ビルド、再現可能ビルドの
-チェックも実行します。[CONTRIBUTING.md](CONTRIBUTING.md) を参照してください。
+最小 Rust バージョン: 1.87。CI では `cargo audit`、`cargo deny`、MSRV テスト、ターゲットごとに 60 秒のファジング、再現可能ビルドの
+チェックも実行します。[CONTRIBUTING.md](../../.github/CONTRIBUTING.md) を参照してください。
 
 ## セキュリティ
 
-脆弱性は [SECURITY.md](SECURITY.md) に記載の方法で、非公開で報告してください。
+脆弱性は [SECURITY.md](../../.github/SECURITY.md) に記載の方法で、非公開で報告してください。
 
 ## ライセンス
 
-[Apache License 2.0](LICENSE)。
+[Apache License 2.0](../../LICENSE)。
