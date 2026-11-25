@@ -411,6 +411,7 @@ impl<S: LogSink, C: Clock> Node<S, C> {
             Connection::Websocket => self.socket(run, open, request, transport, &mut live, updated),
             Connection::Https => self.streamed(run, open, request, transport, &mut live, updated),
             Connection::Tls
+            | Connection::Udp
             | Connection::Ssh
             | Connection::Postgres
             | Connection::Smtp

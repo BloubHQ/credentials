@@ -684,6 +684,11 @@ pub enum Connection {
     Imap,
     /// Redis over TLS: `AUTH`, then commands with bulk-string parameters.
     Redis,
+    /// UDP datagrams to one destination, for request and response protocols that protect
+    /// their messages with a MAC (RADIUS, DNS with TSIG, STUN): `send` writes one datagram,
+    /// `receive` reads one. There is no TLS, so a send may not hold a secret in reversible
+    /// form.
+    Udp,
 }
 
 /// The `open` step: the connection and where it may go.
@@ -1405,7 +1410,28 @@ impl Policy {
         known: &[&str],
         var_ok: fn(Var) -> bool,
     ) -> Result<(Template, bool)> {
+        self.check_template_in(at, kinds, text, known, var_ok, false)
+    }
+
+    /// [`Self::check_template`] for a template rendered on an open TLS connection, after its
+    /// handshake (`after_handshake`), where `tls_exporter` has a value; anywhere else it is
+    /// refused.
+    fn check_template_in(
+        &self,
+        at: &str,
+        kinds: &Kinds<'_>,
+        text: &str,
+        known: &[&str],
+        var_ok: fn(Var) -> bool,
+        after_handshake: bool,
+    ) -> Result<(Template, bool)> {
         let template = Template::parse(text).map_err(|_| Error::policy(at, "template syntax"))?;
+        if !after_handshake && template.calls(crate::template::Func::TlsExporter) {
+            return Err(Error::policy(
+                at,
+                "tls_exporter is available only in the send of a TLS connection",
+            ));
+        }
         let known_name = |name: &str| self.is_field(name) || known.contains(&name);
         if let Some(name) = template.names().into_iter().find(|n| !known_name(n)) {
             return Err(Error::policy(
@@ -1771,11 +1797,11 @@ impl Policy {
                     self.check_proto_relay(at, kinds, c, relay, known)?;
                 }
             }
-            Some(Connection::Tls) => {
+            Some(Connection::Tls | Connection::Udp) => {
                 ensure(
                     ret.response.is_none() && ret.template.is_none(),
                     || at.to_string(),
-                    "a TLS return takes relay only",
+                    "a TLS or UDP return takes relay only",
                 )?;
                 if let Some(relay) = &ret.relay {
                     ensure(
@@ -1906,6 +1932,14 @@ impl Policy {
                     check_destinations(&at, &open.destinations)?;
                     self.check_identity(&at, &kinds, open.identity.as_ref())?;
                     ensure(
+                        open.connection != Connection::Udp
+                            || (open.identity.is_none()
+                                && open.protocol.is_none()
+                                && open.limits.is_none()),
+                        || at.clone(),
+                        "a UDP connection takes no identity, protocol or limits",
+                    )?;
+                    ensure(
                         open.protocol.is_none() || open.connection == Connection::Https,
                         || format!("{at}.protocol"),
                         "protocol is for an HTTPS connection (a WebSocket handshake is HTTP/1.1)",
@@ -2012,12 +2046,46 @@ impl Policy {
                         let Some(template) = &send.template else {
                             return fail(at, "a TLS send needs a template");
                         };
-                        self.check_template(
+                        self.check_template_in(
                             &format!("{at}.template"),
                             &kinds,
                             template,
                             &known,
                             Var::in_stream,
+                            true,
+                        )?;
+                    }
+                    Connection::Udp => {
+                        ensure(
+                            send.request.is_none()
+                                && send.inject.is_empty()
+                                && !send.grpc
+                                && send.frame.is_none(),
+                            || at.clone(),
+                            "a UDP send takes template only",
+                        )?;
+                        let Some(template) = &send.template else {
+                            return fail(at, "a UDP send needs a template");
+                        };
+                        let (parsed, tainted) = self.check_template(
+                            &format!("{at}.template"),
+                            &kinds,
+                            template,
+                            &known,
+                            Var::in_stream,
+                        )?;
+                        // A datagram crosses the network, and the host of an enclave, in
+                        // clear: a secret may reach it only through a one-way function, and
+                        // a guessable one not at all (a MAC of it is a test for each guess).
+                        ensure(
+                            !tainted,
+                            || format!("{at}.template"),
+                            "a UDP datagram is sent in clear: it may not hold a secret in reversible form",
+                        )?;
+                        ensure(
+                            !parsed.guessable(&|name| kinds.kind(name)),
+                            || format!("{at}.template"),
+                            "a UDP datagram is sent in clear: it may not depend on a guessable secret",
                         )?;
                     }
                 },
@@ -2053,6 +2121,14 @@ impl Policy {
                                     .all(|u| !u.is_empty() && u.len() <= MAX_DELIMITER),
                             || format!("{at}.until"),
                             "1 to 8 delimiters of 1 to 256 bytes",
+                        )?;
+                        self.check_captures(&at, &receive.capture, true, true, &mut known)?;
+                    }
+                    Connection::Udp => {
+                        ensure(
+                            receive.until.is_empty(),
+                            || format!("{at}.until"),
+                            "a UDP receive reads one datagram; until is for TLS streams",
                         )?;
                         self.check_captures(&at, &receive.capture, true, true, &mut known)?;
                     }
@@ -2603,6 +2679,7 @@ fn summarize_operation(operation: &Operation, out: &mut Vec<String>) {
                 Connection::Smtp => "SMTP",
                 Connection::Imap => "IMAP",
                 Connection::Redis => "Redis",
+                Connection::Udp => "UDP datagrams (no TLS)",
             },
             destination_names(&open.destinations),
             if open.identity.is_some() {
@@ -2750,7 +2827,9 @@ fn summarize_operation(operation: &Operation, out: &mut Vec<String>) {
                     }
                 }
                 (None, None, None) => out.push(match operation.connection() {
-                    Some(Connection::Tls) => "  return: no caller exchanges".into(),
+                    Some(Connection::Tls | Connection::Udp) => {
+                        "  return: no caller exchanges".into()
+                    }
                     _ => "  return: status".into(),
                 }),
             },

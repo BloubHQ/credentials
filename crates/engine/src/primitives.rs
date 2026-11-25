@@ -17,9 +17,11 @@ use crate::template::{Budget, Bytes, Func};
 use crate::{Error, Result, totp};
 
 mod cbor;
+pub(crate) mod hpke;
 mod kdf;
 mod modes;
 mod sign;
+pub(crate) mod turbo;
 
 pub(crate) use kdf::MAX_DERIVED;
 
@@ -876,7 +878,20 @@ pub(crate) fn output_bound(func: Func, args: &[Bytes]) -> usize {
         | Func::ConcatKdf
         | Func::KbkdfCounter
         | Func::Shake128
-        | Func::Shake256 => MAX_DERIVED,
+        | Func::Shake256
+        | Func::Turboshake128
+        | Func::Turboshake256
+        | Func::Kt128
+        | Func::Kt256
+        | Func::TlsExporter
+        | Func::HpkeReceiverExport => MAX_DERIVED,
+        // `enc` (at most 133 bytes, P-521) before the secret.
+        Func::HpkeExport => MAX_DERIVED + 256,
+        // `enc` and the tag around the plaintext.
+        Func::HpkeSeal => len(5) + 256,
+        Func::HpkeOpen => len(6),
+        Func::HpkePublic => 160,
+        Func::HpkeDeriveKey => 128,
         Func::Nfold => 1024,
         Func::AesCbcHmacEncrypt
         | Func::AesEaxEncrypt
@@ -885,6 +900,10 @@ pub(crate) fn output_bound(func: Func, args: &[Bytes]) -> usize {
         | Func::AesKwpWrap => len(2).max(len(1)) + 96,
         Func::AesCcmEncrypt => len(3) + 32,
         Func::DsaSign | Func::DsaSignDer => 512,
+        // ML-DSA-87: 4627-byte signatures, 2592-byte public keys.
+        Func::MldsaSign => 4627,
+        Func::MldsaPublic => 2592,
+        Func::Sm2Sign => 64,
         Func::CborArray | Func::CborMap => args.iter().map(|a| a.len()).sum::<usize>() + 9,
         Func::CborTag => len(1) + 9,
         _ => len(0) + 128,
@@ -944,8 +963,57 @@ fn call_family(func: Func, args: &[Bytes], budget: &Budget) -> Result<Option<Byt
         Func::CborArray => cbor::array(args)?,
         Func::CborMap => cbor::map(args)?,
         Func::CborTag => cbor::tag(at(0)?, at(1)?)?,
+        Func::Turboshake128 => turbo::turboshake(turbo::Level::L128, at(0)?, at(1)?, at(2)?)?,
+        Func::Turboshake256 => turbo::turboshake(turbo::Level::L256, at(0)?, at(1)?, at(2)?)?,
+        Func::Kt128 => turbo::kt(turbo::Level::L128, at(0)?, at(1)?, at(2)?)?,
+        Func::Kt256 => turbo::kt(turbo::Level::L256, at(0)?, at(1)?, at(2)?)?,
+        // Each HPKE call runs one or two Diffie-Hellman operations: a signature in the budget.
+        Func::HpkeSeal => {
+            budget.signature()?;
+            hpke::seal(args)?
+        }
+        Func::HpkeOpen => {
+            budget.signature()?;
+            hpke::open(args)?
+        }
+        Func::HpkeExport => {
+            budget.signature()?;
+            hpke::export(args)?
+        }
+        Func::HpkeReceiverExport => {
+            budget.signature()?;
+            hpke::receiver_export(args)?
+        }
+        Func::HpkePublic => {
+            budget.signature()?;
+            hpke::public(at(0)?, at(1)?)?
+        }
+        Func::HpkeDeriveKey => hpke::derive_key(at(0)?, at(1)?)?,
+        Func::MldsaSign => {
+            budget.signature()?;
+            sign::mldsa(at(0)?, at(1)?, at(2)?, opt(3), &random(32)?)?
+        }
+        Func::MldsaPublic => {
+            budget.signature()?;
+            sign::mldsa_public(at(0)?, at(1)?)?
+        }
+        Func::Sm2Sign => {
+            budget.signature()?;
+            sign::sm2(at(0)?, at(1)?, args.get(2).map(|v| v.as_slice()))?
+        }
+        // Exported keying material exists only on a connection (`Template::render_on`).
+        Func::TlsExporter => return Err(bad("tls_exporter is available only in a TLS send")),
         _ => return Ok(None),
     }))
+}
+
+/// `tls_exporter(label, context, length)` on an open connection.
+pub(crate) fn tls_exporter(
+    connection: &dyn crate::egress::Stream,
+    args: &[Bytes],
+) -> Result<Bytes> {
+    let length = kdf::length(arg(args, 2)?, MAX_DERIVED)?;
+    connection.tls_exporter(arg(args, 0)?, arg(args, 1)?, length)
 }
 
 pub(crate) fn call(func: Func, args: &[Bytes], unix: u64, budget: &Budget) -> Result<Bytes> {

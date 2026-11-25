@@ -374,3 +374,67 @@ fn http2_is_taken_when_the_server_offers_it() {
     assert!(text.ends_with("hi\r\n0\r\n\r\n"), "{text}");
     assert_eq!(&got.recv().unwrap(), b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n");
 }
+
+/// Reads one line on the server, then exports keying material as `tls_exporter` does.
+fn export_after_line(stream: &mut Server) -> (Vec<u8>, Vec<u8>) {
+    let mut line = Vec::new();
+    let mut byte = [0u8; 1];
+    while !line.ends_with(b"\n") {
+        stream.read_exact(&mut byte).unwrap();
+        line.push(byte[0]);
+    }
+    let mut out = vec![0u8; 32];
+    let exported = stream
+        .conn
+        .export_keying_material(&mut out, b"EXPORTER-Channel-Binding", Some(b""))
+        .is_ok();
+    (line, if exported { out } else { Vec::new() })
+}
+
+#[test]
+fn the_exporter_of_a_stream_matches_the_server() {
+    let server = load("imap");
+    let (address, got) = serve(server_config(&server, None), export_after_line);
+    let mut transport = transport(address);
+    let mut stream = transport
+        .open(&Destination::new("imap.test", 993), None)
+        .unwrap();
+    stream.write(b"a1 NOOP\n").unwrap();
+    let ours = stream
+        .tls_exporter(b"EXPORTER-Channel-Binding", b"", 32)
+        .unwrap();
+    let (line, theirs) = got.recv().unwrap();
+    assert_eq!(line, b"a1 NOOP\n");
+    assert_eq!(theirs.len(), 32);
+    assert!(ours.as_slice() == theirs.as_slice(), "the two sides differ");
+    // Another context gives other bytes.
+    let other = stream
+        .tls_exporter(b"EXPORTER-Channel-Binding", b"x", 32)
+        .unwrap();
+    assert!(
+        other.as_slice() != theirs.as_slice(),
+        "the context is ignored"
+    );
+}
+
+#[test]
+fn no_exporter_over_tls12() {
+    let server = load("imap");
+    let config = ServerConfig::builder_with_provider(provider())
+        .with_protocol_versions(&[&rustls::version::TLS12])
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(vec![server.der.clone()], server.key.clone_key())
+        .unwrap();
+    let (address, _got) = serve(config, export_after_line);
+    let mut transport = transport(address);
+    let mut stream = transport
+        .open(&Destination::new("imap.test", 993), None)
+        .unwrap();
+    stream.write(b"a1 NOOP\n").unwrap();
+    let refused = stream.tls_exporter(b"EXPORTER-Channel-Binding", b"", 32);
+    assert_eq!(
+        refused.err(),
+        Some(Error::transport(TransportKind::Unsupported, true))
+    );
+}

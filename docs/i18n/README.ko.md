@@ -173,7 +173,7 @@ let outcome = node.run(&call, &mut TlsTransport::new());
 }
 ```
 
-operation은 연결 하나 위의 **step** 목록입니다: `open`(HTTPS, TLS 스트림, WebSocket, 프로토콜 연결, 또는 연결 없음),
+operation은 연결 하나 위의 **step** 목록입니다: `open`(HTTPS, TLS 스트림, WebSocket, 프로토콜 연결, UDP 데이터그램, 또는 연결 없음),
 `send`, `receive`(캡처 포함), `compute`(템플릿을 이후 step이 읽는 이름에 담음), 그리고 호출자에게
 무엇이 돌아가는지 정하는 `return`.
 
@@ -183,6 +183,7 @@ operation은 연결 하나 위의 **step** 목록입니다: `open`(HTTPS, TLS �
 | `websocket` | 핸드셰이크 요청, 정책이 쓰는 메시지(첫 메시지 인증), 그다음 호출자가 서명한 프레임. 프레임마다 닫힌 JSON 스키마나 패턴으로 검사합니다. 서버 메시지는 `return`이 허용할 때만 비밀 값 검색을 거쳐 돌려줍니다. 유휴 시간, 지속 시간, 바이트 한도가 있고, 열릴 때와 닫힐 때 로그 항목을 하나씩 남깁니다. |
 | `tls` | TLS 연결 하나 위의 send/receive 스크립트(라인 기반 프로토콜). 그다음 `return`이 중계하는 패턴에 send가 맞는 호출자의 교환만 이어 갑니다. |
 | `ssh`, `postgres`, `smtp`, `imap`, `redis` | 노드가 항목의 비밀 값으로 로그인합니다(SSH는 고정한 호스트 키에 대해 비밀번호, 키, keyboard-interactive; PostgreSQL은 TLS 위 SCRAM-SHA-256; SMTP와 IMAP은 암묵적 TLS나 STARTTLS 위에서 정책이 지정한 메커니즘; Redis는 TLS 위 `AUTH`). 정책이 고정한 명령을 실행한 뒤, 이름이 붙은 호출자 명령을 실행합니다. 매개변수는 패턴에 맞아야 하고 바인딩, 인용, 인자 하나로만 들어가며 명령문에 이어 붙지 않습니다. SMTP는 발신자·수신자 규칙 안의 호출자 메일을 보냅니다. 결과는 비밀 값 검색을 거치고, SSH 셸은 `/stream`에서 돌아갑니다. 최신 알고리즘만 쓰고 다운그레이드하지 않습니다. |
+| `udp` | 정책이 고정한 목적지와 `send`마다 데이터그램 하나, `receive`마다 데이터그램 하나를 주고받습니다(RADIUS, TSIG를 쓰는 DNS, STUN). 응답이 없으면 다시 보냅니다. 그다음 `return`이 중계하는 패턴에 맞는 호출자의 데이터그램이 이어집니다. TLS가 없으므로 비밀 값은 일방향 함수(HMAC, 서명)를 거쳐서만 데이터그램에 들어갈 수 있고, 그 밖의 경우는 서명할 때 거부됩니다. |
 | 없음 | `return`이 템플릿을 렌더링해 호출자에게 돌려줍니다: 서명, HMAC, TOTP 코드, JWT. 호출자의 `$input`은 먼저 operation의 `input` 스키마(raw 바이트, JSON, RLP: 고정 멤버, 허용 값, 숫자 범위, 노드가 넣는 시각)로 검사합니다. |
 
 step 이전 형식(`"kind": "http" | "stream" | "derive"`)의 정책은 `credentials policy upgrade`로
@@ -558,6 +559,9 @@ PKCS#1 v1.5 서명을 하지 못하므로 `rsa_sign_pkcs1("sha1", …)`만 RustC
   스레드 하나를 차지합니다. SSH, PostgreSQL, SMTP, IMAP, Redis는 자체 클라이언트가 있고, MySQL, MQTT,
   AMQP는 TLS send/expect 스크립트로 가능한 범위까지만 동작합니다. gRPC는 단항 호출만 됩니다
   (클라이언트·서버·양방향 스트림은 안 됨).
+- **UDP 데이터그램은 암호화되지 않습니다.** `udp` operation이 주고받는 내용은 경로 위에서,
+  그리고 enclave의 호스트가 읽을 수 있습니다. 정책은 일방향 함수를 거친 값 말고는 비밀 값이 들어가지
+  않게 합니다. DTLS는 제공하지 않습니다.
 - **브라우저 로그인, 하드웨어 키**는 사람이나 기기가 필요하므로 위임할 수 없습니다. 일회용 코드와
   다른 앱에서의 승인은 노드나 호출자가 아니라 소유자에게서 옵니다(`await` 단계).
 - **웹 페이지는 앱보다 약합니다.** [`client`](../../crates/client) 패키지는 페이지에서도 앱과 같은 검증을 하지만,

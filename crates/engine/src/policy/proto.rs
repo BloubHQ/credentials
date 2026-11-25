@@ -124,7 +124,9 @@ impl Login {
             Connection::Smtp => Mechanism::Plain,
             Connection::Imap => Mechanism::Login,
             Connection::Redis => Mechanism::Auth,
-            Connection::Https | Connection::Tls | Connection::Websocket => return None,
+            Connection::Https | Connection::Tls | Connection::Websocket | Connection::Udp => {
+                return None;
+            }
         })
     }
 
@@ -247,6 +249,7 @@ impl Connection {
             Connection::Smtp => "smtp",
             Connection::Imap => "imap",
             Connection::Redis => "redis",
+            Connection::Udp => "udp",
         }
     }
 }
@@ -262,7 +265,7 @@ fn mechanisms(connection: Connection) -> &'static [Mechanism] {
         Connection::Smtp => &[Mechanism::Plain, Mechanism::Login, Mechanism::Xoauth2],
         Connection::Imap => &[Mechanism::Plain, Mechanism::Login, Mechanism::Xoauth2],
         Connection::Redis => &[Mechanism::Auth],
-        Connection::Https | Connection::Tls | Connection::Websocket => &[],
+        Connection::Https | Connection::Tls | Connection::Websocket | Connection::Udp => &[],
     }
 }
 

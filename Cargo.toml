@@ -61,6 +61,18 @@ html5gum = "0.9"
 sha3 = "0.12"
 # SHAKE128 and SHAKE256 (FIPS 202); sha3 0.12 moved them into this crate.
 shake = "0.1"
+# TurboSHAKE (Keccak-p[1600, 12]) and KangarooTwelve, RFC 9861.
+keccak = "0.2"
+k12 = { version = "0.5.1", default-features = false, features = ["zeroize"] }
+# Brainpool P256r1 and P384r1 ECDSA (RFC 5639; COSE ESB256, ESB384), the RustCrypto
+# generation of p256 0.14.
+bp256 = { version = "0.14", default-features = false, features = ["ecdsa", "arithmetic", "pkcs8", "sha256"] }
+bp384 = { version = "0.14", default-features = false, features = ["ecdsa", "arithmetic", "pkcs8", "sha384"] }
+ecdsa = { version = "0.17", default-features = false, features = ["algorithm", "pkcs8"] }
+# ML-DSA (FIPS 204): JOSE, COSE and TLS post-quantum signatures.
+ml-dsa = { version = "0.1.2", default-features = false, features = ["alloc", "zeroize"] }
+# SM2 signatures with SM3 (GB/T 32918, RFC 8998).
+sm2 = { version = "0.14", default-features = false, features = ["dsa", "pkcs8"] }
 # Ed448 and X448. Pre-releases: the only maintained RustCrypto crates for curve448, pinned.
 ed448-goldilocks = { version = "=0.14.0-pre.15", default-features = false, features = ["signing", "pkcs8", "alloc"] }
 x448 = { version = "=0.14.0-pre.12", default-features = false }

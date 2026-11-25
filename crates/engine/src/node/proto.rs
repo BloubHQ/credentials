@@ -461,7 +461,7 @@ fn sign_in<'s>(
             secret,
         )?),
         Connection::Redis => Session::Redis(redis::Client::connect(io, user, secret)?),
-        Connection::Https | Connection::Tls | Connection::Websocket => {
+        Connection::Https | Connection::Tls | Connection::Websocket | Connection::Udp => {
             return Err(Error::transport(TransportKind::Unsupported, false));
         }
     })

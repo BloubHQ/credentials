@@ -273,7 +273,7 @@ impl Send {
         }
     }
 
-    /// A `send` that writes a rendered template (TLS).
+    /// A `send` that writes a rendered template (TLS; one datagram on UDP).
     pub fn write(template: &str) -> Self {
         Self {
             template: Some(template.into()),
@@ -290,7 +290,7 @@ impl Send {
 }
 
 impl Receive {
-    /// A `receive` of the response of the `send` before it (HTTPS).
+    /// A `receive` of the response of the `send` before it (HTTPS), or of one datagram (UDP).
     pub fn response() -> Self {
         Self::default()
     }
@@ -478,6 +478,11 @@ impl Operation {
     /// An operation that opens a TLS stream to `destination`.
     pub fn tls(name: &str, destination: Destination) -> Self {
         Self::opening(name, Connection::Tls, destination)
+    }
+
+    /// An operation that exchanges UDP datagrams with `destination`.
+    pub fn udp(name: &str, destination: Destination) -> Self {
+        Self::opening(name, Connection::Udp, destination)
     }
 
     /// An operation with no connection.

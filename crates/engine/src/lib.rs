@@ -114,6 +114,8 @@ mod totp;
 mod vectors;
 #[cfg(test)]
 mod vectors_families;
+#[cfg(test)]
+mod vectors_part9;
 pub mod websocket;
 
 pub use error::{Error, Result};

@@ -129,7 +129,7 @@ CDP) are not implemented yet.
 
 | Member | Meaning |
 | --- | --- |
-| `connection` | `https`, `tls`, `websocket` (always `wss`), or a [protocol connection](#protocol-connections): `ssh`, `postgres`, `smtp`, `imap`, `redis`. |
+| `connection` | `https`, `tls`, `websocket` (always `wss`), or a [protocol connection](#protocol-connections): `ssh`, `postgres`, `smtp`, `imap`, `redis`; or `udp` (see [UDP](#udp)). |
 | `destinations` | 1–32 hosts and ports. `*.example.com` matches exactly one label (`eu.example.com`, not `example.com` or `a.b.example.com`); `*.` must be followed by at least two labels, so `*.com` is refused. Hosts are lowercase labels of `a–z 0–9 -` (at most 253 bytes), and the port is not 0. The caller's request or stream names one of them. |
 | `identity` | Optional client certificate for mutual TLS: two templates, handed to the transport only. |
 | `protocol` | HTTPS only, optional: `h2` or `http1` pins the HTTP version. Without it the node offers both by ALPN and takes what the server picks. A pinned version the server does not agree to fails the call before the request is written (no downgrade). |
@@ -219,6 +219,34 @@ headers; the engine sends `Accept-Encoding: identity` and `Connection: close`.
 
 `{"do": "send", "template": "a1 LOGIN {{user}} {{password}}\r\n"}` writes the rendered
 template.
+
+### UDP
+
+`"connection": "udp"` is for request and response protocols over datagrams that protect
+their own messages with a MAC (RADIUS with Message-Authenticator, DNS with TSIG, STUN with
+MESSAGE-INTEGRITY): each `send` writes its rendered template as one datagram, each `receive`
+reads one datagram (`until` is empty) and captures from it, as on a TLS stream. The
+destination is fixed by the policy like any other; the node connects its socket to the
+address it resolved, so datagrams from any other address are dropped.
+
+There is no TLS: what a datagram carries is readable on the path, and in an enclave by the
+host that relays it. So:
+
+- a `send` template on `udp` must not be tainted: a secret may go only through a one-way
+  function (`hmac_md5(secret, message)`, `hmac_sha256`, a signature), never as itself or
+  encrypted under a key some operation may use elsewhere, and a `guessable` field not at all
+  (a MAC of a password is a test for each guess); the policy is refused at signing
+  otherwise;
+- `identity`, `protocol` and `limits` are refused on `udp`;
+- a receive waits at most 10 seconds in all and sends the last datagram again after 1, 2 and
+  4 seconds without an answer (the retransmission of RFC 2865 and RFC 8489); a datagram
+  is at most 65,507 bytes;
+- the `return` takes `relay` only, like a TLS stream: each caller exchange is one datagram
+  and its `until` is empty, the answer is one datagram, searched for reflected secrets like
+  every read.
+
+The summary flags each `udp` operation with `plain_datagram`. DTLS is not offered
+(`docs/design.md`, section 7b).
 
 ### HTTP versions and gRPC
 
@@ -889,6 +917,7 @@ crate, which checks the policy first) gives the owner, in JSON:
 | `param_unpinned` | A command parameter of the caller has no pattern (only its length bounds it). |
 | `mail_relay` | The caller sends mail over SMTP as the item's account. |
 | `shell_relay` | The caller types into an SSH shell. |
+| `plain_datagram` | An operation sends UDP datagrams, without TLS: what they carry is readable on the path. |
 | `wider` | Against `previous`: a new destination, method, path, header, query rule, injection, operation, caller or caller key; more of the response; a looser limit; a new sign-in, host key, TLS mode, command or mail rule; a field made public or not guessable; a payment changed or an approval dropped; a session rule changed; the item unbound or its pins and sign-offs changed. |
 | `new_destination` | Against `previous`: a destination it did not have. |
 
@@ -1088,10 +1117,12 @@ reads.
 | Text | `upper` `lower` `trim` `replace(text, from, to)` `json_set(object, key, value)` `json_set_number(object, key, integer)` `canonical_query` `time(unix, format)` `len` `xor(a, b)` `slice(value, start, length)` `between(value, start, end)` |
 | Numbers | `add(a, b)` (signed 64-bit decimal); fixed-width encoders of a decimal number: `u8`, `be16` `be32` `be64`, `le16` `le32` `le64` |
 | Random | `random(n)`: n fresh bytes (1 to 1024), new at every call |
-| Hash and MAC | `md4` `md5` `sha1` `sha256` `sha384` `sha512` `sha512_256` `keccak256` `sha3_224` `sha3_256` `sha3_384` `sha3_512` `shake128(msg, length)` `shake256(msg, length)` `hmac_md5(key, msg)` `hmac_sha1` `hmac_sha256` `hmac_sha384` `hmac_sha512` `aes_cmac(key, msg)` `aes_cbc_mac(key, msg)` `pbkdf2(hash, password, salt, rounds[, length])` `pbkdf2_sha256(password, salt, rounds[, length])` `totp(seed[, digits[, period]])` |
+| Hash and MAC | `md4` `md5` `sha1` `sha256` `sha384` `sha512` `sha512_256` `keccak256` `sha3_224` `sha3_256` `sha3_384` `sha3_512` `shake128(msg, length)` `shake256(msg, length)` `turboshake128(msg, domain, length)` `turboshake256(msg, domain, length)` `kt128(msg, customization, length)` `kt256(msg, customization, length)` `hmac_md5(key, msg)` `hmac_sha1` `hmac_sha256` `hmac_sha384` `hmac_sha512` `aes_cmac(key, msg)` `aes_cbc_mac(key, msg)` `pbkdf2(hash, password, salt, rounds[, length])` `pbkdf2_sha256(password, salt, rounds[, length])` `totp(seed[, digits[, period]])` |
 | Key derivation | `hkdf(hash, ikm, salt, info, length)` `hkdf_expand(hash, prk, info, length)` `concat_kdf(hash, z, other_info, length)` `kbkdf_counter(hash, key, fixed_input, length)` `nfold(value, bits)` `kerberos_dk(key, constant)` |
-| Signature | `ed25519_sign(key, msg)` `ed448_sign(key, msg[, context])` `p256_sign` `p256_sign_der` `p384_sign` `p521_sign` `k256_sign` `k256_sign_recoverable(key, digest32)` `ecdsa_sign_prehash(curve, key, digest)` `rsa_sign_pkcs1(hash, key, msg)` `rsa_sign_pss(hash, key, msg)` `rsa_sign_pkcs1_sha256(key, msg)` `rsa_sign_pss_sha256(key, msg)` `dsa_sign(hash, key, msg)` `dsa_sign_der(hash, key, msg)` |
+| Signature | `ed25519_sign(key, msg)` `ed448_sign(key, msg[, context])` `p256_sign` `p256_sign_der` `p384_sign` `p521_sign` `k256_sign` `k256_sign_recoverable(key, digest32)` `ecdsa_sign_prehash(curve, key, digest)` `rsa_sign_pkcs1(hash, key, msg)` `rsa_sign_pss(hash, key, msg)` `rsa_sign_pkcs1_sha256(key, msg)` `rsa_sign_pss_sha256(key, msg)` `dsa_sign(hash, key, msg)` `dsa_sign_der(hash, key, msg)` `mldsa_sign(level, seed, msg[, context])` `mldsa_public(level, seed)` `sm2_sign(key, msg[, id])` |
 | Key agreement | `ecdh(curve, peer_public[, private])` `ecdh_public(curve)` |
+| HPKE (RFC 9180) | `hpke_seal(suite, mode, recipient_public, info, aad, plaintext[, psk, psk_id][, sender_private])` `hpke_open(suite, mode, recipient_private, enc, info, aad, ciphertext[, psk, psk_id][, sender_public])` `hpke_export(suite, mode, recipient_public, info, context, length[, ...])` `hpke_receiver_export(suite, mode, recipient_private, enc, info, context, length[, ...])` `hpke_public(kem, private)` `hpke_derive_key(kem, ikm)` |
+| TLS channel binding | `tls_exporter(label, context, length)` (only in a TLS `send`) |
 | Encryption | `aes_gcm_encrypt(key, nonce12, msg[, aad])` `aes_cbc_encrypt(key, iv16, msg)` `aes_cbc_hmac_encrypt(key, iv16, msg[, aad])` `aes_ccm_encrypt(key, nonce, tag_length, msg[, aad])` `aes_eax_encrypt(key, nonce16, msg[, aad])` `aes_cts_encrypt(key, iv16, msg)` `chacha20_poly1305_encrypt(key32, nonce12, msg[, aad])` `rsa_encrypt_oaep(hash, public_key, msg)` `rsa_encrypt_pkcs1(public_key, msg)` |
 | Key wrapping | `aes_kw_wrap(kek, key)` `aes_kwp_wrap(kek, key)` |
 | CBOR | `cbor_int(n)` `cbor_bytes(value)` `cbor_text(value)` `cbor_array(item, ...)` `cbor_map(key, value, ...)` `cbor_tag(number, item)` |
@@ -1136,10 +1167,20 @@ vectors (`crates/engine/src/vectors_families.rs` names the source of each):
   RFC 5649 (any length).
 - `ed448_sign` is Ed448 (RFC 8032) with an optional context of up to 255 bytes; the key is the
   57-byte secret or PKCS#8 DER. `ecdsa_sign_prehash(curve, key, digest)` signs a digest the
-  template computed (16 to 64 bytes) on `p256`, `p384`, `p521` or `k256`, with the RFC 6979
-  nonce, `r || s`. `dsa_sign` and `dsa_sign_der` are DSA (FIPS 186-4) with `sha1`, `sha256`,
+  template computed (16 to 64 bytes) on `p256`, `p384`, `p521`, `k256`, or the brainpool
+  curves `bp256` and `bp384` (RFC 5639; COSE ESB256 and ESB384 sign the SHA-256 and SHA-384
+  of the structure), with the RFC 6979 nonce, `r || s`. `dsa_sign` and `dsa_sign_der` are DSA (FIPS 186-4) with `sha1`, `sha256`,
   `sha384` or `sha512` and the RFC 6979 nonce, `r || s` (each as long as q) or DER; the key is
   PKCS#8 DER.
+- `mldsa_sign(level, seed, msg[, context])` is ML-DSA (FIPS 204) with the parameter set `44`,
+  `65` or `87` and a context of up to 255 bytes, hedged (32 fresh random bytes per
+  signature, the default of FIPS 204: the deterministic variant would sign the same message
+  the same way, which fault attacks use). The key is the 32-byte seed of key generation, the
+  private key form of the JOSE, COSE and LAMPS drafts. `mldsa_public(level, seed)` is its
+  encoded public key (1312, 1952 or 2592 bytes).
+- `sm2_sign(key, msg[, id])` is SM2 with SM3 (GB/T 32918.2, RFC 8998): the SM3 of
+  `Z_A || msg` signed with an RFC 6979 nonce, `r || s`; the identifier is
+  `1234567812345678` unless given. The key is the 32-byte scalar or PKCS#8 DER.
 
 `slice` counts bytes from 0 and fails when the range is outside the value. `between` fails when
 a delimiter is missing; an empty `start` means the beginning, an empty `end` the end.
@@ -1159,7 +1200,8 @@ private key never leaves the node, and the next operation has a new one. With a 
 argument, `ecdh(curve, peer_public, private)` uses a static private key instead (a field: the
 raw scalar or PKCS#8 DER for NIST curves, 32 raw bytes for X25519, 56 for X448). A key
 agreement counts as a signature in the budget, and so does each `ed448_sign`,
-`ecdsa_sign_prehash`, `dsa_sign` and `dsa_sign_der`.
+`ecdsa_sign_prehash`, `dsa_sign`, `dsa_sign_der`, `mldsa_sign`, `mldsa_public`, `sm2_sign`
+and HPKE call (but `hpke_derive_key`).
 
 The shared secret is a secret (tainted), the public key is not. For a fresh IV or nonce that
 must appear twice (in the encryption and next to the ciphertext), use `hexdecode($nonce)`
@@ -1196,11 +1238,55 @@ deterministic item. Simple values are literals: `hexdecode("f4")`, `hexdecode("f
 `COSE_Mac0` and `COSE_Encrypt0` are the same shape with `MAC_structure` and `Enc_structure`
 (tags 17 and 16).
 
-TLS channel-binding values (`tls_exporter(label, length)`, `tls_server_end_point`) are not
-template variables yet: an HTTPS `send` renders its request before the connection exists, so
-the exported keying material is not known when the template is rendered. They need the
-request rendered after the handshake, inside the transport; that is the next change of this
-group (`docs/design.md`, Appendix A).
+#### HPKE
+
+`hpke_*` are RFC 9180 single-shot HPKE (section 6), checked against the RFC's vectors
+(`crates/engine/tests/fixtures/vectors/README.md`). `suite` is `kem,kdf,aead`: the KEM is
+`p256`, `p384`, `p521`, `x25519` or `x448` (DHKEM with the HKDF of its curve), the KDF
+`sha256`, `sha384` or `sha512`, the AEAD `aes128gcm`, `aes256gcm`, `chacha20poly1305` or
+`export` (export only: `hpke_seal` and `hpke_open` refuse it). `mode` is `base`, `psk`,
+`auth` or `auth_psk`; the PSK modes take `psk` and `psk_id` after the fixed arguments, the
+auth modes then the sender's private key (sending) or public key (receiving). Public keys
+are the serialized KEM keys (SEC1 uncompressed for the NIST curves), private keys the raw
+scalar or the 32 or 56 bytes of X25519 and X448.
+
+- `hpke_seal` gives `enc || ciphertext`, with a fresh ephemeral key at each call (no
+  ephemeral key can be given: a fixed one would reuse a nonce). It counts as a signature in
+  the budget, like every HPKE call.
+- `hpke_open` gives the plaintext; it fails when the tag does not verify.
+- `hpke_export` gives `enc || secret` (the `length`-byte exported secret, 1 to 8192, after
+  the `enc` the receiver needs); `hpke_receiver_export` gives the secret on the receiving
+  side.
+- `hpke_public(kem, private)` is the public key of a private key, `hpke_derive_key(kem, ikm)`
+  the private key of `DeriveKeyPair` (section 7.1.3) from at least 32 bytes of `ikm`.
+
+Choices the RFC leaves open, made the stricter way: a PSK is at least 32 bytes and its id is
+not empty (section 5.1.2 asks for 32 bytes of entropy; a short PSK would be guessable from a
+recorded `enc`), and `hpke_derive_key` takes at least 32 bytes (section 7.1.3 asks for as
+many as the private key).
+
+#### TurboSHAKE and KangarooTwelve
+
+`turboshake128` and `turboshake256` are RFC 9861 TurboSHAKE with the domain byte `domain` (a
+decimal number, 1 to 127, fixed by the policy) and `length` bytes of output, 1 to 8192.
+`kt128` and `kt256` are KangarooTwelve (KT128, KT256) with a customization string (empty
+for none). They are plain hashes (rule 3).
+
+#### TLS channel binding
+
+`tls_exporter(label, context, length)` is the keying material exported from the TLS
+connection of the operation (RFC 8446 section 7.5), `length` bytes, 1 to 8192. Over
+TLS 1.2 it fails: rustls does not report whether the extended master secret (RFC 7627) was
+agreed, and without it an exporter does not bind the connection (RFC 9266 section 3). RFC 9266's `tls-exporter` binding is
+`tls_exporter("EXPORTER-Channel-Binding", "", "32")`. It is rendered after the handshake, so
+it is available only in the template of a `send` of a `tls` connection; anywhere else
+(a `compute`, an HTTPS request, a derivation) the policy is refused at signing. The value is
+a secret (tainted), known to the node and the server only.
+
+`tls-unique` (RFC 5929) is not offered: it reads the first Finished message, which rustls does
+not expose, it is undefined for TLS 1.3, and RFC 9266 replaces it with the exporter.
+`tls-server-end-point` and an exporter inside an HTTPS request are not offered yet: the
+request is rendered before its connection exists (`docs/design.md`, Appendix A).
 
 ### The analysis
 
@@ -1208,9 +1294,9 @@ Every template is analysed before the policy is signed. Each expression has four
 
 | Property | Set by | Kept through | Removed by |
 | --- | --- | --- | --- |
-| *tainted*: holds a secret in reversible form | secret fields (guessable or not), secret temps, every `ecdh` result; a key derived from a tainted value (`hkdf`, `hkdf_expand`, `concat_kdf`, `kbkdf_counter`, `kerberos_dk`: rule 8); a plain hash (`md4` `md5` `sha1` `sha256` `sha384` `sha512` `sha512_256` `keccak256` `sha3_*` `shake128` `shake256`) of a tainted value with no controlled bytes in it | every function not listed as removing it, and `+`: the encodings, `slice`, `between`, `add`, the fixed-width encoders, `json_set_number`, `nfold`, the `cbor_*` functions, and encryption to a public key (`rsa_encrypt_*`: whoever holds the private key reads it) | a plain hash of a value that is also controlled; `hmac_*`, `pbkdf2`, `pbkdf2_sha256`, `totp`, the signatures and `len`; `aes_cmac` and `aes_cbc_mac` under a secret key; symmetric encryption and key wrapping, only as rule 4 says |
-| *controlled*: chosen by the caller or the server | `$method` `$path` `$pathname` `$query` `$body` `$input`, captured values (temps) | everything except `ecdh`, whose result depends on a private key nobody chooses, and a key derived from a tainted value, of which the caller chooses no byte | — |
-| *caller-chosen*: chosen by the caller (not only a server) | `$method` `$path` `$pathname` `$query` `$body` `$input` | everything except `ecdh` and a key derived from a tainted value | — |
+| *tainted*: holds a secret in reversible form | secret fields (guessable or not), secret temps, every `ecdh`, `tls_exporter`, `hpke_open`, `hpke_export` and `hpke_receiver_export` result; a key derived from a tainted value (`hkdf`, `hkdf_expand`, `concat_kdf`, `kbkdf_counter`, `kerberos_dk`, `hpke_derive_key`: rule 8); a plain hash (`md4` `md5` `sha1` `sha256` `sha384` `sha512` `sha512_256` `keccak256` `sha3_*` `shake128` `shake256` `turboshake*` `kt*`) of a tainted value with no controlled bytes in it | every function not listed as removing it, and `+`: the encodings, `slice`, `between`, `add`, the fixed-width encoders, `json_set_number`, `nfold`, the `cbor_*` functions, and encryption to a public key (`rsa_encrypt_*`, and `hpke_seal` when the info, AAD or plaintext is tainted, or a PSK or sender key that is not a *secret key*: whoever holds the private key reads it) | a plain hash of a value that is also controlled; `hmac_*`, `pbkdf2`, `pbkdf2_sha256`, `totp`, `hpke_public`, the signatures and `len`; `aes_cmac` and `aes_cbc_mac` under a secret key; symmetric encryption and key wrapping, only as rule 4 says |
+| *controlled*: chosen by the caller or the server | `$method` `$path` `$pathname` `$query` `$body` `$input`, captured values (temps) | everything except `ecdh`, `tls_exporter`, `hpke_export` and `hpke_receiver_export`, whose result depends on a key nobody chooses, and a key derived from a tainted value, of which the caller chooses no byte | — |
+| *caller-chosen*: chosen by the caller (not only a server) | `$method` `$path` `$pathname` `$query` `$body` `$input` | everything except `ecdh`, `tls_exporter`, `hpke_export`, `hpke_receiver_export` and a key derived from a tainted value | — |
 | *secret key*: a strong secret nobody else knows, usable as a key | a secret field that is not guessable | `b64decode` `b32decode` `hexdecode` `pem` `trim` `slice` of it | everything else, including hashes, MACs and `+`: a hash or MAC of a key is a new value some operation may hand back |
 | *guessable*: a guess can be checked against it | guessable fields | every function except `len`, and `+` | `len` |
 
@@ -1231,7 +1317,12 @@ Rules:
    | `aes_gcm_encrypt(key, nonce12, ...)` `aes_cbc_encrypt(key, iv16, ...)` `chacha20_poly1305_encrypt(key32, nonce12, ...)` `aes_cbc_hmac_encrypt(key, iv16, ...)` `aes_eax_encrypt(key, nonce16, ...)` `aes_cts_encrypt(key, iv16, ...)` | the key and the nonce or IV |
    | `aes_ccm_encrypt(key, nonce, tag_length, ...)` | the key, the nonce and the tag length |
    | `aes_kw_wrap(kek, key)` `aes_kwp_wrap(kek, key)` `aes_cmac(key, msg)` `aes_cbc_mac(key, msg)` `kerberos_dk(key, constant)` | the key (the KEK) |
-   | `hkdf`, `hkdf_expand`, `concat_kdf`, `kbkdf_counter`, `shake128`, `shake256`, `nfold` | the length |
+   | `hkdf`, `hkdf_expand`, `concat_kdf`, `kbkdf_counter`, `shake128`, `shake256`, `nfold`, `kt128`, `kt256`, `tls_exporter`, `hpke_export`, `hpke_receiver_export` | the length |
+   | `turboshake128` `turboshake256` | the domain byte and the length |
+   | `hpke_seal` `hpke_export` | the recipient's public key, the PSK, its id and the sender's key |
+   | `hpke_open` `hpke_receiver_export` | every argument after the mode: whether the call fails tells whether they match what the sender used |
+   | `hpke_public` `hpke_derive_key` | the key or `ikm` |
+   | `mldsa_sign` `mldsa_public` `sm2_sign` | the key |
    | the signatures | the key |
    | `rsa_encrypt_oaep(hash, public_key, msg)` `rsa_encrypt_pkcs1(public_key, msg)` | the public key |
    | `ecdh(curve, peer_public, private)` | the peer key and the private key |
@@ -1268,14 +1359,16 @@ Rules:
    *guessable*, a derivation may depend on a guessable field only through `len`.
 6. An argument that names a hash or a curve (`pbkdf2`, `rsa_sign_pkcs1`, `rsa_sign_pss`,
    `rsa_encrypt_oaep`, `ecdh`, `ecdh_public`, `hkdf`, `hkdf_expand`, `concat_kdf`,
-   `kbkdf_counter`, `ecdsa_sign_prehash`, `dsa_sign`, `dsa_sign_der`) must be neither tainted
-   nor controlled: the policy fixes the algorithm, so no caller can downgrade it.
-7. The public key of `rsa_encrypt_oaep` and `rsa_encrypt_pkcs1` must not be caller-chosen: it
+   `kbkdf_counter`, `ecdsa_sign_prehash`, `dsa_sign`, `dsa_sign_der`, the suite and mode of
+   the `hpke_*` functions, the KEM of `hpke_public` and `hpke_derive_key`, the domain byte of
+   `turboshake*`, the parameter set of `mldsa_sign` and `mldsa_public`) must be neither tainted nor controlled: the policy fixes the algorithm, so no caller can downgrade it.
+7. The public key of `rsa_encrypt_oaep`, `rsa_encrypt_pkcs1`, `hpke_seal` and `hpke_export`,
+   and the PSK, PSK id and sender key of every `hpke_*` function, must not be caller-chosen: it
    comes from the policy (a literal or a field) or from a capture of the destination's
    response. A key from `$input`, `$body`, `$query` or another request variable would let the
-   caller encrypt the secret to itself.
+   caller encrypt the secret to itself, or pass as the sender of an authenticated HPKE mode.
 8. A key derived from a secret is a secret: the output of `hkdf`, `hkdf_expand`,
-   `concat_kdf`, `kbkdf_counter` and `kerberos_dk` is tainted when any input is, and then not
+   `concat_kdf`, `kbkdf_counter`, `kerberos_dk` and `hpke_derive_key` is tainted when any input is, and then not
    controlled, since the caller chooses no byte of it (as with `ecdh`). So a plain hash of it
    stays tainted, a derivation cannot hand it back, and it may key an encryption whose
    output then stays tainted (it is not a *secret key*: some operation may derive the same
@@ -1283,7 +1376,9 @@ Rules:
    usual.
 9. An argument that sets the output's length or where a cut falls must not be tainted:
    `random(n)`, the length of `pbkdf2_sha256`, `pbkdf2`, `hkdf`, `hkdf_expand`, `concat_kdf`,
-   `kbkdf_counter`, `shake128`, `shake256` and `nfold`, the tag length of `aes_ccm_encrypt`,
+   `kbkdf_counter`, `shake128`, `shake256`, `turboshake128`, `turboshake256`, `kt128`,
+   `kt256`, `nfold`, `tls_exporter`, `hpke_export` and `hpke_receiver_export`, the tag length of
+   `aes_ccm_encrypt`,
    the start and length of `slice`, the delimiters of `between`, and the text `replace` looks
    for. The length of the output, or whether the call fails, would give the secret back
    through `len`. The value being cut or searched may be a secret (`slice(key, "0", "4")`).
