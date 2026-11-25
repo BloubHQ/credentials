@@ -562,3 +562,105 @@ algorithms, HTTP Digest `SHA-512-256`, ML-DSA and SLH-DSA.
 2. Hash-parameterized RSA, P-521, HKDF, ECDH, AES key wrap, Concat KDF: most of JOSE and COSE.
 3. CBOR and channel binding.
 4. Post-quantum and national signature schemes last.
+
+## Appendix B. Gaps found against further registries (2026-11)
+
+Checked entry by entry: IANA EAP Method Types; Kerberos encryption, checksum and
+pre-authentication types; GSS-API mechanism codes under 1.3.6.1.5.5 (IANA SMI numbers) plus
+the Kerberos V5 mechanism (RFC 4121); GSSAPI/Kerberos/SASL service names; SSH key exchange,
+encryption, MAC and compression names and the SSH agent registries (RFC 9987); the names in
+OpenSSH's PROTOCOL, PROTOCOL.agent, PROTOCOL.u2f, PROTOCOL.key and PROTOCOL.sshsig, with
+draft-miller-ssh-cert-06 for certificate types. SSH transport is judged against russh 0.65.4
+and ssh-key 0.7.0-rc.12: a name russh implements counts as planned (section 7). Entries marked
+deprecated, obsolete, historic or MUST NOT (25) are left out, as are reserved rows.
+
+| Of 343 entries | Count |
+| --- | --- |
+| Work today | 0 |
+| Planned (sections 7, 8a, through russh) | 64 |
+| Missing, possible in principle (rows below) | 177 |
+| Not a vault's concern (no client secret, or keys that only the owner's device may add) | 36 |
+| Impossible in principle (SIM/USIM, hardware tokens, smart cards, hardware attestation) | 10 |
+| Unverified: no public specification obtained | 56 |
+
+Unverified: EAP types 7-12, 14-17, 22, 24, 26-28, 30, 31, 33-42, 44, 45 (only a person's name
+as reference); Kerberos etype 65, checksums 9, 10, 14; pre-authentication types 6-10, 20,
+102, 103, 106-108, 131, 132, 145, 146, 152, 153, 166; GSS IDUP mechanisms (PIM, MIM, p7im,
+meim) and the service name `rcmd`.
+
+### SSH transport beyond russh 0.65.4
+
+| Change | Needed by |
+| --- | --- |
+| Key exchange: X448, sntrup761, ML-KEM 512/768/1024 alone and with P-256/P-384, RSA key transport, ECMQV, ECDH on further curves | `curve448-sha512`, `sntrup761x25519-sha512`, `mlkem*`, `rsa2048-sha256`, `ecmqv-sha2`, `ecdh-sha2-*` |
+| GSS-API key exchange on the section 7 Kerberos module | `gss-*` key exchanges, auth `gssapi-keyex` |
+| IANA names for AEAD ciphers russh knows only as `@openssh.com` names | `AEAD_AES_128_GCM`, `AEAD_AES_256_GCM`, `chacha20-poly1305` |
+| Legacy block ciphers, CBC and CTR | `blowfish`, `twofish*`, `serpent*`, `idea`, `cast128`, `3des-ctr` |
+| MACs | `hmac-sha1-96`, `hmac-md5`, `hmac-md5-96`, `umac-64@openssh.com` |
+| Certificate names of draft-miller-ssh-cert-06 as aliases; Ed448 | `*-cert` names, `ssh-ed448-cert` |
+| Host-bound public key authentication | `publickey-hostbound-v00@openssh.com` |
+| Security-key types answered by a software FIDO authenticator in the node (counter re-sealed on each use); hardware-enrolled keys and `ssh-sk-attest-*` stay out of reach | `sk-ecdsa-sha2-nistp256@openssh.com`, `sk-ssh-ed25519@openssh.com`, their certificates, `webauthn-sk-ecdsa-sha2-nistp256@openssh.com` |
+| OpenSSH private key files in the `ssh` item | `openssh-key-v1` with `bcrypt` KDF |
+| SSHSIG signatures as a derive output | `git` commit signing, `ssh-keygen -Y sign` |
+
+### ssh-agent (section 8a)
+
+| Change | Needed by |
+| --- | --- |
+| Agent lock with a passphrase | `SSH_AGENTC_LOCK`, `SSH_AGENTC_UNLOCK` |
+| Extension messages | `SSH_AGENTC_EXTENSION`, `query` |
+| The node checks the host signature in `session-bind@openssh.com` against the item's policy | `session-bind@openssh.com` |
+| `rsa_sign_pkcs1(sha512)` | `SSH_AGENT_RSA_SHA2_512` |
+
+Adding keys through the agent (`ADD_IDENTITY`, constraints, `REMOVE_*`,
+`restrict-destination-v00@openssh.com`) stays refused: keys enter only through items the owner
+signs. Smart-card messages are out of reach.
+
+### EAP peer
+
+Carriers: RADIUS, IKEv2, GSS-EAP. The node plays the supplicant.
+
+| Change | Needed by |
+| --- | --- |
+| EAP peer state machine, length-framed `expect` | Identity, Notification, Nak, Expanded Type, GTC |
+| Listed primitives | MD5-Challenge; OTP (`hash_chain`); MSCHAPv2 (`md4`, `des`) |
+| rustls over EAP framing; TLS key export | EAP-TLS, EAP-TTLS, PEAP, EAP-FAST, TEAP |
+| `aes_cmac`, `aes_eax` | EAP-PSK |
+| Method KDFs over AES-CMAC, HMAC, AES-CBC, DH | EAP-GPSK, EAP-SAKE, EAP-PAX, EAP-POTP |
+| PAKE: elliptic-curve point arithmetic, DH with an encrypted exponent, IKEv2 `prf+`, SRP | EAP-pwd, EAP-EKE, SRP-SHA1 |
+| The IKEv2 module as a method | EAP-IKEv2 |
+| EDHOC over COSE and CBOR | EAP-EDHOC |
+
+### Kerberos beyond the password AS exchange of section 7
+
+Section 7's Kerberos needs the first two rows before it works at all.
+
+| Change | Needed by |
+| --- | --- |
+| `aes_cts`, RFC 3961 n-fold and DK, `pbkdf2(sha1)` | etypes 17, 18; checksums 15, 16 |
+| SP 800-108 counter-mode KDF over HMAC-SHA2 | etypes 19, 20; checksums 19, 20 |
+| Camellia CTS, CMAC, feedback-mode KDF | etypes 25, 26; checksums 17, 18 |
+| PKINIT client: CMS SignedData, `rsa_decrypt_*` whose result never leaves, 3DES and RC2 content decryption, DH/ECDH | etypes 9-15; PKINIT pre-authentication and typed data |
+| FAST armor, KRB-FX-CF2, encrypted challenge | PA 133-138 |
+| SPAKE2 over edwards25519, P-256, P-384, P-521 | PA 151 |
+| OTP pre-authentication, SAM with S/Key | PA 141, 142, 144; 12, 13, 21, 23, 30, 31 |
+| Referrals | PA 25, 149 |
+| Microsoft PAC request and S4U2self | PA 128, 129, 130 |
+| PKU2U | PA 148 |
+
+### GSS-API and GS2
+
+| Change | Needed by |
+| --- | --- |
+| GS2 framing (RFC 5801) and SASL GSSAPI (RFC 4752) on Kerberos V5; channel binding for `-PLUS` | imap, pop, smtp, xmpp, ftp, nntp, sieve, acap, beep, mupdate, sacred, nfs |
+| A Kerberos-backed authenticator for russh's `gssapi-with-mic` | SSH host service |
+| IAKERB | 1.3.6.1.5.5.10 |
+| SPKM-1/2/3, LIPKEY | 1.3.6.1.5.5.1.1-3, 1.3.6.1.5.5.9 |
+| SAML20 and OPENID20 as GSS mechanisms | 1.3.6.1.5.5.17, 1.3.6.1.5.5.16 |
+
+### Corrections to Appendix A
+
+- russh 0.65.4 already has client `keyboard-interactive` and `gssapi-with-mic`; the row "SSH
+  beyond russh's defaults" narrows to `hostbased`, `gssapi-keyex` and X.509 keys.
+- SASL `ECDH-X25519-CHALLENGE` also needs `hkdf(sha256)` (atheme's reference implementation).
+- SSH `gssapi` and `external-keyx` are names RFC 4462 section 8 reserves, not methods.
