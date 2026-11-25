@@ -31,7 +31,7 @@
 //! template is refused: it would be an oracle that gives the secret back piece by piece.
 //! A value handed back to the caller must be untainted.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 
 use zeroize::Zeroizing;
@@ -165,27 +165,51 @@ funcs! {
     Len = "len"(1, 1): "The length in bytes, as decimal text (one-way).",
     Be16 = "be16"(1, 1): "A decimal number as 2 big-endian bytes.",
     Be32 = "be32"(1, 1): "A decimal number as 4 big-endian bytes.",
+    Be64 = "be64"(1, 1): "A decimal number as 8 big-endian bytes.",
+    Le16 = "le16"(1, 1): "A decimal number as 2 little-endian bytes.",
+    Le32 = "le32"(1, 1): "A decimal number as 4 little-endian bytes.",
+    Le64 = "le64"(1, 1): "A decimal number as 8 little-endian bytes.",
+    U8 = "u8"(1, 1): "A decimal number from 0 to 255 as one byte.",
+    Add = "add"(2, 2): "`add(a, b)`: the sum of two signed 64-bit decimal integers, as decimal text.",
+    Slice = "slice"(3, 3): "`slice(value, start, length)`: `length` bytes from byte `start`.",
+    Between = "between"(3, 3): "`between(value, start, end)`: the bytes after the first `start` and before the next `end`; an empty `start` is the beginning, an empty `end` the end.",
+    JsonSetNumber = "json_set_number"(3, 3): "`json_set_number(object, key, integer)`: the object with the integer member added.",
+    Random = "random"(1, 1): "`random(n)`: n fresh random bytes, 1 to 1024.",
     Xor = "xor"(2, 2): "`xor(a, b)` of two values of one length.",
     Md5 = "md5"(1, 1): "MD5 digest, for protocols that require it (one-way).",
     Sha1 = "sha1"(1, 1): "SHA-1 digest (one-way).",
     Sha256 = "sha256"(1, 1): "SHA-256 digest (one-way).",
+    Sha384 = "sha384"(1, 1): "SHA-384 digest (one-way).",
     Sha512 = "sha512"(1, 1): "SHA-512 digest (one-way).",
+    Sha512_256 = "sha512_256"(1, 1): "SHA-512/256 digest (one-way).",
+    Md4 = "md4"(1, 1): "MD4 digest, for protocols that require it (one-way).",
     Keccak256 = "keccak256"(1, 1): "Keccak-256 digest as Ethereum uses it (one-way).",
     HmacSha1 = "hmac_sha1"(2, 2): "`hmac_sha1(key, message)` (one-way).",
     HmacSha256 = "hmac_sha256"(2, 2): "`hmac_sha256(key, message)` (one-way).",
+    HmacSha384 = "hmac_sha384"(2, 2): "`hmac_sha384(key, message)` (one-way).",
     HmacSha512 = "hmac_sha512"(2, 2): "`hmac_sha512(key, message)` (one-way).",
+    HmacMd5 = "hmac_md5"(2, 2): "`hmac_md5(key, message)` (one-way).",
     Pbkdf2Sha256 = "pbkdf2_sha256"(3, 4): "`pbkdf2_sha256(password, salt, rounds[, length])`, 32 bytes by default (one-way).",
+    Pbkdf2 = "pbkdf2"(4, 5): "`pbkdf2(hash, password, salt, rounds[, length])` with `sha1`, `sha256`, `sha384` or `sha512`; the digest length by default (one-way).",
     Totp = "totp"(1, 3): "`totp(seed[, digits[, period]])`, 6 digits and 30 s by default (one-way).",
     Ed25519Sign = "ed25519_sign"(2, 2): "`ed25519_sign(key, message)`; key raw 32 bytes or PKCS#8 DER (one-way).",
     P256Sign = "p256_sign"(2, 2): "ECDSA P-256 SHA-256, `r || s`; key raw 32 bytes or PKCS#8 DER (one-way).",
     P256SignDer = "p256_sign_der"(2, 2): "ECDSA P-256 SHA-256, DER (one-way).",
     P384Sign = "p384_sign"(2, 2): "ECDSA P-384 SHA-384, `r || s`; key raw 48 bytes or PKCS#8 DER (one-way).",
+    P521Sign = "p521_sign"(2, 2): "ECDSA P-521 SHA-512, `r || s`; key raw 66 bytes or PKCS#8 DER (one-way).",
     K256Sign = "k256_sign"(2, 2): "ECDSA secp256k1 SHA-256, `r || s` with low s; key raw 32 bytes or PKCS#8 DER (one-way).",
     K256SignRecoverable = "k256_sign_recoverable"(2, 2): "`k256_sign_recoverable(key, digest32)`: `r || s || v`, v = 27 + recovery id (one-way).",
     RsaSignPkcs1Sha256 = "rsa_sign_pkcs1_sha256"(2, 2): "RSASSA-PKCS1-v1_5 SHA-256 (RS256); key PKCS#8 or PKCS#1 DER (one-way).",
     RsaSignPssSha256 = "rsa_sign_pss_sha256"(2, 2): "RSASSA-PSS SHA-256 (PS256); key PKCS#8 or PKCS#1 DER (one-way).",
-    AesGcmEncrypt = "aes_gcm_encrypt"(3, 4): "`aes_gcm_encrypt(key, nonce12, message[, aad])`: ciphertext and tag; key 16 or 32 bytes.",
+    RsaSignPkcs1 = "rsa_sign_pkcs1"(3, 3): "`rsa_sign_pkcs1(hash, key, message)`: RSASSA-PKCS1-v1_5 with `sha1`, `sha256`, `sha384` or `sha512` (one-way).",
+    RsaSignPss = "rsa_sign_pss"(3, 3): "`rsa_sign_pss(hash, key, message)`: RSASSA-PSS with `sha256`, `sha384` or `sha512`, salt of the digest length (one-way).",
+    RsaEncryptOaep = "rsa_encrypt_oaep"(3, 3): "`rsa_encrypt_oaep(hash, public_key, message)`: RSAES-OAEP, MGF1 with the same hash, empty label; key SPKI or PKCS#1 DER.",
+    RsaEncryptPkcs1 = "rsa_encrypt_pkcs1"(2, 2): "`rsa_encrypt_pkcs1(public_key, message)`: RSAES-PKCS1-v1_5; key SPKI or PKCS#1 DER.",
+    Ecdh = "ecdh"(2, 3): "`ecdh(curve, peer_public[, private])`: the shared secret (x-coordinate) on `p256`, `p384`, `p521` or `x25519`; without `private`, with the ephemeral key of the operation.",
+    EcdhPublic = "ecdh_public"(1, 1): "`ecdh_public(curve)`: the public key of the ephemeral key of the operation (SEC1 uncompressed, or 32 bytes for X25519).",
+    AesGcmEncrypt = "aes_gcm_encrypt"(3, 4): "`aes_gcm_encrypt(key, nonce12, message[, aad])`: ciphertext and tag; key 16, 24 or 32 bytes.",
     AesCbcEncrypt = "aes_cbc_encrypt"(3, 3): "`aes_cbc_encrypt(key, iv16, message)` with PKCS#7 padding; key 16, 24 or 32 bytes.",
+    ChaCha20Poly1305Encrypt = "chacha20_poly1305_encrypt"(3, 4): "`chacha20_poly1305_encrypt(key32, nonce12, message[, aad])`: ciphertext and tag (RFC 8439).",
 }
 
 impl Func {
@@ -198,23 +222,36 @@ impl Func {
             self,
             Func::Len
                 | Func::Md5
+                | Func::Md4
                 | Func::Sha1
                 | Func::Sha256
+                | Func::Sha384
                 | Func::Sha512
+                | Func::Sha512_256
                 | Func::Keccak256
                 | Func::HmacSha1
                 | Func::HmacSha256
+                | Func::HmacSha384
                 | Func::HmacSha512
+                | Func::HmacMd5
                 | Func::Pbkdf2Sha256
+                | Func::Pbkdf2
                 | Func::Totp
-                | Func::Ed25519Sign
-                | Func::P256Sign
-                | Func::P256SignDer
-                | Func::P384Sign
-                | Func::K256Sign
-                | Func::K256SignRecoverable
-                | Func::RsaSignPkcs1Sha256
-                | Func::RsaSignPssSha256
+        ) || self.signs()
+    }
+
+    /// A plain hash: one-way, but a hash of secret bytes alone stays tainted (rule 3).
+    fn plain_hash(self) -> bool {
+        matches!(
+            self,
+            Func::Md5
+                | Func::Md4
+                | Func::Sha1
+                | Func::Sha256
+                | Func::Sha384
+                | Func::Sha512
+                | Func::Sha512_256
+                | Func::Keccak256
         )
     }
 
@@ -225,10 +262,49 @@ impl Func {
                 | Func::P256Sign
                 | Func::P256SignDer
                 | Func::P384Sign
+                | Func::P521Sign
                 | Func::K256Sign
                 | Func::K256SignRecoverable
                 | Func::RsaSignPkcs1Sha256
                 | Func::RsaSignPssSha256
+                | Func::RsaSignPkcs1
+                | Func::RsaSignPss
+        )
+    }
+
+    /// The index of an argument that names a hash or a curve: it must be fixed by the policy.
+    fn algorithm_arg(self) -> Option<usize> {
+        match self {
+            Func::Pbkdf2
+            | Func::RsaSignPkcs1
+            | Func::RsaSignPss
+            | Func::RsaEncryptOaep
+            | Func::Ecdh
+            | Func::EcdhPublic => Some(0),
+            _ => None,
+        }
+    }
+
+    /// The index of the public key argument of an encryption to a public key.
+    fn public_key_arg(self) -> Option<usize> {
+        match self {
+            Func::RsaEncryptOaep => Some(1),
+            Func::RsaEncryptPkcs1 => Some(0),
+            _ => None,
+        }
+    }
+
+    /// Functions where a tainted and a controlled value may not meet in any argument: the
+    /// controlled value would pick which part of the secret comes out, or whether it fails.
+    fn no_mixing(self) -> bool {
+        matches!(
+            self,
+            Func::Replace
+                | Func::Xor
+                | Func::Slice
+                | Func::Between
+                | Func::Add
+                | Func::JsonSetNumber
         )
     }
 
@@ -243,11 +319,22 @@ impl Func {
             | Func::Pem
             | Func::CanonicalQuery
             | Func::Be16
-            | Func::Be32 => 0..1,
+            | Func::Be32
+            | Func::Be64
+            | Func::Le16
+            | Func::Le32
+            | Func::Le64
+            | Func::U8
+            | Func::Random => 0..1,
             Func::Time => 0..2,
             Func::Totp => 1..3,
             Func::Pbkdf2Sha256 => 2..4,
-            Func::AesGcmEncrypt | Func::AesCbcEncrypt => 0..2,
+            Func::Pbkdf2 => 3..5,
+            Func::AesGcmEncrypt | Func::AesCbcEncrypt | Func::ChaCha20Poly1305Encrypt => 0..2,
+            Func::RsaSignPkcs1 | Func::RsaSignPss | Func::RsaEncryptOaep => 1..2,
+            Func::RsaEncryptPkcs1 => 0..1,
+            // The peer key and the static private key.
+            Func::Ecdh => 1..3,
             f if f.signs() => 0..1,
             _ => 0..0,
         }
@@ -274,6 +361,8 @@ pub enum NameKind {
 struct Info {
     tainted: bool,
     controlled: bool,
+    /// The caller (not only a server) chooses part of it: a request or input variable.
+    caller: bool,
     secret_key: bool,
     guessable: bool,
 }
@@ -474,6 +563,7 @@ fn analyze(expr: &Expr, kind: &dyn Fn(&str) -> NameKind) -> core::result::Result
         },
         Expr::Var(v) => Info {
             controlled: v.controlled(),
+            caller: v.controlled(),
             ..Info::default()
         },
         Expr::Concat(parts) => {
@@ -484,6 +574,7 @@ fn analyze(expr: &Expr, kind: &dyn Fn(&str) -> NameKind) -> core::result::Result
             Info {
                 tainted: infos.iter().any(|i| i.tainted),
                 controlled: infos.iter().any(|i| i.controlled),
+                caller: infos.iter().any(|i| i.caller),
                 secret_key: false,
                 guessable: infos.iter().any(|i| i.guessable),
             }
@@ -502,37 +593,54 @@ fn call_info(func: Func, args: &[Info]) -> core::result::Result<Info, Rule> {
     let at = |i: usize| args.get(i).copied().unwrap_or_default();
     let any_tainted = args.iter().any(|i| i.tainted);
     let any_controlled = args.iter().any(|i| i.controlled);
-    if matches!(func, Func::Replace | Func::Xor) && any_tainted && any_controlled {
-        return Err("a secret and a chosen value meet in replace, xor or json_set");
+    if let Some(i) = func.algorithm_arg() {
+        if at(i).tainted || at(i).controlled {
+            return Err("a hash or curve name must be fixed by the policy");
+        }
+    }
+    if let Some(i) = func.public_key_arg() {
+        if at(i).caller {
+            return Err(
+                "an encryption key must come from the policy or the destination, not the caller",
+            );
+        }
+    }
+    if func.no_mixing() && any_tainted && any_controlled {
+        return Err("a secret and a chosen value meet in a function that compares or cuts them");
     }
     // `json_set` compares its object and its key (a member present makes it fail); the value
     // is only escaped and appended.
     if func == Func::JsonSet && (at(0).tainted || at(1).tainted) && any_controlled {
-        return Err("a secret and a chosen value meet in replace, xor or json_set");
+        return Err("a secret and a chosen value meet in a function that compares or cuts them");
     }
     if func.sensitive_args().any(|i| at(i).mixed()) {
         return Err("a secret mixed with a chosen value reaches a decoder, number or key");
     }
     // A secret in one number argument and a chosen value in another is the same oracle as
     // both in one: `time(secret, $input)` picks which digits of the secret come out.
-    if matches!(func, Func::Time | Func::Totp | Func::Pbkdf2Sha256)
-        && func.sensitive_args().any(|i| at(i).tainted)
+    if matches!(
+        func,
+        Func::Time | Func::Totp | Func::Pbkdf2Sha256 | Func::Pbkdf2
+    ) && func.sensitive_args().any(|i| at(i).tainted)
         && func.sensitive_args().any(|i| at(i).controlled)
     {
         return Err("a secret and a chosen value meet in the number arguments of a function");
     }
-    let plain_hash = matches!(
-        func,
-        Func::Md5 | Func::Sha1 | Func::Sha256 | Func::Sha512 | Func::Keccak256
-    );
-    let tainted = if plain_hash {
+    let tainted = if func.plain_hash() {
         // A hash of nothing but secret bytes is as good as the secret where the secret is
         // hashed first: an HMAC key longer than its block, an Ed25519 seed, a password hash.
         // Only a hash that also covers bytes the caller or server chooses hides the secret.
         at(0).tainted && !at(0).controlled
     } else if func.one_way() {
         false
-    } else if matches!(func, Func::AesGcmEncrypt | Func::AesCbcEncrypt) {
+    } else if func == Func::Ecdh {
+        // A shared secret is known to the node and the peer only: a secret, whatever the
+        // arguments.
+        true
+    } else if matches!(
+        func,
+        Func::AesGcmEncrypt | Func::AesCbcEncrypt | Func::ChaCha20Poly1305Encrypt
+    ) {
         let (key, nonce, message, aad) = (at(0), at(1), at(2), at(3));
         if key.secret_key {
             // A secret key hides only itself. A secret in the message stays readable: another
@@ -544,15 +652,24 @@ fn call_info(func: Func, args: &[Info]) -> core::result::Result<Info, Rule> {
             any_tainted
         }
     } else {
+        // Encryption to a public key included: whoever holds the private key reads it.
         any_tainted
     };
-    // Only a secret field itself, or a decoding of it, is a key nobody else knows. A hash or
-    // MAC of it is a new value that some operation may hand back, after which it hides
-    // nothing.
+    // The shared secret depends on a private key nobody but the node holds; the peer, who
+    // chose its public key, learns it, but nothing the caller chooses reaches it. Treating it
+    // as not controlled keeps a hash of it tainted (rule 3), so a key derived from it is never
+    // handed back.
+    let controlled = func != Func::Ecdh && any_controlled;
+    // Only a secret field itself, or a decoding or a fixed part of it, is a key nobody else
+    // knows. A hash or MAC of it is a new value that some operation may hand back, after
+    // which it hides nothing.
     let secret_key = match func {
-        Func::B64Decode | Func::B32Decode | Func::HexDecode | Func::Pem | Func::Trim => {
-            at(0).secret_key
-        }
+        Func::B64Decode
+        | Func::B32Decode
+        | Func::HexDecode
+        | Func::Pem
+        | Func::Trim
+        | Func::Slice => at(0).secret_key,
         _ => false,
     };
     // A guessable value stays guessable through every function but `len`. A signature or a
@@ -561,7 +678,8 @@ fn call_info(func: Func, args: &[Info]) -> core::result::Result<Info, Rule> {
     let guessable = func != Func::Len && args.iter().any(|i| i.guessable);
     Ok(Info {
         tainted,
-        controlled: any_controlled,
+        controlled,
+        caller: controlled && args.iter().any(|i| i.caller),
         secret_key,
         guessable,
     })
@@ -698,11 +816,17 @@ fn concat(parts: &[Bytes], budget: &Budget) -> Result<Bytes> {
 /// Values captured by earlier steps of an operation.
 pub(crate) type Temps = HashMap<String, Zeroizing<Vec<u8>>>;
 
-/// The limits of one operation: bytes produced, PBKDF2 rounds and signatures.
+/// An ephemeral key agreement key: its curve and its raw private scalar.
+pub(crate) type Ephemeral = (&'static str, Zeroizing<Vec<u8>>);
+
+/// The limits of one operation: bytes produced, PBKDF2 rounds and signatures. It also holds
+/// the ephemeral key agreement keys of the operation, one per curve, made when first used and
+/// erased when the operation ends; they never leave the node.
 pub(crate) struct Budget {
     bytes: Cell<usize>,
     rounds: Cell<u64>,
     signatures: Cell<u32>,
+    pub(crate) ephemeral: RefCell<Vec<Ephemeral>>,
 }
 
 impl Default for Budget {
@@ -711,6 +835,7 @@ impl Default for Budget {
             bytes: Cell::new(MAX_RENDER_BYTES),
             rounds: Cell::new(MAX_RENDER_ROUNDS),
             signatures: Cell::new(MAX_RENDER_SIGNATURES),
+            ephemeral: RefCell::new(Vec::new()),
         }
     }
 }
@@ -740,7 +865,7 @@ impl Budget {
         Ok(())
     }
 
-    /// Spends one signature.
+    /// Spends one signature or key agreement.
     pub(crate) fn signature(&self) -> Result<()> {
         let left = self
             .signatures
@@ -1014,5 +1139,162 @@ mod tests {
         assert!(!refused(r#"{{ sha256(key + $input) }}"#));
         assert!(!refused(r#"{{ replace($body, "a", "b") }}"#));
         assert!(!refused(r#"{{ pbkdf2_sha256(key, $input, "1000") }}"#));
+    }
+
+    fn try_render(text: &str) -> Result<Vec<u8>> {
+        let fields = Fields::new();
+        let temps = Temps::new();
+        let budget = Budget::default();
+        let ctx = Context {
+            fields: &fields,
+            temps: &temps,
+            vars: HashMap::from([(Var::Input, b"in".to_vec())]),
+            unix: 59,
+            budget: &budget,
+        };
+        Template::parse(text)?.render(&ctx).map(|v| v.to_vec())
+    }
+
+    #[test]
+    fn renders_structure_functions() {
+        let cases: [(&str, &[u8]); 16] = [
+            (r#"{{ add("1700000000", "300") }}"#, b"1700000300"),
+            (r#"{{ add("-5", "3") }}"#, b"-2"),
+            (r#"{{ slice("abcdef", "1", "3") }}"#, b"bcd"),
+            (r#"{{ slice("abcdef", "6", "0") }}"#, b""),
+            (r#"{{ between("k=v1&x=2", "k=", "&") }}"#, b"v1"),
+            (r#"{{ between("sess,04ab", "", ",") }}"#, b"sess"),
+            (r#"{{ between("sess,04ab", ",", "") }}"#, b"04ab"),
+            (r#"{{ hex(u8("255")) }}"#, b"ff"),
+            (r#"{{ hex(be64("258")) }}"#, b"0000000000000102"),
+            (r#"{{ hex(le16("258")) }}"#, b"0201"),
+            (r#"{{ hex(le32("258")) }}"#, b"02010000"),
+            (r#"{{ hex(le64("1")) }}"#, b"0100000000000000"),
+            (
+                r#"{{ json_set_number("{\"a\":\"x\"}", "exp", "1800000300") }}"#,
+                br#"{"a":"x","exp":1800000300}"#,
+            ),
+            (r#"{{ json_set_number("", "n", "-0") }}"#, br#"{"n":-0}"#),
+            (r#"{{ json_set_number("{}", "n", "0") }}"#, br#"{"n":0}"#),
+            (r#"{{ len(random("24")) }}"#, b"24"),
+        ];
+        for (template, expected) in cases {
+            assert_eq!(try_render(template).unwrap(), expected, "{template}");
+        }
+        assert_ne!(
+            try_render(r#"{{ random("16") }}"#).unwrap(),
+            try_render(r#"{{ random("16") }}"#).unwrap()
+        );
+        for (template, rule) in [
+            (r#"{{ add("9223372036854775807", "1") }}"#, "add overflows"),
+            (
+                r#"{{ add("1.5", "1") }}"#,
+                "argument is not a signed 64-bit integer",
+            ),
+            (r#"{{ slice("abc", "2", "2") }}"#, "slice out of range"),
+            (
+                r#"{{ slice("abc", "18446744073709551615", "2") }}"#,
+                "slice out of range",
+            ),
+            (
+                r#"{{ between("abc", "x", "") }}"#,
+                "between delimiter not found",
+            ),
+            (
+                r#"{{ between("abc", "a", "x") }}"#,
+                "between delimiter not found",
+            ),
+            (r#"{{ u8("256") }}"#, "number too large"),
+            (
+                r#"{{ json_set_number("{}", "n", "01") }}"#,
+                "json_set_number of a value that is not an integer",
+            ),
+            (
+                r#"{{ json_set_number("{}", "n", "1e3") }}"#,
+                "json_set_number of a value that is not an integer",
+            ),
+            (
+                r#"{{ json_set_number("{\"n\":1}", "n", "2") }}"#,
+                "json_set of a member the object has",
+            ),
+            (r#"{{ random("0") }}"#, "random of 1 to 1024 bytes"),
+            (r#"{{ random("1025") }}"#, "random of 1 to 1024 bytes"),
+            (r#"{{ pbkdf2("md5", "p", "s", "1") }}"#, "unknown hash name"),
+            (r#"{{ ecdh_public("p224") }}"#, "unknown curve name"),
+        ] {
+            assert_eq!(
+                try_render(template),
+                Err(Error::TemplateInvalid { rule }),
+                "{template}"
+            );
+        }
+    }
+
+    #[test]
+    fn taint_of_the_new_functions() {
+        let tainted = |t: &str| Template::parse(t).unwrap().analyze(&kind).unwrap();
+        let refused = |t: &str| Template::parse(t).unwrap().analyze(&kind).is_err();
+        // Structure keeps the taint.
+        assert!(tainted(r#"{{ slice(key, "0", "16") }}"#));
+        assert!(tainted(r#"{{ between(key, "", "x") }}"#));
+        assert!(tainted(r#"{{ add(key, "1") }}"#));
+        assert!(tainted(r#"{{ u8(key) + le64(key) }}"#));
+        assert!(tainted(r#"{{ json_set_number("{}", "n", key) }}"#));
+        // A fixed part of a secret field is still a secret key.
+        assert!(!tainted(
+            r#"{{ aes_gcm_encrypt(slice(key, "0", "16"), hexdecode(replace($nonce, "00000000", "")), $input) }}"#
+        ));
+        // ...but a part the caller chooses is an oracle, and so is a cut secret temp.
+        for t in [
+            r#"{{ slice(key, $input, "1") }}"#,
+            r#"{{ slice(key, "0", len($input)) }}"#,
+            r#"{{ between(key, $input, "") }}"#,
+            r#"{{ between(session, "a", "b") }}"#,
+            r#"{{ add(key, $input) }}"#,
+            r#"{{ json_set_number($input, "n", key) }}"#,
+            r#"{{ u8(key + $input) }}"#,
+        ] {
+            assert!(refused(t), "{t}");
+        }
+        // Algorithm names are fixed by the policy.
+        for t in [
+            r#"{{ pbkdf2($input, key, "s", "1") }}"#,
+            r#"{{ pbkdf2(nonce_t, key, "s", "1") }}"#,
+            r#"{{ rsa_sign_pss(key, key, "m") }}"#,
+            r#"{{ ecdh(nonce_t, "x") }}"#,
+        ] {
+            assert!(refused(t), "{t}");
+        }
+        // Public-key encryption: a server-sent key is accepted, a caller-sent one is not.
+        assert!(!refused(r#"{{ rsa_encrypt_pkcs1(nonce_t, key) }}"#));
+        assert!(tainted(r#"{{ rsa_encrypt_pkcs1(nonce_t, key) }}"#));
+        assert!(!tainted(
+            r#"{{ rsa_encrypt_oaep("sha256", nonce_t, $input) }}"#
+        ));
+        assert!(refused(r#"{{ rsa_encrypt_pkcs1($body, key) }}"#));
+        assert!(refused(
+            r#"{{ rsa_encrypt_oaep("sha1", "k" + $query, key) }}"#
+        ));
+        // Key agreement: the shared secret is a secret that a plain hash does not hide, the
+        // ephemeral public key is public.
+        assert!(tainted(r#"{{ ecdh("p256", nonce_t) }}"#));
+        assert!(tainted(r#"{{ hex(sha256(hex(ecdh("p256", nonce_t)))) }}"#));
+        assert!(!tainted(r#"{{ hex(ecdh_public("x25519")) }}"#));
+        assert!(!tainted(
+            r#"{{ hex(hmac_sha256(ecdh("p256", nonce_t), $input)) }}"#
+        ));
+        assert!(refused(r#"{{ ecdh("p256", nonce_t, key + $input) }}"#));
+        // One-way functions drop it; plain hashes of the secret alone keep it.
+        assert!(!tainted(
+            r#"{{ hex(hmac_sha384(key, $input)) + hex(hmac_md5(key, "x")) }}"#
+        ));
+        assert!(!tainted(r#"{{ hex(pbkdf2("sha1", key, "s", "1")) }}"#));
+        assert!(!tainted(r#"{{ hex(p521_sign(key, $input)) }}"#));
+        assert!(tainted(r#"{{ hex(md4(key)) }}"#));
+        assert!(!tainted(r#"{{ hex(sha512_256(key + $input)) }}"#));
+        assert!(!tainted(r#"{{ hex(random("16")) }}"#));
+        assert!(tainted(
+            r#"{{ chacha20_poly1305_encrypt(key, hexdecode($nonce + $nonce), key) }}"#
+        ));
     }
 }

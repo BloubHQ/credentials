@@ -99,5 +99,7 @@ pub mod response;
 pub mod secret;
 pub mod template;
 mod totp;
+#[cfg(test)]
+mod vectors;
 
 pub use error::{Error, Result};

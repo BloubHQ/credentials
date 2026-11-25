@@ -35,9 +35,18 @@ aes-gcm = "0.11"
 cbc = { version = "0.2.1", features = ["alloc"] }
 k256 = { version = "0.14", features = ["ecdsa", "pkcs8"] }
 md-5 = "0.11"
+md4 = "0.11"
 pbkdf2 = "0.13"
 ring = "0.17"
-p384 = { version = "0.14", features = ["ecdsa", "pkcs8"] }
+p384 = { version = "0.14", features = ["ecdsa", "ecdh", "pkcs8"] }
+p521 = { version = "0.14", features = ["ecdsa", "ecdh", "pkcs8"] }
+x25519-dalek = "3"
+# RSA encryption (OAEP, PKCS#1 v1.5) and PKCS#1 v1.5 signatures with SHA-1, which ring lacks.
+rsa = { version = "0.10", default-features = false, features = ["std", "encoding", "getrandom", "pkcs1v15"] }
+# Captures: linear-time regular expressions over bytes, no Unicode tables.
+regex = { version = "1.12", default-features = false, features = ["std", "perf"] }
+# Captures: a WHATWG HTML tokenizer with no dependencies and no unsafe code.
+html5gum = "0.9"
 sha3 = "0.12"
 base64 = "0.22"
 chacha20poly1305 = "0.11"
@@ -47,11 +56,11 @@ getrandom = { version = "0.4", features = ["sys_rng"] }
 hkdf = "0.13"
 hpke = { version = "0.15", default-features = false, features = ["alloc", "x25519", "chacha", "getrandom"] }
 hmac = "0.13"
-p256 = { version = "0.14", features = ["ecdsa", "pkcs8", "pem"] }
+p256 = { version = "0.14", features = ["ecdsa", "ecdh", "pkcs8", "pem"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["raw_value"] }
 memchr = "2"
-sha1 = "0.11"
+sha1 = { version = "0.11", features = ["oid"] }
 sha2 = "0.11"
 thiserror = "2"
 # Attestation documents: CBOR, and the X.509 chain of the Nitro Secure Module.
