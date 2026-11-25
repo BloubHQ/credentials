@@ -42,7 +42,8 @@ value against every place.
 typed items     card · login · oauth · identity · totp · ssh · database · ftp · mail · api
 sessions        login sessions · protocol sessions · challenges · approvals
 engine          fields · signed policies · templates · captures · log          (exists)
-transports      HTTP/1.1 · HTTP/2 · TLS/mTLS · text streams · protocol modules · CDP fill
+transports      HTTP/1.1 · HTTP/2 · WebSocket · streamed responses · TLS/mTLS · text streams ·
+                protocol modules · UDP relay · CDP fill
 ```
 
 Everything below *typed items* exists in some form today; the work adds to each layer without
@@ -70,6 +71,8 @@ Each kind fixes its field names, their **disclosure level**, validation and defa
 | `database` | engine, host, port, database, user (public), password (secret), TLS mode and CA pin | TLS required unless the owner signs it off |
 | `ftp` | host, mode (FTPS explicit/implicit, SFTP goes to `ssh`), user, password | plain FTP only when signed off |
 | `mail` | IMAP/SMTP/POP3 host, user, app password or OAuth | |
+| `queue` | MQTT, AMQP, Kafka, NATS, STOMP, XMPP host; user or client id (public); password, SASL secret, NATS nkey seed or client key (secret) | TLS required unless signed off |
+| `vpn` | WireGuard peer (endpoint, public key), private key (secret); or IPsec/IKEv2 identity and PSK or key | endpoint pinned |
 | `api` | free-form fields with a hand-written policy (today's records) | as today |
 
 **Implementation.** `engine::item` holds the schemas as data (`items.json` compiled in, so it
@@ -181,6 +184,15 @@ client tool -> credentials tunnel -> (signed call, TLS) -> node: authenticate, t
 | SMTP, IMAP, POP3 | text auth (`stream`, exists) + STARTTLS |
 | LDAP | simple bind over LDAPS / StartTLS |
 | SMB | NTLMv2 session setup |
+| Telnet | text login (`stream`) |
+| MQTT | CONNECT with username/password or TLS client certificate (also over WebSocket) |
+| AMQP 0-9-1 (RabbitMQ) | SASL PLAIN / AMQPLAIN / EXTERNAL |
+| Kafka | SASL PLAIN, SCRAM-SHA-256/512, OAUTHBEARER, or mTLS |
+| NATS | token, user/password, or nkey: the node signs the server nonce with the seed |
+| STOMP | CONNECT login/passcode |
+| XMPP | SASL SCRAM-SHA-1/256, PLAIN |
+| Kerberos | AS-REQ with the password-derived key, then service tickets (for SMB, LDAP, HTTP Negotiate) |
+| RADIUS | Access-Request with the shared secret (UDP, below) |
 | RDP, VNC | last: RDP NLA (CredSSP) and VNC auth |
 
 Every module: TLS (or SSH) ends inside the enclave; a fuzz target for its parser; the
@@ -191,6 +203,45 @@ session with start, end and byte counts (contents only if the policy asks for it
 `engine` operation kind `session`, the caller side in `cli` (`credentials tunnel`), the
 relay over the existing vsock egress.
 
+## 7a. WebSocket, streamed responses, long connections
+
+| Case | Node-side work |
+| --- | --- |
+| WebSocket, credential at the handshake | headers, cookie or query injected into the upgrade request (as for HTTP) |
+| WebSocket, credential in the first message | a template for the first frame (Discord `IDENTIFY`, exchange `login`), then relay |
+| WebSocket, every message signed | a template applied to each outgoing frame the policy matches (exchange orders: HMAC over the frame, a nonce or time in it); frames that do not match a declared shape are refused |
+| GraphQL subscriptions, JSON-RPC over WebSocket | as above |
+| Server-sent events, chunked and streamed responses (LLM APIs, long downloads) | the node forwards the body as it arrives instead of buffering it |
+| gRPC streaming | over HTTP/2 (section 8), frames forwarded both ways |
+
+Reflection scrubbing on a stream keeps the last `n - 1` bytes of each chunk back, where `n` is
+the longest encoded form of any secret, so a secret split across two chunks or frames is still
+caught. Streams have their own limits apart from the 10-second request deadline of plain calls:
+an idle timeout, a total duration, byte counts and a cap on open streams per caller, owner and
+node; each stream writes one log entry when it opens and one when it closes.
+
+**Implementation.** `tungstenite`-style framing in `transport` (no async runtime; the server is
+synchronous), operation kind `socket` with `handshake`, `first`, `each` templates and declared
+frame shapes; streamed bodies through a `Sink`-like writer in `server`; the caller side opens a
+WebSocket to the node through `credentials host`.
+
+## 7b. UDP
+
+The enclave reaches the network only through TCP connections the host relays (vsock port
+5001). UDP needs a second relay: datagrams framed over vsock, the host sending them to the one
+`host:port` the node asked for and returning replies from that address only.
+
+| Use | Node-side work |
+| --- | --- |
+| HTTP/3 (QUIC) | `quinn`-style QUIC client in `transport`; only for destinations that refuse HTTP/2 |
+| WireGuard | handshake and transport keys in the enclave (`boringtun`-style), the caller gets a tunnel to the peer's network; the private key never leaves |
+| IPsec / IKEv2 | IKEv2 with PSK or certificate; later than WireGuard |
+| SIP, RTP (calls) | SIP digest authentication; media relayed |
+| RADIUS, DNS over UDP | request authenticators and TSIG signatures computed by the node |
+
+**Implementation.** a `datagram` channel next to the egress relay in `relay` and `host`
+(allow-listed like TCP), and the protocol modules above in `tunnel`.
+
 ## 8. Transport and engine gaps
 
 | Gap | Change |
@@ -199,8 +250,32 @@ relay over the existing vsock egress.
 | Sites that encrypt the password in JavaScript | `rsa_encrypt_pkcs1`, `rsa_encrypt_oaep`; the public key must come from the policy or from the destination's response, never from the caller |
 | Missing algorithms | `sha384`, `hmac_sha384`, `md4`, `hmac_md5`, `aes_ecb`, `des` (for VNC), `ed25519` already |
 | HTTP/2, gRPC | `h2` in `transport`, ALPN; gRPC framing for injected metadata |
-| Reflection | every response path (HTTP bodies, headers, errors, stream bytes, CDP results) scrubbed of every secret value and its common encodings before it leaves |
+| Reflection | every response path (HTTP bodies, headers, errors, stream bytes, WebSocket frames, datagrams, CDP results) scrubbed of every secret value and its common encodings before it leaves |
 | Tokens obtained by the node | always re-sealed into the item, never returned (exists for OAuth capture; extended to sessions) |
+
+## 8a. Further schemes possible in principle
+
+| Scheme | Where it is used | Change |
+| --- | --- | --- |
+| OAuth 1.0a | older APIs (X v1.1, Garmin, some e-commerce) | HMAC-SHA1 / RSA-SHA1 over the normalized parameter string; `canonical_query` gains the OAuth normalization |
+| OAuth 2.0 authorization code + PKCE, device code | first connection of an account | the consent runs on the owner's device (or the device-code page), the app seals the tokens; the node only refreshes |
+| DPoP, HTTP Message Signatures (RFC 9421), Hawk | newer APIs, banks | per-request proof JWT or signature base built by template; `htm`, `htu`, `jti` from the request and the node's nonce |
+| AWS SigV4A | multi-region AWS | ECDSA P-256 with the key derived from the secret (new derivation function) |
+| NTLM and Negotiate over HTTP | corporate intranets, SharePoint, Exchange | NTLMv2 (MD4, HMAC-MD5) and Kerberos (section 7) for `WWW-Authenticate: NTLM / Negotiate` |
+| SAML and OIDC single sign-on | enterprise logins | multi-step HTTP with `html` capture of `SAMLResponse` / form posts; `private_key_jwt` client authentication by derive |
+| SRP-6a | Apple ID, Proton, 1Password-style logins | big-integer SRP client functions; the password never leaves |
+| Payload encryption: JWE, SEED, ARIA | Korean PG and bank APIs, government APIs | `jwe_encrypt` (RSA-OAEP / ECDH-ES + AES-GCM), SEED and ARIA ciphers (KISA) |
+| Korean certificates (공동인증서, NPKI) | tax, bank and government APIs | item `certificate`: `signCert.der` + `signPri.key` + its password; the node decrypts the key (SEED-CBC with PBKDF) and makes CMS/PKCS#7 signatures; sites that require their own browser plug-in stay out |
+| Software passkeys | passkey-only sites | the node registers a passkey of its own with the site (owner approves), keeps the private key and answers WebAuthn assertions, through the CDP virtual authenticator or directly |
+| HOTP, Steam Guard, other OTP variants | games, older 2FA | counter-based `hotp` (counter stored in the item), Steam's alphabet |
+| SMS codes without the owner | sites that only send SMS | a phone number the node controls (an SMS provider account as an item); the node reads the code itself |
+| OpenPGP | signing, decrypting mail and files | item `pgp`; sign and decrypt by derive, the private key stays |
+| ssh-agent | `git`, `ssh`, `scp` with the caller's own tools | the node answers the ssh-agent protocol through `credentials tunnel --agent`, signing challenges without handing over the key |
+| Schnorr (BIP-340), EIP-712, Solana | Bitcoin Taproot, typed Ethereum signatures | `secp256k1_schnorr_sign`; EIP-712 by templates over `keccak256` |
+| Incoming webhooks | Stripe, GitHub, Slack callbacks to the service | operation `verify`: the node checks a signature over the caller's payload and returns one bit |
+| Decrypting what a service sent | encrypted API responses, PGP mail | derive `decrypt` whose output is the plaintext of the data, never the key |
+| Secrets made inside the node | new site passwords, rotated API keys, SSH keys | `generate` (random password to a site's rules, key pairs): the value is sealed into the item and never shown; rotation flows change a site's password with the old one and keep only the new |
+| Egress through a proxy | sites that block data-centre addresses, sessions bound to the owner's network | upstream HTTP CONNECT or SOCKS5 (with proxy credentials as secrets), including a relay on the owner's own network |
 
 ## 9. Who sees what
 
@@ -241,14 +316,24 @@ each, or a node hands its grants to a peer of the same release.
 | 4 | Sessions and challenges (`await` step, mail-read codes, app answers) | 2 |
 | 5 | Browser fills over CDP (Kernel), card and login items | 3, 4 |
 | 6 | Protocol tunnels: SSH, PostgreSQL, MySQL, Redis, FTP/FTPS first; then MongoDB, MSSQL, LDAP, SMB; RDP/VNC last | 2 |
-| 7 | HTTP/2 and gRPC | 1 |
+| 7 | HTTP/2 and gRPC; WebSocket; streamed responses and long-connection limits | 1 |
+| 7b | Queue and messaging protocols (MQTT, AMQP, Kafka, NATS, STOMP, XMPP), Telnet, Kerberos | 6 |
+| 7c | UDP relay; WireGuard, QUIC, SIP, RADIUS; IPsec last | 6 |
 | 8 | Node hand-over and successor statements | 2 |
 | 9 | Key backup and device transfer in `client` (Keychain, Block Store, 6-digit transfer) | |
+| 10 | Section 8a: payload ciphers and Korean certificates; OAuth 1.0a, DPoP, SigV4A, NTLM, SAML, SRP; software passkeys; generated and rotated secrets; `verify` and `decrypt`; proxies; ssh-agent; OpenPGP | 2 |
 
 Each part adds its rows to `docs/threat-model.md`, fuzz targets for any new parser, and
 measured results in its pull request.
 
-## 12. Open questions
+## 12. Out of reach by principle
+
+A node in a data centre cannot touch devices near the owner: Bluetooth, NFC, USB security
+keys, smart cards, serial ports. Credentials bound to them (passkeys in a phone's secure
+element, hardware OTP tokens) go through the owner's device each time: an approval or a
+challenge, never a stored secret.
+
+## 13. Open questions
 
 - PCI DSS scope of storing card numbers in the node, and Kernel's PCI status.
 - Korean card issuers: none was found with a public one-time virtual card API; cards stay real
