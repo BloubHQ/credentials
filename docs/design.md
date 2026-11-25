@@ -121,6 +121,15 @@ When a step needs a code the node cannot compute:
    under a policy that allows exactly that (sender and pattern pinned).
 3. The node resumes. The code never passes through the agent.
 
+A challenge of kind `external` carries no code: the site waits for the owner to approve in
+another company's app (KakaoTalk, a bank's app push). The node keeps the parked operation,
+polls the site's status endpoint as the policy describes, and resumes when the site reports
+the approval, or fails at the deadline. The owner's own app only shows what is pending.
+
+Proofs only the owner's phone can make (Apple Pay, Google Pay, app attestation tokens) are not
+challenges: there is no value the node could receive. A task that needs one runs on the
+owner's device, and the node is not involved.
+
 **Implementation.** `engine::session` (parked operations, bounded count per owner and in
 total, expiry) and a new step kind `await {challenge}` in `Operation::Http` and `Stream`.
 
