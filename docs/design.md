@@ -174,8 +174,19 @@ Proofs only the owner's phone can make (Apple Pay, Google Pay, app attestation t
 challenges: there is no value the node could receive. A task that needs one runs on the
 owner's device, and the node is not involved.
 
-**Implementation.** `engine::session` (parked operations, bounded count per owner and in
-total, expiry) and a new step kind `await {challenge}` in `Operation::Http` and `Stream`.
+**Implementation (part 5, done).** A step `await {challenge}` in HTTPS operations and
+operations with no connection; parked operations in the node's memory (8 per owner, 256 and
+128 MiB in all, at most five minutes, dropped on revoke and restart); `engine::session` for
+the device's sealed, signed answer. Where the design left a choice, the more secure one was
+taken:
+
+- `await` is refused on TLS: a parked operation would hold an open connection to the site.
+- A resume is accepted only from the caller that started the operation, on the same record
+  and operation; every other case gets the same `parked_unknown` as an unknown id, so ids
+  cannot be probed.
+- An external challenge is polled only when the caller resumes (no background requests the
+  owner cannot see), and the poll is a fixed request of the signed policy.
+- Reading the code from a `mail` item is not done: it needs a mail connection kind (part 6).
 
 ### Approvals
 
@@ -183,6 +194,14 @@ An item or policy can require the owner's approval per use: payments always, plu
 the owner marks. The node returns `approval_required {id, summary}`; the summary is built by
 the node (merchant origin, amount, currency, item masked view), and the owner's device signs
 `approve(id, summary hash)`. The log records the approval.
+
+Done in part 5. The node asks before it sends anything (not between steps), so nothing
+reaches the site before the owner approved. Every use of a `card` waits, whatever the
+limits say. Amounts come only from a required, bounded query parameter or JSON input member
+(or the policy); a body contract is next. A payment within the owner's limits is counted
+when the node decides to send it, under the same lock as the check, even if the request then
+fails: counting early can only make the owner approve sooner, never let a split payment
+through.
 
 ## 6. Browser fills (card and login on JavaScript pages)
 
@@ -334,7 +353,7 @@ The enclave reaches the network only through TCP connections the host relays (vs
 
 | Scheme | Where it is used | Change |
 | --- | --- | --- |
-| Spending limits | real cards, exchange orders, transfers | per item, merchant, day and month limits kept by the node; above them an approval (section 5) |
+| Spending limits (done in part 5) | real cards, exchange orders, transfers | per item, merchant, day and month limits kept by the node; above them an approval (section 5); the day and month are rolling 24 hours and 30 days, so a payment cannot be split across a calendar boundary |
 | Short-lived credentials handed to the caller | `aws`, `gcloud`, `kubectl`, GitHub Apps, databases with IAM tokens | operation `vend`: the node mints a scoped, short-lived credential from the long-lived secret (STS AssumeRole with a session policy, a GCP downscoped token, a GitHub installation token, an RDS IAM token) and returns only that; the owner's policy sets scope and lifetime |
 | SASL XOAUTH2 / OAUTHBEARER | Gmail, Outlook over IMAP and SMTP | the mail item takes an OAuth token instead of a password |
 | ACME, JWS in general | certificates (Let's Encrypt), any JWS API | account key JWS by derive |
@@ -391,7 +410,8 @@ changes on every load needs the hash left unpinned, which the approval screen fl
 **Implementation.** this is layer 3: IR step `run {module, entry, inputs}`; one WebAssembly
 runtime in the node, and a JavaScript engine compiled to WebAssembly as a reviewed module, so
 there is one sandbox to audit. Runtime and engine are chosen by measured size, speed and audit
-surface in their pull request.
+surface in their pull request: the runtime is wasmi 1.1.0, an interpreter (measurements and
+the JavaScript plan in `docs/sandbox.md`; the step in `docs/policy.md`, `run`).
 
 ## 8d. Primitives shipped up front
 
@@ -443,9 +463,9 @@ each, or a node hands its grants to a peer of the same release.
 | 2 | Policy IR: one step language replacing `http`/`stream`/`derive`, with the contracts of section 2a, response projection and the path fixes; existing policies converted by a tool | 1 |
 | 3 | Typed items, disclosure levels, `describe`, custom kinds (done: `docs/policy.md`, Typed items) | 2 |
 | 4 | Policy JSON Schema, `client::summarize` with risk flags, approval format (done: `docs/policy.md`; the approval runtime is part 5) | 2, 3 |
-| 5 | Sessions, challenges, approvals, spending limits | 2 |
+| 5 | Sessions, challenges, approvals, spending limits (done: `docs/policy.md`, Operations that wait; codes read from a `mail` item, `await` on TLS and amounts from body contracts are next) | 2 |
 | 6 | Connection kinds in layer 1: HTTP/2, WebSocket, streamed responses, then SSH, databases, FTP, mail, queues; tunnels as an IR relay step | 2 |
-| 7 | Trusted code sandbox (layer 3): WebAssembly runtime, JavaScript module, origin-pinned site code | 2 |
+| 7 | Trusted code sandbox (layer 3): WebAssembly runtime, JavaScript module, origin-pinned site code (done: `run` step, `crates/sandbox`, wasmi 1.1.0 chosen by measurement; JavaScript measured with boa in the sandbox, its shipping plan in `docs/sandbox.md`) | 2 |
 | 8 | Browser fills over CDP | 4, 5 |
 | 9 | Remaining primitive families (Appendices A, B), UDP relay and its protocols | 1 |
 | 10 | Node hand-over; key backup and device transfer in `client` | 3 |

@@ -10,6 +10,7 @@ members = [
     "crates/engine",
     "crates/host",
     "crates/relay",
+    "crates/sandbox",
     "crates/server",
     "crates/transport",
     "crates/verify",
@@ -30,6 +31,7 @@ transport = { path = "crates/transport" }
 server = { path = "crates/server" }
 relay = { path = "crates/relay" }
 host = { path = "crates/host" }
+sandbox = { path = "crates/sandbox" }
 aes = "0.9.2"
 aes-gcm = "0.11"
 # AES modes and MACs (RustCrypto, cipher 0.5 generation): key wrap (RFC 3394, RFC 5649),
@@ -87,6 +89,12 @@ zeroize = { version = "1", features = ["derive"] }
 uniffi = { version = "0.32", default-features = false }
 wasm-bindgen = "0.2"
 js-sys = "0.3"
+# The trusted code sandbox (layer 3): an interpreter, no code generated at run time; no
+# memory64 or SIMD. The 1.x line, not 2.0: wasmi 2.0.3 crashed (access violation) when built
+# at a higher optimisation level than the crate embedding it (`docs/sandbox.md`).
+wasmi = { version = "1.1.0", default-features = false, features = ["std"] }
+# WebAssembly text, for the tests of the sandbox and its reviewed library modules.
+wat = "1"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

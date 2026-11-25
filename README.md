@@ -175,7 +175,8 @@ reference is in [docs/policy.md](docs/policy.md).
 
 An operation is a list of **steps** over one connection: `open` (HTTPS, a TLS stream, or
 none), `send`, `receive` (with captures), `compute` (a template into a name later steps
-read), and `return`, which says what goes back to the caller.
+read), `run` (the site's own code in a sandbox, below), and `return`, which says what goes
+back to the caller.
 
 | Connection | What it does |
 | --- | --- |
@@ -234,11 +235,31 @@ keys, TLS unless signed off) and bounds what its policies may do; the node refus
 policy wider than its kind, even a signed one. A caller may `describe` a typed record and gets
 the public fields and masks such as `visa ••••4242`, never a secret field.
 
+**Site code.** When a login encrypts or packages the password in the site's own
+WebAssembly and the steps cannot be written as templates, a `run` step fetches the module
+from the destination's own origin (its URL and, ideally, its SHA-256 are in the signed
+policy) or takes a reviewed library compiled into the node, and runs it in a sandbox
+(wasmi, an interpreter: no I/O, no clock, no randomness, fuel and memory limits). Its output
+may go only into a request the policy fixes to that same origin: never back to the caller,
+to another destination or into the log; the signing check refuses every other use. An
+unpinned module is flagged. Measurements and the plan for JavaScript are in
+[docs/sandbox.md](docs/sandbox.md).
+
 **Before signing.** `summarize` lists, per secret, where it can go and in what form, what
 comes back, and risk flags (a destination outside the item's origin, wildcards, plain HTTP,
 any-bytes inputs, reversible outputs, relays, and everything a new version widens over the
 last). The format has a JSON Schema, `crates/engine/policy.schema.json`. Details in
 [docs/policy.md](docs/policy.md).
+
+**Operations that wait for the owner.** An `await` step parks an operation in the node's
+memory (five minutes at most, never logged, dropped on restart) until the owner's device
+answers: a one-time code signed and sealed to the node (`answer_challenge`), never typed by
+the caller, or an approval in another app that the node polls the site for. Every use of a
+card, an operation the owner marks, and a payment above the owner's spending limits (per
+item, merchant, day and 30 days, signed by the device) wait for an approval of a summary the
+node builds from what it checked: merchant, amount, currency and the masked card. Sessions
+the node obtains carry an expiry and are renewed by a login operation of the policy, or by the
+owner. The caller resumes with the id it was given, and only that caller can.
 
 ## Records, generations and rollback
 
@@ -316,7 +337,8 @@ credentials verify log.jsonl <node-public-key> --owner alice --user-key key.txt 
   which refuses a cut log.
 - **Command line and server.** [`credentials`](crates/cli) makes keys, signs policies, seals
   records, makes grants and signed calls, and `credentials serve` runs a node over HTTP with a
-  durable JSONL log.
+  durable JSONL log. `POST /answer`, `/approve` and `/limits` take what the owner's device
+  signs for operations that wait; operations waiting when the node restarts are gone.
 - **Concurrency.** Every method takes `&self`; share one node between threads. Transport I/O
   runs outside the node's lock.
 
@@ -449,6 +471,10 @@ stops if it cannot. `credentials host` is described in [crates/host](crates/host
 - Grants open only on the node they were sealed to, only from a device the node knows for the
   owner (first use is trusted), and cannot be replayed. Revocations need a known device.
 - Records cannot be rolled back past a pin or a generation the node saw.
+- A challenge is answered and an approval given only by a known device of the owner, over
+  exactly what the node built; a waiting operation resumes only for the caller that started
+  it, and its values never leave the node. Payments within the owner's limits are counted
+  before anything is sent; above them, the owner approves.
 - Templates are analysed before signing; derivations cannot hand back a secret, an oracle on
   a secret, or a check for guesses of a guessable field.
 - Responses are parsed strictly (framing, encodings, sizes); captured secrets are redacted;
@@ -511,8 +537,11 @@ explains each.
   owner who loses every device starts a new owner name.
 - **Stream sessions** end with the call. SSH, database wire protocols, gRPC and WebSocket
   framing work only as far as a send/expect script can go.
-- **Browser logins, push 2FA and hardware keys** need a person or a device and cannot be
-  delegated.
+- **Site code is trusted as the site.** A `run` module computes on the secret; it can fail
+  or take time depending on it, and an unpinned module is whatever the origin serves.
+- **Browser logins and hardware keys** need a person or a device and cannot be delegated.
+  One-time codes and approvals in another app come from the owner (an `await` step), not from
+  the node or the caller.
 - **A web page is weaker than an app.** The [`client`](crates/client) package runs in a page
   as in an app, but the server of the page can send other code at any load; grant from an
   app where you can. Its keys are not hardware keys either (the Secure Enclave and StrongBox
@@ -531,6 +560,7 @@ explains each.
 | [`verify`](crates/verify) | Verifier of node logs, run as `credentials verify` |
 | [`attest`](crates/attest) | Verifier of AWS Nitro Enclaves attestation documents, run as `credentials attest` |
 | [`client`](crates/client) | The app side for iOS, Android and the web: keys, node attestation, grants, records and calls, bound to Swift and Kotlin (UniFFI) and JavaScript (wasm-bindgen) |
+| [`sandbox`](crates/sandbox) | The WebAssembly sandbox of the `run` step (wasmi): fuel and memory limits, inputs in and one output out, reviewed library modules |
 | [`cli`](crates/cli) | The `credentials` tool: keys, policies, records, grants, calls, a node server, and `credentials host` |
 
 ## Development

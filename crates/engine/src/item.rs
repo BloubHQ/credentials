@@ -247,6 +247,10 @@ pub struct Shape {
     /// The secret fields a response may fill (`*`: any, for free fields only).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub captures: Vec<String>,
+    /// True when every use of an item of the kind waits for the owner's approval (a card:
+    /// every payment), whatever the policy or the spending limits say.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub approval: bool,
 }
 
 /// A kind of item.
@@ -905,7 +909,13 @@ fn check_operation(
                     "the kind does not relay the caller's exchanges",
                 )?;
             }
-            Step::Send(_) | Step::Compute(_) | Step::Repeat(_) | Step::If(_) => {}
+            // A run step's origin is one of the connection's destinations, checked above.
+            Step::Send(_)
+            | Step::Compute(_)
+            | Step::Run(_)
+            | Step::Repeat(_)
+            | Step::If(_)
+            | Step::Await(_) => {}
         }
     }
     Ok(())

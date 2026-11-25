@@ -46,8 +46,26 @@ Rust names; Swift and Kotlin use the same names in camel case (`verifyNode`), Ja
 | `policy_json_schema()` | `String` | The JSON Schema of the policy format |
 | `item_kinds()` | `String` | The reviewed kinds of item |
 | `sign_kind(device_key, kind_json)` | signed kind JSON | A custom kind of item |
-| `approval_hash(summary_json)` | `String` | The SHA-256 an approval signs |
-| `approve(device_key, identity_json, summary_json)` | approval JSON | Approves a summary that node built, while it is open |
+| `approval_hash(summary_json)` | `String` | The SHA-256 an approval signs (of a summary, or of the pending reply that carries it) |
+| `approve(device_key, identity_json, summary_json)` | approval JSON | Approves a summary that node built (or the `approval_required` reply as the node sent it), while it is open; for `POST /approve` |
+| `answer_challenge(device_key, owner, identity_json, pending_json, code)` | sealed answer JSON | Answers a code challenge the node handed back, signed by the device and sealed to the node; the code is erased once sealed; for `POST /answer` |
+| `sign_resume_call(caller_key, caller, identity_json, record_json, operation, id)` | signed call JSON | Goes on with a waiting operation: the same caller, record (the last one the node handed back) and operation, and the pending `id` |
+| `sign_limits(device_key, owner, identity_json, record_id, rules_json)` | limits JSON | Spending limits of a record on the node: per currency and merchant, per payment, day and 30 days; for `POST /limits` |
+| `update_record(user_key, record_json, fields: [Field])` | record JSON | Replaces values one generation later, writing a session's expiry: how the owner renews a session the node cannot |
+
+A call whose operation waits for the owner gets `{"kind": "challenge", ...}` or
+`{"kind": "approval_required", ...}` back (see [docs/policy.md](../../docs/policy.md),
+Operations that wait). The app shows it on the owner's device, which answers or approves;
+then the app resumes:
+
+```kotlin
+val reply = http.post("$url/call", signCall(callerKey, "app", identity, record, "pay", """{"kind": "http"}"""))
+val pending = reply.ok                                     // {"kind": "approval_required", "id", "summary"}
+// On the owner's device, after showing the summary:
+http.post("$url/approve", approve(deviceKey, identity, pending))
+// Back in the app:
+http.post("$url/call", signResumeCall(callerKey, "app", identity, record, "pay", pending.id))
+```
 
 `grant` takes a `VerifiedNode`, never a bare identity, and only `verify_node` and
 `verify_attestation_reply` make one; it must be at most five minutes old. So an app cannot
@@ -131,7 +149,7 @@ locally: `wasm-bindgen` was not installed on the machine these were measured on)
 The web build exposes the same functions in camel case (`generateKey`, `verifyNode`,
 `verifyAttestationReply`, `grant`, `sealRecord`, ...), with `Nonce` and `VerifiedNode`
 classes. Bytes are `Uint8Array`, `valid_for_secs` a number of seconds, millisecond times
-numbers, and the fields of `sealRecord` a `Map<string, Uint8Array>`. A failure throws an
+numbers, and the fields of `sealRecord` and `updateRecord` a `Map<string, Uint8Array>`. A failure throws an
 `Error` with `code` (and `reason` for `attestation_refused`). Randomness comes from
 `crypto.getRandomValues`, the time from `Date.now()`.
 

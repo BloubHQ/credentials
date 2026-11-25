@@ -15,16 +15,20 @@ The JSON Schema of the format is `crates/engine/policy.schema.json`
 ```text
 Policy
 ├── item:       ItemBinding          optional: a kind of item (see Typed items)
-├── fields:     [FieldSpec]          1–32
+├── fields:     [FieldSpec]          1–32 (a secret may hold a session: expiry and renewal)
 ├── callers:    [Caller]             1–32
 └── operations: [Operation]          1–16
     ├── name
     ├── input:  raw | json | rlp     (operations with no connection)
+    ├── payment: amount, currency    optional: checked against the owner's spending limits
+    ├── approval: true               optional: every use waits for the owner's approval
     └── steps:  [Step]               1–64
         ├── open     connection: https | tls, destinations, identity
         ├── send     https: request (caller contract | fixed) + inject;  tls: template
         ├── receive  https: the response of the send;  tls: until a delimiter;  + capture
         ├── compute  into a name, from a template
+        ├── run      site code or a reviewed library in the sandbox; output only to its origin
+        ├── await    a challenge: a code from the owner's device, or a site the node polls
         ├── return   https: response projection;  tls: relay;  none: template
         ├── repeat   (syntax only, refused)
         └── if       (syntax only, refused)
@@ -51,6 +55,7 @@ too (`policy/v4`), so no old signature verifies.
 | `secret` | A secret is tracked by the template analysis and searched for in responses. A public value (a user name, a client id) is not. |
 | `optional` | The record may lack it: a value an operation fills in later, such as an access token. |
 | `guessable` | Secret only. A value with few possibilities (PIN, password a person chose). A derivation may depend on it only through `len`: a hash, MAC, signature or encryption of it lets a guess be checked. |
+| `session` | Secret only. The field holds a session the node obtains (a cookie, a bearer token): how long it lasts, where its expiry goes and how it is renewed. See [Sessions](#sessions). |
 
 A record holds at most 32 fields and 16 MiB in all.
 
@@ -108,11 +113,14 @@ Rules for every operation:
 - `return` is the last step, and every operation ends with one.
 - On HTTPS, a `receive` follows the `send` whose response it reads; at most 8 sends.
 - `compute` may appear anywhere after `open`.
+- `run` needs an HTTPS connection and may appear anywhere after `open`.
+- `await` may appear in an HTTPS operation or one with no connection, at most 4 times; not
+  on TLS, whose connection would stay open while it waits.
 - `repeat` and `if` are refused for now (see [Loops and branches](#loops-and-branches)).
 
-New kinds of connection (WebSocket, SSH, database handshakes, a browser over CDP, a WASM
-`run`) fit the same steps: each kind says what its `send`, `receive` and `return` carry, and
-the template analysis stays the same. None is implemented yet.
+New kinds of connection (WebSocket, SSH, database handshakes, a browser over CDP) fit the
+same steps: each kind says what its `send`, `receive` and `return` carry, and the template
+analysis stays the same. None is implemented yet.
 
 ### `open`
 
@@ -256,6 +264,107 @@ the same as writing its template inline: every rule below applies across steps. 
 connection, `compute` reads what the `return` template reads (`$input` included); with a
 connection, the clock and `$nonce`.
 
+### `run`
+
+```json
+{"name": "login",
+ "steps": [
+   {"do": "open", "connection": "https",
+    "destinations": [{"host": "login.example.com", "port": 443}]},
+   {"do": "run",
+    "module": {"url": "https://login.example.com/static/enc.wasm",
+               "sha256": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"},
+    "entry": "encrypt", "inputs": ["{{password}}", "{{ $unix }}"], "into": "enc"},
+   {"do": "send",
+    "request": {"from": "fixed", "method": "POST", "path": "/login"},
+    "inject": [{"target": {"kind": "body"}, "template": "pw={{ b64url(enc) }}"}]},
+   {"do": "return"}
+ ]}
+```
+
+Runs code that must compute on secret bytes (a site's own JavaScript or WebAssembly that
+encrypts or packages a password before the login call) in the sandbox of layer 3
+(`docs/design.md`, section 8e; the runtime and its measurements are in
+[`docs/sandbox.md`](sandbox.md)). The code is never the caller's or an agent's:
+
+| `module` | The code |
+| --- | --- |
+| `{"url": "https://host[:port]/path", "sha256": "<64 hex>"}` | Fetched by the node with `GET` from the destination's own origin, over the operation's connection, as a logged request. The host and port must be one of the connection's destinations (concrete or matched by a `*.` pattern). `sha256` (optional) pins the bytes; without it the summary flags `run_unpinned`, since the site may change the code at any time. A status other than 200, a module over 8 MiB or a pin mismatch stops the operation (`ModuleRefused`) before any later request. |
+| `{"library": "lenprefix8"}` | A reviewed module compiled into the node (and so into its measurement, PCR2). `destination` names where its output may go; it may be left out when the connection has one concrete destination. |
+
+| Member | Meaning |
+| --- | --- |
+| `entry` | The exported function `() -> ()` to call (a token). |
+| `inputs` | 0 to 16 templates, rendered like a `compute` (fields, temporaries, the clock and `$nonce`; no request variable): secrets may go in. |
+| `into` | A new token name for the output; never a field. |
+| `destination` | For a library only: the destination its output may go to. |
+
+The module sees only its inputs: it imports at most `input_count`, `input_len`,
+`input_read` and `output` of the module `credentials` (no WASI, no clock, no randomness
+unless an input carries it, no I/O), exports its memory as `memory`, and runs under a fuel
+limit (10⁹ units, 1.25 s measured) and a memory limit (64 MiB), with at most 64 KiB of output.
+A failure is `Sandbox` with a fixed reason (`Fuel`, `Memory`, `Trap`, `Import`, ...):
+nothing the module computed reaches an error.
+
+The output is **confined to the module's origin** (the URL's host and port, or a library's
+`destination`). When the policy is signed:
+
+- `run` needs an HTTPS connection; an operation with no connection or a TLS stream cannot
+  have one (its output could only go back to the caller or to a stream the caller drives).
+- the output, every `compute` that reads it, and every temporary value captured from the
+  response of a request that carried it, may only be injected into a `send` whose request the
+  policy **fixes** to that origin: not a request of the caller (the caller would choose the
+  path, for example an endpoint that echoes), not another destination, not `return`;
+- every `run` of an operation has the same origin.
+
+At run time the output is also searched for in every response, like a rendered secret: a
+response that echoes it is refused (`Reflection`). The log records the request as for any
+`send` (method, host, path, the SHA-256 and length of the body, sealed to the owner), never
+the output.
+
+### `await`
+
+The operation waits for the owner. The node keeps it, with every value it holds, in its
+memory under a random id and hands the caller a pending reply instead of a result
+([Operations that wait](#operations-that-wait)); the caller resumes it with the id.
+
+```json
+{"do": "await", "challenge": {"kind": "sms", "hint": "The code your bank texts you",
+                              "into": "otp", "pattern": "[0-9]{6}", "timeout_ms": 120000}}
+```
+
+A **code** (`sms`, `email`, `app`, `3ds`) comes from a device of the owner, signed and sealed
+to the node; never from the caller. It goes into the secret temporary value `into` (a new
+token), which later steps read like a captured secret and which is redacted from what goes
+back. `pattern` is a regular expression the whole code must match (by default
+`[0-9A-Za-z-]{1,64}`); a code is 1 to 256 bytes.
+
+```json
+{"do": "await", "challenge": {"kind": "external", "hint": "Approve the payment in your bank's app",
+  "poll": {"send": {"request": {"from": "fixed", "method": "GET", "path": "/v1/status"},
+                    "inject": [{"target": {"kind": "header", "name": "Authorization"},
+                                "template": "Bearer {{token}}"}]},
+           "success": {"source": {"from": "json", "pointer": "/state"}, "one_of": ["approved"]},
+           "failure": {"source": {"from": "json", "pointer": "/state"}, "one_of": ["declined", "expired"]},
+           "every_ms": 3000}}}
+```
+
+An **external** challenge carries no code: the site waits for the owner in another app. Each
+time the caller resumes, and no sooner than `every_ms` (1 second to the timeout) after the
+last poll, the node sends the fixed request of `poll` (checked like any `send`; it is logged
+like any request) and reads its response: `success` lets the operation go on, with that
+response as the last one, `failure` fails it (`challenge_failed`), anything else keeps it
+waiting. A condition reads one capture source (not `all`) and compares it with 1 to 16
+values of at most 256 bytes, exactly.
+
+| Member | Meaning |
+| --- | --- |
+| `kind` | `sms`, `email`, `app`, `3ds` (a code) or `external`. |
+| `hint` | What the owner is told: 1 to 256 bytes without control characters, written by the owner in the policy. The caller writes no part of it. |
+| `into`, `pattern` | Codes only. |
+| `poll` | `external` only, required. |
+| `timeout_ms` | How long the operation waits: 1000 to 300000 (the default, five minutes). |
+
 ### `return`
 
 #### HTTPS: the response projection
@@ -358,6 +467,10 @@ one that gives the caller less:
 | --- | --- |
 | The status is the only thing an HTTPS operation returns unless `response` says more. | A server's answer may hold what the policy never meant to hand out (temporary credentials minted by the call); the owner lists what the caller needs. |
 | A caller may send no query parameter that is not listed; there is no wildcard for names. | An unlisted parameter can change what the signed request does (an action, a scope, a limit). |
+| A `run` output goes only into a request the policy fixes, not one of the caller's, even to the same origin. | The caller would choose the path and query around it, and so could send it to an endpoint of the site that echoes what it receives. |
+| The output of a `run`, and what the response to a request that carried it gives into temporary values, are confined alike. | A site that echoes the output would otherwise hand it to a capture that may go anywhere. |
+| A `run` module's limits (fuel, memory, output) are the node's, not the policy's. | One bound to audit; a policy cannot raise them. |
+| The sandbox runtime is an interpreter (wasmi), not a JIT. | No code is generated at run time, and it adds about 1.3 MB to the node instead of 11.5 MB (`docs/sandbox.md`). |
 | A caller may never send a query name the `send` injects. | Servers disagree on which of two equal names wins. |
 | `%25` in a caller's path is refused unless `encoded_percent`. | A server or proxy that decodes twice reads another path than the one checked. Measured: no test or example of the repository needed it. |
 | Dot segments are checked as sent, after `;` parameters are stripped and after one and two decodings. | Servers strip path parameters (`..;`) or decode twice. |
@@ -401,8 +514,8 @@ The reviewed kinds ship in the node (`crates/engine/src/items.json`, or `item_ki
 
 | Kind | Fields (secret · masked · public) | Shape |
 | --- | --- | --- |
-| `card` | cvc · number (brand and last four), expiry (year) · holder, billing | HTTPS to the owner's destinations; JSON members back |
-| `login` | password, totp, session · username (email) · origin (pinned) | HTTPS to the pinned origin only; may capture `session` |
+| `card` | cvc · number (brand and last four), expiry (year) · holder, billing | HTTPS to the owner's destinations; JSON members back; every use waits for the owner's approval |
+| `login` | password, totp, session · username (email) · origin (pinned), session_expires | HTTPS to the pinned origin only; may capture `session` |
 | `oauth` | client_secret, refresh_token, access_token · — · provider (pinned), client_id, scopes | HTTPS; JSON members back; captures the tokens |
 | `identity` | national_id · name, birth_date, phone, email, address · — | HTTPS; JSON members back |
 | `totp` | seed (≥128 bits) · account · digits, period, issuer | derivations only |
@@ -496,7 +609,10 @@ crate, which checks the policy first) gives the owner, in JSON:
   derivation and whether that is one-way);
 - per operation: the connection and destinations, each request (fixed, or the caller's
   methods, path templates, headers and query allow-list), the injections, the response
-  projection or relay patterns, and the input schema;
+  projection or relay patterns, the input schema, and each `run` step (`runs`: the module's
+  URL or library, its origin, its pin or `unpinned`, the entry, the inputs and the output
+  name); a secret read by a module's input is listed as going in `module_input` to the
+  module's origin;
 - the callers with their operations and limits, and the item with its pins and sign-offs;
 - `lines`, the text of `Policy::summary()`;
 - the risk flags, each with a code, a place and words:
@@ -516,7 +632,8 @@ crate, which checks the policy first) gives the owner, in JSON:
 | `encoded_percent` | The caller's path may hold `%25`. |
 | `override_params` | The caller may send method-override parameters. |
 | `client_certificate` | A client certificate goes to a destination. |
-| `wider` | Against `previous`: a new destination, method, path, header, query rule, injection, operation, caller or caller key; more of the response; a looser limit; a field made public or not guessable; the item unbound or its pins and sign-offs changed. |
+| `run_unpinned` | A `run` step fetches its module without a `sha256` pin: the site can change the code that reads the secrets. |
+| `wider` | Against `previous`: a new destination, method, path, header, query rule, injection, operation, caller or caller key; more of the response; a looser limit; a field made public or not guessable; a payment changed or an approval dropped; a session rule changed; the item unbound or its pins and sign-offs changed. |
 | `new_destination` | Against `previous`: a destination it did not have. |
 
 What changed without widening (an operation or a caller removed) is listed in `changes`.
@@ -534,8 +651,8 @@ analysis, path templates, the shape of the kind).
 
 ## Approvals
 
-An operation that needs the owner's approval (part 5 of `docs/design.md` section 11 runs
-them) is described by the node in an `ApprovalSummary`: a random id, the node, owner, record
+An operation that needs the owner's approval ([Operations that wait](#operations-that-wait))
+is described by the node in an `ApprovalSummary`: a random id, the node, owner, record
 and generation, caller and operation, destination and origin, an amount (a decimal and an
 ISO 4217 code), the item's `describe` view and at most 32 lines, created and expiring at
 most five minutes apart. The caller writes no part of it. The owner's device signs an
@@ -544,6 +661,133 @@ most five minutes apart. The caller writes no part of it. The owner's device sig
 the node, owner and record. The node accepts it when the id and hash are those of the summary
 it built, the device is a known device of the owner, and it was issued while the summary was
 open. `approve` in the `client` crate refuses a summary of another node or one that lapsed.
+
+## Operations that wait
+
+An operation waits for the owner at an `await`, or before it sends anything when it needs
+the owner's approval. The node then keeps it **in memory only**: the opened fields, the
+temporary values, the last response, under a random 16-byte id, for at most five minutes.
+Nothing of it is written anywhere or handed back. It is dropped when it lapses, when the
+owner revokes the node's grant and when the node restarts. A node keeps at most 8 waiting
+operations per owner, 256 in all and 128 MiB of their values; an operation that may wait is
+refused (`parked_full`, HTTP 429) before it sends anything when there is no room.
+
+The caller gets, as the `ok` of `POST /call` (`Output::Pending`):
+
+```text
+{"kind": "challenge", "id": "<base64url>", "challenge": "sms", "hint": "...", "expires_ms": ...}
+{"kind": "approval_required", "id": "<base64url>", "summary": {...}}
+```
+
+and resumes with a call of the **same caller, record and operation** whose body is
+`{"kind": "resume", "id": "<base64url>"}` (`Body::resume`, `sign_resume_call` in the `client`
+crate), signed like any call. While the operation still waits, the node answers with the same
+pending reply. An id is taken only from the caller that started the operation, on the record
+it was left with (the one the node sealed before it waited, if it sealed one): for anyone
+else, and once the operation went on, lapsed or was dropped, the node answers
+`parked_unknown`, the same as for an id nobody parked.
+
+The owner's device acts on it, never the caller:
+
+- **A code**: `DeviceKey::answer_challenge` (`answer_challenge` in the `client` crate) signs
+  the node, owner, id, the SHA-256 of the code, the device and the time (domain `answer/v1`)
+  and seals all of it with the code to the node (HPKE, as a grant). `POST /answer` takes it
+  when a known device of the owner signed it, after the challenge opened, for a challenge
+  that waits for a code, and the code matches the pattern; once. The log records an `answer`
+  entry (operation and device), never the code.
+- **An approval**: an `Approval` of the summary the node built (`POST /approve`, see
+  [Approvals](#approvals)). The log records an `approve` entry with the summary's SHA-256.
+
+### Approvals at run time
+
+An operation waits for approval before it sends anything when:
+
+- the operation says `"approval": true`;
+- the item's kind says so: every use of a `card` waits (`"approval": true` in its shape),
+  whatever the policy or the spending limits say;
+- it declares a `payment` that no spending limit of the record covers, or that is above one.
+
+The node builds the summary: the destination of the first request, the origin (the
+merchant: `https://host[:port]` of that destination, else the item's origin), the amount and
+currency of the payment, the item's `describe` view, and lines the node writes itself (why it
+waits). Nothing in it comes from the caller as text. An approval is for that summary only:
+another amount, another id, or the same approval again is refused.
+
+### Payments and spending limits
+
+```json
+{"name": "charge",
+ "payment": {"amount": {"from": "query", "name": "amount"}, "currency": "EUR", "exponent": 2},
+ "steps": [
+   {"do": "open", "connection": "https", "destinations": [{"host": "pay.example", "port": 443}]},
+   {"do": "send", "request": {"from": "caller", "methods": ["POST"], "paths": ["/v1/charges"],
+                              "query": [{"name": "amount", "required": true, "min": "1", "max": "500000"}]},
+    "inject": [{"target": {"kind": "header", "name": "Authorization"}, "template": "Bearer {{key}}"}]},
+   {"do": "return"}
+ ]}
+```
+
+`payment` says how much the operation pays, as an integer of minor units (`exponent` digits
+after the point: 2 for EUR, 0 for JPY, at most 8) of `currency` (an ISO 4217 code the policy
+fixes). The amount comes only from a value the contract checked:
+
+| `amount` | Where |
+| --- | --- |
+| `{"from": "query", "name": "amount"}` | A query parameter of the caller's request whose rule is `required` with `min` (at least 0) and `max` (at most 10^18). |
+| `{"from": "input", "pointer": "/amount"}` | A member of the checked JSON input that is a required `number` with `min` and `max`, not `set`. |
+| `{"from": "fixed", "value": "500"}` | A decimal integer the policy states. |
+
+At run time a value that is not a decimal integer (`12.5`, `1e3`), or a parameter given twice,
+is refused before anything happens.
+
+The owner's device signs **spending limits** for one record on one node
+(`DeviceKey::sign_limits`, `sign_limits` in the `client` crate; `POST /limits`):
+
+```text
+{"node": "...", "owner": "alice", "record_id": "card",
+ "rules": [{"currency": "EUR", "per_payment": "50", "per_day": "100", "per_month": "500"},
+           {"currency": "EUR", "merchant": "https://shop.example", "per_day": "20"}],
+ "device": "...", "issued_ms": ..., "signature": "..."}
+```
+
+Each rule bounds one currency, at one merchant (an exact origin) or at any, with at most a
+decimal `per_payment`, `per_day` (the last 24 hours) and `per_month` (the last 30 days). A
+node takes them from a known device of the owner, issued within five minutes of its clock and
+after the limits it holds; they replace those. Before an operation with a `payment` sends
+anything, the node checks the amount against every rule that applies, with the payments it
+counted. Within all of them (and at least one applies), the payment is counted at once,
+under the same lock as the check, so payments made together cannot each fit a limit they
+exceed together; otherwise the operation waits for approval, and the payment is counted when
+it goes on. Limits and payments are written to the log sealed under a key only the node
+derives from its own key (`limits` and `spend` entries), so a restarted node counts them again
+and the log store reads neither amounts nor merchants. A node remembers at most 4096 payments
+of a record within 30 days; beyond, every payment waits.
+
+### Sessions
+
+```json
+{"name": "session", "secret": true, "optional": true,
+ "session": {"lifetime_ms": 3600000, "expires": "session_expires",
+             "renew": {"by": "operation", "name": "login"}}}
+```
+
+A secret field that holds a session the node obtains. When a `receive` captures into it, the
+node writes `now + lifetime_ms` (at most 30 days) into the field `expires` (public, optional,
+with no session of its own) and seals both into the new record, as any capture. Before an
+operation reads the session, the node checks its expiry; when it lapsed (or there is none):
+
+- `{"by": "operation", "name": "login"}`: the node runs that operation of the policy first
+  (HTTPS, a fixed request only, no `await`, `payment` or approval; it captures into the
+  session and does not read it; a login with the stored password), then the operation asked
+  for, with the new session;
+- `{"by": "owner"}`: the node refuses with `session_expired`; the owner logs in on the
+  device and seals the new session with `Record::update` (`update_record` in the `client`
+  crate), which writes its expiry too, one generation later.
+
+### Next
+
+Reading a code from a `mail` item of the owner, `await` on TLS, and amounts read from a
+request body contract are not done yet.
 
 ## Converting a policy
 

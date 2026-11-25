@@ -63,6 +63,8 @@ pub enum Payload<'a> {
     Derive(&'a [u8]),
     /// The description of a typed item.
     Describe,
+    /// Goes on with the waiting operation of this id.
+    Resume(&'a [u8; 16]),
 }
 
 fn part(hasher: &mut Sha256, bytes: &[u8]) {
@@ -110,6 +112,10 @@ impl Payload<'_> {
                 part(&mut h, input);
             }
             Payload::Describe => part(&mut h, b"describe"),
+            Payload::Resume(id) => {
+                part(&mut h, b"resume");
+                part(&mut h, id.as_slice());
+            }
         }
         h.finalize().into()
     }

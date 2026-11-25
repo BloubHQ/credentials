@@ -293,6 +293,8 @@ fn convert(operation: Operation, notes: &mut Vec<String>) -> NewOperation {
                 name,
                 input: None,
                 steps: out,
+                payment: None,
+                approval: false,
             }
         }
         Operation::Stream {
@@ -325,6 +327,8 @@ fn convert(operation: Operation, notes: &mut Vec<String>) -> NewOperation {
                 name,
                 input: None,
                 steps: out,
+                payment: None,
+                approval: false,
             }
         }
         Operation::Derive { name, template } => {
@@ -341,6 +345,8 @@ fn convert(operation: Operation, notes: &mut Vec<String>) -> NewOperation {
                     template: Some(template),
                     ..Return::default()
                 })],
+                payment: None,
+                approval: false,
             }
         }
     }

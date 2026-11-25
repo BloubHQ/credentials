@@ -189,6 +189,36 @@ impl Record {
         )
     }
 
+    /// The record with some values replaced, one generation later: what the owner's device
+    /// does when the owner renews a session the node cannot renew itself (`renew: owner`), or
+    /// changes a value. Each name must be a field of the policy. A field that holds a session
+    /// gets its expiry written too, `now_ms` plus the lifetime its rule gives. Runs on the
+    /// device: the values never leave the engine.
+    pub fn update(&self, user_key: &UserKey, values: &Fields, now_ms: u64) -> Result<Record> {
+        let policy = &self.policy.policy;
+        let mut fields = self.open(user_key)?;
+        for (name, value) in values.values() {
+            let spec = policy
+                .fields
+                .iter()
+                .find(|f| f.name == name)
+                .ok_or_else(|| Error::policy("fields", "a value for a field the policy lacks"))?;
+            fields.set(name, zeroize::Zeroizing::new(value.to_vec()))?;
+            if let Some(rule) = &spec.session {
+                let expires = now_ms.saturating_add(rule.lifetime_ms).to_string();
+                fields.set(&rule.expires, zeroize::Zeroizing::new(expires.into_bytes()))?;
+            }
+        }
+        Self::sealed(
+            user_key,
+            &self.id,
+            &self.owner,
+            self.next_generation()?,
+            self.policy.clone(),
+            &fields,
+        )
+    }
+
     /// Decrypts the fields. Only the engine can call this.
     pub(crate) fn open(&self, user_key: &UserKey) -> Result<Fields> {
         if self.v != VERSION {

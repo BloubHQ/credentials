@@ -10,7 +10,7 @@ use crate::keys;
 use crate::owner::to_json;
 use crate::time::now_ms;
 
-fn sign(
+pub(crate) fn sign(
     caller_key: String,
     caller: &str,
     identity_json: &str,

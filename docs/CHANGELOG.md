@@ -7,6 +7,50 @@ before 1.0, minor versions may break formats and APIs.
 
 ### Added
 
+- Trusted code sandbox (`docs/design.md` section 11, part 7; `docs/sandbox.md`): the IR step
+  `run {module, entry, inputs, into}` runs a WebAssembly module fetched from the
+  destination's own origin (`{"url": ..., "sha256": ...}`, fetched as a logged `GET` over the
+  operation's connection, pin checked) or a reviewed library compiled into the node
+  (`{"library": "lenprefix8"}`). Its output may only go into a request the policy fixes to
+  that origin; signing refuses `return`, the caller's request, another destination, a field,
+  a second origin, and temporary values captured from a response to a request that carried
+  it. New crate `sandbox` (wasmi 1.1.0, chosen over wasmtime 51 and wasmi 2.0.3 by
+  measurement): fuel (10⁹), 64 MiB memory, 64 KiB output, four host functions, no WASI,
+  clock or randomness. Errors `ModuleRefused` and `Sandbox`. Summaries list `runs` and a
+  `module_input` form, and flag `run_unpinned`. Fuzz target `sandbox_module`. JavaScript:
+  boa compiled to WebAssembly measured inside the sandbox; shipping plan in
+  `docs/sandbox.md`.
+- Operations that wait (`docs/design.md` section 11, part 5; `docs/policy.md`, Operations
+  that wait): an `await` step parks an operation in the node's memory under a random id
+  (at most 8 per owner, 256 and 128 MiB in all, five minutes, dropped on revoke and restart)
+  and the caller gets `Output::Pending` (`challenge {id, challenge, hint, expires_ms}` or
+  `approval_required {id, summary}`); it resumes with `Body::Resume {id}`, as the same
+  caller on the same record and operation only.
+  - Code challenges (`sms`, `email`, `app`, `3ds`): the owner's device answers with
+    `DeviceKey::answer_challenge`, signed and sealed to the node (`engine::session`,
+    `Node::answer`, `POST /answer`); the code becomes a secret temporary value and is never
+    logged.
+  - External challenges: the node polls a fixed status request of the policy when the caller
+    resumes, no sooner than `every_ms`, and goes on, fails or keeps waiting by its
+    conditions.
+  - Approvals at run time: an operation with `"approval": true`, every use of a `card`, and a
+    payment no spending limit covers or above one wait before anything is sent for an
+    `Approval` over the node-built summary (`Node::approve`, `POST /approve`).
+  - Payments and spending limits (section 8b): `"payment"` reads an amount only from a
+    required, bounded query parameter or JSON input member, or the policy; owner-signed
+    `SpendingLimits` (`engine::limits`, `DeviceKey::sign_limits`, `Node::set_limits`,
+    `POST /limits`) per currency and merchant, per payment, rolling day and 30 days, counted
+    under one lock and restored from sealed log entries.
+  - Sessions: a secret field with `"session": {lifetime_ms, expires, renew}`; the node writes
+    the expiry when it captures the session and, when it lapsed, runs the renewal operation
+    first or refuses with `session_expired` (`renew: owner`), after which the device seals a
+    new one with `Record::update`.
+  - Log events `answer`, `approve`, `limits` and `spend`; errors `Pending`, `ParkedUnknown`,
+    `ParkedFull` (HTTP 429), `ChallengeFailed`, `AnswerInvalid`, `SessionExpired`,
+    `LimitsInvalid`.
+  - `client` crate (UniFFI and wasm): `answer_challenge`, `sign_resume_call`, `sign_limits`,
+    `update_record`; `approve` and `approval_hash` also take the pending reply.
+  - Fuzz targets `decimal_amount` and `owner_waits`.
 - Typed items (`docs/design.md` section 11, part 3): a policy may bind its record to a kind
   (`"item": {"kind": ..., "pins": {...}, "signoff": [...]}`), a schema of secret, masked
   and public fields with checks and a shape of what its policies may do. Twelve reviewed
@@ -206,6 +250,12 @@ before 1.0, minor versions may break formats and APIs.
 
 ### Changed
 
+- Every use of a `card` item waits for the owner's approval (`"approval": true` in the kind's
+  shape); the `login` kind has a public `session_expires` field. `Step::Await`,
+  `Operation::payment`, `Operation::approval`, `FieldSpec::session` and `Shape::approval` are
+  new members; `call::Output::Pending`, `call::Body::Resume`, `caller::Payload::Resume` are
+  new variants. `Node::http`, `stream` and `derive` fail with `Error::Pending` where `run`
+  returns the pending reply.
 - `Policy` has an optional first member `item`; a policy without it signs and verifies as
   before. `call::Body::Describe`, `call::Output::Describe`, `caller::Payload::Describe`,
   `log::Event::Describe` and the errors `KindInvalid`, `KindSignature`, `FieldInvalid`,

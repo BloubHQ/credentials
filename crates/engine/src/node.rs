@@ -36,7 +36,7 @@ use crate::keys::{DevicePublicKey, Endorsement, NodeKey, NodePublicKey, Retireme
 use crate::log::{Detail, Event, Log, LogSink, SignedEntry, SignedHead};
 use crate::policy::{
     Capture, Compute, Connection, Destination, Identity, Kinds, MAX_DELIMITER, MAX_DELIMITERS,
-    Open, Operation, Policy, Send, Step, Store,
+    Method, ModuleRef, Open, Operation, Policy, RunModule, Send, Step, StepRequest, Store,
 };
 use crate::record::{Pin, Record, check_name};
 use crate::reflection::{self, MIN_NEEDLE, Secrets};
@@ -44,6 +44,11 @@ use crate::request::{self, Inputs, MAX_BODY, Outbound, Request};
 use crate::response::{Http, MAX_RESPONSE};
 use crate::template::{Budget, Context, Template, Temps, Var};
 use crate::{Error, Result};
+
+mod park;
+mod waits;
+
+pub use park::{MAX_PARKED, MAX_PARKED_BYTES, MAX_PARKED_PER_OWNER};
 
 pub use crate::caller::{CallerExchange, DESCRIBE};
 pub use crate::response::Response;
@@ -127,6 +132,7 @@ impl Captured {
         fields: &mut Fields,
         capture: &Capture,
         value: Option<Zeroizing<Vec<u8>>>,
+        now: u64,
     ) -> Result<()> {
         let Some(value) = value else {
             return if capture.optional {
@@ -151,6 +157,19 @@ impl Captured {
                 fields.set(name, value)?;
                 if !self.changed.contains(name) {
                     self.changed.push(name.clone());
+                }
+                // A session the node obtained lasts what its rule says, from now.
+                let rule = policy
+                    .fields
+                    .iter()
+                    .find(|f| f.name == *name)
+                    .and_then(|f| f.session.as_ref());
+                if let Some(rule) = rule {
+                    let expires = now.saturating_add(rule.lifetime_ms).to_string();
+                    fields.set(&rule.expires, Zeroizing::new(expires.into_bytes()))?;
+                    if !self.changed.contains(&rule.expires) {
+                        self.changed.push(rule.expires.clone());
+                    }
                 }
             }
             Store::Temp { name, secret } => {
@@ -303,6 +322,10 @@ struct State<S> {
     /// refused: a restart loses the replay state of those.
     started_ms: u64,
     calls: HashMap<(String, String, String), VecDeque<u64>>,
+    /// Operations that wait for a challenge or an approval, in memory only.
+    parked: park::Registry,
+    /// Spending limits and the payments counted against them, per record.
+    limits: HashMap<RecordKey, crate::limits::Ledger>,
 }
 
 impl<S: LogSink> State<S> {
@@ -420,6 +443,7 @@ pub struct Node<S: LogSink, C: Clock> {
     public: NodePublicKey,
     identity: NodeIdentity,
     seal: SealSecret,
+    state_key: crate::limits::StateKey,
     clock: C,
     state: Mutex<State<S>>,
 }
@@ -429,30 +453,36 @@ impl<S: LogSink, C: Clock> Node<S, C> {
     /// and payload its caller signed.
     pub fn run<T: Transport>(&self, call: &SignedCall, transport: &mut T) -> Outcome<Output> {
         let (record, operation, auth) = (&call.record, call.operation.as_str(), &call.auth);
+        let mut updated = None;
         match &call.body {
-            Body::Http { request } => {
-                let o = self.http(record, operation, auth, request.as_ref(), transport);
+            Body::Http { .. } | Body::Stream { .. } | Body::Resume { .. } => {
+                let result = self.execute(
+                    record,
+                    operation,
+                    auth,
+                    call.body.payload(),
+                    transport,
+                    &mut updated,
+                );
                 Outcome {
-                    result: o.result.map(Output::Http),
-                    record: o.record,
+                    result,
+                    record: updated,
                 }
             }
-            Body::Stream {
-                destination,
-                exchanges,
-            } => {
-                let o = self.stream(record, operation, auth, destination, exchanges, transport);
+            Body::Derive { .. } => {
+                let result = self.execute(
+                    record,
+                    operation,
+                    auth,
+                    call.body.payload(),
+                    &mut NoTransport,
+                    &mut updated,
+                );
                 Outcome {
-                    result: o.result.map(Output::Stream),
-                    record: o.record,
+                    result,
+                    record: updated,
                 }
             }
-            Body::Derive { input } => Outcome {
-                result: self
-                    .derive(record, operation, auth, input)
-                    .map(Output::Derive),
-                record: None,
-            },
             Body::Describe {} => Outcome {
                 result: if operation == DESCRIBE {
                     self.describe(record, auth).map(Output::Describe)
@@ -469,10 +499,17 @@ impl<S: LogSink, C: Clock> Node<S, C> {
     /// A node with a fresh chain.
     pub fn new(key: NodeKey, sink: S, clock: C) -> Self {
         let seal = SealSecret::of(&key);
-        Self::with_log(Log::new(key), seal, sink, clock)
+        let state_key = crate::limits::StateKey::of(&key);
+        Self::with_log(Log::new(key), seal, state_key, sink, clock)
     }
 
-    fn with_log(log: Log, seal: (SealSecret, NodeSealKey), sink: S, clock: C) -> Self {
+    fn with_log(
+        log: Log,
+        seal: (SealSecret, NodeSealKey),
+        state_key: crate::limits::StateKey,
+        sink: S,
+        clock: C,
+    ) -> Self {
         let public = log.public_key();
         let started_ms = clock.now_ms();
         Self {
@@ -482,6 +519,7 @@ impl<S: LogSink, C: Clock> Node<S, C> {
                 seal_key: seal.1,
             },
             seal: seal.0,
+            state_key,
             clock,
             state: Mutex::new(State {
                 log,
@@ -492,6 +530,8 @@ impl<S: LogSink, C: Clock> Node<S, C> {
                 nonces: Nonces::default(),
                 started_ms,
                 calls: HashMap::new(),
+                parked: park::Registry::default(),
+                limits: HashMap::new(),
             }),
         }
     }
@@ -507,7 +547,8 @@ impl<S: LogSink, C: Clock> Node<S, C> {
     /// [`Node::checkpoint`] there and use [`Node::restore_anchored`].
     pub fn restore(key: NodeKey, sink: S, clock: C, entries: &[SignedEntry]) -> Result<Self> {
         let seal = SealSecret::of(&key);
-        let node = Self::with_log(Log::resume(key, entries)?, seal, sink, clock);
+        let state_key = crate::limits::StateKey::of(&key);
+        let node = Self::with_log(Log::resume(key, entries)?, seal, state_key, sink, clock);
         {
             let mut state = node.lock();
             // Something signed in the very millisecond of the restart may predate it.
@@ -520,9 +561,36 @@ impl<S: LogSink, C: Clock> Node<S, C> {
                     | Event::Stream { generation, .. }
                     | Event::Derive { generation, .. }
                     | Event::Update { generation, .. }
+                    | Event::Approve { generation, .. }
                     | Event::Pin { generation } => {
                         state.raise(&e.owner, &e.record_id, *generation);
                     }
+                    Event::Spend {
+                        generation, sealed, ..
+                    } => {
+                        state.raise(&e.owner, &e.record_id, *generation);
+                        let spend: crate::limits::Spend =
+                            node.state_key
+                                .open(&e.owner, &e.record_id, park::SPEND, sealed)?;
+                        state
+                            .limits
+                            .entry((e.owner.clone(), e.record_id.clone()))
+                            .or_default()
+                            .record(spend, e.time_ms);
+                    }
+                    Event::Limits {
+                        issued_ms, sealed, ..
+                    } => {
+                        let rules: Vec<crate::limits::LimitRule> =
+                            node.state_key
+                                .open(&e.owner, &e.record_id, park::LIMITS, sealed)?;
+                        state
+                            .limits
+                            .entry((e.owner.clone(), e.record_id.clone()))
+                            .or_default()
+                            .set(rules, *issued_ms);
+                    }
+                    Event::Answer { .. } => {}
                     Event::Grant {
                         device,
                         issued_ms,
@@ -769,6 +837,8 @@ impl<S: LogSink, C: Clock> Node<S, C> {
             },
         )?;
         state.grants.remove(owner);
+        // Operations that wait hold values opened under the key just taken back.
+        state.parked.drop_owner(owner);
         state.issued(owner, revocation.issued_ms);
         Ok(())
     }
@@ -843,6 +913,7 @@ impl<S: LogSink, C: Clock> Node<S, C> {
                     (Some(Connection::Https), Payload::Http(_))
                         | (Some(Connection::Tls), Payload::Stream { .. })
                         | (None, Payload::Derive(_))
+                        | (_, Payload::Resume(_))
                 );
                 if !kind_ok {
                     return Err(operation.unknown());
@@ -978,6 +1049,7 @@ impl<S: LogSink, C: Clock> Node<S, C> {
             )
             .and_then(|output| match output {
                 Output::Http(response) => Ok(response),
+                Output::Pending(_) => Err(Error::Pending),
                 _ => Err(Error::OperationUnknown {
                     name: operation.to_string(),
                 }),
@@ -1010,6 +1082,7 @@ impl<S: LogSink, C: Clock> Node<S, C> {
             .execute(record, operation, auth, payload, transport, &mut updated)
             .and_then(|output| match output {
                 Output::Stream(output) => Ok(output),
+                Output::Pending(_) => Err(Error::Pending),
                 _ => Err(Error::OperationUnknown {
                     name: operation.to_string(),
                 }),
@@ -1041,6 +1114,7 @@ impl<S: LogSink, C: Clock> Node<S, C> {
         )?;
         match output {
             Output::Derive(bytes) => Ok(bytes),
+            Output::Pending(_) => Err(Error::Pending),
             _ => Err(Error::OperationUnknown {
                 name: operation.to_string(),
             }),
@@ -1058,6 +1132,9 @@ impl<S: LogSink, C: Clock> Node<S, C> {
         transport: &mut T,
         updated: &mut Option<Record>,
     ) -> Result<Output> {
+        if let Payload::Resume(id) = payload {
+            return self.resume(record, name, auth, id, transport, updated);
+        }
         if let Payload::Derive(input) = payload {
             if input.len() > MAX_INPUT {
                 return Err(Error::RequestInvalid {
@@ -1071,7 +1148,7 @@ impl<S: LogSink, C: Clock> Node<S, C> {
         // request leaves no entry and reaches no server.
         let mut input = Vec::new();
         match payload {
-            Payload::Describe => return Err(operation.unknown()),
+            Payload::Describe | Payload::Resume(_) => return Err(operation.unknown()),
             Payload::Http(request) => match (request, operation.takes_request()) {
                 (Some(request), true) => request.validate(operation)?,
                 (None, false) => {}
@@ -1121,26 +1198,54 @@ impl<S: LogSink, C: Clock> Node<S, C> {
             captured: Captured::default(),
             tainted: Vec::new(),
             now,
+            start: 0,
+            last: None,
+            log_seqs: Vec::new(),
         };
+        // An operation that may wait needs room to wait in, checked before anything is sent.
+        if operation.parks() {
+            self.lock().parked.room(&record.owner, now)?;
+        }
+        // The owner's approval and the spending limits, before anything is sent.
+        if let Some(pending) = self.gate(&mut run, payload, &input)? {
+            return Ok(Output::Pending(pending));
+        }
+        self.proceed(&mut run, payload, &input, transport, updated)
+    }
+
+    /// Runs the steps of `run` from `run.start` over the connection of the operation, and parks
+    /// it at an `await`.
+    fn proceed<T: Transport>(
+        &self,
+        run: &mut Run<'_>,
+        payload: Payload<'_>,
+        input: &[u8],
+        transport: &mut T,
+        updated: &mut Option<Record>,
+    ) -> Result<Output> {
+        if run.start == 0 {
+            self.renew_sessions(run, transport, updated)?;
+        }
         match payload {
-            Payload::Http(request) => self
-                .run_https(&mut run, request, transport, updated)
-                .map(Output::Http),
+            Payload::Http(request) => match self.run_https(run, request, transport, updated)? {
+                Flow::Done(response) => Ok(Output::Http(response)),
+                Flow::Park(at) => self
+                    .park_challenge(run, at, payload, input, updated)
+                    .map(Output::Pending),
+            },
             Payload::Stream {
                 destination,
                 exchanges,
             } => self
-                .run_tls(
-                    &mut run,
-                    &payload,
-                    destination,
-                    exchanges,
-                    transport,
-                    updated,
-                )
+                .run_tls(run, &payload, destination, exchanges, transport, updated)
                 .map(Output::Stream),
-            Payload::Derive(given) => self.run_local(&mut run, given, input).map(Output::Derive),
-            Payload::Describe => Err(operation.unknown()),
+            Payload::Derive(given) => match self.run_local(run, given, input)? {
+                Flow::Done(output) => Ok(Output::Derive(output)),
+                Flow::Park(at) => self
+                    .park_challenge(run, at, payload, input, updated)
+                    .map(Output::Pending),
+            },
+            Payload::Describe | Payload::Resume(_) => Err(run.operation.unknown()),
         }
     }
 
@@ -1150,16 +1255,14 @@ impl<S: LogSink, C: Clock> Node<S, C> {
         request: Option<&Request>,
         transport: &mut T,
         updated: &mut Option<Record>,
-    ) -> Result<Response> {
+    ) -> Result<Flow<Response>> {
         let operation = run.operation;
         let open = operation.open().ok_or_else(|| operation.unknown())?;
         let (now, who) = (run.now, run.who);
-        let mut last: Option<Http> = None;
         // The log entry of the last request, until its outcome is known.
         let mut pending: Option<(u64, u16)> = None;
-        let mut log_seqs = Vec::new();
-        for step in &operation.steps {
-            let result: Result<Option<Response>> = match step {
+        for (i, step) in operation.steps.iter().enumerate().skip(run.start) {
+            let result: Result<Option<Flow<Response>>> = match step {
                 Step::Open(_) => Ok(None),
                 Step::Send(send) => {
                     if let Some((seq, status)) = pending.take() {
@@ -1167,18 +1270,18 @@ impl<S: LogSink, C: Clock> Node<S, C> {
                     }
                     self.https_send(run, open, send, request, transport, updated)
                         .map(|(seq, http)| {
-                            log_seqs.push(seq);
+                            run.log_seqs.push(seq);
                             pending = Some((seq, http.status));
-                            last = Some(http);
+                            run.last = Some(http);
                             None
                         })
                 }
                 Step::Receive(receive) => {
-                    let stored = match &last {
+                    let stored = match &run.last {
                         Some(http) => receive.capture.iter().try_for_each(|capture| {
                             let value = http.capture(&capture.source)?;
                             run.captured
-                                .store(run.policy, &mut run.fields, capture, value)
+                                .store(run.policy, &mut run.fields, capture, value, now)
                         }),
                         None => Err(operation.unknown()),
                     };
@@ -1186,11 +1289,28 @@ impl<S: LogSink, C: Clock> Node<S, C> {
                     stored.and(persisted).map(|()| None)
                 }
                 Step::Compute(compute) => run.compute(compute, compute_vars(now)).map(|()| None),
+                Step::Run(step) => {
+                    // A module fetch is a request of its own: the one before it is done.
+                    if let Some((seq, status)) = pending.take() {
+                        self.done(now, who, seq, Some(status), true);
+                    }
+                    self.run_module(run, open, step, transport, updated)
+                        .map(|()| None)
+                }
+                Step::Await(_) => {
+                    // The request before it has ended; the operation waits from here.
+                    if let Some((seq, status)) = pending.take() {
+                        self.done(now, who, seq, Some(status), true);
+                    }
+                    Ok(Some(Flow::Park(i)))
+                }
                 Step::Return(ret) => {
-                    let response = last
+                    let log_seqs = run.log_seqs.clone();
+                    let response = run
+                        .last
                         .take()
                         .ok_or_else(|| operation.unknown())
-                        .and_then(|http| http.project(ret.response.as_ref(), log_seqs.clone()))
+                        .and_then(|http| http.project(ret.response.as_ref(), log_seqs))
                         .and_then(|response| {
                             let secrets = Secrets {
                                 policy: run.policy,
@@ -1203,12 +1323,12 @@ impl<S: LogSink, C: Clock> Node<S, C> {
                     if let Some((seq, status)) = pending.take() {
                         self.done(now, who, seq, Some(status), response.is_ok());
                     }
-                    response.map(Some)
+                    response.map(|r| Some(Flow::Done(r)))
                 }
                 Step::Repeat(_) | Step::If(_) => Err(operation.unknown()),
             };
             match result {
-                Ok(Some(response)) => return Ok(response),
+                Ok(Some(flow)) => return Ok(flow),
                 Ok(None) => {}
                 Err(error) => {
                     if let Some((seq, status)) = pending.take() {
@@ -1219,6 +1339,104 @@ impl<S: LogSink, C: Clock> Node<S, C> {
             }
         }
         Err(operation.unknown())
+    }
+
+    /// A `run` step: gets the module (a reviewed library, or `GET` on the module's origin
+    /// over the operation's connection, logged like any request, its pin checked), renders
+    /// the inputs, runs the module in the sandbox and keeps the output as a secret temporary
+    /// value. The output is added to what responses are searched for; the policy check made
+    /// sure it goes nowhere but a fixed request to the module's origin.
+    fn run_module<T: Transport>(
+        &self,
+        run: &mut Run<'_>,
+        open: &Open,
+        step: &RunModule,
+        transport: &mut T,
+        updated: &Option<Record>,
+    ) -> Result<()> {
+        let fetched;
+        let module: &[u8] = match step.source() {
+            Some(ModuleRef::Library(name)) => {
+                sandbox::library(name).ok_or(Error::ModuleRefused {
+                    rule: "unknown library module",
+                })?
+            }
+            Some(ModuleRef::Url {
+                origin,
+                path,
+                sha256,
+            }) => {
+                fetched = self.fetch_module(run, open, origin, path, sha256, transport, updated)?;
+                &fetched
+            }
+            None => return Err(run.operation.unknown()),
+        };
+        let ctx = Context {
+            fields: &run.fields,
+            temps: &run.captured.temps,
+            vars: compute_vars(run.now),
+            unix: run.now / 1000,
+            budget: &run.budget,
+        };
+        let inputs = step
+            .inputs
+            .iter()
+            .map(|text| Template::parse(text).and_then(|t| t.render(&ctx)))
+            .collect::<Result<Vec<_>>>()?;
+        let slices: Vec<&[u8]> = inputs.iter().map(|i| i.as_slice()).collect();
+        let ran = sandbox::run(module, &step.entry, &slices).map_err(Error::Sandbox)?;
+        drop(inputs);
+        let output = ran.output;
+        run.captured.temps_len = run.captured.temps_len.saturating_add(output.len());
+        if run.captured.temps_len > MAX_TEMPS {
+            return Err(Error::Budget {
+                what: "captured values",
+            });
+        }
+        run.tainted.push(output.clone());
+        run.captured.temps.insert(step.into.clone(), output);
+        Ok(())
+    }
+
+    /// Fetches a module with `GET` from its origin, as a logged request of the operation,
+    /// and checks the status, the size and the pin.
+    #[allow(clippy::too_many_arguments)]
+    fn fetch_module<T: Transport>(
+        &self,
+        run: &mut Run<'_>,
+        open: &Open,
+        origin: Destination,
+        path: &str,
+        sha256: Option<[u8; 32]>,
+        transport: &mut T,
+        updated: &Option<Record>,
+    ) -> Result<Vec<u8>> {
+        let send = Send {
+            request: Some(StepRequest::Fixed {
+                method: Method::Get,
+                path: path.to_string(),
+                destination: Some(origin),
+            }),
+            ..Send::default()
+        };
+        let (seq, http) = self.https_send(run, open, &send, None, transport, updated)?;
+        let checked = if http.status != 200 {
+            Err(Error::ModuleRefused {
+                rule: "the module's origin did not answer 200",
+            })
+        } else if http.body.len() > sandbox::MAX_MODULE {
+            Err(Error::ModuleRefused {
+                rule: "module larger than the limit",
+            })
+        } else if sha256.is_some_and(|pin| <[u8; 32]>::from(Sha256::digest(&*http.body)) != pin) {
+            Err(Error::ModuleRefused {
+                rule: "the module does not match its sha256 pin",
+            })
+        } else {
+            Ok(http.body.to_vec())
+        };
+        self.done(run.now, run.who, seq, Some(http.status), checked.is_ok());
+        checked
     }
 
     /// Builds, logs and sends one HTTPS request, and parses its response.
@@ -1350,12 +1568,15 @@ impl<S: LogSink, C: Clock> Node<S, C> {
                         .and_then(|read| {
                             receive.capture.iter().try_for_each(|c| {
                                 let value = crate::response::capture_bytes(&read, &c.source)?;
-                                run.captured.store(run.policy, &mut run.fields, c, value)
+                                run.captured
+                                    .store(run.policy, &mut run.fields, c, value, now)
                             })
                         })
                 }
                 Step::Compute(compute) => run.compute(compute, compute_vars(now)),
-                Step::Repeat(_) | Step::If(_) => Err(operation.unknown()),
+                Step::Run(_) | Step::Repeat(_) | Step::If(_) | Step::Await(_) => {
+                    Err(operation.unknown())
+                }
             };
             if let Err(error) = result {
                 steps_result = Err(error);
@@ -1402,14 +1623,16 @@ impl<S: LogSink, C: Clock> Node<S, C> {
 
     /// Runs an operation with no connection: its `compute` steps, then the template of its
     /// `return`, logged before the output is handed back.
-    fn run_local(&self, run: &mut Run<'_>, given: &[u8], input: Vec<u8>) -> Result<Vec<u8>> {
+    fn run_local(&self, run: &mut Run<'_>, given: &[u8], input: &[u8]) -> Result<Flow<Vec<u8>>> {
         let operation = run.operation;
-        // One nonce and one clock reading for the whole derivation.
+        // One nonce and one clock reading for the whole derivation (for each part of it, when
+        // it waits).
         let mut vars = compute_vars(run.now);
-        vars.insert(Var::Input, input);
-        for step in &operation.steps {
+        vars.insert(Var::Input, input.to_vec());
+        for (i, step) in operation.steps.iter().enumerate().skip(run.start) {
             match step {
                 Step::Compute(compute) => run.compute(compute, vars.clone())?,
+                Step::Await(_) => return Ok(Flow::Park(i)),
                 Step::Return(ret) => {
                     let template = ret.template.as_deref().ok_or_else(|| operation.unknown())?;
                     let template = Template::parse(template)?;
@@ -1431,11 +1654,12 @@ impl<S: LogSink, C: Clock> Node<S, C> {
                         detail: detail.seal(&run.user_key, &run.record.owner, &run.record.id)?,
                     };
                     self.lock().commit(run.now, run.who, event)?;
-                    return Ok(output.to_vec());
+                    return Ok(Flow::Done(output.to_vec()));
                 }
                 Step::Open(_)
                 | Step::Send(_)
                 | Step::Receive(_)
+                | Step::Run(_)
                 | Step::Repeat(_)
                 | Step::If(_) => return Err(operation.unknown()),
             }
@@ -1552,6 +1776,18 @@ struct Run<'a> {
     /// Rendered values that hold a secret in reversible form.
     tainted: Vec<Zeroizing<Vec<u8>>>,
     now: u64,
+    /// The first step to run: 0, or the step after an `await` the operation waited at.
+    start: usize,
+    /// The response of the last HTTPS request.
+    last: Option<Http>,
+    /// The log entries of the HTTPS requests so far.
+    log_seqs: Vec<u64>,
+}
+
+/// How the steps of an operation ended: done, or waiting at the `await` of this index.
+enum Flow<T> {
+    Done(T),
+    Park(usize),
 }
 
 impl Run<'_> {

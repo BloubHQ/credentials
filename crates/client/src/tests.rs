@@ -917,3 +917,164 @@ fn the_documents_of_the_web_smoke_test_hold_on_the_host() {
         serde_json::from_str(&approve(device, identity, open).unwrap()).unwrap();
     assert_eq!(approval["device"], device_public.as_str());
 }
+
+/// Answers every request with `200 {}`.
+struct Accepting(usize);
+
+impl Transport for Accepting {
+    fn send(
+        &mut self,
+        _: &Destination,
+        _: Option<&ClientIdentity>,
+        _: &[u8],
+        _: usize,
+    ) -> engine::Result<Vec<u8>> {
+        self.0 += 1;
+        Ok(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}".to_vec())
+    }
+}
+
+#[test]
+fn a_waiting_payment_is_approved_on_the_device_and_resumed_by_the_app() {
+    let node = a_node();
+    let identity = node.identity();
+    let ident = identity_json(&identity);
+    let device = generate_key(KeyKind::Device);
+    let user = generate_key(KeyKind::User);
+    let caller = generate_key(KeyKind::Caller);
+    let caller_public = public_key(KeyKind::Caller, caller.clone()).unwrap();
+    let signed = sign_policy(device.clone(), card_policy_json(&caller_public)).unwrap();
+    let record = seal_record(
+        user.clone(),
+        signed,
+        "card".into(),
+        "alice".into(),
+        card_fields("4242424242424242", "12/40"),
+    )
+    .unwrap();
+    let verified = Arc::new(VerifiedNode::for_test(identity, now_ms()));
+    let sealed = grant(
+        device.clone(),
+        user.clone(),
+        verified,
+        "alice".into(),
+        600,
+        vec![record.clone()],
+    )
+    .unwrap();
+    node.grant(&serde_json::from_str(&sealed).unwrap()).unwrap();
+
+    // The app asks; a card waits for the owner.
+    let call = sign_call(
+        caller.clone(),
+        "app".into(),
+        ident.clone(),
+        record.clone(),
+        "pay".into(),
+        r#"{"kind": "http"}"#.into(),
+    )
+    .unwrap();
+    let mut transport = Accepting(0);
+    let call: SignedCall = serde_json::from_str(&call).unwrap();
+    let Output::Pending(pending) = node.run(&call, &mut transport).result.unwrap() else {
+        panic!("a pending operation");
+    };
+    assert_eq!(transport.0, 0);
+    let pending_json = serde_json::to_string(&pending).unwrap();
+    let id = URL_SAFE_NO_PAD.encode(pending.id());
+
+    // A code is no answer to an approval.
+    assert_eq!(
+        code(answer_challenge(
+            device.clone(),
+            "alice".into(),
+            ident.clone(),
+            pending_json.clone(),
+            b"123456".to_vec()
+        )),
+        "invalid_input"
+    );
+    // The device approves the pending operation as the node handed it back.
+    let approval = approve(device.clone(), ident.clone(), pending_json).unwrap();
+    node.approve(&serde_json::from_str(&approval).unwrap())
+        .unwrap();
+    let resume = sign_resume_call(
+        caller.clone(),
+        "app".into(),
+        ident.clone(),
+        record.clone(),
+        "pay".into(),
+        id,
+    )
+    .unwrap();
+    let resume: SignedCall = serde_json::from_str(&resume).unwrap();
+    let Output::Http(response) = node.run(&resume, &mut transport).result.unwrap() else {
+        panic!("a response");
+    };
+    assert_eq!(response.status(), 200);
+    assert_eq!(transport.0, 1);
+    assert_eq!(
+        code(sign_resume_call(
+            caller,
+            "app".into(),
+            ident.clone(),
+            record.clone(),
+            "pay".into(),
+            "short".into()
+        )),
+        "invalid_input"
+    );
+
+    // Limits the device signs, for this node.
+    let limits = sign_limits(
+        device.clone(),
+        "alice".into(),
+        ident.clone(),
+        "card".into(),
+        r#"[{"currency": "EUR", "per_day": "100.00"}]"#.into(),
+    )
+    .unwrap();
+    node.set_limits(&serde_json::from_str(&limits).unwrap())
+        .unwrap();
+    assert_eq!(
+        code(sign_limits(
+            device.clone(),
+            "alice".into(),
+            ident.clone(),
+            "card".into(),
+            r#"[{"currency": "EUR"}]"#.into(),
+        )),
+        "refused"
+    );
+
+    // A code for a challenge, sealed to the node: it opens and verifies there (and the node
+    // has no such challenge waiting).
+    let challenge = serde_json::json!({
+        "kind": "challenge",
+        "id": "AQEBAQEBAQEBAQEBAQEBAQ",
+        "challenge": "sms",
+        "hint": "The code your bank texts you",
+        "expires_ms": now_ms() + 60_000,
+    })
+    .to_string();
+    let answer =
+        answer_challenge(device, "alice".into(), ident, challenge, b"123456".to_vec()).unwrap();
+    assert!(!answer.contains("123456"), "the code is sealed");
+    assert_eq!(
+        node.answer(&serde_json::from_str(&answer).unwrap()),
+        Err(engine::Error::ParkedUnknown)
+    );
+
+    // The device renews a value: one generation later.
+    let renewed = update_record(
+        user,
+        record,
+        vec![Field {
+            name: "holder".into(),
+            value: b"J. Doe".to_vec(),
+        }],
+    )
+    .unwrap();
+    let renewed: Record = serde_json::from_str(&renewed).unwrap();
+    assert_eq!(renewed.generation, 2);
+}

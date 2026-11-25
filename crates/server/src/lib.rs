@@ -14,7 +14,9 @@
 //! may connect, is the deployer's job.
 //!
 //! The endpoints: `GET /identity`, `GET /checkpoint`, and `POST /grant`, `/revoke`, `/pin`,
-//! `/device/add`, `/device/retire`, `/call`. Bodies and answers are JSON.
+//! `/device/add`, `/device/retire`, `/call`, `/answer` (a code for a challenge, sealed by a
+//! device of the owner), `/approve` (the owner's approval of a waiting operation) and
+//! `/limits` (spending limits a device of the owner signed). Bodies and answers are JSON.
 
 pub mod http;
 pub mod logfile;
@@ -25,14 +27,17 @@ use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use engine::Error;
+use engine::approval::Approval;
 use engine::call::{Output, SignedCall};
 use engine::egress::Transport;
 use engine::encoding::to_b64;
 use engine::grant::{NodeIdentity, Revocation, SealedGrant};
 use engine::keys::{Endorsement, Retirement};
+use engine::limits::SpendingLimits;
 use engine::log::{LogSink, SignedEntry, SignedHead};
 use engine::node::{Node, SystemClock};
 use engine::record::Pin;
+use engine::session::SealedAnswer;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 
@@ -374,7 +379,8 @@ impl<S: Sink, T: Transport> Shared<S, T> {
             },
             (
                 "POST",
-                "/grant" | "/revoke" | "/pin" | "/device/add" | "/device/retire" | "/call",
+                "/grant" | "/revoke" | "/pin" | "/device/add" | "/device/retire" | "/call"
+                | "/answer" | "/approve" | "/limits",
             ) => {
                 // Acts run on at most `threads` transports at once; reads of the identity and
                 // the checkpoint above never wait for them.
@@ -390,13 +396,16 @@ impl<S: Sink, T: Transport> Shared<S, T> {
                     "/pin" => self.act(body, |n, p: &Pin| n.pin(p)),
                     "/device/add" => self.act(body, |n, e: &Endorsement| n.add_device(e)),
                     "/device/retire" => self.act(body, |n, r: &Retirement| n.retire_device(r)),
+                    "/answer" => self.act(body, |n, a: &SealedAnswer| n.answer(a)),
+                    "/approve" => self.act(body, |n, a: &Approval| n.approve(a)),
+                    "/limits" => self.act(body, |n, l: &SpendingLimits| n.set_limits(l)),
                     _ => self.call(transport, body),
                 }
             }
             (
                 method,
                 "/identity" | "/checkpoint" | "/grant" | "/revoke" | "/pin" | "/device/add"
-                | "/device/retire" | "/call",
+                | "/device/retire" | "/call" | "/answer" | "/approve" | "/limits",
             ) => error_reply(405, format!("method {method} not allowed here")),
             _ => self
                 .hooks
@@ -435,7 +444,7 @@ fn status_of(error: &Error) -> u16 {
         | Error::PolicySignature => 403,
         Error::LogUnconfirmed | Error::LogHalted => 503,
         Error::Transport(_) => 502,
-        Error::RateLimited => 429,
+        Error::RateLimited | Error::ParkedFull => 429,
         e if e.is_caller_error() => 400,
         _ => 403,
     }
@@ -476,6 +485,9 @@ pub fn output_json(output: &Output) -> Value {
             "kind": "describe",
             "description": serde_json::to_value(description).unwrap_or(Value::Null),
         }),
+        // `{"kind": "challenge", "id", "challenge", "hint", "expires_ms"}` or
+        // `{"kind": "approval_required", "id", "summary"}`: resume with the id.
+        Output::Pending(pending) => serde_json::to_value(pending).unwrap_or(Value::Null),
     }
 }
 

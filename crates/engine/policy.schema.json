@@ -27,7 +27,25 @@
         "name": {"$ref": "#/$defs/Token"},
         "secret": {"type": "boolean"},
         "optional": {"type": "boolean"},
-        "guessable": {"type": "boolean"}
+        "guessable": {"type": "boolean"},
+        "session": {"$ref": "#/$defs/SessionRule"}
+      }
+    },
+    "SessionRule": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["lifetime_ms", "expires", "renew"],
+      "properties": {
+        "lifetime_ms": {"type": "integer", "minimum": 1000, "maximum": 2592000000},
+        "expires": {"$ref": "#/$defs/Token"},
+        "renew": {
+          "oneOf": [
+            {"type": "object", "additionalProperties": false, "required": ["by", "name"],
+             "properties": {"by": {"const": "operation"}, "name": {"$ref": "#/$defs/Token"}}},
+            {"type": "object", "additionalProperties": false, "required": ["by"],
+             "properties": {"by": {"const": "owner"}}}
+          ]
+        }
       }
     },
     "Caller": {
@@ -56,7 +74,28 @@
       "properties": {
         "name": {"$ref": "#/$defs/Token"},
         "input": {"$ref": "#/$defs/Input"},
-        "steps": {"type": "array", "minItems": 1, "maxItems": 64, "items": {"$ref": "#/$defs/Step"}}
+        "steps": {"type": "array", "minItems": 1, "maxItems": 64, "items": {"$ref": "#/$defs/Step"}},
+        "payment": {"$ref": "#/$defs/Payment"},
+        "approval": {"type": "boolean"}
+      }
+    },
+    "Payment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["amount", "currency", "exponent"],
+      "properties": {
+        "amount": {
+          "oneOf": [
+            {"type": "object", "additionalProperties": false, "required": ["from", "name"],
+             "properties": {"from": {"const": "query"}, "name": {"type": "string", "minLength": 1}}},
+            {"type": "object", "additionalProperties": false, "required": ["from", "pointer"],
+             "properties": {"from": {"const": "input"}, "pointer": {"type": "string"}}},
+            {"type": "object", "additionalProperties": false, "required": ["from", "value"],
+             "properties": {"from": {"const": "fixed"}, "value": {"type": "string", "pattern": "^[0-9]{1,19}$"}}}
+          ]
+        },
+        "currency": {"type": "string", "pattern": "^[A-Z]{3}$"},
+        "exponent": {"type": "integer", "minimum": 0, "maximum": 8}
       }
     },
     "Input": {
@@ -128,6 +167,8 @@
         {"$ref": "#/$defs/Send"},
         {"$ref": "#/$defs/Receive"},
         {"$ref": "#/$defs/Compute"},
+        {"$ref": "#/$defs/Run"},
+        {"$ref": "#/$defs/Await"},
         {"$ref": "#/$defs/Return"},
         {"$ref": "#/$defs/Repeat"},
         {"$ref": "#/$defs/If"}
@@ -234,6 +275,27 @@
          "properties": {"kind": {"const": "body"}}}
       ]
     },
+    "Run": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["do", "module", "entry", "into"],
+      "properties": {
+        "do": {"const": "run"},
+        "module": {
+          "oneOf": [
+            {"type": "object", "additionalProperties": false, "required": ["url"],
+             "properties": {"url": {"type": "string", "pattern": "^https://[a-z0-9.-]{1,253}(:[0-9]{1,5})?/", "maxLength": 2048},
+                            "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}}},
+            {"type": "object", "additionalProperties": false, "required": ["library"],
+             "properties": {"library": {"$ref": "#/$defs/Token"}}}
+          ]
+        },
+        "entry": {"$ref": "#/$defs/Token"},
+        "inputs": {"type": "array", "maxItems": 16, "items": {"type": "string", "maxLength": 8192}},
+        "into": {"$ref": "#/$defs/Token"},
+        "destination": {"$ref": "#/$defs/Destination"}
+      }
+    },
     "Receive": {
       "type": "object",
       "additionalProperties": false,
@@ -288,6 +350,54 @@
         {"type": "object", "additionalProperties": false, "required": ["kind", "name", "secret"],
          "properties": {"kind": {"const": "temp"}, "name": {"$ref": "#/$defs/Token"}, "secret": {"type": "boolean"}}}
       ]
+    },
+    "Await": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["do", "challenge"],
+      "properties": {
+        "do": {"const": "await"},
+        "challenge": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "hint"],
+          "properties": {
+            "kind": {"enum": ["sms", "email", "app", "3ds", "external"]},
+            "hint": {"type": "string", "minLength": 1, "maxLength": 256},
+            "into": {"$ref": "#/$defs/Token"},
+            "pattern": {"type": "string", "maxLength": 256},
+            "poll": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["send", "success", "every_ms"],
+              "properties": {
+                "send": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": ["request"],
+                  "properties": {
+                    "request": {"$ref": "#/$defs/StepRequest"},
+                    "inject": {"type": "array", "maxItems": 16, "items": {"$ref": "#/$defs/Injection"}}
+                  }
+                },
+                "success": {"$ref": "#/$defs/Condition"},
+                "failure": {"$ref": "#/$defs/Condition"},
+                "every_ms": {"type": "integer", "minimum": 1000, "maximum": 300000}
+              }
+            },
+            "timeout_ms": {"type": "integer", "minimum": 1000, "maximum": 300000}
+          }
+        }
+      }
+    },
+    "Condition": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["source", "one_of"],
+      "properties": {
+        "source": {"$ref": "#/$defs/Source"},
+        "one_of": {"type": "array", "minItems": 1, "maxItems": 16, "items": {"type": "string"}}
+      }
     },
     "Compute": {
       "type": "object",
@@ -445,7 +555,8 @@
         "returns": {"enum": ["status", "json", "all"]},
         "relay": {"type": "boolean"},
         "identity": {"type": "boolean"},
-        "captures": {"type": "array", "items": {"type": "string", "pattern": "^([A-Za-z0-9_-]{1,64}|\\*)$"}}
+        "captures": {"type": "array", "items": {"type": "string", "pattern": "^([A-Za-z0-9_-]{1,64}|\\*)$"}},
+        "approval": {"type": "boolean"}
       }
     }
   }

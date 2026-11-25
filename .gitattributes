@@ -4,3 +4,4 @@
 *.cbor -text
 *.der -text
 *.nonce -text
+*.wasm -text

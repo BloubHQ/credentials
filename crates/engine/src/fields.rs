@@ -67,7 +67,7 @@ impl Fields {
         self.items.iter().map(|(n, _)| n.as_str()).collect()
     }
 
-    fn total(&self) -> usize {
+    pub(crate) fn total(&self) -> usize {
         self.items.iter().map(|(_, v)| v.len()).sum()
     }
 

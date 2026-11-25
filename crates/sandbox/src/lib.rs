@@ -1,0 +1,381 @@
+//! The trusted code sandbox of the credentials node (layer 3 of `docs/design.md`).
+//!
+//! [`run`] executes one exported function of a WebAssembly module on byte inputs and returns
+//! the bytes it wrote. The module gets nothing else: no WASI, no clock, no randomness, no
+//! I/O, no other module, no state from an earlier run. It may import only these functions of
+//! the module `credentials`:
+//!
+//! | Import | Type | Effect |
+//! | --- | --- | --- |
+//! | `input_count` | `() -> i32` | The number of inputs. |
+//! | `input_len` | `(index: i32) -> i32` | The length of an input, or `-1` when there is none. |
+//! | `input_read` | `(index: i32, ptr: i32)` | Copies the whole input to `ptr` in the exported memory. |
+//! | `output` | `(ptr: i32, len: i32)` | Appends `len` bytes at `ptr` to the output. |
+//!
+//! The module exports its memory as `memory` and the entry as a function `() -> ()`. A
+//! module that imports anything else or breaks the structural limits of
+//! [`wasmi::EnforcedLimits::strict`] is refused before it runs. A start function, if the
+//! module has one, runs first under the same limits.
+//!
+//! The runtime is [wasmi](https://github.com/wasmi-labs/wasmi), an interpreter: no code is
+//! generated at run time. Nothing a module can reach varies between runs (no clock, no
+//! randomness, no host state), so a module gives the same output for the same inputs on every
+//! node of a release. Execution costs fuel (wasmi's units, plus one per 64 bytes a host
+//! function copies) and stops at [`MAX_FUEL`]; the memory stops at [`MAX_MEMORY`]. Every
+//! failure is a fixed [`Error`]: nothing the module computes reaches an error message. The
+//! memory is erased before it is freed.
+//!
+//! The choice of runtime, with its measurements, is in `docs/sandbox.md`.
+
+use wasmi::errors::{ErrorKind, InstantiationError};
+use wasmi::{
+    Caller, CompilationMode, Config, EnforcedLimits, Engine, Extern, ExternType, Linker, Module,
+    Store, StoreLimits, StoreLimitsBuilder, TrapCode,
+};
+use zeroize::{Zeroize, Zeroizing};
+
+mod libraries;
+
+pub use libraries::{LIBRARIES, library};
+
+/// The module name of the host functions.
+pub const HOST: &str = "credentials";
+/// The host functions a module may import.
+pub const IMPORTS: [&str; 4] = ["input_count", "input_len", "input_read", "output"];
+/// Largest module accepted, in bytes.
+pub const MAX_MODULE: usize = 8 * 1024 * 1024;
+/// Most inputs of one run.
+pub const MAX_INPUTS: usize = 16;
+/// Most bytes of all inputs of one run together.
+pub const MAX_INPUT_BYTES: usize = 1024 * 1024;
+/// Largest output, in bytes.
+pub const MAX_OUTPUT: usize = 64 * 1024;
+/// Most fuel of one run: 1.25 s of the interpreter on the measured host (`docs/sandbox.md`).
+pub const MAX_FUEL: u64 = 1_000_000_000;
+/// Most linear memory of one run, in bytes.
+pub const MAX_MEMORY: usize = 64 * 1024 * 1024;
+/// Longest entry name.
+pub const MAX_ENTRY: usize = 64;
+
+/// Bytes copied by a host function per unit of fuel.
+const COPY_PER_FUEL: usize = 64;
+
+/// Why a run failed. Every message is fixed: no byte of the module, its inputs or its memory
+/// appears in it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum Error {
+    /// The module is larger than [`MAX_MODULE`].
+    #[error("module larger than the limit")]
+    ModuleTooLarge,
+    /// The module does not decode or validate, or breaks a structural limit (functions,
+    /// globals, tables, segments, parameters).
+    #[error("module invalid")]
+    ModuleInvalid,
+    /// The module imports something other than the host functions.
+    #[error("module imports something the sandbox does not provide")]
+    Import,
+    /// The module exports no memory named `memory`.
+    #[error("module exports no memory")]
+    NoMemory,
+    /// The entry is not an exported function `() -> ()`, or its name is not a token.
+    #[error("entry missing or not a function () -> ()")]
+    Entry,
+    /// More than [`MAX_INPUTS`] inputs, or more than [`MAX_INPUT_BYTES`] in all.
+    #[error("inputs over the limits")]
+    Inputs,
+    /// The run used its fuel.
+    #[error("module ran out of fuel")]
+    Fuel,
+    /// The module asked for more memory than its limit.
+    #[error("module reached the memory limit")]
+    Memory,
+    /// The output grew past [`MAX_OUTPUT`].
+    #[error("output larger than the limit")]
+    Output,
+    /// The module trapped (unreachable, out of bounds, division by zero, stack overflow, a bad
+    /// call to a host function).
+    #[error("module trapped")]
+    Trap,
+}
+
+/// The limits of one run. [`Limits::default`] is the most a node allows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Limits {
+    /// Fuel, at most [`MAX_FUEL`].
+    pub fuel: u64,
+    /// Linear memory in bytes, at most [`MAX_MEMORY`].
+    pub memory: usize,
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        Limits {
+            fuel: MAX_FUEL,
+            memory: MAX_MEMORY,
+        }
+    }
+}
+
+/// What a run gave back.
+#[derive(Debug)]
+pub struct Ran {
+    /// The bytes the module wrote, erased when dropped.
+    pub output: Zeroizing<Vec<u8>>,
+    /// The fuel it used.
+    pub fuel: u64,
+}
+
+struct Host {
+    inputs: Vec<Zeroizing<Vec<u8>>>,
+    output: Zeroizing<Vec<u8>>,
+    limits: StoreLimits,
+    /// A failure a host function saw, reported instead of the trap it causes.
+    fault: Option<Error>,
+}
+
+fn config() -> Config {
+    let mut config = Config::default();
+    config
+        .consume_fuel(true)
+        .compilation_mode(CompilationMode::LazyTranslation)
+        .enforced_limits(EnforcedLimits::strict())
+        // Proposals beyond what compilers emit by default stay off: less to audit.
+        .wasm_multi_memory(false)
+        .wasm_tail_call(false)
+        .wasm_extended_const(false)
+        .wasm_custom_page_sizes(false)
+        .wasm_wide_arithmetic(false);
+    config
+}
+
+fn is_token(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= MAX_ENTRY
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
+/// Checks a module without running it: size, decoding, validation, structural limits, imports
+/// and the exported memory. A node runs this on a fetched module before [`run`] does the same.
+pub fn check(module: &[u8]) -> Result<(), Error> {
+    compile(&Engine::new(&config()), module).map(|_| ())
+}
+
+fn compile(engine: &Engine, bytes: &[u8]) -> Result<Module, Error> {
+    if bytes.len() > MAX_MODULE {
+        return Err(Error::ModuleTooLarge);
+    }
+    let module = Module::new(engine, bytes).map_err(|_| Error::ModuleInvalid)?;
+    let imports_ok = module.imports().all(|import| {
+        import.module() == HOST
+            && IMPORTS.contains(&import.name())
+            && matches!(import.ty(), ExternType::Func(_))
+    });
+    if !imports_ok {
+        return Err(Error::Import);
+    }
+    let memory = module
+        .exports()
+        .any(|export| export.name() == "memory" && matches!(export.ty(), ExternType::Memory(_)));
+    if !memory {
+        return Err(Error::NoMemory);
+    }
+    Ok(module)
+}
+
+/// Runs `entry` of `module` on `inputs` under the node's limits ([`Limits::default`]).
+pub fn run(module: &[u8], entry: &str, inputs: &[&[u8]]) -> Result<Ran, Error> {
+    run_with(module, entry, inputs, Limits::default())
+}
+
+/// Runs `entry` of `module` on `inputs` under `limits` (each capped at the node's).
+pub fn run_with(
+    module: &[u8],
+    entry: &str,
+    inputs: &[&[u8]],
+    limits: Limits,
+) -> Result<Ran, Error> {
+    if !is_token(entry) {
+        return Err(Error::Entry);
+    }
+    let total = inputs
+        .iter()
+        .map(|i| i.len())
+        .fold(0usize, usize::saturating_add);
+    if inputs.len() > MAX_INPUTS || total > MAX_INPUT_BYTES {
+        return Err(Error::Inputs);
+    }
+    let fuel = limits.fuel.min(MAX_FUEL);
+    let memory = limits.memory.min(MAX_MEMORY);
+    // One engine per run: nothing compiled or cached is shared between runs.
+    let engine = Engine::new(&config());
+    let module = compile(&engine, module)?;
+    let host = Host {
+        inputs: inputs.iter().map(|i| Zeroizing::new(i.to_vec())).collect(),
+        output: Zeroizing::new(Vec::new()),
+        limits: StoreLimitsBuilder::new()
+            .memory_size(memory)
+            .memories(1)
+            .tables(16)
+            .table_elements(1 << 20)
+            .instances(1)
+            .trap_on_grow_failure(true)
+            .build(),
+        fault: None,
+    };
+    let mut store = Store::new(&engine, host);
+    store.limiter(|host| &mut host.limits);
+    store.set_fuel(fuel).map_err(|_| Error::Fuel)?;
+    let linker = linker(&engine)?;
+    let called = linker
+        .instantiate_and_start(&mut store, &module)
+        .map_err(|error| stopped(&error, Error::ModuleInvalid))
+        .and_then(|instance| {
+            let func = instance
+                .get_typed_func::<(), ()>(&store, entry)
+                .map_err(|_| Error::Entry)?;
+            func.call(&mut store, ())
+                .map_err(|error| stopped(&error, Error::Trap))?;
+            Ok(instance)
+        });
+    let used = fuel.saturating_sub(store.get_fuel().unwrap_or(0));
+    // The memory may hold inputs and whatever the module derived from them.
+    if let Ok(instance) = &called {
+        if let Some(memory) = instance.get_memory(&store, "memory") {
+            memory.data_mut(&mut store).zeroize();
+        }
+    }
+    let host = store.data_mut();
+    if let Some(fault) = host.fault {
+        return Err(fault);
+    }
+    called?;
+    Ok(Ran {
+        output: core::mem::take(&mut host.output),
+        fuel: used,
+    })
+}
+
+/// What stopped a module, from the error of wasmi: fuel, memory, or `other`.
+fn stopped(error: &wasmi::Error, other: Error) -> Error {
+    match (error.as_trap_code(), error.kind()) {
+        (Some(TrapCode::OutOfFuel), _) => Error::Fuel,
+        (Some(TrapCode::GrowthOperationLimited), _)
+        | (
+            _,
+            ErrorKind::Memory(_)
+            | ErrorKind::Table(_)
+            | ErrorKind::Instantiation(
+                InstantiationError::FailedToInstantiateMemory(_)
+                | InstantiationError::FailedToInstantiateTable(_),
+            ),
+        ) => Error::Memory,
+        _ => other,
+    }
+}
+
+/// The memory a host function reads or writes.
+fn memory_of(caller: &mut Caller<'_, Host>) -> Result<wasmi::Memory, wasmi::Error> {
+    match caller.get_export("memory").and_then(Extern::into_memory) {
+        Some(memory) => Ok(memory),
+        None => Err(fail(caller, Error::NoMemory)),
+    }
+}
+
+/// Records why a host function failed and returns the trap that stops the module.
+fn fail(caller: &mut Caller<'_, Host>, error: Error) -> wasmi::Error {
+    let host = caller.data_mut();
+    if host.fault.is_none() {
+        host.fault = Some(error);
+    }
+    wasmi::Error::from(TrapCode::UnreachableCodeReached)
+}
+
+/// Charges the fuel of copying `len` bytes.
+fn charge(caller: &mut Caller<'_, Host>, len: usize) -> Result<(), wasmi::Error> {
+    let cost = u64::try_from(len / COPY_PER_FUEL)
+        .unwrap_or(u64::MAX)
+        .saturating_add(1);
+    let left = caller.get_fuel().unwrap_or(0);
+    match left.checked_sub(cost) {
+        Some(left) => caller.set_fuel(left).map_err(|_| fail(caller, Error::Fuel)),
+        None => {
+            let _ = caller.set_fuel(0);
+            Err(fail(caller, Error::Fuel))
+        }
+    }
+}
+
+fn input_index(caller: &Caller<'_, Host>, index: i32) -> Option<usize> {
+    usize::try_from(index)
+        .ok()
+        .filter(|i| *i < caller.data().inputs.len())
+}
+
+fn linker(engine: &Engine) -> Result<Linker<Host>, Error> {
+    let mut linker = Linker::<Host>::new(engine);
+    linker
+        .func_wrap(HOST, "input_count", |caller: Caller<'_, Host>| -> i32 {
+            i32::try_from(caller.data().inputs.len()).unwrap_or(i32::MAX)
+        })
+        .map_err(|_| Error::Import)?;
+    linker
+        .func_wrap(
+            HOST,
+            "input_len",
+            |caller: Caller<'_, Host>, index: i32| -> i32 {
+                input_index(&caller, index)
+                    .and_then(|i| caller.data().inputs.get(i))
+                    .map_or(-1, |input| i32::try_from(input.len()).unwrap_or(-1))
+            },
+        )
+        .map_err(|_| Error::Import)?;
+    linker
+        .func_wrap(
+            HOST,
+            "input_read",
+            |mut caller: Caller<'_, Host>, index: i32, ptr: i32| -> Result<(), wasmi::Error> {
+                let Some(index) = input_index(&caller, index) else {
+                    return Err(fail(&mut caller, Error::Trap));
+                };
+                let memory = memory_of(&mut caller)?;
+                let len = caller.data().inputs.get(index).map_or(0, |i| i.len());
+                charge(&mut caller, len)?;
+                // The input is copied out of the host state first: the memory and the state
+                // are borrowed through the same store.
+                let input = caller.data().inputs.get(index).cloned().unwrap_or_default();
+                let offset = ptr as u32 as usize;
+                memory
+                    .write(&mut caller, offset, &input)
+                    .map_err(|_| fail(&mut caller, Error::Trap))
+            },
+        )
+        .map_err(|_| Error::Import)?;
+    linker
+        .func_wrap(
+            HOST,
+            "output",
+            |mut caller: Caller<'_, Host>, ptr: i32, len: i32| -> Result<(), wasmi::Error> {
+                let len = len as u32 as usize;
+                let total = caller.data().output.len().saturating_add(len);
+                if total > MAX_OUTPUT {
+                    return Err(fail(&mut caller, Error::Output));
+                }
+                let memory = memory_of(&mut caller)?;
+                charge(&mut caller, len)?;
+                let mut bytes = Zeroizing::new(vec![0u8; len]);
+                memory
+                    .read(&caller, ptr as u32 as usize, &mut bytes)
+                    .map_err(|_| fail(&mut caller, Error::Trap))?;
+                caller.data_mut().output.extend_from_slice(&bytes);
+                Ok(())
+            },
+        )
+        .map_err(|_| Error::Import)?;
+    Ok(linker)
+}
+
+#[cfg(test)]
+mod tests;

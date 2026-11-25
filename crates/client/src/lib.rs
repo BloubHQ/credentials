@@ -17,6 +17,10 @@
 //! - Review: [`summarize`] a policy (and what a new version widens), [`policy_json_schema`],
 //!   [`item_kinds`]; the owner's device also signs custom kinds ([`sign_kind`]) and approves
 //!   summaries the node built ([`approve`], [`approval_hash`]).
+//! - Operations that wait for the owner: the device answers a challenge
+//!   ([`answer_challenge`]) or approves ([`approve`], which also takes the pending operation
+//!   the node handed back), sets spending limits ([`sign_limits`]) and renews a session the
+//!   node cannot ([`update_record`]); the app goes on with [`sign_resume_call`].
 //!
 //! Every failure is a [`ClientError`] with a stable [`ClientError::code`].
 //!
@@ -46,6 +50,7 @@ mod error;
 mod keys;
 mod owner;
 mod review;
+mod session;
 mod time;
 #[cfg(target_arch = "wasm32")]
 pub mod wasm;
@@ -64,6 +69,7 @@ pub use owner::{
     sign_policy, upgrade_policy,
 };
 pub use review::{approval_hash, approve, item_kinds, policy_json_schema, sign_kind, summarize};
+pub use session::{answer_challenge, sign_limits, sign_resume_call, update_record};
 
 #[cfg(not(target_arch = "wasm32"))]
 uniffi::setup_scaffolding!();
