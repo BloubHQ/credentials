@@ -486,7 +486,7 @@ cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace --locked
 ```
 
-최소 Rust 버전: 1.87(`enclave` 크레이트는 `aws-nitro-enclaves-nsm-api` 때문에 1.92). CI는 `cargo audit`, `cargo deny`, MSRV 테스트, 재현 가능 빌드 검사, 대상별 60초 퍼징도 실행합니다.
+최소 Rust 버전: 1.87(`enclave` 크레이트는 `aws-nitro-enclaves-nsm-api` 때문에 1.92). CI는 `cargo audit`, `cargo deny`, MSRV 테스트, 재현 가능 빌드 검사, 대상별 60초 퍼징도 실행합니다. 변경 기록은 [CHANGELOG](../CHANGELOG.md)에 있습니다.
 [CONTRIBUTING.md](../../.github/CONTRIBUTING.md)를 참고하세요.
 
 ## 보안

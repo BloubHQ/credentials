@@ -493,7 +493,7 @@ cargo test --workspace --locked
 ```
 
 最小 Rust バージョン: 1.87 (`enclave` クレートは `aws-nitro-enclaves-nsm-api` のため 1.92)。CI では `cargo audit`、`cargo deny`、MSRV テスト、ターゲットごとに 60 秒のファジング、再現可能ビルドの
-チェックも実行します。[CONTRIBUTING.md](../../.github/CONTRIBUTING.md) を参照してください。
+チェックも実行します。[CONTRIBUTING.md](../../.github/CONTRIBUTING.md) を参照してください。変更履歴は [CHANGELOG](../CHANGELOG.md) にあります。
 
 ## セキュリティ
 
