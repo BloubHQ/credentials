@@ -92,6 +92,7 @@ before 1.0, minor versions may break formats and APIs.
 
 ### Changed
 
+- Fuzz targets moved from `fuzz/` to `crates/fuzz/`.
 - Releases attach one CycloneDX SBOM per shipped artifact instead of one per crate:
   `credentials-<tag>.cdx.json` for the `credentials` binary (every target's dependencies) and
   `enclave-<tag>.cdx.json` for the enclave program (`x86_64-unknown-linux-musl`), both in

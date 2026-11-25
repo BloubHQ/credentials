@@ -1,5 +1,7 @@
 [workspace]
 resolver = "3"
+# Fuzz targets need a nightly compiler; they are a workspace of their own.
+exclude = ["crates/fuzz"]
 members = [
     "crates/attest",
     "crates/cli",

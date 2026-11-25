@@ -41,5 +41,5 @@ cargo +nightly fuzz run <target> artifacts/<target>/<crash-file>
 
 and turn it into a regular test in the engine before fixing it. The corpus grows in
 `corpus/<target>/`; neither directory is committed. libFuzzer needs Linux or macOS (on
-Windows use WSL). `cargo check --manifest-path fuzz/Cargo.toml` type-checks the targets on
+Windows use WSL). `cargo check --manifest-path crates/fuzz/Cargo.toml` type-checks the targets on
 stable.
