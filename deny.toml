@@ -1,6 +1,11 @@
 [advisories]
 version = 2
 yanked = "deny"
+ignore = [
+  # serde_cbor is unmaintained. aws-nitro-enclaves-nsm-api (the AWS API of the Nitro Secure
+  # Module) uses it to encode requests to /dev/nsm and decode its answers, inside the enclave.
+  { id = "RUSTSEC-2021-0127", reason = "dependency of aws-nitro-enclaves-nsm-api; NSM messages only" },
+]
 
 [licenses]
 version = 2

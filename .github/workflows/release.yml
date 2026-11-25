@@ -65,8 +65,34 @@ jobs:
           path: dist/*
           if-no-files-found: error
 
+  # The enclave image file, built twice (the second time without any cache); the job fails
+  # unless PCR0, PCR1 and PCR2 are the same. measurements.json names the release, the commit,
+  # the PCRs and the digest of every input.
+  enclave:
+    needs: test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Build the enclave image file twice and compare
+        run: build/reproduce.sh --release "$GITHUB_REF_NAME" --out out
+      - name: The measurements name the pushed tag and its commit
+        run: |
+          test "$(jq -er .release out/measurements.json)" = "$GITHUB_REF_NAME"
+          test "$(jq -er .git_commit out/measurements.json)" = "$GITHUB_SHA"
+          cat out/measurements.json
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: enclave
+          path: |
+            out/enclave.eif
+            out/measurements.json
+          if-no-files-found: error
+
   release:
-    needs: build
+    needs: [build, enclave]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -81,6 +107,10 @@ jobs:
           pattern: bin-*
           path: dist
           merge-multiple: true
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: enclave
+          path: dist
       - uses: taiki-e/install-action@fe3acb53a98b62c772db35de75ce0e4595e7ca8c # v2.90.8
         with:
           tool: cargo-cyclonedx
@@ -108,9 +138,21 @@ jobs:
           if [[ "$GITHUB_REF_NAME" == *-* ]]; then
             flags=(--prerelease --latest=false)
           fi
+          # The notes start with the measurements of the enclave image file; the generated
+          # notes follow them.
+          {
+            echo "## Enclave measurements"
+            echo
+            echo 'PCR0, PCR1 and PCR2 of `enclave.eif`. Build it again with `build/reproduce.sh` at this tag to check them.'
+            echo
+            echo '```json'
+            cat dist/measurements.json
+            echo '```'
+          } > notes.md
           gh release create "$GITHUB_REF_NAME" dist/* \
             --repo "$GITHUB_REPOSITORY" \
             --title "$GITHUB_REF_NAME" \
             --verify-tag \
+            --notes-file notes.md \
             --generate-notes \
             "${flags[@]}"

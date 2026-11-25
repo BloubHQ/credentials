@@ -1,18 +1,20 @@
 //! `credentials`: the command-line tool of the credentials engine.
 //!
 //! - The owner's device: `keygen`, `policy check|sign`, `seal`, `pin`, `grant`, `revoke`,
-//!   `device endorse|retire`.
+//!   `device endorse|retire`, and `attest` to check a node's Nitro attestation first.
 //! - A caller: `call http|derive` signs a call and can send it to a node.
 //! - A node: `serve` runs a node behind a small HTTP server, its log in a JSONL file;
-//!   `node identity` prints what owners grant to.
+//!   `node identity` prints what owners grant to; `host` runs on the parent instance of a
+//!   Nitro Enclave that runs the `enclave` node (HTTP forwarding, egress relay, log writer).
 //! - Anyone: `verify` checks a node log offline (the `verify` crate).
 //!
 //! Keys are files holding base64url text; documents are JSON. Secret values are read from
 //! files or environment variables, never from the command line.
 
+mod attestation;
 mod client;
 mod files;
-mod http;
+mod host;
 mod serve;
 
 use std::path::{Path, PathBuf};
@@ -44,7 +46,7 @@ Exit codes:
   0  success
   1  any other failure (an invalid document, a value the engine refuses)
   2  usage error
-  3  refused by the node (HTTP 400, 403, 404)
+  3  refused by the node (HTTP 400, 403, 404), or its attestation document refused
   4  rate limited by the node (HTTP 429)
   5  connection, transport, log or file I/O failure (HTTP 502, 503 from the node)
 `credentials verify` keeps its own codes: 0 valid, 1 invalid, 2 usage or I/O.";
@@ -95,6 +97,9 @@ enum Command {
     Pin(PinArgs),
     /// Grants a node the user key for a while, sealed so only that node can open it.
     Grant(GrantArgs),
+    /// Verifies an AWS Nitro Enclaves attestation document of a node: the chain to the pinned
+    /// AWS root, the signature, the nonce, and that the PCRs are those of an accepted release.
+    Attest(AttestArgs),
     /// Takes the user key back from a node.
     Revoke(RevokeArgs),
     /// Endorses or retires another device of the owner on a node.
@@ -105,6 +110,8 @@ enum Command {
     Call(CallCommand),
     /// Runs a node server.
     Serve(ServeArgs),
+    /// Runs the host side of a node in an AWS Nitro Enclave (Linux parent instance only).
+    Host(HostArgs),
     /// Node information.
     #[command(subcommand)]
     Node(NodeCommand),
@@ -235,8 +242,38 @@ struct GrantArgs {
     /// Records to pin at their generations. Repeat it, or list several.
     #[arg(long = "pin", value_name = "RECORD", num_args = 1..)]
     pins: Vec<PathBuf>,
+    /// An attestation document of the node (CBOR, `-` for stdin): the grant is sealed only if
+    /// it verifies and vouches for the node identity of --node. Needs --nonce and
+    /// --measurements.
+    #[arg(long, value_name = "FILE", requires_all = ["nonce", "measurements"])]
+    attestation: Option<PathBuf>,
+    /// The nonce the attestation document was asked for (base64url).
+    // Base64url may start with `-`.
+    #[arg(long, requires = "attestation", allow_hyphen_values = true)]
+    nonce: Option<String>,
+    /// The measurements.json of the releases to accept (one object or an array).
+    #[arg(long, value_name = "FILE", requires = "attestation")]
+    measurements: Option<PathBuf>,
     #[command(flatten)]
     deliver: Deliver,
+}
+
+#[derive(Args)]
+struct AttestArgs {
+    /// The attestation document (CBOR, as the node returns it), or `-` for stdin.
+    #[arg(long, value_name = "FILE", allow_hyphen_values = true)]
+    document: PathBuf,
+    /// The nonce the document was asked for (base64url, at least 16 bytes).
+    // Base64url may start with `-`.
+    #[arg(long, allow_hyphen_values = true)]
+    nonce: String,
+    /// The measurements.json of the releases to accept (one object or an array).
+    #[arg(long, value_name = "FILE")]
+    measurements: PathBuf,
+    /// The node identity JSON: also checks that the user data of the document is its report
+    /// data, so the keys in it belong to the attested enclave.
+    #[arg(long, value_name = "FILE")]
+    identity: Option<PathBuf>,
 }
 
 #[derive(Args)]
@@ -369,6 +406,36 @@ struct ServeArgs {
     /// Largest request body, in bytes; a larger one is refused (413) before it is read.
     #[arg(long, value_name = "BYTES", default_value_t = serve::DEFAULT_MAX_BODY)]
     max_body: usize,
+}
+
+#[derive(Args)]
+struct HostArgs {
+    /// The vsock CID of the enclave (`nitro-cli describe-enclaves`).
+    #[arg(long)]
+    enclave_cid: u32,
+    /// The directory of the logs: one JSONL file per node key (a restarted enclave is a new
+    /// node), each with its latest checkpoint next to it.
+    #[arg(long)]
+    log_dir: PathBuf,
+    /// The TCP address clients connect to; each connection is forwarded to the enclave.
+    #[arg(long, default_value = "127.0.0.1:8700")]
+    listen: String,
+    /// A destination the egress relay may connect to, as host:port (repeat it). Without any,
+    /// the relay connects wherever the node asks (the node checks the signed policies).
+    #[arg(long, value_name = "HOST:PORT", value_parser = host::parse_allow)]
+    allow: Vec<String>,
+    /// The vsock port of the node server in the enclave.
+    #[arg(long, default_value_t = server::relay::HTTP_PORT)]
+    http_port: u32,
+    /// The vsock port of the egress relay on this host.
+    #[arg(long, default_value_t = server::relay::EGRESS_PORT)]
+    egress_port: u32,
+    /// The vsock port of the log writer on this host.
+    #[arg(long, default_value_t = server::relay::LOG_PORT)]
+    log_port: u32,
+    /// Most client connections open at once; beyond it the host answers 503.
+    #[arg(long, default_value_t = serve::DEFAULT_MAX_CONNECTIONS)]
+    max_connections: usize,
 }
 
 #[derive(Subcommand)]
@@ -670,6 +737,26 @@ fn grant(args: &GrantArgs) -> Res<()> {
     let device = device_key(&args.device)?;
     let key = user_key(&args.user_key)?;
     let node: NodeIdentity = files::read_json(&args.node)?;
+    match (&args.attestation, &args.nonce, &args.measurements) {
+        (Some(document), Some(nonce), Some(measurements)) => {
+            let verified = attestation::check(document, nonce, measurements, Some(&node))?;
+            eprintln!(
+                "attestation verified: release {}, module {}, at {}; it vouches for the node identity",
+                verified.release,
+                verified.module_id,
+                verify::rfc3339(verified.timestamp_ms)
+            );
+        }
+        (None, None, None) => eprintln!(
+            "warning: no --attestation given: nothing shows that the node runs an accepted release \
+             (see `credentials attest --help`)"
+        ),
+        _ => {
+            return Err(Failure::usage(
+                "--attestation, --nonce and --measurements go together",
+            ));
+        }
+    }
     let minutes = Duration::from_secs(args.valid.saturating_mul(60));
     let mut terms = GrantTerms::new(&args.owner, minutes);
     if args.pins.is_empty() {
@@ -848,6 +935,12 @@ fn run(command: Command) -> Res<()> {
         Command::Seal(args) => seal(&args),
         Command::Pin(args) => pin(&args),
         Command::Grant(args) => grant(&args),
+        Command::Attest(args) => attestation::attest(
+            &args.document,
+            &args.nonce,
+            &args.measurements,
+            args.identity.as_deref(),
+        ),
         Command::Revoke(args) => revoke(&args),
         Command::Device(command) => device_change(&command),
         Command::Call(CallCommand::Http(args)) => {
@@ -870,6 +963,16 @@ fn run(command: Command) -> Res<()> {
         // Whatever stops the server from starting or running is a key, log or socket
         // failure.
         .map_err(|e| Failure::io(e.message)),
+        Command::Host(args) => host::run(&host::Config {
+            listen: args.listen,
+            enclave_cid: args.enclave_cid,
+            http_port: args.http_port,
+            egress_port: args.egress_port,
+            log_port: args.log_port,
+            log_dir: args.log_dir,
+            allow: args.allow,
+            max_connections: args.max_connections,
+        }),
         Command::Node(NodeCommand::Identity { key, url, out }) => {
             node_identity(key.as_deref(), url.as_deref(), out.as_deref())
         }

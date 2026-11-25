@@ -12,6 +12,7 @@ cargo-fuzz = true
 [workspace]
 
 [dependencies]
+attest = { path = "../crates/attest" }
 engine = { path = "../crates/engine" }
 libfuzzer-sys = "0.4"
 serde_json = "1"
@@ -33,6 +34,13 @@ bench = false
 [[bin]]
 name = "log_entry"
 path = "fuzz_targets/log_entry.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "attestation"
+path = "fuzz_targets/attestation.rs"
 test = false
 doc = false
 bench = false

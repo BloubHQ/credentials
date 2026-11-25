@@ -23,10 +23,13 @@ What the engine protects, against whom, under which assumptions, and what is lef
 ## Assumptions
 
 - **A1.** In deployment, the node runs inside a TEE whose attestation the owner checks, and
-  the quote carries `NodeIdentity::report_data()`. *This repository does not include the TEE
-  integration.* Without it, the operator can read node memory and every guarantee that relies
-  on the node keeping a secret falls away; the log, signatures and policy checks still bind
-  an honest node.
+  the quote carries `NodeIdentity::report_data()`. The repository integrates AWS Nitro
+  Enclaves (`crates/enclave`, `credentials host`): the NSM attestation document carries it as
+  `user_data`, with the owner's nonce, and the owner checks it (`attest`, `credentials attest`, `credentials grant --attestation`):
+  the chain to AWS Nitro Enclaves Root-G1, the nonce, `user_data`, and PCR0, PCR1 and PCR2
+  against the published measurements of a reproducible release. Outside a TEE, the operator can read node
+  memory and every guarantee that relies on the node keeping a secret falls away; the log,
+  signatures and policy checks still bind an honest node.
 - **A2.** The owner's device and its keys are not compromised.
 - **A3.** The standard primitives hold: Ed25519, X25519/HPKE (RFC 9180), ChaCha20-Poly1305,
   SHA-2, HMAC, TLS with WebPKI.
@@ -39,6 +42,9 @@ What the engine protects, against whom, under which assumptions, and what is lef
 | --- | --- | --- |
 | Operator changes where a value goes | Policy signed by a device and bound into the record's AEAD | `policy`, `record` |
 | Operator swaps in an older record (narrower policy undone, revoked token back) | Generations in the AEAD; node floors; pins in grants and `Node::pin`; unpinned records refused | `record`, `node` |
+| Operator impersonates a node: hands the owner an identity whose seal key it holds outside the enclave | The grant is sealed only after the attestation document verifies (chain to the pinned AWS Nitro root at the document's time, ES384 signature, the owner's fresh nonce) and its `user_data` equals `report_data()` of that identity; a document of another node, or replayed from an earlier request, is refused | `attest`, `cli` |
+| Operator runs the node in a debug enclave, whose memory the host can read | A document with PCR0, PCR1 and PCR2 all zero is refused even when the owner lists zero measurements | `attest` |
+| Operator runs an old or unknown release (a build with a known flaw, or its own build) | PCR0–2 must equal one entry of the owner's `measurements.json`; the owner drops a release from the list to refuse it | `attest` |
 | Operator reads a grant in transit | HPKE to the node's seal key; the key is bound to the attested identity | `grant` |
 | Operator replays a stored grant after a revocation | Issue time within ±5 min and newer than the owner's last grant, revocation or device change (restored from the log); after a restart, nothing issued before the node started is accepted | `node` |
 | Operator restarts the node with a cut log to forget revocations, devices and floors | Grants and calls made before the restart are refused, so stored ones cannot be replayed; `Node::restore_anchored` refuses a log shorter than the last checkpoint the platform kept out of the operator's reach | `node` |
@@ -50,6 +56,10 @@ What the engine protects, against whom, under which assumptions, and what is lef
 | Operator edits, reorders or cuts the log | Signed chain per node and per owner; signed checkpoints; `credentials verify` | `log`, `verify` |
 | Log store reads where secrets were used | Use details sealed to the owner's user key | `log` |
 | Operator points DNS at its own server | TLS certificate checked for the signed host | `transport` |
+| Nitro host reads or changes the egress of an enclave node | TLS ends inside the enclave; the host relays only ciphertext to the `host:port` the node asked for, after the node checked it against the signed policy | `transport`, `server::relay` |
+| Nitro host confirms a log entry it did not store, or drops one | Entries are signed and chained inside the enclave; a dropped or edited entry breaks `credentials verify`. A host that lies about storing can only lose the log, not forge it | `log`, `server::relay`, `verify` |
+| Nitro host serves an attestation of other code, or of a debug-mode enclave | The document is signed by the NSM (AWS Nitro root); its PCRs must equal the published measurements, which are never zero for a production enclave; the nonce makes it fresh and `user_data` binds it to the identity granted to | `enclave` |
+| Nitro host builds a different image and claims a release | The EIF build is reproducible (`build/reproduce.sh`): anyone can rebuild a tag and compare PCR0, PCR1 and PCR2 with the release | `build` |
 | Caller not in the policy, or replaying a call | Per-call Ed25519 signature over node, record generation, operation, request digest, time, nonce; nonce cache | `caller`, `node` |
 | Anyone probes whether an owner has a grant or which record generation is current | Grant, pin and generation errors are given only after the policy and the caller's signature verify | `node` |
 | Anyone creates owners to grow the node's state | Owners are trusted on first use, so their number is capped (`MAX_OWNERS`) | `node` |
@@ -66,7 +76,29 @@ What the engine protects, against whom, under which assumptions, and what is lef
 
 These remain by design; each is listed in the README.
 
-- **No TEE here (A1).** The largest gap until a platform integration exists.
+- **One TEE (A1).** Only AWS Nitro Enclaves are integrated. Elsewhere the node is an ordinary
+  process. The attestation document must be verified by the owner (certificate chain, PCRs,
+  nonce, `user_data`); the node only produces it.
+- **Nitro: no sealed storage.** A restarted enclave generates a new node key: it is a new node,
+  with a new log file, and owners grant to it again. The host can restart it at will (an
+  availability matter: nothing granted to the old node opens on the new one), and the floors
+  and devices learnt by the old node do not carry over; pins in new grants bring the floors
+  back.
+- **Nitro: the clock comes from the host.** The enclave reads its time from the hypervisor of
+  the parent instance; the NSM attests nothing about it. A host that sets it back or forward
+  has the effects listed under *Trusted clock* below. Owners should keep grant lifetimes
+  short and watch checkpoint times.
+- **Nitro: the host sees traffic metadata.** It learns which `host:port` the node connects to,
+  when, and how many bytes flow (not their content), and when entries are logged. It can
+  refuse any of it; the node then fails closed.
+- **Nitro: build supply chain.** The PCRs bind the image to the commit, the Rust image, the
+  Amazon Linux image and the nitro-cli packages named by digest and version in
+  `measurements.json`; a compromised input that every rebuild uses is reproduced too.
+- **Nitro attestation trusts AWS and the measurement list.** Whoever holds the AWS Nitro root
+  key can sign any document; a release in the owner's list is trusted whatever it does. The
+  attestation is checked once, before a grant: a node replaced later under the same identity
+  is not re-checked until the next grant. The document's time is the module's, not the
+  owner's clock; freshness comes from the nonce.
 - **Unknown encodings.** A server that transforms a secret in a way the search does not know
   (compression of its own, encryption, splitting across fields) can return it to the caller.
   Policies should only call services that do not echo credentials.

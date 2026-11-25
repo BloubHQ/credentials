@@ -31,6 +31,7 @@ TOTP、IMAP 登录、双向 TLS（mutual TLS）和以太坊签名，全都是策
 - [记录、代数与回滚](#记录代数与回滚)
 - [日志](#日志)
 - [运行节点](#运行节点)
+- [在 Nitro Enclave 中运行](#在-nitro-enclave-中运行)
 - [它保证什么](#它保证什么)
 - [实测数据](#实测数据)
 - [它不做什么](#它不做什么)
@@ -258,7 +259,9 @@ credentials verify log.jsonl <node-public-key> --owner alice --user-key key.txt 
   （见下表）。
 - **远程证明（attestation）。** 在 TEE（可信执行环境：SGX、TDX、SEV-SNP、Nitro）中运行节点。把
   `NodeIdentity::report_data()`（对日志密钥和封装密钥计算的 SHA-512）放入 quote 的
-  report data；所有者在封装授权之前检查 quote 和该值。quote 的验证与平台相关，不在本仓库中。
+  report data；所有者在封装授权之前检查 quote 和该值。已集成 AWS Nitro Enclaves：
+  见[在 Nitro Enclave 中运行](#在-nitro-enclave-中运行)；所有者的检查由 [`attest`](../../crates/attest)
+  crate 和 `credentials attest` 完成。
 - **密钥与重启。** 将 `NodeKey::to_bytes()` 封装（seal）到 enclave 中保存。重启后，
   `Node::restore(key, sink, clock, entries)` 会延续链，并恢复记录下限、已知设备和最近的授权时间；
   所有者需要重新授权，重启前签发或签名的内容一律不被接受。请把 `Node::checkpoint()` 保存在运营方无法回滚的
@@ -266,6 +269,109 @@ credentials verify log.jsonl <node-public-key> --owner alice --user-key key.txt 
 - **命令行与服务器。** [`credentials`](../../crates/cli) 可生成密钥、签署策略、封装记录、生成授权和签名调用；
   `credentials serve` 通过 HTTP 运行节点，并使用持久的 JSONL 日志。
 - **并发。** 每个方法都接受 `&self`；可在线程之间共享一个节点。传输 I/O 在节点的锁之外运行。
+
+## 在 Nitro Enclave 中运行
+
+[`enclave`](../../crates/enclave) 程序在 AWS Nitro Enclave 中运行节点，`credentials host` 则在父实例上
+与它并行运行。enclave 没有网络，也没有磁盘；通往父实例的 vsock 是它唯一的连接。
+
+```mermaid
+flowchart LR
+  client[所有者 / 调用方] -- HTTP --> host
+  subgraph parent[父 EC2 实例]
+    host[credentials host]
+    logs[(log-dir/NODE.jsonl)]
+  end
+  subgraph enclave[Nitro Enclave]
+    node[enclave: node + TLS]
+    nsm[NSM]
+  end
+  host -- "vsock 5000: HTTP" --> node
+  node -- "vsock 5001: CONNECT host:port, 然后是 TLS 字节" --> host
+  node -- "vsock 5002: 日志条目，确认前已同步" --> host
+  host --> logs
+  host -- TCP --> dest[目标]
+  node --- nsm
+```
+
+- **启动。** 除非内核从 NSM（`nsm-hwrng`）获取随机数，否则程序拒绝启动；随后它生成一个全新的节点密钥。
+  Nitro 上没有封装存储：**重启后的 enclave 就是一个新节点**，拥有新的身份和新的日志文件，所有者需要
+  重新向它授权（授权封装给单个节点的密钥，本来就不会在重启后保留）。
+- **API。** 在 vsock 端口 5000 上提供 `credentials serve` 的 HTTP API（同一套服务器代码，来自
+  [`server`](../../crates/server) crate），外加 `GET /attestation?nonce=<base64url>`，其应答为
+  `{"identity": <NodeIdentity>, "document": <base64url>}`。该文档是经 COSE 签名的 NSM 证明文档，其
+  `user_data` 为 `NodeIdentity::report_data()`，`nonce` 为调用方提供的值（1 到 512 字节）。
+- **授权之前**，所有者检查该文档：其证书链是否通向 AWS Nitro 根证书；PCR0、PCR1 和 PCR2 是否与某个
+  发布版本的 `measurements.json` 一致（PCR 全为零表示调试模式的 enclave，父实例可以读取其内存）；
+  nonce 是否为它发送的那个；以及 `user_data` 是否等于它即将授权的身份的 `report_data()`。
+- **出站连接。** TLS 留在 enclave 内部（基于 vsock `Connector` 的 `TlsTransport`）。对每个连接，节点先
+  按签名的策略检查目标，再向主机发送 `CONNECT host:port`；主机通过 TCP 建立连接（若给出 `--allow`，
+  则只连接其中的条目），然后双向传送密文。DNS 由主机解析；与没有 enclave 时一样，绑定连接的是对目标
+  证书的检查。
+- **日志。** 条目发往主机，主机将每个条目追加到 `<log-dir>/<node log key>.jsonl`，并在确认之前对其执行
+  `sync_data`；节点只有在收到该确认后才把条目视为已存储，否则停止，并与主机报告的内容进行核对。
+  检查点写入 `<node log key>.jsonl.head.json`。照常用 `credentials verify` 检查日志。
+- **时钟。** 节点使用 enclave 的系统时钟，它来自主机的 hypervisor（见[威胁模型](../threat-model.md)）。
+
+### 授权前验证节点
+
+运行在 AWS Nitro Enclave 中的节点会把 `NodeIdentity::report_data()` 放入其证明文档的 `user_data`。在封装
+授权之前，所有者向节点发送一个新的随机 nonce（32 字节），取回文档，并对照它所接受的各发布版本的
+`measurements.json`（`{"release": ..., "git_commit": ..., "pcr0": ..., "pcr1": ..., "pcr2":
+...}`，单个对象或数组；PCR 为十六进制）进行检查：
+
+```sh
+credentials attest --document doc.cbor --nonce <base64url> --measurements measurements.json \
+    --identity identity.json
+credentials grant ... --node identity.json \
+    --attestation doc.cbor --nonce <base64url> --measurements measurements.json
+```
+
+`attest::verify`（以及这两个命令）会拒绝文档，除非：
+
+- 它是用 ES384 签名的 COSE_Sign1（受保护头部恰好为 `{1: -35}`），其载荷是 Nitro Secure Module 的映射，
+  `digest` 为 `SHA384`；
+- 其证书经由 `cabundle` 中间证书链接到固定的 AWS Nitro Enclaves Root-G1（SHA-256 `641a0321...79bb5b`），
+  并在文档声明的时间有效；文档内附带的根证书副本不受信任；
+- 签名可用该证书的 P-384 密钥验证通过；
+- 其 nonce 正是所有者发送的那个，因此旧文档无法被重放；
+- PCR0、PCR1 和 PCR2 不全为零（全为零是调试 enclave，主机可读取其内存），并且等于某个被接受的发布
+  版本，因此旧的或未知的构建一旦其度量值从列表中移除就会被拒绝；
+- 使用 `--identity` 时（`grant --attestation` 则始终如此），其 `user_data` 等于节点身份的
+  `report_data()`，因此授权所封装给的封装密钥属于被证明的 enclave。
+
+不带 `--attestation` 的 `credentials grant` 仍然可用，但会打印警告：此时没有任何东西能表明是什么代码
+持有封装密钥。
+
+### 构建 enclave 镜像文件
+
+```sh
+build/reproduce.sh --release dev --out out   # needs git and Docker with buildx
+```
+
+`build/build.sh` 构建的是提交 `HEAD`（而不是工作区）：`build/Dockerfile.enclave` 在按 digest 固定的
+Rust 1.97.1 镜像中，使用 `--locked`、设为提交时间的 `SOURCE_DATE_EPOCH` 和重映射的路径，将 `enclave`
+静态编译为 `x86_64-unknown-linux-musl`；随后在按 digest 固定、并按版本固定 `aws-nitro-enclaves-cli` 的
+Amazon Linux 2023 镜像中，由 `nitro-cli build-enclave` 生成 `enclave.eif`。`measurements.json` 记录发布
+版本、提交、PCR0、PCR1、PCR2，以及每项输入（镜像、提交中的文件、nitro-cli 添加的内核和 init、程序本身）
+的 SHA-256。`build/reproduce.sh` 构建两次，第二次不使用任何缓存，度量值不一致则失败；CI 在 enclave 或其
+构建每次变更时运行它，每个发布版本都附带 `enclave.eif` 和 `measurements.json`（包含在 `SHA256SUMS` 和
+构建来源证明中），并在发布说明中列出度量值。EIF 文件本身每次构建都不同（其元数据包含构建时间）；
+其 PCR 则不变。
+
+### 运行
+
+在已安装 `aws-nitro-enclaves-cli` 并配置好分配器（allocator）、支持 Nitro 的实例上：
+
+```sh
+nitro-cli run-enclave --eif-path enclave.eif --cpu-count 2 --memory 1024 --enclave-cid 16
+credentials host --enclave-cid 16 --log-dir /var/lib/credentials \
+  --listen 127.0.0.1:8700 --allow api.github.com:443
+curl -s "http://127.0.0.1:8700/attestation?nonce=$(head -c 32 /dev/urandom | basenc --base64url | tr -d '=')"
+```
+
+先启动 `credentials host`，或紧接着启动：节点在启动时会连接其日志写入端，连接不上就会停止。
+`credentials host` 的说明见 [crates/cli](../../crates/cli#the-host-nitro-enclaves)。
 
 ## 它保证什么
 
@@ -314,8 +420,9 @@ credentials verify log.jsonl <node-public-key> --owner alice --user-key key.txt 
 
 这些是设计上的限制，而不是缺失的代码。[威胁模型](../threat-model.md)对每一项都有说明。
 
-- **本仓库中没有 TEE。** 这里的节点是一个普通进程；远程证明属于平台集成
-  （见[运行节点](#运行节点)）。没有 TEE，运行节点的人就能读取其内存。
+- **仅支持一种 TEE。** 已集成 AWS Nitro Enclaves（[在 Nitro Enclave 中运行](#在-nitro-enclave-中运行)）；
+  在其他环境中，节点是一个普通进程，运行它的人就能读取其内存。Nitro 节点没有封装存储：重启即成为
+  新节点，所有者需要重新授权。
 - **回显搜索只能发现已知编码**：原始、base64（两种字母表）、百分号编码、JSON 和十六进制，
   以及转义的 JSON 字符串。服务器若对回显的密钥进行拆分、以自有方式压缩或加密，则无法被发现。
   4 到 7 字节的秘密字段只按原始形式搜索，其字节偶然出现时也会丢弃响应。
@@ -334,9 +441,12 @@ credentials verify log.jsonl <node-public-key> --owner alice --user-key key.txt 
 | Crate | |
 | --- | --- |
 | [`engine`](../../crates/engine) | 密钥、策略、模板、记录、授权、调用方、日志、响应、节点 |
-| [`transport`](../../crates/transport) | TLS 传输（rustls），以及一个端到端示例 |
+| [`transport`](../../crates/transport) | 基于 TCP 或任意 `Connector` 的 TLS 传输（rustls），以及一个端到端示例 |
+| [`server`](../../crates/server) | 节点的 HTTP 服务器，以及 enclave 与其主机之间的 vsock 中继协议 |
+| [`enclave`](../../crates/enclave) | 在 AWS Nitro Enclave 中运行的节点程序（NSM 远程证明） |
 | [`verify`](../../crates/verify) | 节点日志验证器，以 `credentials verify` 运行 |
-| [`cli`](../../crates/cli) | `credentials` 工具：密钥、策略、记录、授权、调用和节点服务器 |
+| [`attest`](../../crates/attest) | AWS Nitro Enclaves 证明文档验证器，以 `credentials attest` 运行 |
+| [`cli`](../../crates/cli) | `credentials` 工具：密钥、策略、记录、授权、调用、节点服务器和 enclave 的主机 |
 
 ## 开发
 
@@ -346,7 +456,7 @@ cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace --locked
 ```
 
-最低 Rust 版本：1.87。CI 还会运行 `cargo audit`、`cargo deny`、MSRV 测试、可复现构建检查，以及每个目标 60 秒的模糊测试。
+最低 Rust 版本：1.87（`enclave` crate 为 1.92，因为需要 `aws-nitro-enclaves-nsm-api`）。CI 还会运行 `cargo audit`、`cargo deny`、MSRV 测试、可复现构建检查，以及每个目标 60 秒的模糊测试。
 参见 [CONTRIBUTING.md](../../.github/CONTRIBUTING.md)。
 
 ## 安全

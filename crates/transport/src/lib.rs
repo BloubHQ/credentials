@@ -14,9 +14,13 @@
 //!
 //! rustls keeps TLS records in buffers of its own that are not erased when freed. Run a node
 //! with a zeroizing global allocator to cover them (see the README of the repository).
+//!
+//! TLS runs over any byte stream a [`Connector`] opens: TCP by default ([`TcpConnector`]),
+//! or a relay such as the vsock link of a Nitro Enclave to its parent instance. TLS ends in
+//! this process either way, so whatever carries the bytes sees only ciphertext.
 
 use std::io::{self, Read, Write};
-use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
+use std::net::{Shutdown, SocketAddr, TcpStream, ToSocketAddrs};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -33,6 +37,92 @@ use zeroize::{Zeroize, Zeroizing};
 pub type Resolver = dyn Fn(&str, u16) -> io::Result<Vec<SocketAddr>> + Send + Sync;
 
 const CHUNK: usize = 16 * 1024;
+
+/// A connected byte stream that TLS runs over.
+pub trait Socket: Read + Write + Send {
+    /// Sets the timeout of each read and each write (`None`: block).
+    fn set_timeouts(&self, timeout: Option<Duration>) -> io::Result<()>;
+
+    /// Closes both directions.
+    fn shutdown(&self) -> io::Result<()>;
+}
+
+impl Socket for TcpStream {
+    fn set_timeouts(&self, timeout: Option<Duration>) -> io::Result<()> {
+        self.set_read_timeout(timeout)?;
+        self.set_write_timeout(timeout)
+    }
+
+    fn shutdown(&self) -> io::Result<()> {
+        TcpStream::shutdown(self, Shutdown::Both)
+    }
+}
+
+/// Opens the byte streams TLS runs over.
+pub trait Connector: Send + Sync {
+    /// Connects to `host:port`. Each attempt (one address, say) takes at most `attempt`, and
+    /// no attempt starts after `deadline`.
+    fn connect(
+        &self,
+        host: &str,
+        port: u16,
+        attempt: Duration,
+        deadline: Instant,
+    ) -> io::Result<Box<dyn Socket>>;
+}
+
+/// Connects over TCP to the addresses a resolver gives, in order.
+pub struct TcpConnector {
+    resolve: Box<Resolver>,
+}
+
+impl Default for TcpConnector {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl TcpConnector {
+    /// A connector that uses the system resolver.
+    pub fn new() -> Self {
+        Self::with_resolver(|host, port| Ok((host, port).to_socket_addrs()?.collect()))
+    }
+
+    /// A connector that uses `resolve`.
+    pub fn with_resolver(
+        resolve: impl Fn(&str, u16) -> io::Result<Vec<SocketAddr>> + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            resolve: Box::new(resolve),
+        }
+    }
+}
+
+impl Connector for TcpConnector {
+    fn connect(
+        &self,
+        host: &str,
+        port: u16,
+        attempt: Duration,
+        deadline: Instant,
+    ) -> io::Result<Box<dyn Socket>> {
+        let mut last = io::Error::new(io::ErrorKind::NotFound, "no address for the host");
+        for address in (self.resolve)(host, port)? {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return Err(io::Error::new(io::ErrorKind::TimedOut, "connect deadline"));
+            }
+            match TcpStream::connect_timeout(&address, attempt.min(left)) {
+                Ok(stream) => {
+                    stream.set_nodelay(true)?;
+                    return Ok(Box::new(stream));
+                }
+                Err(e) => last = e,
+            }
+        }
+        Err(last)
+    }
+}
 
 fn fault(kind: TransportKind, sent: bool) -> Error {
     Error::transport(kind, sent)
@@ -73,7 +163,7 @@ pub struct TlsTransport {
     connect_timeout: Duration,
     io_timeout: Duration,
     total_timeout: Duration,
-    resolve: Box<Resolver>,
+    connector: Box<dyn Connector>,
 }
 
 impl Default for TlsTransport {
@@ -99,7 +189,7 @@ impl TlsTransport {
             connect_timeout: Duration::from_secs(10),
             io_timeout: Duration::from_secs(30),
             total_timeout: Duration::from_secs(120),
-            resolve: Box::new(|host, port| Ok((host, port).to_socket_addrs()?.collect())),
+            connector: Box::new(TcpConnector::new()),
         }
     }
 
@@ -111,12 +201,17 @@ impl TlsTransport {
         self
     }
 
-    /// Replaces the resolver (the system resolver by default).
+    /// Connects over TCP with this resolver (the system resolver by default).
     pub fn resolver(
-        mut self,
+        self,
         resolve: impl Fn(&str, u16) -> io::Result<Vec<SocketAddr>> + Send + Sync + 'static,
     ) -> Self {
-        self.resolve = Box::new(resolve);
+        self.connector(TcpConnector::with_resolver(resolve))
+    }
+
+    /// Replaces what opens the byte streams TLS runs over ([`TcpConnector`] by default).
+    pub fn connector(mut self, connector: impl Connector + 'static) -> Self {
+        self.connector = Box::new(connector);
         self
     }
 
@@ -153,30 +248,32 @@ impl TlsTransport {
         identity: Option<&ClientIdentity>,
         alpn: bool,
         deadline: Instant,
-    ) -> Result<StreamOwned<ClientConnection, TcpStream>> {
-        let connect = || fault(TransportKind::Connect, false);
-        let name = ServerName::try_from(destination.host.clone()).map_err(|_| connect())?;
-        let addresses =
-            (self.resolve)(&destination.host, destination.port).map_err(|_| connect())?;
-        let mut tcp = None;
-        for address in addresses {
-            let left = deadline.saturating_duration_since(Instant::now());
-            if left.is_zero() {
-                return Err(fault(TransportKind::Timeout, false));
-            }
-            if let Ok(stream) = TcpStream::connect_timeout(&address, self.connect_timeout.min(left))
-            {
-                tcp = Some(stream);
-                break;
-            }
+    ) -> Result<StreamOwned<ClientConnection, Box<dyn Socket>>> {
+        let name = ServerName::try_from(destination.host.clone())
+            .map_err(|_| fault(TransportKind::Connect, false))?;
+        if deadline.saturating_duration_since(Instant::now()).is_zero() {
+            return Err(fault(TransportKind::Timeout, false));
         }
-        let mut tcp = tcp.ok_or(fault(TransportKind::Connect, false))?;
-        tcp.set_nodelay(true).map_err(|_| connect())?;
+        let mut tcp = self
+            .connector
+            .connect(
+                &destination.host,
+                destination.port,
+                self.connect_timeout,
+                deadline,
+            )
+            .map_err(|_| {
+                if Instant::now() >= deadline {
+                    fault(TransportKind::Timeout, false)
+                } else {
+                    fault(TransportKind::Connect, false)
+                }
+            })?;
         let config = self.config(identity, alpn)?;
         let mut tls =
             ClientConnection::new(config, name).map_err(|_| fault(TransportKind::Tls, false))?;
         while tls.is_handshaking() {
-            set_timeouts(&tcp, self.io_timeout, deadline, false)?;
+            set_timeouts(tcp.as_ref(), self.io_timeout, deadline, false)?;
             tls.complete_io(&mut tcp).map_err(|e| match io_kind(&e) {
                 TransportKind::Timeout => fault(TransportKind::Timeout, false),
                 TransportKind::Io | TransportKind::Closed if !tls.is_handshaking() => {
@@ -190,14 +287,13 @@ impl TlsTransport {
 }
 
 /// Sets the read and write timeouts to what is left before `deadline`, at most `io`.
-fn set_timeouts(tcp: &TcpStream, io: Duration, deadline: Instant, sent: bool) -> Result<()> {
+fn set_timeouts(socket: &dyn Socket, io: Duration, deadline: Instant, sent: bool) -> Result<()> {
     let left = deadline.saturating_duration_since(Instant::now());
     if left.is_zero() {
         return Err(fault(TransportKind::Timeout, sent));
     }
-    let timeout = Some(io.min(left));
-    tcp.set_read_timeout(timeout)
-        .and_then(|()| tcp.set_write_timeout(timeout))
+    socket
+        .set_timeouts(Some(io.min(left)))
         .map_err(|_| fault(TransportKind::Io, sent))
 }
 
@@ -211,7 +307,7 @@ impl Transport for TlsTransport {
     ) -> Result<Vec<u8>> {
         let deadline = Instant::now() + self.total_timeout;
         let mut stream = self.connect(destination, identity, true, deadline)?;
-        set_timeouts(&stream.sock, self.io_timeout, deadline, true)?;
+        set_timeouts(stream.sock.as_ref(), self.io_timeout, deadline, true)?;
         stream
             .write_all(wire)
             .and_then(|()| stream.flush())
@@ -219,7 +315,7 @@ impl Transport for TlsTransport {
         let mut out = Vec::with_capacity(CHUNK);
         let mut chunk = Zeroizing::new([0u8; CHUNK]);
         loop {
-            set_timeouts(&stream.sock, self.io_timeout, deadline, true)?;
+            set_timeouts(stream.sock.as_ref(), self.io_timeout, deadline, true)?;
             let n = match stream.read(chunk.as_mut_slice()) {
                 Ok(0) => break,
                 Ok(n) => n,
@@ -258,7 +354,7 @@ impl Transport for TlsTransport {
 
 /// An open TLS connection of a stream operation.
 struct TlsStream {
-    inner: StreamOwned<ClientConnection, TcpStream>,
+    inner: StreamOwned<ClientConnection, Box<dyn Socket>>,
     pending: Vec<u8>,
     io_timeout: Duration,
     deadline: Instant,
@@ -282,7 +378,12 @@ fn first_end(bytes: &[u8], delimiters: &[&[u8]], from: usize) -> Option<usize> {
 
 impl Stream for TlsStream {
     fn write(&mut self, bytes: &[u8]) -> Result<()> {
-        set_timeouts(&self.inner.sock, self.io_timeout, self.deadline, true)?;
+        set_timeouts(
+            self.inner.sock.as_ref(),
+            self.io_timeout,
+            self.deadline,
+            true,
+        )?;
         self.inner
             .write_all(bytes)
             .and_then(|()| self.inner.flush())
@@ -306,7 +407,12 @@ impl Stream for TlsStream {
             if self.pending.len() > max {
                 return Err(fault(TransportKind::TooLarge, true));
             }
-            set_timeouts(&self.inner.sock, self.io_timeout, self.deadline, true)?;
+            set_timeouts(
+                self.inner.sock.as_ref(),
+                self.io_timeout,
+                self.deadline,
+                true,
+            )?;
             let n = match self.inner.read(chunk.as_mut_slice()) {
                 Ok(0) => return Err(fault(TransportKind::Closed, true)),
                 Ok(n) => n,
@@ -320,7 +426,7 @@ impl Stream for TlsStream {
     fn close(&mut self) -> Result<()> {
         self.inner.conn.send_close_notify();
         let _ = self.inner.flush();
-        let _ = self.inner.sock.shutdown(std::net::Shutdown::Both);
+        let _ = self.inner.sock.shutdown();
         Ok(())
     }
 }
