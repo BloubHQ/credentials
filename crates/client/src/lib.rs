@@ -22,6 +22,14 @@
 //!   the node handed back), sets spending limits ([`sign_limits`]) and renews a session the
 //!   node cannot ([`update_record`]); the app goes on with [`sign_resume_call`].
 //!
+//! - Node continuity: grants follow a node to its successor unless granted with
+//!   [`grant_without_successor`]; when the old node is gone, [`verify_successor`] checks a
+//!   newer node against the signed successor statement and [`regrant`] grants to it under
+//!   the owner's [`SuccessorPolicy`].
+//! - Keys on a new phone: [`wrap_keys`] and [`unwrap_keys`] (a blob for the platform's end-to-end
+//!   encrypted backup), or a 6-digit transfer between two devices ([`start_transfer`],
+//!   [`join_transfer`]: SPAKE2, so the code cannot be guessed offline).
+//!
 //! Every failure is a [`ClientError`] with a stable [`ClientError::code`].
 //!
 //! # A grant
@@ -45,31 +53,44 @@
 //! ```
 
 mod attestation;
+pub(crate) mod backup;
 mod caller;
+mod continuity;
 mod error;
 mod keys;
 mod owner;
 mod review;
 mod session;
 mod time;
+mod transfer;
 #[cfg(target_arch = "wasm32")]
 pub mod wasm;
 
+#[cfg(test)]
+mod continuity_tests;
 #[cfg(test)]
 mod tests;
 
 pub use attestation::{
     MAX_AGE_MS, NONCE_LEN, Nonce, VerifiedNode, nonce, verify_attestation_reply, verify_node,
 };
+pub use backup::{
+    BACKUP_FORMAT, BackedUpKey, MAX_BACKUP_KEYS, generate_backup_key, unwrap_keys, wrap_keys,
+};
 pub use caller::{sign_call, sign_derive_call, sign_describe_call};
+pub use continuity::{SuccessorPolicy, regrant, verify_successor};
 pub use error::{ClientError, Result};
 pub use keys::{KeyKind, generate_key, import_key, public_key};
 pub use owner::{
-    Field, endorse_device, grant, pin_record, retire_device, revoke, rewrap_record, seal_record,
-    sign_policy, upgrade_policy,
+    Field, endorse_device, grant, grant_without_successor, pin_record, retire_device, revoke,
+    rewrap_record, seal_record, sign_policy, upgrade_policy,
 };
 pub use review::{approval_hash, approve, item_kinds, policy_json_schema, sign_kind, summarize};
 pub use session::{answer_challenge, sign_limits, sign_resume_call, update_record};
+pub use transfer::{
+    MAX_ATTEMPTS, TRANSFER_TTL_MS, TransferReceiver, TransferSender, TransferredKeys,
+    join_transfer, start_transfer,
+};
 
 #[cfg(not(target_arch = "wasm32"))]
 uniffi::setup_scaffolding!();

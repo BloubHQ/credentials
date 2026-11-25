@@ -175,6 +175,21 @@ pub struct GrantTerms {
     pub issued_ms: u64,
     /// The lowest generation of each record of the owner the node may accept.
     pub pins: Vec<RecordPin>,
+    /// Whether the node may hand this grant over to a successor release whose successor
+    /// statement the release workflow signed (`docs/design.md`, section 10). On by default;
+    /// absent from the signed terms when on, so grants made before the field existed read as
+    /// on and keep their signature.
+    #[serde(default = "allow", skip_serializing_if = "is_allowed")]
+    pub allow_successor: bool,
+}
+
+fn allow() -> bool {
+    true
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_allowed(value: &bool) -> bool {
+    *value
 }
 
 impl GrantTerms {
@@ -192,7 +207,16 @@ impl GrantTerms {
             expires_ms: issued_ms.saturating_add(valid_ms),
             issued_ms,
             pins: Vec::new(),
+            allow_successor: true,
         }
+    }
+
+    /// Keeps the grant on this node only: a hand-over to a successor release drops it, and
+    /// the owner grants to the successor again.
+    #[must_use]
+    pub fn without_successor(mut self) -> Self {
+        self.allow_successor = false;
+        self
     }
 
     /// Pins `record` at its generation: the node will refuse any older copy of it.

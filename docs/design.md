@@ -455,6 +455,52 @@ A Nitro node has no sealed storage; a new release is a new node. Releases hand o
 The design admits several nodes; one runs at first (cost). With several, an owner grants to
 each, or a node hands its grants to a peer of the same release.
 
+As built (part 10):
+
+- **Statement**: `successor.json` (`{"type": ".../successor/v1", "from": <measurements of X>,
+  "to": <measurements of Y>}`) and `successor.sigstore.json` (a Sigstore bundle v0.3 of a
+  `hashedrekord` entry), published with release Y. `crates/continuity` verifies it offline:
+  the certificate chain to a pinned Fulcio root at the time Rekor integrated the entry, the
+  signer (SAN `https://github.com/BloubHQ/credentials/.github/workflows/release.yml@refs/tags/<Y>`,
+  issuer `https://token.actions.githubusercontent.com`, runner `github-hosted`, repository and
+  ref extensions), the signature, the log entry, the signed entry timestamp and the inclusion
+  proof up to a checkpoint signed by a pinned Rekor key. Both log proofs are required (the more
+  secure choice: either alone would let one compromised key vouch). No maintained pure-Rust
+  verifier of the current RustCrypto generation existed, so the checks are written out and
+  fuzzed. Not checked: the certificate's SCTs (a residual risk in `docs/threat-model.md`).
+  The trust root is `crates/continuity/trust/trusted_root.json`, compared with Sigstore's TUF
+  repository by the release workflow; it is empty in the source until it is committed, and an
+  empty root refuses every statement.
+- **Order**: releases are Semantic Versions; `to` must be newer than `from` (a statement that
+  is not is refused as a downgrade before its signature is read), `from` must be the old node's
+  compiled release (`CREDENTIALS_RELEASE`, set by `build/build.sh`), and the new node's PCRs
+  must be the statement's `to` measurements and nothing else.
+- **Protocol** (`continuity::protocol`): four messages, relayed by the host over vsock port
+  5003 of each enclave (`credentials hand-over --from-cid --to-cid`): a challenge with a nonce
+  from the old node; the new node's attestation over it, bound to its identity, and its own
+  nonce; the old node's attestation and the package; the take-over. Each node attests to the
+  other (mutual); nonces are used once, within five minutes. The package is a sealed message,
+  not a TLS session: HPKE (X25519, HKDF-SHA256, ChaCha20-Poly1305) to the new node's seal key,
+  with the hand-over header as additional data, inside a hand-over entry signed by the old
+  node. The host sees ciphertext only.
+- **What moves**: for every owner, devices, retired devices, the issue time of the last grant,
+  record floors and spending limits (the protective state, always); the user key only for
+  grants with `allow_successor` that have not expired. Records stay sealed under the user key
+  and move with it; the floors keep a host from serving older copies to the new node.
+- **Log**: the old node's last entry is `HandOver` (successor identity, release, statement
+  and package hashes, counts); the new node's first is `Continue` (prev = that entry's hash),
+  then one `Carry` per owner. `ChainVerifier` switches keys at the hand-over and refuses any
+  further entry of the old key (a fork); `credentials verify <old> <key> --next <new>` checks
+  one chain. The old node refuses every act once it has handed over.
+- **Crash path**: `client::verify_successor` checks a newer node against the statement of the
+  release the owner granted to, then `client::regrant` grants under the owner's
+  `SuccessorPolicy` (`Automatic`, `AskOwner`, `Never`).
+- **Keys on a new phone**: `client::wrap_keys` (format `credentials-key-backup/v1`,
+  XChaCha20-Poly1305 under a random backup key the app keeps in iCloud Keychain or Google
+  Block Store; no passphrase mode, as a memorable passphrase is guessable offline from the
+  blob), and a 6-digit device transfer over SPAKE2 (RustCrypto `spake2`) with HMAC key
+  confirmation, three wrong codes per code and five minutes per transfer.
+
 ## 11. Order
 
 | # | Part | Depends on |
@@ -468,7 +514,7 @@ each, or a node hands its grants to a peer of the same release.
 | 7 | Trusted code sandbox (layer 3): WebAssembly runtime, JavaScript module, origin-pinned site code (done: `run` step, `crates/sandbox`, wasmi 1.1.0 chosen by measurement; JavaScript measured with boa in the sandbox, its shipping plan in `docs/sandbox.md`) | 2 |
 | 8 | Browser fills over CDP | 4, 5 |
 | 9 | Remaining primitive families (Appendices A, B), UDP relay and its protocols | 1 |
-| 10 | Node hand-over; key backup and device transfer in `client` | 3 |
+| 10 | Node hand-over; key backup and device transfer in `client` (done: `crates/continuity`, `Node::hand_over`/`take_over`, `credentials hand-over`, `credentials verify --next`, `client` continuity, backup and transfer; real Nitro hardware and the real Sigstore root are not exercised by the tests, and the compiled Sigstore trust root is empty until it is committed, so nodes refuse every statement until then) | 3 |
 | 11 | Section 8a and 8b schemes as IR policies and reviewed modules | 6, 7 |
 
 Each part adds its rows to `docs/threat-model.md`, fuzz targets for any new parser, and

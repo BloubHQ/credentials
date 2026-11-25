@@ -7,6 +7,38 @@ before 1.0, minor versions may break formats and APIs.
 
 ### Added
 
+- Node continuity (`docs/design.md` section 11, part 10; section 10): a node hands its state
+  to a node of a newer release. New crate `continuity`: successor statements
+  (`successor.json`, "release X may hand over to the measurements of release Y") signed in the
+  release workflow with Sigstore keyless signing (`cosign sign-blob --new-bundle-format`,
+  `id-token: write`) and verified offline in Rust (Fulcio chain to a pinned root, the
+  workflow identity, the signature, the `hashedrekord` entry, the Rekor signed entry timestamp
+  and the inclusion proof to a signed checkpoint; no maintained pure-Rust verifier of the
+  current RustCrypto generation existed); the four-message mutual-attestation protocol and
+  its framing over vsock port 5003; test roots for Nitro and Sigstore behind the `testing`
+  feature. Engine: `Node::hand_over` and `Node::take_over` (state sealed with HPKE to the
+  successor; devices, retired devices, floors and limits always, user keys of grants with
+  `allow_successor`), log events `HandOver`, `Continue` and `Carry`, one chain across nodes
+  in `ChainVerifier`, errors `HandedOver` and `HandOverInvalid`; `GrantTerms::allow_successor`
+  (default on, absent from old signed terms) and `GrantTerms::without_successor`. CLI:
+  `credentials hand-over --from-cid --to-cid --statement --bundle`, `credentials grant
+  --no-successor`, `credentials verify --next <log>` (JSON `hand_overs`). Enclave: the
+  release name compiled in (`CREDENTIALS_RELEASE` from `build/build.sh`, so it is part of the
+  measurements) and the hand-over listener. Release workflow: the successor statement, its
+  signature and verification, and a check of the compiled Sigstore trust root against
+  Sigstore's TUF repository. The compiled trust root
+  (`crates/continuity/trust/trusted_root.json`) is empty until it is committed, so every
+  statement is refused until then.
+- `client`: `verify_successor` and `regrant` with `SuccessorPolicy` (`Automatic`,
+  `AskOwner`, `Never`) for a node whose predecessor is gone; `grant_without_successor`; key
+  backup (`generate_backup_key`, `wrap_keys`, `unwrap_keys`, format
+  `credentials-key-backup/v1`); 6-digit device transfer over SPAKE2 (`start_transfer`,
+  `join_transfer`; RustCrypto `spake2` 0.5.0-pre.0, HMAC key confirmation, three wrong codes
+  per code, five minutes); errors `successor_refused`, `transfer_refused`, `backup_refused`;
+  UniFFI and wasm bindings and the web smoke test.
+- Fuzz targets `sigstore_bundle`, `fulcio_certificate`, `successor_statement`,
+  `handover_package`, `key_transfer`.
+
 - Trusted code sandbox (`docs/design.md` section 11, part 7; `docs/sandbox.md`): the IR step
   `run {module, entry, inputs, into}` runs a WebAssembly module fetched from the
   destination's own origin (`{"url": ..., "sha256": ...}`, fetched as a logged `GET` over the

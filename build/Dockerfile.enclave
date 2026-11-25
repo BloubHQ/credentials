@@ -20,12 +20,18 @@ FROM rust:1.97.1-alpine@sha256:3c38f3f82c2f3d73da3b38e18d279393a04cb43ddded0e350
 # image with it.
 ARG SOURCE_DATE_EPOCH=0
 
+# The release name, compiled into the program (`enclave::RELEASE`): the hand-over protocol
+# checks successor statements against it. It is part of the measurements, so a release is
+# reproduced with the same name (build.sh --release).
+ARG CREDENTIALS_RELEASE=
+
 # RUSTUP_TOOLCHAIN makes rustup use the toolchain of the image as it is: rust-toolchain.toml
 # would also ask for rustfmt and clippy, which the build does not need.
 ENV CARGO_INCREMENTAL=0 \
     TZ=UTC \
     LC_ALL=C \
     SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH} \
+    CREDENTIALS_RELEASE=${CREDENTIALS_RELEASE} \
     RUSTUP_TOOLCHAIN=1.97.1-x86_64-unknown-linux-musl \
     RUSTFLAGS="-C target-feature=+crt-static --remap-path-prefix=/build=/src --remap-path-prefix=/usr/local/cargo=/cargo --remap-path-prefix=/usr/local/rustup=/rustup"
 

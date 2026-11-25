@@ -389,6 +389,38 @@ impl Ledger {
         }
         self.spends.push_back((at, spend));
     }
+
+    /// The rules and the payments counted, to move them to a successor node.
+    pub fn snapshot(&self) -> LedgerState {
+        LedgerState {
+            rules: self.rules.clone(),
+            issued_ms: self.issued_ms,
+            spends: self.spends.iter().cloned().collect(),
+        }
+    }
+
+    /// A ledger from a [`Ledger::snapshot`], within the bounds of a ledger.
+    pub fn from_state(state: LedgerState) -> Result<Self> {
+        if state.rules.len() > MAX_RULES || state.spends.len() > MAX_SPENDS {
+            return Err(Error::LimitsInvalid {
+                rule: "more rules or payments than a ledger holds",
+            });
+        }
+        Ok(Self {
+            rules: state.rules,
+            issued_ms: state.issued_ms,
+            spends: state.spends.into(),
+        })
+    }
+}
+
+/// The content of a [`Ledger`], as a hand-over moves it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct LedgerState {
+    pub rules: Vec<LimitRule>,
+    pub issued_ms: u64,
+    pub spends: Vec<(u64, Spend)>,
 }
 
 /// The key a node seals its own state into the log with: derived from the node key, so only

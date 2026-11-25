@@ -6,6 +6,7 @@ members = [
     "crates/attest",
     "crates/cli",
     "crates/client",
+    "crates/continuity",
     "crates/enclave",
     "crates/engine",
     "crates/host",
@@ -26,6 +27,7 @@ repository = "https://github.com/BloubHQ/credentials"
 
 [workspace.dependencies]
 attest = { path = "crates/attest" }
+continuity = { path = "crates/continuity" }
 engine = { path = "crates/engine" }
 transport = { path = "crates/transport" }
 server = { path = "crates/server" }
@@ -85,6 +87,12 @@ ciborium = { version = "0.2", default-features = false, features = ["std"] }
 rustls-pki-types = { version = "1", features = ["std"] }
 webpki = { package = "rustls-webpki", version = "0.103", default-features = false, features = ["ring", "std"] }
 zeroize = { version = "1", features = ["derive"] }
+# Device transfer: SPAKE2 (RFC 9382) of RustCrypto, the PAKE crate of the current
+# generation (curve25519-dalek 5, sha2 0.11, hkdf 0.13). A pre-release: pinned.
+spake2 = { version = "=0.5.0-pre.0", default-features = false }
+# Test-only certificates (test Nitro and Sigstore roots, generated at run time).
+rcgen = { version = "0.14", default-features = false, features = ["ring", "crypto"] }
+time = { version = "0.3", default-features = false }
 # The bindings of the client crate: Swift and Kotlin (UniFFI), JavaScript (wasm-bindgen).
 uniffi = { version = "0.32", default-features = false }
 wasm-bindgen = "0.2"

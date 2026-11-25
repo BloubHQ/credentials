@@ -14,6 +14,8 @@ cargo-fuzz = true
 [dependencies]
 attest = { path = "../attest" }
 engine = { path = "../engine" }
+continuity = { path = "../continuity" }
+client = { path = "../client" }
 sandbox = { path = "../sandbox" }
 libfuzzer-sys = "0.4"
 serde_json = "1"
@@ -105,6 +107,41 @@ bench = false
 [[bin]]
 name = "owner_waits"
 path = "fuzz_targets/owner_waits.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "sigstore_bundle"
+path = "fuzz_targets/sigstore_bundle.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fulcio_certificate"
+path = "fuzz_targets/fulcio_certificate.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "successor_statement"
+path = "fuzz_targets/successor_statement.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "handover_package"
+path = "fuzz_targets/handover_package.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "key_transfer"
+path = "fuzz_targets/key_transfer.rs"
 test = false
 doc = false
 bench = false

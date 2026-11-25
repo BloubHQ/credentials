@@ -31,7 +31,16 @@ Rust names; Swift and Kotlin use the same names in camel case (`verifyNode`), Ja
 | `verify_node(document, nonce, measurements_json, identity_json)` | `VerifiedNode` | Verifies the attestation document of the node and that it vouches for the identity |
 | `verify_attestation_reply(reply_json, nonce, measurements_json)` | `VerifiedNode` | The same, on the `{identity, document}` answer of `GET /attestation` |
 | `VerifiedNode::release()`, `module_id()`, `timestamp_ms()`, `verified_ms()`, `pcr(index)`, `identity_json()`, `log_key()` | | What the verified document states |
-| `grant(device_key, user_key, node: VerifiedNode, owner, valid_for_secs, pins_json)` | sealed grant JSON | Grants the node the user key; pins each record given |
+| `grant(device_key, user_key, node: VerifiedNode, owner, valid_for_secs, pins_json)` | sealed grant JSON | Grants the node the user key; pins each record given. The node may hand the grant over to a node of a newer release signed by the release workflow |
+| `grant_without_successor(...)` (same arguments) | sealed grant JSON | The same, but the grant never moves to a successor node |
+| `verify_successor(document, nonce, statement, bundle, previous_release, identity_json, trusted_root_json?)` | `VerifiedNode` | When the node the owner granted to is gone: verifies a node of a newer release against the signed successor statement of `previous_release` (`successor.json`, `successor.sigstore.json`) |
+| `VerifiedNode::successor_of()` | `String?` | The release a successor-verified node succeeds |
+| `regrant(device_key, user_key, node, owner, valid_for_secs, pins_json, policy: SuccessorPolicy, owner_approved)` | sealed grant JSON | Grants to a node from `verify_successor` if the owner's policy allows: `Automatic`, `AskOwner` (needs `owner_approved`), `Never` |
+| `generate_backup_key()` | `String` | A random backup key, for the platform's end-to-end encrypted store only |
+| `wrap_keys(backup_key, owner, keys: [BackedUpKey])` | backup blob JSON | The keys encrypted under the backup key (format `credentials-key-backup/v1`) |
+| `unwrap_keys(backup_key, owner, blob)` | `[BackedUpKey]` | The keys of a blob, for its owner only |
+| `start_transfer()` | `TransferSender` | The old device's side of a 6-digit transfer: `code()`, `offer()`, `seal(answer, owner, keys)`, `attempts_left()` |
+| `join_transfer(code, offer_json)` | `TransferReceiver` | The new device's side: `answer()`, then `open(sealed)` gives `TransferredKeys {owner, keys}` |
 | `revoke(device_key, owner, identity_json)` | revocation JSON | Takes the user key back |
 | `endorse_device(device_key, owner, identity_json, new_device_public_key)` | endorsement JSON | Adds another device of the owner on the node |
 | `retire_device(device_key, owner, identity_json, device_public_key)` | retirement JSON | Withdraws another device |
@@ -87,6 +96,56 @@ http.post("$url/grant", sealed)
 
 The Kotlin package is `uniffi.client` and the Swift module `client` (UniFFI's defaults).
 
+### When the node changes
+
+A node of a newer release takes over grants by itself (`docs/design.md`, section 10): the app
+has nothing to do. When the old node is gone instead (it crashed), the app re-grants on its
+next start, after checking the new node against the successor statement of the release it had
+granted to:
+
+```kotlin
+val nonce = nonce()
+val reply = http.get("$url/attestation?nonce=${nonce.toB64()}")
+val node = verifySuccessor(document, nonce, successorJson, bundleJson, "v1.0.0", identity, null)
+val sealed = regrant(deviceKey, userKey, node, "alice", 3600uL, listOf(recordJson),
+                     SuccessorPolicy.ASK_OWNER, ownerApproved = askTheOwner(node.release()))
+```
+
+`verify_successor` refuses a downgrade, a statement of another release than `previous_release`,
+a statement not signed by the release workflow of this repository at the tag of the newer
+release (Sigstore: Fulcio certificate chain, signer, Rekor signed entry timestamp and inclusion
+proof, all checked offline), and a node whose PCRs are not the statement's. The Sigstore trust
+root compiled in is empty until it is committed: until then, pass a `trusted_root.json` the app
+fetched through Sigstore's TUF repository, or every statement is refused.
+
+### A new phone
+
+Two ways to bring the device and user keys to a new phone, both without the keys ever being
+readable on the way:
+
+- **Backup.** `generate_backup_key()` once; store it only in iCloud Keychain (a synchronizable
+  item) or Google Block Store (`setShouldBackupToCloud(true)`), which both encrypt end to end
+  with the device passcode. `wrap_keys` gives the blob (JSON: `format`
+  `credentials-key-backup/v1`, `owner`, `created_ms`, `nonce`, `ciphertext`; XChaCha20-Poly1305
+  under HKDF-SHA256 of the backup key, with format, owner and time as additional data), which
+  may be stored anywhere. On the new phone, `unwrap_keys` with the restored backup key. There is
+  no passphrase mode on purpose: a passphrase a person remembers can be guessed offline from
+  the blob.
+- **Transfer with a 6-digit code.** The old phone calls `start_transfer()` and shows `code()`;
+  the messages go through any relay:
+
+  ```kotlin
+  // old phone                                   // new phone
+  val sender = startTransfer(); show(sender.code())
+  send(sender.offer())                           val receiver = joinTransfer(typedCode, offer)
+                                                 send(receiver.answer())
+  send(sender.seal(answer, "alice", keys))       val got = receiver.open(sealed)
+  ```
+
+  SPAKE2 runs on the code, so a recorded transfer gives nothing to test guesses against; each
+  side confirms the other (HMAC over the transcript) before any key is sent. Three wrong codes
+  end the code, a transfer lasts five minutes, and each side seals or opens once.
+
 ### Errors
 
 Every function fails with one error type, `ClientError`, whose variant is a stable code
@@ -103,7 +162,10 @@ which never holds a secret and may change.
 | `attestation_refused` | The document was refused; `reason` names the check: `nonce_mismatch`, `unknown_measurement`, `debug_enclave`, `chain_untrusted`, `signature_invalid`, `certificate_not_valid_at`, `not_cbor`, ... |
 | `binding_mismatch` | The document verifies but its user data is not the report data of the identity |
 | `verification_expired` | The `VerifiedNode` is older than five minutes |
-| `refused` | The engine refused: a policy that breaks a rule, an invalid record, too many pins |
+| `refused` | The engine refused: a policy that breaks a rule, an invalid record, too many pins; or a re-grant the owner's policy does not allow |
+| `successor_refused` | A successor statement or its node was refused; `reason` names the check: `downgrade`, `not_for_this_release`, `signer_mismatch`, `chain_untrusted`, `signature_invalid`, `log_proof_invalid`, `bundle_invalid`, `trust_root_empty`, ... (a refused attestation of the node is `attestation_refused`) |
+| `transfer_refused` | A wrong code or a changed message (with the attempts left), too many wrong codes, a transfer older than five minutes, or one already done |
+| `backup_refused` | Another backup key, another owner, or a changed blob |
 
 ## Builds
 

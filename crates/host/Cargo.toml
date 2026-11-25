@@ -11,6 +11,7 @@ repository.workspace = true
 
 [dependencies]
 engine.workspace = true
+continuity.workspace = true
 relay.workspace = true
 server.workspace = true
 thiserror.workspace = true

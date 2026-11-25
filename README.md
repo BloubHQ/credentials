@@ -306,6 +306,7 @@ credentials verify log.jsonl <node-public-key>                   # the whole cha
 credentials verify log.jsonl <node-public-key> --head head.json  # must end at a signed checkpoint
 credentials verify log.jsonl <node-public-key> --owner alice     # one owner's chain
 credentials verify log.jsonl <node-public-key> --owner alice --user-key key.txt   # with the details
+credentials verify old.jsonl <old-node-key> --next new.jsonl     # one chain across a hand-over
 ```
 
 ## Running a node
@@ -370,7 +371,8 @@ flowchart LR
 - **Boot.** The program refuses to start unless the kernel draws randomness from the NSM
   (`nsm-hwrng`), then generates a fresh node key. There is no sealed storage on Nitro: **a
   restarted enclave is a new node** with a new identity and a new log file, and owners grant
-  to it again (grants are sealed to one node's key and never survive a restart anyway).
+  to it again (grants are sealed to one node's key and never survive a restart anyway),
+  unless the old node handed over to it (below).
 - **API.** The HTTP API of `credentials serve` (the same server code, from the
   [`server`](crates/server) crate) on vsock port 5000, plus `GET /attestation?nonce=<base64url>`,
   which answers `{"identity": <NodeIdentity>, "document": <base64url>}`. The document is a
@@ -459,6 +461,43 @@ curl -s "http://127.0.0.1:8700/attestation?nonce=$(head -c 32 /dev/urandom | bas
 
 Start `credentials host` first or right after: the node connects to its log writer at boot and
 stops if it cannot. `credentials host` is described in [crates/host](crates/host).
+
+### Hand over to a new release
+
+A restarted enclave is a new node, but a node does not have to lose its owners when a new
+release comes out: it hands its state to a node of the newer release (`docs/design.md`,
+section 10).
+
+```sh
+nitro-cli run-enclave --eif-path enclave-v1.1.0.eif --cpu-count 2 --memory 1024 --enclave-cid 17
+credentials hand-over --from-cid 16 --to-cid 17 \
+  --statement successor.json --bundle successor.sigstore.json
+credentials verify old.jsonl <old node key> --next new.jsonl --head new.jsonl.head.json
+```
+
+- **Successor statement.** Each release publishes `successor.json` ("release X may hand over
+  to these measurements of release Y") and `successor.sigstore.json`, signed by the release
+  workflow with Sigstore keyless signing and logged in Rekor. Both nodes verify it offline
+  (`crates/continuity`): the Fulcio certificate chain to a pinned root, the signer (the
+  release workflow of this repository at the tag of Y, on a GitHub-hosted runner), the Rekor
+  signed entry timestamp and inclusion proof. Y must be newer than X.
+- **Mutual attestation.** The old node hands over only to an enclave whose PCRs are Y's in
+  the statement, the new node takes over only from an enclave whose PCRs are X's; each checks
+  the other's NSM document over its own nonce and its binding to the node identity.
+- **What moves.** Devices, retired devices, record floors and spending limits of every owner,
+  and the user keys of grants that allow a successor (the default; `credentials grant
+  --no-successor` or `client::grant_without_successor` keep a grant on its node). The state
+  is sealed (HPKE) to the new node's key; the host carries ciphertext over vsock port 5003.
+- **One log.** The old node's last entry is the hand-over, the new node's first entry names
+  its hash; `credentials verify --next` checks one chain across both, and the old node refuses
+  every act after it.
+- **If the old node is gone**, apps re-grant: `client::verify_successor` checks the new node
+  against the statement of the release the owner had granted to, and `client::regrant`
+  grants under the owner's policy.
+- **Not yet active.** The Sigstore trust root compiled into the nodes
+  (`crates/continuity/trust/trusted_root.json`) is empty until it is committed: until then
+  every statement is refused. The hand-over is tested with test roots only (no Nitro hardware,
+  no Sigstore service in the tests).
 
 ## What it guarantees
 
@@ -559,7 +598,8 @@ explains each.
 | [`host`](crates/host) | The program on the parent instance of an enclave, run as `credentials host` |
 | [`verify`](crates/verify) | Verifier of node logs, run as `credentials verify` |
 | [`attest`](crates/attest) | Verifier of AWS Nitro Enclaves attestation documents, run as `credentials attest` |
-| [`client`](crates/client) | The app side for iOS, Android and the web: keys, node attestation, grants, records and calls, bound to Swift and Kotlin (UniFFI) and JavaScript (wasm-bindgen) |
+| [`client`](crates/client) | The app side for iOS, Android and the web: keys, node attestation, grants, records and calls, re-grants to a successor node, key backup and 6-digit device transfer, bound to Swift and Kotlin (UniFFI) and JavaScript (wasm-bindgen) |
+| [`continuity`](crates/continuity) | Node continuity: successor statements signed with Sigstore keyless signing and verified offline, and the attested hand-over between two nodes |
 | [`sandbox`](crates/sandbox) | The WebAssembly sandbox of the `run` step (wasmi): fuel and memory limits, inputs in and one output out, reviewed library modules |
 | [`cli`](crates/cli) | The `credentials` tool: keys, policies, records, grants, calls, a node server, and `credentials host` |
 

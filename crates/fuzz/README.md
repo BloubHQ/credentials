@@ -18,6 +18,11 @@ it needs a nightly compiler.
 | `log_entry` | JSON | `SignedEntry` deserialization, `SignedEntry::hash`, `verify_chain` on a one-entry chain, and that `ChainVerifier` agrees with it. |
 | `decimal_amount` | Bytes, read as lossy UTF-8; the first nine also as minor units and an exponent | `limits::scaled`, the decimal amounts of spending limits, `show`, `decimal` and `from_minor`: no panic; an accepted amount prints and reads back the same, and minor units scale exactly. |
 | `owner_waits` | JSON, then the bytes as a code | `SealedAnswer`, `Approval`, `SpendingLimits`, `Pending` and `SignedCall` (a resume) deserialization, and `Node::answer`, `approve`, `set_limits` and `run` on a node with nothing waiting and no grant; `DeviceKey::answer_challenge` of the bytes; errors, never a panic. |
+| `sigstore_bundle` | JSON | `continuity::sigstore::Bundle` deserialization and `verify` against a trust root whose keys are not keys: every parser of the bundle (protobuf-JSON integers, base64, the certificate) runs, and nothing verifies. |
+| `fulcio_certificate` | DER, read also as a log entry body and as UTF-8 | The minimal DER and X.509 reader of the continuity crate (extensions, subject alternative names, the Fulcio OIDs, duplicates refused), the `hashedrekord` body check, and the checkpoint (signed note) reader; errors, never a panic. |
+| `successor_statement` | JSON, a release name, and 16 bytes of index and size then 32-byte hashes | `Statement::from_json` (a statement that reads is never a downgrade), `SignedStatement` and `TrustRoot` deserialization, `release::Version` order, and the RFC 6962 inclusion proof check on the hashes. |
+| `handover_package` | JSON, also as a length-framed message | The frames of the hand-over protocol (`continuity::wire`), `HandOver` deserialization, and `Node::take_over` on a fresh node, which must refuse a package not sealed to it and log nothing. |
+| `key_transfer` | UTF-8 | `client::unwrap_keys` with a fixed backup key, a transfer offer and a sealed transfer with a fixed code, and an answer to a real offer: none opens, nothing panics. |
 
 The HTTP response parser in `crates/engine/src/response.rs` is not public, so it has no
 target here.

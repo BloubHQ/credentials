@@ -63,6 +63,29 @@ pub enum ClientError {
         /// What is wrong.
         detail: String,
     },
+    /// A successor statement, or the node it was checked for, was refused; `reason` is a
+    /// stable code of the check that failed (`downgrade`, `not_for_this_release`,
+    /// `signer_mismatch`, `chain_untrusted`, `log_proof_invalid`, ...).
+    #[error("successor refused ({reason}): {detail}")]
+    SuccessorRefused {
+        /// The stable code of the failed check.
+        reason: String,
+        /// What is wrong.
+        detail: String,
+    },
+    /// A device transfer was refused: a wrong code, a changed message, too many attempts, or
+    /// a transfer that expired.
+    #[error("transfer refused: {detail}")]
+    TransferRefused {
+        /// What is wrong.
+        detail: String,
+    },
+    /// A key backup cannot be opened: another backup key, another owner, or a changed blob.
+    #[error("backup refused: {detail}")]
+    BackupRefused {
+        /// What is wrong.
+        detail: String,
+    },
 }
 
 impl ClientError {
@@ -77,6 +100,9 @@ impl ClientError {
             ClientError::BindingMismatch { .. } => "binding_mismatch",
             ClientError::VerificationExpired { .. } => "verification_expired",
             ClientError::Refused { .. } => "refused",
+            ClientError::SuccessorRefused { .. } => "successor_refused",
+            ClientError::TransferRefused { .. } => "transfer_refused",
+            ClientError::BackupRefused { .. } => "backup_refused",
         }
     }
 

@@ -155,6 +155,9 @@ pub fn pin_record(device_key: String, record_json: String) -> Result<String> {
 /// Only a [`VerifiedNode`] can be granted to, so the attestation of the node is always
 /// checked first, and it must have been verified within the last five minutes
 /// ([`MAX_AGE_MS`]).
+///
+/// The grant allows the node to hand it over to a node of a newer release signed by the
+/// release workflow (`docs/design.md`, section 10); [`grant_without_successor`] does not.
 #[cfg_attr(not(target_arch = "wasm32"), uniffi::export)]
 pub fn grant(
     device_key: String,
@@ -163,6 +166,48 @@ pub fn grant(
     owner: String,
     valid_for_secs: u64,
     pins_json: Vec<String>,
+) -> Result<String> {
+    grant_with(
+        device_key,
+        user_key,
+        &node,
+        owner,
+        valid_for_secs,
+        pins_json,
+        true,
+    )
+}
+
+/// [`grant`], but the node never hands this grant over to a successor: when the node is
+/// replaced by a newer release, the owner grants again.
+#[cfg_attr(not(target_arch = "wasm32"), uniffi::export)]
+pub fn grant_without_successor(
+    device_key: String,
+    user_key: String,
+    node: Arc<VerifiedNode>,
+    owner: String,
+    valid_for_secs: u64,
+    pins_json: Vec<String>,
+) -> Result<String> {
+    grant_with(
+        device_key,
+        user_key,
+        &node,
+        owner,
+        valid_for_secs,
+        pins_json,
+        false,
+    )
+}
+
+pub(crate) fn grant_with(
+    device_key: String,
+    user_key: String,
+    node: &VerifiedNode,
+    owner: String,
+    valid_for_secs: u64,
+    pins_json: Vec<String>,
+    allow_successor: bool,
 ) -> Result<String> {
     // Both key strings are read (and erased) before either can fail.
     let device = keys::device_key(device_key);
@@ -179,6 +224,9 @@ pub fn grant(
         });
     }
     let mut terms = GrantTerms::at(&owner, now, Duration::from_secs(valid_for_secs));
+    if !allow_successor {
+        terms = terms.without_successor();
+    }
     for json in &pins_json {
         let record = record(json)?;
         if record.owner != owner {

@@ -452,6 +452,43 @@ curl -s "http://127.0.0.1:8700/attestation?nonce=$(head -c 32 /dev/urandom | bas
 できなければ停止します。`credentials host` については [crates/host](../../crates/host)
 で説明しています。
 
+### 新しいリリースへの引き継ぎ
+
+再起動したエンクレーブは新しいノードですが、新しいリリースが出たからといってノードが所有者を
+失う必要はありません。ノードは状態を新しいリリースのノードへ引き継ぎます（`docs/design.md`
+10 節）。
+
+```sh
+nitro-cli run-enclave --eif-path enclave-v1.1.0.eif --cpu-count 2 --memory 1024 --enclave-cid 17
+credentials hand-over --from-cid 16 --to-cid 17 \
+  --statement successor.json --bundle successor.sigstore.json
+credentials verify old.jsonl <旧ノードの鍵> --next new.jsonl --head new.jsonl.head.json
+```
+
+- **後継ステートメント。** 各リリースは `successor.json`（「リリース X はリリース Y のこの
+  計測値へ引き継げる」）と `successor.sigstore.json` を公開します。リリースワークフローが
+  Sigstore のキーレス署名で署名し、Rekor に記録します。両ノードはオフラインで検証します
+  （`crates/continuity`）：固定ルートまでの Fulcio 証明書チェーン、署名者（GitHub ホストの
+  ランナーで Y のタグに対して実行されたこのリポジトリのリリースワークフロー）、Rekor の署名付き
+  エントリタイムスタンプと包含証明。Y は X より新しくなければなりません。
+- **相互アテステーション。** 旧ノードは PCR がステートメントの Y の値であるエンクレーブにだけ
+  引き継ぎ、新ノードは PCR が X の値であるエンクレーブからだけ引き継ぎます。それぞれ自分の
+  nonce に対する相手の NSM ドキュメントとノード ID への結び付けを確認します。
+- **移るもの。** すべての所有者のデバイス、廃止済みデバイス、レコードの下限、支出上限、
+  そして後継を許可したグラントのユーザー鍵（既定。`credentials grant --no-successor` または
+  `client::grant_without_successor` でグラントをそのノードに留められます）。状態は新ノードの
+  鍵へ封印（HPKE）され、ホストは vsock 5003 番ポートで暗号文だけを運びます。
+- **一つのログ。** 旧ノードの最後のエントリが引き継ぎで、新ノードの最初のエントリがその
+  ハッシュを指します。`credentials verify --next` が両ノードにまたがる一本のチェーンを検査し、
+  旧ノードは引き継ぎ後のすべての操作を拒否します。
+- **旧ノードが失われた場合**はアプリが再グラントします。`client::verify_successor` が所有者が
+  グラントしたリリースのステートメントで新ノードを確認し、`client::regrant` が所有者の
+  ポリシーに従ってグラントします。
+- **まだ無効。** ノードに組み込まれる Sigstore トラストルート
+  （`crates/continuity/trust/trusted_root.json`）はコミットされるまで空で、それまでは
+  すべてのステートメントが拒否されます。引き継ぎはテスト用ルートでのみ試験しています
+  （テストに Nitro ハードウェアや Sigstore サービスは使いません）。
+
 ## 保証すること
 
 - シークレットがエンジンから出るのは、確定したログエントリの後に、`Transport` を通じて、所有者が

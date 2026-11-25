@@ -43,6 +43,28 @@ pub mod b64_array {
     }
 }
 
+/// Serde form of a boxed fixed-size byte array as base64 (as [`b64_array`]; boxed to keep a
+/// rare variant of a large enum small).
+pub mod b64_box_array {
+    use serde::{Deserializer, Serializer};
+
+    /// Serializes the array.
+    #[allow(clippy::borrowed_box)]
+    pub fn serialize<S: Serializer, const N: usize>(
+        value: &Box<[u8; N]>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        super::b64_array::serialize(value, serializer)
+    }
+
+    /// Deserializes the array; any other length is an error.
+    pub fn deserialize<'de, D: Deserializer<'de>, const N: usize>(
+        deserializer: D,
+    ) -> Result<Box<[u8; N]>, D::Error> {
+        super::b64_array::deserialize(deserializer).map(Box::new)
+    }
+}
+
 /// Serde form of a list of byte vectors as a list of base64 strings.
 pub mod b64_list {
     use base64::Engine;

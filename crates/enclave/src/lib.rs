@@ -17,7 +17,32 @@
 //! The parts that need Nitro hardware (the `nitro` module) are compiled on Linux only; the
 //! attestation endpoint ([`attestation`]) is portable and tested with a stand-in for the NSM.
 
+//!
+//! Node continuity: a node of a release built by the release workflow (which sets
+//! `CREDENTIALS_RELEASE`, [`RELEASE`]) also listens on vsock port
+//! [`continuity::wire::HANDOVER_PORT`] for the hand-over protocol, driven by
+//! `credentials host hand-over`: it hands its state to a node of a newer release named by a
+//! successor statement, or takes over from one. See `docs/design.md`, section 10.
+
 pub mod attestation;
+
+/// The release this image was built as (`CREDENTIALS_RELEASE` at build time, set by
+/// `build/build.sh` from the tag). `None` for a build that is not a release: such a node
+/// neither hands over nor takes over, as no successor statement can name it.
+pub const RELEASE: Option<&str> = option_env!("CREDENTIALS_RELEASE");
+
+/// The checks of the hand-over for this image, or why it cannot take part (not a release, or
+/// no Sigstore trust root compiled in).
+pub fn hand_over_checks() -> Result<continuity::Checks, String> {
+    let release = RELEASE
+        .filter(|release| !release.is_empty())
+        .ok_or("this image is not a release build (no CREDENTIALS_RELEASE)")?;
+    let checks = continuity::Checks::production(release).map_err(|e| e.to_string())?;
+    if checks.trust.is_empty() {
+        return Err(continuity::Error::TrustRootEmpty.to_string());
+    }
+    Ok(checks)
+}
 
 #[cfg(target_os = "linux")]
 pub mod nitro;

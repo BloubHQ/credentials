@@ -419,6 +419,35 @@ curl -s "http://127.0.0.1:8700/attestation?nonce=$(head -c 32 /dev/urandom | bas
 先启动 `credentials host`，或紧接着启动：节点在启动时会连接其日志写入端，连接不上就会停止。
 `credentials host` 的说明见 [crates/host](../../crates/host)。
 
+### 移交给新版本
+
+重启的 enclave 是一个新节点，但新版本发布时节点不必失去它的所有者：它把状态移交给更新版本的
+节点（`docs/design.md` 第 10 节）。
+
+```sh
+nitro-cli run-enclave --eif-path enclave-v1.1.0.eif --cpu-count 2 --memory 1024 --enclave-cid 17
+credentials hand-over --from-cid 16 --to-cid 17 \
+  --statement successor.json --bundle successor.sigstore.json
+credentials verify old.jsonl <旧节点密钥> --next new.jsonl --head new.jsonl.head.json
+```
+
+- **后继声明。** 每个版本发布 `successor.json`（“版本 X 可以移交给版本 Y 的这些度量值”）和
+  `successor.sigstore.json`，由发布工作流用 Sigstore 无密钥签名并记录到 Rekor。两个节点都离线
+  验证（`crates/continuity`）：到固定根的 Fulcio 证书链、签名者（在 GitHub 托管运行器上、以 Y
+  的标签运行的本仓库发布工作流）、Rekor 签名条目时间戳和包含证明。Y 必须比 X 新。
+- **双向证明。** 旧节点只移交给 PCR 等于声明中 Y 值的 enclave，新节点只从 PCR 等于 X 值的
+  enclave 接管；双方都检查对方针对自己 nonce 的 NSM 文档及其与节点身份的绑定。
+- **移交的内容。** 每个所有者的设备、已停用设备、记录下限、支出限额，以及允许后继的授权的
+  用户密钥（默认允许；`credentials grant --no-successor` 或 `client::grant_without_successor`
+  让授权留在原节点）。状态用新节点的密钥封装（HPKE），主机只经 vsock 5003 端口传递密文。
+- **一条日志。** 旧节点的最后一条是移交条目，新节点的第一条指向它的哈希；
+  `credentials verify --next` 检查跨两个节点的一条链，旧节点移交后拒绝一切操作。
+- **旧节点已不在时**，应用重新授权：`client::verify_successor` 用所有者曾授权的版本的声明检查
+  新节点，`client::regrant` 按所有者的策略授权。
+- **尚未启用。** 编译进节点的 Sigstore 信任根（`crates/continuity/trust/trusted_root.json`）在
+  提交之前为空，在此之前所有声明都会被拒绝。移交只用测试根测试过（测试中没有 Nitro 硬件，
+  也不访问 Sigstore 服务）。
+
 ## 它保证什么
 
 - 密钥只会以一个请求的字节形式离开引擎，发往所有者签名的目标，经由 `Transport`，
