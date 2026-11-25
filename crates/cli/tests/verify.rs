@@ -17,7 +17,7 @@ use engine::grant::{GrantTerms, RecordPin};
 use engine::keys::{CallerKey, DeviceKey, NodeKey, UserKey};
 use engine::log::{Event, Log, MemorySink, SignedEntry, owner_entries};
 use engine::node::{Clock, Node, SystemClock};
-use engine::policy::{Caller, FieldSpec, Operation, Policy};
+use engine::policy::{Caller, FieldSpec, Input, Operation, Policy};
 use engine::record::Record;
 
 struct Written {
@@ -39,10 +39,9 @@ fn write_log(name: &str) -> Written {
             operations: vec!["hash".into()],
             limit: None,
         }],
-        operations: vec![Operation::Derive {
-            name: "hash".into(),
-            template: "{{ hex(hmac_sha256(key, $input)) }}".into(),
-        }],
+        operations: vec![
+            Operation::derive("hash", "{{ hex(hmac_sha256(key, $input)) }}").input(Input::any()),
+        ],
     };
     let mut values = Fields::new();
     values.insert("key", b"0123456789abcdef".to_vec()).unwrap();

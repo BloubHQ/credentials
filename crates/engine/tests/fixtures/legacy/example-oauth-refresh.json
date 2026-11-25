@@ -1,0 +1,29 @@
+{
+  "fields": [
+    {"name": "client_id", "secret": false},
+    {"name": "client_secret", "secret": true},
+    {"name": "refresh_token", "secret": true},
+    {"name": "access_token", "secret": true, "optional": true}
+  ],
+  "callers": [{"name": "app", "key": "<caller public key>", "operations": ["refresh"],
+               "limit": {"count": 10, "window_ms": 60000}}],
+  "operations": [
+    {"kind": "http", "name": "refresh",
+     "destinations": [{"host": "auth.example.com", "port": 443}],
+     "steps": [{
+       "request": {"from": "fixed", "method": "POST", "path": "/oauth/token"},
+       "inject": [
+         {"target": {"kind": "header", "name": "Content-Type"},
+          "template": "application/x-www-form-urlencoded"},
+         {"target": {"kind": "body"},
+          "template": "grant_type=refresh_token&refresh_token={{pct(refresh_token)}}&client_id={{pct(client_id)}}&client_secret={{pct(client_secret)}}"}
+       ],
+       "capture": [
+         {"source": {"from": "json", "pointer": "/access_token"},
+          "into": {"kind": "field", "name": "access_token"}},
+         {"source": {"from": "json", "pointer": "/refresh_token"},
+          "into": {"kind": "field", "name": "refresh_token"}, "optional": true}
+       ]
+     }]}
+  ]
+}

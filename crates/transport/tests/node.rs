@@ -20,7 +20,8 @@ use engine::keys::{CallerKey, DeviceKey, NodeKey, UserKey};
 use engine::log::{MemorySink, verify_chain};
 use engine::node::{Clock, Node, SystemClock};
 use engine::policy::{
-    Caller, Destination, FieldSpec, Injection, Method, Operation, Policy, Step, StepRequest,
+    Caller, CallerRequest, Destination, FieldSpec, Injection, Method, Operation, Policy, Return,
+    Send,
 };
 use engine::record::Record;
 use engine::request::Request;
@@ -81,19 +82,14 @@ fn a_node_sends_through_tls_and_hands_back_the_response() {
             operations: vec!["call".into()],
             limit: None,
         }],
-        operations: vec![Operation::Http {
-            name: "call".into(),
-            destinations: vec![Destination::https("api.test")],
-            methods: vec![Method::Get],
-            paths: vec!["/user".into()],
-            caller_headers: vec![],
-            identity: None,
-            steps: vec![Step {
-                request: StepRequest::Caller,
-                inject: vec![Injection::header("Authorization", "Bearer {{token}}")],
-                capture: vec![],
-            }],
-        }],
+        operations: vec![
+            Operation::https("call", Destination::https("api.test"))
+                .then(
+                    Send::caller(CallerRequest::new([Method::Get]).paths(["/user"]))
+                        .inject(Injection::header("Authorization", "Bearer {{token}}")),
+                )
+                .then(Return::status().body()),
+        ],
     };
     let mut values = Fields::new();
     values.insert("token", TOKEN.to_vec()).unwrap();

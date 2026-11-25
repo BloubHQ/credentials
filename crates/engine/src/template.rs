@@ -108,9 +108,15 @@ impl Var {
         matches!(self, Var::Host | Var::Unix | Var::UnixMs | Var::Nonce)
     }
 
-    /// True when a derivation may read the variable.
+    /// True when a derivation (a `compute` or the `return` template of an operation with no
+    /// connection) may read the variable.
     pub fn in_derive(self) -> bool {
         matches!(self, Var::Input | Var::Unix | Var::UnixMs | Var::Nonce)
+    }
+
+    /// True when a `compute` step of an operation with a connection may read the variable.
+    pub fn in_compute(self) -> bool {
+        matches!(self, Var::Unix | Var::UnixMs | Var::Nonce)
     }
 
     /// True when the caller chooses the value.
@@ -355,9 +361,37 @@ pub enum NameKind {
     SecretTemp,
     /// A captured value not marked secret.
     PublicTemp,
+    /// A value a `compute` step rendered. It has exactly the properties of its template, so
+    /// for the analysis naming it is the same as writing its template in its place.
+    Computed(Props),
 }
 
-#[derive(Clone, Copy, Debug, Default)]
+/// The properties the analysis gives the output of a template (taint, control, key strength,
+/// guessability), kept for a name a `compute` step defines.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Props(Info);
+
+impl Props {
+    /// The most a value can be: tainted, chosen by the caller and guessable, never a secret
+    /// key. Given to a computed name that cannot be analysed (its template does not parse or
+    /// breaks a rule), so nothing built on it is ever handed back.
+    pub fn unknown() -> Self {
+        Props(Info {
+            tainted: true,
+            controlled: true,
+            caller: true,
+            secret_key: false,
+            guessable: true,
+        })
+    }
+
+    /// True when the value can hold a secret in reversible form.
+    pub fn tainted(self) -> bool {
+        self.0.tainted
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct Info {
     tainted: bool,
     controlled: bool,
@@ -560,6 +594,7 @@ fn analyze(expr: &Expr, kind: &dyn Fn(&str) -> NameKind) -> core::result::Result
                 controlled: true,
                 ..Info::default()
             },
+            NameKind::Computed(props) => props.0,
         },
         Expr::Var(v) => Info {
             controlled: v.controlled(),
@@ -769,6 +804,24 @@ impl Template {
             tainted |= analyze(expr, kind)?.tainted;
         }
         Ok(tainted)
+    }
+
+    /// The properties of the whole output: what a name a `compute` step defines from this
+    /// template is. Text around the expressions is fixed by the policy; the output is a
+    /// secret key only when it is one expression and nothing else.
+    pub fn props(&self, kind: &dyn Fn(&str) -> NameKind) -> core::result::Result<Props, Rule> {
+        let infos = self
+            .exprs()
+            .map(|e| analyze(e, kind))
+            .collect::<core::result::Result<Vec<_>, _>>()?;
+        let single = self.segments.len() == 1 && infos.len() == 1;
+        Ok(Props(Info {
+            tainted: infos.iter().any(|i| i.tainted),
+            controlled: infos.iter().any(|i| i.controlled),
+            caller: infos.iter().any(|i| i.caller),
+            secret_key: single && infos.first().is_some_and(|i| i.secret_key),
+            guessable: infos.iter().any(|i| i.guessable),
+        }))
     }
 
     /// True when the output depends on a guessable field in a way a guess can be checked

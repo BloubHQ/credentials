@@ -1,0 +1,28 @@
+{
+  "fields": [
+    {"name": "client_id", "secret": false},
+    {"name": "client_secret", "secret": true},
+    {"name": "refresh_token", "secret": true},
+    {"name": "access_token", "secret": true, "optional": true}
+  ],
+  "callers": [
+    {"name": "billing-agent", "key": "<caller public key>",
+     "operations": ["refresh", "call"], "limit": {"count": 100, "window_ms": 60000}}
+  ],
+  "operations": [
+    {"kind": "http", "name": "refresh",
+     "destinations": [{"host": "auth.example.com", "port": 443}],
+     "steps": [{
+       "request": {"from": "fixed", "method": "POST", "path": "/oauth/token"},
+       "inject": [{"target": {"kind": "body"},
+                   "template": "grant_type=refresh_token&refresh_token={{pct(refresh_token)}}&client_id={{pct(client_id)}}&client_secret={{pct(client_secret)}}"}],
+       "capture": [{"source": {"from": "json", "pointer": "/access_token"},
+                    "into": {"kind": "field", "name": "access_token"}}]
+     }]},
+    {"kind": "http", "name": "call",
+     "destinations": [{"host": "*.api.example.com", "port": 443}],
+     "methods": ["GET", "POST"], "paths": ["/v1/"], "caller_headers": ["Accept"],
+     "steps": [{"inject": [{"target": {"kind": "header", "name": "Authorization"},
+                            "template": "Bearer {{access_token}}"}]}]}
+  ]
+}

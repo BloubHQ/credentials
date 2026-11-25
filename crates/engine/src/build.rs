@@ -2,23 +2,31 @@
 //!
 //! ```
 //! use engine::keys::CallerKey;
-//! use engine::policy::{Caller, Capture, Destination, FieldSpec, Injection, Method, Operation,
-//!     Policy, Source, Step, Store};
+//! use engine::policy::{Caller, CallerRequest, Capture, Destination, FieldSpec, Injection,
+//!     Method, Operation, Policy, Receive, Return, Send, Source, Store};
 //!
 //! let app = CallerKey::generate();
 //! let policy = Policy::new()
 //!     .with_field(FieldSpec::secret("refresh_token"))
 //!     .with_field(FieldSpec::secret("access_token").optional())
-//!     .with_operation(Operation::http("refresh", Destination::https("auth.example.com")).step(
-//!         Step::fixed(Method::Post, "/oauth/token")
-//!             .inject(Injection::body("grant_type=refresh_token&refresh_token={{pct(refresh_token)}}"))
-//!             .capture(Capture::new(Source::json("/access_token"), Store::field("access_token"))),
-//!     ))
 //!     .with_operation(
-//!         Operation::http("call", Destination::https("api.example.com"))
-//!             .methods([Method::Get])
-//!             .paths(["/v1/"])
-//!             .step(Step::caller().inject(Injection::header("Authorization", "Bearer {{access_token}}"))),
+//!         Operation::https("refresh", Destination::https("auth.example.com"))
+//!             .then(Send::fixed(Method::Post, "/oauth/token").inject(Injection::body(
+//!                 "grant_type=refresh_token&refresh_token={{pct(refresh_token)}}",
+//!             )))
+//!             .then(Receive::response().capture(Capture::new(
+//!                 Source::json("/access_token"),
+//!                 Store::field("access_token"),
+//!             )))
+//!             .then(Return::status()),
+//!     )
+//!     .with_operation(
+//!         Operation::https("call", Destination::https("api.example.com"))
+//!             .then(
+//!                 Send::caller(CallerRequest::new([Method::Get]).paths(["/v1/repos/*"]))
+//!                     .inject(Injection::header("Authorization", "Bearer {{access_token}}")),
+//!             )
+//!             .then(Return::status().json("/name").json("/stars")),
 //!     )
 //!     .with_caller(Caller::new("agent", app.public(), ["refresh", "call"]).limit(100, 60_000));
 //! policy.validate().unwrap();
@@ -26,8 +34,9 @@
 
 use crate::keys::CallerPublicKey;
 use crate::policy::{
-    Caller, Capture, Destination, Exchange, FieldSpec, Identity, Injection, Limit, Method,
-    Operation, Policy, Source, Step, StepRequest, Store, Target,
+    BodyProjection, Caller, CallerRequest, Capture, Compute, Connection, Destination, FieldSpec,
+    Identity, Injection, Input, Limit, Method, Open, Operation, Policy, Projection, QueryRule,
+    Receive, Relay, Return, Send, Source, Step, StepRequest, Store, Target,
 };
 
 impl Policy {
@@ -167,47 +176,126 @@ impl Capture {
     }
 }
 
-impl Step {
-    /// A step that sends the request of the caller.
-    pub fn caller() -> Self {
+impl CallerRequest {
+    /// A contract that lets the caller use `methods` on the paths added with
+    /// [`CallerRequest::paths`]; no header and no query parameter yet.
+    pub fn new(methods: impl IntoIterator<Item = Method>) -> Self {
         Self {
-            request: StepRequest::Caller,
-            inject: Vec::new(),
-            capture: Vec::new(),
+            methods: methods.into_iter().collect(),
+            ..Self::default()
         }
     }
 
-    /// A step that sends a request the policy fixes, to the one destination of the operation.
+    /// Sets the path templates.
+    #[must_use]
+    pub fn paths<I, S>(mut self, list: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.paths = list.into_iter().map(Into::into).collect();
+        self
+    }
+
+    /// Sets the headers the caller may send.
+    #[must_use]
+    pub fn headers<I, S>(mut self, list: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.headers = list.into_iter().map(Into::into).collect();
+        self
+    }
+
+    /// Adds a query parameter the caller may send.
+    #[must_use]
+    pub fn query(mut self, rule: QueryRule) -> Self {
+        self.query.push(rule);
+        self
+    }
+
+    /// Allows `%25` in the path (off by default).
+    #[must_use]
+    pub fn encoded_percent(mut self, allow: bool) -> Self {
+        self.encoded_percent = allow;
+        self
+    }
+
+    /// Allows the reserved method-override parameter names (off by default).
+    #[must_use]
+    pub fn override_params(mut self, allow: bool) -> Self {
+        self.override_params = allow;
+        self
+    }
+}
+
+impl Send {
+    /// A `send` of the caller's request, within `contract` (HTTPS).
+    pub fn caller(contract: CallerRequest) -> Self {
+        Self {
+            request: Some(StepRequest::Caller(contract)),
+            ..Self::default()
+        }
+    }
+
+    /// A `send` of a request the policy fixes, to the one destination of the operation
+    /// (HTTPS).
     pub fn fixed(method: Method, path: &str) -> Self {
         Self {
-            request: StepRequest::Fixed {
+            request: Some(StepRequest::Fixed {
                 method,
                 path: path.into(),
                 destination: None,
-            },
-            inject: Vec::new(),
-            capture: Vec::new(),
+            }),
+            ..Self::default()
         }
     }
 
-    /// A step that sends a request the policy fixes, to `destination`.
+    /// A `send` of a request the policy fixes, to `destination` (HTTPS).
     pub fn fixed_to(method: Method, path: &str, destination: Destination) -> Self {
         Self {
-            request: StepRequest::Fixed {
+            request: Some(StepRequest::Fixed {
                 method,
                 path: path.into(),
                 destination: Some(destination),
-            },
-            inject: Vec::new(),
-            capture: Vec::new(),
+            }),
+            ..Self::default()
         }
     }
 
-    /// Adds an injection.
+    /// A `send` that writes a rendered template (TLS).
+    pub fn write(template: &str) -> Self {
+        Self {
+            template: Some(template.into()),
+            ..Self::default()
+        }
+    }
+
+    /// Adds an injection (HTTPS).
     #[must_use]
     pub fn inject(mut self, injection: Injection) -> Self {
         self.inject.push(injection);
         self
+    }
+}
+
+impl Receive {
+    /// A `receive` of the response of the `send` before it (HTTPS).
+    pub fn response() -> Self {
+        Self::default()
+    }
+
+    /// A `receive` up to the first of `until` (TLS).
+    pub fn until<I, S>(until: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        Self {
+            until: until.into_iter().map(Into::into).collect(),
+            capture: Vec::new(),
+        }
     }
 
     /// Adds a capture.
@@ -218,119 +306,152 @@ impl Step {
     }
 }
 
-impl Exchange {
-    /// Writes a rendered template.
-    pub fn send(template: &str) -> Self {
-        Exchange::Send {
-            template: template.into(),
-        }
+impl Return {
+    /// The status only (HTTPS), no relay (TLS).
+    pub fn status() -> Self {
+        Self::default()
     }
 
-    /// Reads up to the first of `until`.
-    pub fn expect<I, S>(until: I) -> Self
+    /// Lets a response header go back (HTTPS).
+    #[must_use]
+    pub fn header(mut self, name: &str) -> Self {
+        self.response
+            .get_or_insert_with(Projection::default)
+            .headers
+            .push(name.into());
+        self
+    }
+
+    /// Lets the whole response body go back (HTTPS).
+    #[must_use]
+    pub fn body(mut self) -> Self {
+        self.response.get_or_insert_with(Projection::default).body = Some(BodyProjection::All);
+        self
+    }
+
+    /// Lets the JSON member at `pointer` go back (HTTPS).
+    #[must_use]
+    pub fn json(mut self, pointer: &str) -> Self {
+        let projection = self.response.get_or_insert_with(Projection::default);
+        match &mut projection.body {
+            Some(BodyProjection::Json(pointers)) => pointers.push(pointer.into()),
+            _ => projection.body = Some(BodyProjection::Json(vec![pointer.into()])),
+        }
+        self
+    }
+
+    /// Relays the caller's sends that match one of `patterns` whole (TLS).
+    pub fn relay<I, S>(patterns: I) -> Self
     where
         I: IntoIterator<Item = S>,
         S: Into<String>,
     {
-        Exchange::Expect {
-            until: until.into_iter().map(Into::into).collect(),
-            capture: Vec::new(),
+        Self {
+            relay: Some(Relay {
+                sends: patterns.into_iter().map(Into::into).collect(),
+            }),
+            ..Self::default()
         }
     }
 
-    /// Adds a capture to an `expect`; on a `send` it does nothing.
-    #[must_use]
-    pub fn capture(mut self, capture: Capture) -> Self {
-        if let Exchange::Expect { capture: c, .. } = &mut self {
-            c.push(capture);
+    /// Hands back a rendered template (no connection).
+    pub fn output(template: &str) -> Self {
+        Self {
+            template: Some(template.into()),
+            ..Self::default()
         }
-        self
+    }
+}
+
+impl From<Open> for Step {
+    fn from(step: Open) -> Self {
+        Step::Open(step)
+    }
+}
+
+impl From<Send> for Step {
+    fn from(step: Send) -> Self {
+        Step::Send(step)
+    }
+}
+
+impl From<Receive> for Step {
+    fn from(step: Receive) -> Self {
+        Step::Receive(step)
+    }
+}
+
+impl From<Compute> for Step {
+    fn from(step: Compute) -> Self {
+        Step::Compute(step)
+    }
+}
+
+impl From<Return> for Step {
+    fn from(step: Return) -> Self {
+        Step::Return(step)
     }
 }
 
 impl Operation {
-    /// An HTTP operation to `destination`, with no steps yet.
-    pub fn http(name: &str, destination: Destination) -> Self {
-        Operation::Http {
+    fn opening(name: &str, connection: Connection, destination: Destination) -> Self {
+        Self {
             name: name.into(),
-            destinations: vec![destination],
-            methods: Vec::new(),
-            paths: Vec::new(),
-            caller_headers: Vec::new(),
-            identity: None,
+            input: None,
+            steps: vec![Step::Open(Open {
+                connection,
+                destinations: vec![destination],
+                identity: None,
+            })],
+        }
+    }
+
+    /// An operation that opens HTTPS to `destination`; add its steps with
+    /// [`Operation::then`].
+    pub fn https(name: &str, destination: Destination) -> Self {
+        Self::opening(name, Connection::Https, destination)
+    }
+
+    /// An operation that opens a TLS stream to `destination`.
+    pub fn tls(name: &str, destination: Destination) -> Self {
+        Self::opening(name, Connection::Tls, destination)
+    }
+
+    /// An operation with no connection.
+    pub fn local(name: &str) -> Self {
+        Self {
+            name: name.into(),
+            input: None,
             steps: Vec::new(),
         }
     }
 
-    /// A stream operation to `destination`, with an empty script.
-    pub fn stream(name: &str, destination: Destination) -> Self {
-        Operation::Stream {
-            name: name.into(),
-            destinations: vec![destination],
-            identity: None,
-            script: Vec::new(),
-        }
-    }
-
-    /// A derivation.
+    /// An operation with no connection that hands back `template`, with no input.
     pub fn derive(name: &str, template: &str) -> Self {
-        Operation::Derive {
-            name: name.into(),
-            template: template.into(),
-        }
+        Self::local(name).then(Return::output(template))
     }
 
-    /// Adds a destination (HTTP and stream).
+    /// Declares the schema of the caller's input.
+    #[must_use]
+    pub fn input(mut self, input: Input) -> Self {
+        self.input = Some(input);
+        self
+    }
+
+    /// Adds a destination to the `open` step.
     #[must_use]
     pub fn destination(mut self, destination: Destination) -> Self {
-        if let Operation::Http { destinations, .. } | Operation::Stream { destinations, .. } =
-            &mut self
-        {
-            destinations.push(destination);
+        if let Some(Step::Open(open)) = self.steps.first_mut() {
+            open.destinations.push(destination);
         }
         self
     }
 
-    /// Sets the methods the caller may use (HTTP).
-    #[must_use]
-    pub fn methods(mut self, list: impl IntoIterator<Item = Method>) -> Self {
-        if let Operation::Http { methods, .. } = &mut self {
-            *methods = list.into_iter().collect();
-        }
-        self
-    }
-
-    /// Sets the path prefixes the caller may use (HTTP).
-    #[must_use]
-    pub fn paths<I, S>(mut self, list: I) -> Self
-    where
-        I: IntoIterator<Item = S>,
-        S: Into<String>,
-    {
-        if let Operation::Http { paths, .. } = &mut self {
-            *paths = list.into_iter().map(Into::into).collect();
-        }
-        self
-    }
-
-    /// Sets the headers the caller may send (HTTP).
-    #[must_use]
-    pub fn caller_headers<I, S>(mut self, list: I) -> Self
-    where
-        I: IntoIterator<Item = S>,
-        S: Into<String>,
-    {
-        if let Operation::Http { caller_headers, .. } = &mut self {
-            *caller_headers = list.into_iter().map(Into::into).collect();
-        }
-        self
-    }
-
-    /// Sets the client certificate (HTTP and stream).
+    /// Sets the client certificate of the `open` step.
     #[must_use]
     pub fn identity(mut self, cert: &str, key: &str) -> Self {
-        if let Operation::Http { identity, .. } | Operation::Stream { identity, .. } = &mut self {
-            *identity = Some(Identity {
+        if let Some(Step::Open(open)) = self.steps.first_mut() {
+            open.identity = Some(Identity {
                 cert: cert.into(),
                 key: key.into(),
             });
@@ -338,21 +459,19 @@ impl Operation {
         self
     }
 
-    /// Adds a step (HTTP).
+    /// Adds a step.
     #[must_use]
-    pub fn step(mut self, step: Step) -> Self {
-        if let Operation::Http { steps, .. } = &mut self {
-            steps.push(step);
-        }
+    pub fn then(mut self, step: impl Into<Step>) -> Self {
+        self.steps.push(step.into());
         self
     }
 
-    /// Adds an exchange to the script (stream).
+    /// Adds a `compute` step.
     #[must_use]
-    pub fn exchange(mut self, exchange: Exchange) -> Self {
-        if let Operation::Stream { script, .. } = &mut self {
-            script.push(exchange);
-        }
-        self
+    pub fn compute(self, into: &str, template: &str) -> Self {
+        self.then(Compute {
+            into: into.into(),
+            template: template.into(),
+        })
     }
 }

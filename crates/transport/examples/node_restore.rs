@@ -23,7 +23,7 @@ use engine::grant::GrantTerms;
 use engine::keys::{CallerKey, DeviceKey, NodeKey, UserKey};
 use engine::log::{LogSink, MemorySink, SignedEntry, owner_entries, verify_owner_chain};
 use engine::node::{Node, SystemClock};
-use engine::policy::{Caller, FieldSpec, Operation, Policy};
+use engine::policy::{Caller, FieldSpec, Input, Operation, Policy, RawInput};
 use engine::record::Record;
 use transport::TlsTransport;
 
@@ -59,10 +59,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let app = CallerKey::generate();
     let policy = Policy::new()
         .with_field(FieldSpec::secret("key"))
-        .with_operation(Operation::derive(
-            "mac",
-            "{{ hex(hmac_sha256(key, $input)) }}",
-        ))
+        .with_operation(
+            Operation::derive("mac", "{{ hex(hmac_sha256(key, $input)) }}").input(Input::Raw(
+                RawInput {
+                    max_len: Some(64),
+                    pattern: Some("[a-z]+".into()),
+                },
+            )),
+        )
         .with_caller(Caller::new("app", app.public(), ["mac"]));
     let mut values = Fields::new();
     values.insert("key", b"an example key of 32 bytes......".to_vec())?;

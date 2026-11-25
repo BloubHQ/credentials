@@ -58,3 +58,24 @@ path = "fuzz_targets/regex_capture.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "policy_upgrade"
+path = "fuzz_targets/policy_upgrade.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "caller_request"
+path = "fuzz_targets/caller_request.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "input_schema"
+path = "fuzz_targets/input_schema.rs"
+test = false
+doc = false
+bench = false

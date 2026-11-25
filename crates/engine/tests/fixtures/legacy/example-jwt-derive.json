@@ -1,0 +1,8 @@
+{
+  "fields": [{"name": "key", "secret": true}],
+  "callers": [{"name": "app", "key": "<caller public key>", "operations": ["jwt"]}],
+  "operations": [
+    {"kind": "derive", "name": "jwt",
+     "template": "{{ b64urlraw(\"{\\\"alg\\\":\\\"RS256\\\",\\\"typ\\\":\\\"JWT\\\"}\") + \".\" + b64urlraw($input) + \".\" + b64urlraw(rsa_sign_pkcs1_sha256(pem(key), b64urlraw(\"{\\\"alg\\\":\\\"RS256\\\",\\\"typ\\\":\\\"JWT\\\"}\") + \".\" + b64urlraw($input))) }}"}
+  ]
+}

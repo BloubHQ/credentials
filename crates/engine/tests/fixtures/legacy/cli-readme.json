@@ -1,0 +1,6 @@
+{
+  "fields": [{"name": "key", "secret": true}],
+  "callers": [{"name": "app", "key": "<caller public key>", "operations": ["sign"]}],
+  "operations": [{"kind": "derive", "name": "sign",
+                  "template": "{{ hex(hmac_sha256(key, $input)) }}"}]
+}

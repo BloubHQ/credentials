@@ -2,7 +2,7 @@
 
 The `credentials` command: the owner's device, a caller and a node, as one tool.
 
-- **Owner** (on a device it controls): `keygen`, `policy check|sign`, `seal`, `pin`, `grant`,
+- **Owner** (on a device it controls): `keygen`, `policy check|sign|upgrade`, `seal`, `pin`, `grant`,
   `revoke`, `device endorse|retire`, and `attest` to check a node's AWS Nitro Enclaves
   attestation before granting.
 - **Caller** (an application or agent): `call http|derive` signs a call and can send it.
@@ -49,16 +49,18 @@ icacls device.key /inheritance:r /grant:r "%USERNAME%:F"
 ### 2. A policy
 
 The policy says what may be done with the secret, and by whom (see
-[docs/policy.md](../../docs/policy.md)). Here: one derivation, an HMAC of the caller's input,
-for one caller.
+[docs/policy.md](../../docs/policy.md)). Here: one operation with no connection, an HMAC of
+the caller's input (at most 64 bytes of lowercase letters and digits), for one caller.
 
 ```sh
 cat > policy.json <<EOF
 {
   "fields": [{"name": "key", "secret": true}],
   "callers": [{"name": "app", "key": "$CALLER", "operations": ["sign"]}],
-  "operations": [{"kind": "derive", "name": "sign",
-                  "template": "{{ hex(hmac_sha256(key, \$input)) }}"}]
+  "operations": [{"name": "sign",
+                  "input": {"raw": {"max_len": 64, "pattern": "[a-z0-9]+"}},
+                  "steps": [{"do": "return",
+                             "template": "{{ hex(hmac_sha256(key, \$input)) }}"}]}]
 }
 EOF
 credentials policy check policy.json
@@ -236,6 +238,7 @@ fails asks whether the key given is the node's log public key.
 | `pubkey device\|caller\|node --key F` | Prints the public key of a key file. |
 | `policy check P [--device KEY]` | Validates a policy or a signed policy (and with `--device` its signature), prints the summary; exit 1 with the rule on error. |
 | `policy sign P --device F --out S` | Summary to stderr, then writes the signed policy. |
+| `policy upgrade OLD --out P` | Converts a policy of the format before steps (`"kind": "http"`, `"stream"`, `"derive"`; signed or not) and writes it unsigned; notes on stderr say what it narrowed. Read the summary and sign the result again. |
 | `seal --user-key F --id I --owner O --policy S --field N=@path\|N=env:V... --out R` | Seals values into a new record (generation 1). |
 | `seal --user-key F --policy S --from R --out R2` | Rewraps a record under a new signed policy. |
 | `pin --device F --record R [--out\|--send]` | Pins a record at its generation (`POST /pin`). |

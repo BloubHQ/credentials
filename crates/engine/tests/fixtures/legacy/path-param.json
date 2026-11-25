@@ -1,0 +1,11 @@
+{
+  "fields": [{"name": "token", "secret": true}],
+  "callers": [{"name": "app", "key": "<caller public key>", "operations": ["bot"]}],
+  "operations": [
+    {"kind": "http", "name": "bot",
+     "destinations": [{"host": "api.example.org", "port": 443}],
+     "methods": ["GET", "POST"], "paths": ["/"],
+     "steps": [{"inject": [{"target": {"kind": "path_param", "name": "token"},
+                            "template": "{{token}}"}]}]}
+  ]
+}

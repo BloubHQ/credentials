@@ -7,8 +7,11 @@
 //!
 //! SigV4 is two header templates in the policy (`X-Amz-Date` and `Authorization`); the engine
 //! knows nothing of AWS. The signing key is derived from the secret key with nested
-//! `hmac_sha256`, so the secret key never leaves the node, and the caller may only send
-//! `GET https://sts.amazonaws.com/` requests. Long-term keys only: temporary credentials would
+//! `hmac_sha256`, so the secret key never leaves the node. The caller may only send
+//! `GET https://sts.amazonaws.com/?Action=GetCallerIdentity&Version=2011-06-15`: the query is
+//! part of the contract, each parameter pinned to its one value, so the same signature cannot
+//! be spent on another action (such as one that mints temporary credentials). Only the
+//! identity members of the response go back to the caller. Long-term keys only: temporary credentials would
 //! also need a signed `X-Amz-Security-Token` header.
 //!
 //! Without the variables, the example prints what it would do and sends nothing.
@@ -21,7 +24,10 @@ use engine::grant::GrantTerms;
 use engine::keys::{CallerKey, DeviceKey, NodeKey, UserKey};
 use engine::log::MemorySink;
 use engine::node::{Node, SystemClock};
-use engine::policy::{Caller, Destination, FieldSpec, Injection, Method, Operation, Policy, Step};
+use engine::policy::{
+    Caller, CallerRequest, Destination, FieldSpec, Injection, Method, Operation, Policy, QueryRule,
+    Return, Send,
+};
 use engine::record::Record;
 use engine::request::Request;
 use transport::TlsTransport;
@@ -60,11 +66,19 @@ fn policy(app: &CallerKey) -> Policy {
         .with_field(FieldSpec::public("access_key"))
         .with_field(FieldSpec::secret("secret_key"))
         .with_operation(
-            Operation::http("sts", Destination::https(HOST))
-                .methods([Method::Get])
-                .paths(["/"])
-                .caller_headers(["Accept"])
-                .step(Step::caller().inject(date).inject(authorization)),
+            Operation::https("sts", Destination::https(HOST))
+                .then(
+                    Send::caller(
+                        CallerRequest::new([Method::Get])
+                            .paths(["/"])
+                            .headers(["Accept"])
+                            .query(QueryRule::fixed("Action", "GetCallerIdentity"))
+                            .query(QueryRule::fixed("Version", "2011-06-15")),
+                    )
+                    .inject(date)
+                    .inject(authorization),
+                )
+                .then(Return::status().json("/GetCallerIdentityResponse/GetCallerIdentityResult")),
         )
         .with_caller(Caller::new("app", app.public(), ["sts"]))
 }

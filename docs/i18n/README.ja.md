@@ -87,7 +87,7 @@ sequenceDiagram
     C->>N: レコード + オペレーション + リクエスト + Authorization
     N->>N: グラントは有効? レコードはピン留め済みで古くない?<br/>ポリシーは既知のデバイスが署名したもの?
     N->>N: 呼び出し元はオペレーションに登録済み? 署名、<br/>±5 分、使い捨て nonce、レート制限
-    N->>N: リクエストがオペレーションの範囲内 (host、method、<br/>path prefix、headers)、復号、予算内でレンダリング
+    N->>N: リクエストがオペレーションの範囲内 (host、method、<br/>path template、query、headers)、復号、予算内でレンダリング
     N->>L: エントリ (seq、prev hash、所有者チェーン、呼び出し元、封印された詳細)
     L-->>N: 確定
     N->>D: シークレットを注入した TLS リクエスト
@@ -148,29 +148,44 @@ let outcome = node.run(&call, &mut TlsTransport::new());
      "operations": ["refresh", "call"], "limit": {"count": 100, "window_ms": 60000}}
   ],
   "operations": [
-    {"kind": "http", "name": "refresh",
-     "destinations": [{"host": "auth.example.com", "port": 443}],
-     "steps": [{
-       "request": {"from": "fixed", "method": "POST", "path": "/oauth/token"},
+    {"name": "refresh", "steps": [
+      {"do": "open", "connection": "https",
+       "destinations": [{"host": "auth.example.com", "port": 443}]},
+      {"do": "send", "request": {"from": "fixed", "method": "POST", "path": "/oauth/token"},
        "inject": [{"target": {"kind": "body"},
-                   "template": "grant_type=refresh_token&refresh_token={{pct(refresh_token)}}&client_id={{pct(client_id)}}&client_secret={{pct(client_secret)}}"}],
-       "capture": [{"source": {"from": "json", "pointer": "/access_token"},
-                    "into": {"kind": "field", "name": "access_token"}}]
-     }]},
-    {"kind": "http", "name": "call",
-     "destinations": [{"host": "*.api.example.com", "port": 443}],
-     "methods": ["GET", "POST"], "paths": ["/v1/"], "caller_headers": ["Accept"],
-     "steps": [{"inject": [{"target": {"kind": "header", "name": "Authorization"},
-                            "template": "Bearer {{access_token}}"}]}]}
+                   "template": "grant_type=refresh_token&refresh_token={{pct(refresh_token)}}&client_id={{pct(client_id)}}&client_secret={{pct(client_secret)}}"}]},
+      {"do": "receive", "capture": [{"source": {"from": "json", "pointer": "/access_token"},
+                                     "into": {"kind": "field", "name": "access_token"}}]},
+      {"do": "return", "response": {"body": {"json": ["/expires_in"]}}}
+    ]},
+    {"name": "call", "steps": [
+      {"do": "open", "connection": "https",
+       "destinations": [{"host": "*.api.example.com", "port": 443}]},
+      {"do": "send",
+       "request": {"from": "caller", "methods": ["GET", "POST"],
+                   "paths": ["/v1/invoices", "/v1/invoices/*"], "headers": ["Accept"],
+                   "query": [{"name": "status", "one_of": ["open", "paid"]},
+                             {"name": "limit", "min": "1", "max": "100"}]},
+       "inject": [{"target": {"kind": "header", "name": "Authorization"},
+                   "template": "Bearer {{access_token}}"}]},
+      {"do": "return", "response": {"headers": ["Content-Type"], "body": "all"}}
+    ]}
   ]
 }
 ```
 
-| オペレーション | 役割 |
+オペレーションは 1 本の接続上の **ステップ** の列です: `open` (HTTPS、TLS ストリーム、または接続なし)、
+`send`、`receive` (キャプチャ付き)、`compute` (テンプレートを後続ステップが読む名前に入れる)、そして
+呼び出し元に何を返すかを決める `return`。
+
+| 接続 | 役割 |
 | --- | --- |
-| `http` | 1〜8 ステップ。各ステップは呼び出し元のリクエストまたはポリシーが固定したリクエストを送り、値を注入し、レスポンスから値をキャプチャしてフィールド (新しいレコード世代) または後続ステップ用の一時値に入れる。返されるのは最後のレスポンスだけ。 |
-| `stream` | 1 本の TLS 接続上での send/expect スクリプト (IMAP、SMTP、行指向プロトコル)。その後、認証済みの接続上で呼び出し元のやり取りを行う。 |
-| `derive` | テンプレートの出力が呼び出し元に返される: 署名、HMAC、TOTP コード、JWT。 |
+| `https` | 1〜8 リクエスト。各 `send` は **契約** (method、パステンプレート、ヘッダー、クエリパラメータとその値) の範囲内の呼び出し元のリクエスト、またはポリシーが固定したリクエストを、値を注入して送る。`receive` はそのレスポンスから値をキャプチャしてフィールド (新しいレコード世代) または一時値に入れる。`return` はステータスと、列挙したヘッダーと JSON メンバーだけを返す (すべては `"body": "all"`)。 |
+| `tls` | 1 本の TLS 接続上での send/receive スクリプト (IMAP、SMTP、行指向プロトコル)。その後、`return` が中継するパターンに send が一致する呼び出し元のやり取りだけを行う。 |
+| なし | `return` がテンプレートをレンダリングして呼び出し元に返す: 署名、HMAC、TOTP コード、JWT。呼び出し元の `$input` は先にオペレーションの `input` スキーマ (raw バイト、JSON、RLP: 固定メンバー、許可値、数値範囲、ノードが入れる時刻) で検査される。 |
+
+ステップ以前の形式 (`"kind": "http" | "stream" | "derive"`) のポリシーは `credentials policy upgrade`
+で変換する。結果は呼び出し元が受け取るものを狭め、その内容を知らせる。再署名が必要。
 
 値は**テンプレート**を通して入ります: `{{ hex(hmac_sha256(secret, $query)) }}`。この言語には名前、
 変数、文字列リテラル、関数呼び出し、`+` があり、分岐やループはありません。ポリシーが署名される前に、
@@ -188,13 +203,15 @@ let outcome = node.run(&call, &mut TlsTransport::new());
   呼び出し元から来ません。
 - **推測可能なフィールド。** 導出が `guessable` と指定されたフィールド (PIN、パスワード) に依存できるのは
   `len` を通してだけです。そのハッシュ、署名、MAC、暗号文はどれも呼び出し元に推測を照合させてしまいます。
+- **ステップ。** `compute` ステップの名前はそのテンプレートとまったく同じ性質を持つので、ステップ間で
+  渡す値もインラインで書いたのと同じように解析される。
 - **予算 (budget)。** 1 つのオペレーションでレンダリングできるのは最大 128 MiB、PBKDF2 1,000,000
   ラウンド、署名と鍵合意あわせて 32 回までです。
 
 | 認証情報 | ポリシー |
 | --- | --- |
 | Bearer トークン、Cookie、API キー | ヘッダーテンプレート 1 つ |
-| Telegram ボット | `/bot{token}/getMe` 内の `path_param` `{{token}}` |
+| Telegram ボット | パステンプレート `/{token}/getMe` で `path_param` `token` = `bot{{token}}` |
 | 取引所の HMAC 署名 | クエリ `signature` = `{{ hex(hmac_sha256(secret, $query)) }}` |
 | AWS SigV4 | ヘッダーテンプレート 2 つ (`time`、`canonical_query`、ネストした `hmac_sha256`)。テストが公式ベクターを再現する |
 | HTTP Digest | ステップ 1 で `header_param` により `realm`/`nonce` をキャプチャし、ステップ 2 で `md5` により応答する。RFC 2617 のベクター |
@@ -202,12 +219,12 @@ let outcome = node.run(&call, &mut TlsTransport::new());
 | セッションログイン | `fixed` POST /login、`cookie` キャプチャで一時値へ、呼び出し元のリクエストに `Cookie` |
 | CSRF トークン付きのログインフォーム | `html` キャプチャ `input[name=_csrf]` (`value`) を一時値へ、続けて `fixed` POST /login |
 | ブラウザーで暗号化するパスワード | `ecdh("p256", server_key)` + `sha256` + `aes_cbc_encrypt`、`u8(len(…))` の長さ接頭辞と `ecdh_public("p256")`。またはサーバーからキャプチャした鍵で `rsa_encrypt_oaep("sha256", key, password)` |
-| JWT RS256 | derive `b64urlraw(header) + "." + b64urlraw($input) + "." + b64urlraw(rsa_sign_pkcs1_sha256(pem(key), …))` |
-| ポリシーが有効期間を決める JWT | derive で `json_set_number(..., "exp", add($unix, "300"))` と `rsa_sign_pkcs1("sha512", pem(key), …)`: `iat`/`exp` はノードが入れます |
-| Ethereum | derive `{{ k256_sign_recoverable(key, keccak256($input)) }}` |
-| IMAP | stream: グリーティングを expect、`a1 LOGIN {{user}} {{password}}` を send、expect、中継 |
-| TOTP | derive `{{ totp(b32decode(seed)) }}` |
-| Mutual TLS | `"identity": {"cert": "{{cert}}", "key": "{{key}}"}` |
+| JWT RS256 | 接続なし: `b64urlraw(header) + "." + b64urlraw($input) + "." + b64urlraw(rsa_sign_pkcs1_sha256(pem(key), …))` |
+| ポリシーが有効期間を決める JWT | `iss`/`aud` を固定し `iat`/`exp` をノードが `set` する `json` input スキーマ、またはテンプレートの `json_set_number(..., "exp", add($unix, "300"))` |
+| Ethereum | 接続なし: `{{ k256_sign_recoverable(key, keccak256($input)) }}` と、宛先・チェーン・data を固定し金額を制限する `rlp` input スキーマ |
+| IMAP | tls: グリーティングを receive、`a1 LOGIN {{user}} {{password}}` を send、receive、ポリシーが列挙したコマンドだけ中継 |
+| TOTP | 接続なし: `{{ totp(b32decode(seed)) }}` |
+| Mutual TLS | `open` の `"identity": {"cert": "{{cert}}", "key": "{{key}}"}` |
 
 ## レコード、世代、ロールバック
 

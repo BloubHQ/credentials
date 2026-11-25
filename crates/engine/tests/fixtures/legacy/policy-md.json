@@ -1,0 +1,20 @@
+{
+  "fields": [
+    {"name": "user", "secret": false},
+    {"name": "password", "secret": true},
+    {"name": "key", "secret": true}
+  ],
+  "callers": [{"name": "app", "key": "<caller public key>", "operations": ["imap", "sign"]}],
+  "operations": [
+    {"kind": "stream", "name": "imap",
+     "destinations": [{"host": "imap.example.com", "port": 993}],
+     "script": [
+       {"kind": "expect", "until": ["\r\n"]},
+       {"kind": "send", "template": "a1 LOGIN {{user}} {{password}}\r\n"},
+       {"kind": "expect", "until": ["a1 OK", "a1 NO"],
+        "capture": [{"source": {"from": "between", "start": "[", "end": "]"},
+                     "into": {"kind": "temp", "name": "caps", "secret": false}}]}
+     ]},
+    {"kind": "derive", "name": "sign", "template": "{{ k256_sign_recoverable(key, keccak256($input)) }}"}
+  ]
+}

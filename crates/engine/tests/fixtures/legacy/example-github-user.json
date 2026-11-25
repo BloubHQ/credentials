@@ -1,0 +1,11 @@
+{
+  "fields": [{"name": "token", "secret": true}],
+  "callers": [{"name": "example", "key": "<caller public key>", "operations": ["github"]}],
+  "operations": [
+    {"kind": "http", "name": "github",
+     "destinations": [{"host": "api.github.com", "port": 443}],
+     "methods": ["GET"], "paths": ["/user"], "caller_headers": ["Accept", "User-Agent"],
+     "steps": [{"inject": [{"target": {"kind": "header", "name": "Authorization"},
+                            "template": "Bearer {{token}}"}]}]}
+  ]
+}

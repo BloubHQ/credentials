@@ -171,6 +171,16 @@ enum PolicyCommand {
         #[arg(long)]
         out: PathBuf,
     },
+    /// Converts a policy of the format before the step language (operations of kind `http`,
+    /// `stream` and `derive`, signed or not) and writes it unsigned. The notes printed to
+    /// stderr say what the conversion narrowed; the result must be read and signed again.
+    Upgrade {
+        /// The old policy JSON, or an old signed policy.
+        policy: PathBuf,
+        /// The converted policy to write.
+        #[arg(long)]
+        out: PathBuf,
+    },
 }
 
 #[derive(Args)]
@@ -928,6 +938,21 @@ fn run(command: Command) -> Res<()> {
                 .sign_policy(policy)
                 .map_err(engine("cannot sign"))?;
             files::write_json(&out, &signed)?;
+            eprintln!("wrote {}", out.display());
+            Ok(())
+        }
+        Command::Policy(PolicyCommand::Upgrade { policy, out }) => {
+            let text = std::fs::read_to_string(&policy)
+                .map_err(|e| format!("cannot read {}: {e}", policy.display()))?;
+            let upgraded = engine::policy::legacy::upgrade_json(&text)
+                .map_err(|e| format!("{}: {e}", policy.display()))?;
+            for note in &upgraded.notes {
+                eprintln!("note: {note}");
+            }
+            if let Err(e) = upgraded.policy.validate() {
+                eprintln!("note: the converted policy does not validate yet: {e}");
+            }
+            files::write_json(&out, &upgraded.policy)?;
             eprintln!("wrote {}", out.display());
             Ok(())
         }

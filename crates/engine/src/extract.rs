@@ -45,6 +45,21 @@ pub(crate) fn compile(pattern: &str) -> Option<regex::bytes::Regex> {
         .ok()
 }
 
+/// Compiles a pattern that must match a whole value (a query value, an input member, a
+/// caller send of a stream), with the limits of [`compile`]. `None` as for [`compile`].
+pub(crate) fn compile_whole(pattern: &str) -> Option<regex::bytes::Regex> {
+    // The pattern alone is checked first, so the anchors do not count against its length and
+    // an alternation in it cannot escape them.
+    compile(pattern)?;
+    regex::bytes::RegexBuilder::new(&format!(r"\A(?:{pattern})\z"))
+        .unicode(false)
+        .size_limit(REGEX_SIZE)
+        .dfa_size_limit(REGEX_CACHE)
+        .nest_limit(32)
+        .build()
+        .ok()
+}
+
 /// The group of a pattern a capture takes: `group` when given (it must exist), otherwise 1
 /// when the pattern has a group and 0 (the whole match) when it has none.
 pub(crate) fn group_of(regex: &regex::bytes::Regex, group: Option<u8>) -> Option<usize> {

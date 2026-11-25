@@ -22,8 +22,9 @@ use engine::keys::{CallerKey, DeviceKey, NodeKey, UserKey};
 use engine::log::{Detail, Event, LogSink, MemorySink, SignedEntry, verify_chain};
 use engine::node::{CallerExchange, Clock, Node, Outcome, Response, StreamOutput};
 use engine::policy::{
-    Caller, Capture, Destination, Exchange, FieldSpec, Identity, Injection, Method, Operation,
-    Policy, Source, Step, StepRequest, Store, Target,
+    Caller, CallerRequest, Capture, Destination, FieldSpec, Injection, Input, Method, Operation,
+    Policy, QueryRule, Receive, Return, Send, Source, Step as IrStep, StepRequest as IrRequest,
+    Store, Target,
 };
 use engine::record::Record;
 use engine::request::Request;
@@ -189,12 +190,94 @@ fn inject(target: Target, template: &str) -> Injection {
     }
 }
 
+/// What one request of an HTTPS test operation sends.
+#[derive(Clone, Debug, PartialEq)]
+enum StepRequest {
+    /// The caller's request, within [`contract`].
+    Caller,
+    /// A request the policy fixes.
+    Fixed {
+        method: Method,
+        path: String,
+        destination: Option<Destination>,
+    },
+}
+
+/// One request of an HTTPS test operation: a `send` and, when it captures, the `receive`
+/// of its response.
+#[derive(Clone, Debug)]
+struct Step {
+    request: StepRequest,
+    inject: Vec<Injection>,
+    capture: Vec<Capture>,
+}
+
+/// The contract of the caller in these tests: GET and POST on any path, no header, the query
+/// parameters `x` and `full`.
+fn contract() -> CallerRequest {
+    CallerRequest::new([Method::Get, Method::Post])
+        .paths(["/", "/**"])
+        .query(QueryRule::any("x"))
+        .query(QueryRule::any("full"))
+}
+
 fn caller_step(inject: Vec<Injection>) -> Step {
     Step {
         request: StepRequest::Caller,
         inject,
         capture: vec![],
     }
+}
+
+/// The IR of `steps` after an `open`, with a `return` of `ret`.
+fn steps_to_ir(steps: Vec<Step>, contract: &CallerRequest, ret: Return) -> Vec<IrStep> {
+    let mut out = Vec::new();
+    for step in steps {
+        let request = match step.request {
+            StepRequest::Caller => IrRequest::Caller(contract.clone()),
+            StepRequest::Fixed {
+                method,
+                path,
+                destination,
+            } => IrRequest::Fixed {
+                method,
+                path,
+                destination,
+            },
+        };
+        out.push(IrStep::Send(Send {
+            request: Some(request),
+            inject: step.inject,
+            template: None,
+        }));
+        if !step.capture.is_empty() {
+            out.push(IrStep::Receive(Receive {
+                until: vec![],
+                capture: step.capture,
+            }));
+        }
+    }
+    out.push(IrStep::Return(ret));
+    out
+}
+
+/// The `return` of the HTTPS test operations: the status, the body and the headers the
+/// tests read.
+fn everything() -> Return {
+    Return::status()
+        .header("Content-Type")
+        .header("Set-Cookie")
+        .header("X-Echo")
+        .header("Location")
+        .body()
+}
+
+fn http(name: &str, destination: Destination, steps: Vec<Step>) -> Operation {
+    let mut operation = Operation::https(name, destination);
+    operation
+        .steps
+        .extend(steps_to_ir(steps, &contract(), everything()));
+    operation
 }
 
 fn capture(source: Source, into: Store) -> Capture {
@@ -212,23 +295,6 @@ fn temp(name: &str, secret: bool) -> Store {
     }
 }
 
-fn http(name: &str, destination: Destination, steps: Vec<Step>) -> Operation {
-    let has_caller = steps.iter().any(|s| s.request == StepRequest::Caller);
-    Operation::Http {
-        name: name.into(),
-        destinations: vec![destination],
-        methods: if has_caller {
-            vec![Method::Get, Method::Post]
-        } else {
-            vec![]
-        },
-        paths: if has_caller { vec!["/".into()] } else { vec![] },
-        caller_headers: vec![],
-        identity: None,
-        steps,
-    }
-}
-
 fn request_policy(fields: Vec<FieldSpec>, inject: Vec<Injection>) -> Policy {
     Policy {
         fields,
@@ -241,24 +307,52 @@ fn derive_policy(fields: Vec<FieldSpec>, derive: &str) -> Policy {
     Policy {
         fields,
         callers: vec![],
-        operations: vec![Operation::Derive {
-            name: "derive".into(),
-            template: derive.into(),
-        }],
+        operations: vec![derive_op("derive", derive)],
     }
 }
 
-fn steps_of(policy: &mut Policy) -> &mut Vec<Step> {
-    match &mut policy.operations[0] {
-        Operation::Http { steps, .. } => steps,
-        other => panic!("not http: {other:?}"),
+/// An operation with no connection that renders `template`; it takes any input.
+fn derive_op(name: &str, template: &str) -> Operation {
+    let operation = Operation::derive(name, template);
+    if template.contains("$input") {
+        operation.input(Input::any())
+    } else {
+        operation
     }
+}
+
+/// The `n`-th `send` of the first operation.
+fn send_of(policy: &mut Policy, n: usize) -> &mut Send {
+    policy.operations[0]
+        .steps
+        .iter_mut()
+        .filter_map(|s| match s {
+            IrStep::Send(send) => Some(send),
+            _ => None,
+        })
+        .nth(n)
+        .expect("a send")
+}
+
+/// The contract of the first `send` of the first operation that takes the caller's request.
+fn contract_of(policy: &mut Policy) -> &mut CallerRequest {
+    policy.operations[0]
+        .steps
+        .iter_mut()
+        .find_map(|s| match s {
+            IrStep::Send(Send {
+                request: Some(IrRequest::Caller(contract)),
+                ..
+            }) => Some(contract),
+            _ => None,
+        })
+        .expect("a caller send")
 }
 
 fn destinations_of(policy: &mut Policy) -> &mut Vec<Destination> {
-    match &mut policy.operations[0] {
-        Operation::Http { destinations, .. } => destinations,
-        other => panic!("not http: {other:?}"),
+    match &mut policy.operations[0].steps[0] {
+        IrStep::Open(open) => &mut open.destinations,
+        other => panic!("not open: {other:?}"),
     }
 }
 
@@ -488,18 +582,22 @@ fn every_usage_is_policy_data() {
             "Cookie: sid=tok_live_9f8e7d6c5b4a; theme=dark\r\n",
         ),
         (
-            request_policy(
-                vec![token.clone()],
-                vec![inject(
-                    Target::PathParam {
-                        name: "token".into(),
-                    },
-                    "{{token}}",
-                )],
-            ),
+            {
+                let mut policy = request_policy(
+                    vec![token.clone()],
+                    vec![inject(
+                        Target::PathParam {
+                            name: "token".into(),
+                        },
+                        "{{token}}",
+                    )],
+                );
+                contract_of(&mut policy).paths = vec!["/{token}/getMe".into()];
+                policy
+            },
             vec![("token", TOKEN)],
-            get("/bot{token}/getMe"),
-            "GET /bottok_live_9f8e7d6c5b4a/getMe HTTP/1.1",
+            get("/{token}/getMe"),
+            "GET /tok_live_9f8e7d6c5b4a/getMe HTTP/1.1",
         ),
         (
             request_policy(
@@ -526,18 +624,38 @@ fn every_usage_is_policy_data() {
             "\r\n\r\n{\"a\":1,\"api_key\":\"tok_live_9f8e7d6c5b4a\"}",
         ),
         (
-            request_policy(
-                vec![secret("api_key"), secret("api_secret")],
-                vec![
-                    header("X-MBX-APIKEY", "{{api_key}}"),
-                    inject(
-                        Target::Query {
-                            name: "signature".into(),
-                        },
-                        "{{ hex(hmac_sha256(api_secret, $query)) }}",
-                    ),
-                ],
-            ),
+            {
+                let mut policy = request_policy(
+                    vec![secret("api_key"), secret("api_secret")],
+                    vec![
+                        header("X-MBX-APIKEY", "{{api_key}}"),
+                        inject(
+                            Target::Query {
+                                name: "signature".into(),
+                            },
+                            "{{ hex(hmac_sha256(api_secret, $query)) }}",
+                        ),
+                    ],
+                );
+                let contract = contract_of(&mut policy);
+                contract.query = ["symbol", "type", "timeInForce", "price", "timestamp"]
+                    .into_iter()
+                    .map(QueryRule::any)
+                    .collect();
+                contract.query.push(QueryRule {
+                    one_of: vec!["BUY".into(), "SELL".into()],
+                    ..QueryRule::any("side")
+                });
+                contract.query.push(QueryRule {
+                    max: Some("10".into()),
+                    ..QueryRule::any("quantity")
+                });
+                contract.query.push(QueryRule {
+                    max: Some("60000".into()),
+                    ..QueryRule::any("recvWindow")
+                });
+                policy
+            },
             vec![
                 ("api_key", b"key-0123456789"),
                 (
@@ -680,13 +798,13 @@ fn requests_outside_the_policy_are_refused_before_the_log() {
         (
             get("no-slash"),
             Error::RequestInvalid {
-                rule: "path must start with / and hold no fragment, dot segment or encoded separator",
+                rule: "path must start with /",
             },
         ),
         (
             get("/a/../b"),
             Error::RequestInvalid {
-                rule: "path must start with / and hold no fragment, dot segment or encoded separator",
+                rule: "path holds a dot segment or separator, as sent, after ; parameters or after decoding",
             },
         ),
     ] {
@@ -719,7 +837,7 @@ fn a_policy_cannot_be_widened_or_swapped() {
     );
 
     let mut leaky = s.record.clone();
-    steps_of(&mut leaky.policy.policy)[0]
+    send_of(&mut leaky.policy.policy, 0)
         .inject
         .push(header("X-Echo", "{{token}}"));
     assert_eq!(
@@ -1377,14 +1495,8 @@ fn secp256k1_keys_sign_and_recover() {
         fields: vec![secret("key")],
         callers: vec![],
         operations: vec![
-            Operation::Derive {
-                name: "derive".into(),
-                template: "{{ k256_sign(key, $input) }}".into(),
-            },
-            Operation::Derive {
-                name: "eth".into(),
-                template: "{{ k256_sign_recoverable(key, keccak256($input)) }}".into(),
-            },
+            derive_op("derive", "{{ k256_sign(key, $input) }}"),
+            derive_op("eth", "{{ k256_sign_recoverable(key, keccak256($input)) }}"),
         ],
     };
     let s = setup(&clock, policy, &[("key", &secret_key)]);
@@ -1446,30 +1558,19 @@ fn imap_policy() -> Policy {
     Policy {
         fields: vec![public("user"), secret("password")],
         callers: vec![],
-        operations: vec![Operation::Stream {
-            name: "imap".into(),
-            destinations: vec![Destination::new("imap.example.com", 993)],
-            identity: None,
-            script: vec![
-                Exchange::Expect {
-                    until: vec!["\r\n".into()],
-                    capture: vec![],
-                },
-                Exchange::Send {
-                    template: "a1 LOGIN {{user}} {{password}}\r\n".into(),
-                },
-                Exchange::Expect {
-                    until: vec!["\r\n".into()],
-                    capture: vec![capture(
-                        Source::Between {
-                            start: "a1 ".into(),
-                            end: " ".into(),
-                        },
-                        temp("status", false),
-                    )],
-                },
-            ],
-        }],
+        operations: vec![
+            Operation::tls("imap", Destination::new("imap.example.com", 993))
+                .then(Receive::until(["\r\n"]))
+                .then(Send::write("a1 LOGIN {{user}} {{password}}\r\n"))
+                .then(Receive::until(["\r\n"]).capture(capture(
+                    Source::Between {
+                        start: "a1 ".into(),
+                        end: " ".into(),
+                    },
+                    temp("status", false),
+                )))
+                .then(Return::relay([r"a[0-9]+ (SELECT INBOX|NOOP|LOGOUT)\r\n"])),
+        ],
     }
 }
 
@@ -1583,18 +1684,9 @@ fn client_certificates_reach_only_the_transport() {
     let policy = Policy {
         fields: vec![public("cert"), secret("key")],
         callers: vec![],
-        operations: vec![Operation::Http {
-            name: "call".into(),
-            destinations: vec![host()],
-            methods: vec![Method::Get],
-            paths: vec!["/".into()],
-            caller_headers: vec![],
-            identity: Some(Identity {
-                cert: "{{cert}}".into(),
-                key: "{{key}}".into(),
-            }),
-            steps: vec![caller_step(vec![])],
-        }],
+        operations: vec![
+            http("call", host(), vec![caller_step(vec![])]).identity("{{cert}}", "{{key}}"),
+        ],
     };
     let s = setup(&clock, policy, &[("cert", cert), ("key", key)]);
     let mut transport = FakeTransport {
@@ -1757,28 +1849,20 @@ fn a_stream_keeps_its_captured_field_when_an_exchange_fails() {
     let policy = Policy {
         fields: vec![secret("password"), later("session")],
         callers: vec![],
-        operations: vec![Operation::Stream {
-            name: "s".into(),
-            destinations: vec![Destination::new("imap.example.com", 993)],
-            identity: None,
-            script: vec![
-                Exchange::Send {
-                    template: "LOGIN {{password}}\r\n".into(),
-                },
-                Exchange::Expect {
-                    until: vec!["\r\n".into()],
-                    capture: vec![capture(
-                        Source::Between {
-                            start: "SESSION ".into(),
-                            end: "\r\n".into(),
-                        },
-                        Store::Field {
-                            name: "session".into(),
-                        },
-                    )],
-                },
-            ],
-        }],
+        operations: vec![
+            Operation::tls("s", Destination::new("imap.example.com", 993))
+                .then(Send::write("LOGIN {{password}}\r\n"))
+                .then(Receive::until(["\r\n"]).capture(capture(
+                    Source::Between {
+                        start: "SESSION ".into(),
+                        end: "\r\n".into(),
+                    },
+                    Store::Field {
+                        name: "session".into(),
+                    },
+                )))
+                .then(Return::relay([r"NOOP\r\n"])),
+        ],
     };
     let s = setup(&clock, policy, &[("password", b"p4ssw0rd-imap")]);
     let mut transport = FakeTransport::default();
@@ -1885,16 +1969,13 @@ fn a_capture_into_a_public_field_is_refused() {
         callers: vec![],
         operations: vec![
             http("call", host(), vec![step]),
-            Operation::Derive {
-                name: "name".into(),
-                template: "{{display_name}}".into(),
-            },
+            derive_op("name", "{{display_name}}"),
         ],
     });
     assert_eq!(
         DeviceKey::generate().sign_policy(policy),
         Err(Error::PolicyInvalid {
-            at: "operations[0].steps[0].capture[0]".into(),
+            at: "operations[0].steps[2].capture[0]".into(),
             rule: "capture into a public field (a derivation could hand it back)"
         })
     );
@@ -1913,9 +1994,7 @@ fn an_older_record_is_refused_after_a_newer_one_or_a_pin() {
 
     // The owner narrows the policy on the device: same values, one generation later.
     let mut narrow = with_caller(wide);
-    if let Operation::Http { methods, .. } = &mut narrow.operations[0] {
-        *methods = vec![Method::Get];
-    }
+    contract_of(&mut narrow).methods = vec![Method::Get];
     let narrow = old
         .rewrap(&user_key(), s.device.sign_policy(narrow).unwrap())
         .unwrap();
@@ -2016,10 +2095,9 @@ fn calls_need_a_listed_caller_and_a_fresh_signature() {
         vec![secret("token")],
         vec![header("Authorization", "Bearer {{token}}")],
     );
-    policy.operations.push(Operation::Derive {
-        name: "hash".into(),
-        template: "{{ hex(hmac_sha256(token, $input)) }}".into(),
-    });
+    policy
+        .operations
+        .push(derive_op("hash", "{{ hex(hmac_sha256(token, $input)) }}"));
     let reader = CallerKey::from_bytes(&mut [6u8; 32]);
     policy.callers = vec![
         Caller {
@@ -2180,15 +2258,10 @@ fn caller_paths_and_headers_are_allowlisted() {
         vec![secret("token")],
         vec![header("Authorization", "Bearer {{token}}")],
     );
-    if let Operation::Http {
-        paths,
-        caller_headers,
-        ..
-    } = &mut policy.operations[0]
-    {
-        *paths = vec!["/v1/".into(), "/health".into()];
-        *caller_headers = vec!["Accept".into()];
-    }
+    let contract = contract_of(&mut policy);
+    contract.paths = vec!["/v1/**".into(), "/health".into()];
+    contract.headers = vec!["Accept".into()];
+    contract.query = vec![QueryRule::any("full")];
     let s = setup(&clock, policy, &[("token", TOKEN)]);
     let mut transport = FakeTransport::default();
     let mut accept = get("/v1/repos");
@@ -2206,16 +2279,19 @@ fn caller_paths_and_headers_are_allowlisted() {
     let mut other = get("/v1/x");
     other.headers.push(("X-Other".into(), "1".into()));
     let denied = |path: &str| Error::PathDenied { path: path.into() };
-    let path_rule = Error::RequestInvalid {
-        rule: "path must start with / and hold no fragment, dot segment or encoded separator",
+    let dot_rule = Error::RequestInvalid {
+        rule: "path holds a dot segment or separator, as sent, after ; parameters or after decoding",
+    };
+    let encoded_rule = Error::RequestInvalid {
+        rule: "path holds an encoded /, \\ or .",
     };
     for (request, error) in [
         (get("/v2/x"), denied("/v2/x")),
         (get("/healthz"), denied("/healthz")),
         (get("/v1"), denied("/v1")),
-        (get("/v1/../admin"), path_rule.clone()),
-        (get("/v1/%2e%2e/admin"), path_rule.clone()),
-        (get("/v1%2Fadmin"), path_rule),
+        (get("/v1/../admin"), dot_rule),
+        (get("/v1/%2e%2e/admin"), encoded_rule.clone()),
+        (get("/v1%2Fadmin"), encoded_rule),
         (
             other,
             Error::RequestInvalid {
@@ -2681,10 +2757,7 @@ fn guessable_fields_give_back_no_check_for_guesses() {
         let policy = Policy {
             fields: vec![FieldSpec::guessable("pin"), secret("key")],
             callers: vec![],
-            operations: vec![Operation::Derive {
-                name: "derive".into(),
-                template: template.into(),
-            }],
+            operations: vec![derive_op("derive", template)],
         };
         device.sign_policy(with_caller(policy)).map(|_| ())
     };
@@ -2712,10 +2785,7 @@ fn guessable_fields_give_back_no_check_for_guesses() {
             ..public("user")
         }],
         callers: vec![],
-        operations: vec![Operation::Derive {
-            name: "derive".into(),
-            template: "{{ len(user) }}".into(),
-        }],
+        operations: vec![derive_op("derive", "{{ len(user) }}")],
     };
     assert!(matches!(
         device.sign_policy(with_caller(public)),
@@ -3037,10 +3107,7 @@ fn derives(fields: Vec<FieldSpec>, ops: &[(&str, &str)]) -> Policy {
         callers: vec![],
         operations: ops
             .iter()
-            .map(|(name, template)| Operation::Derive {
-                name: (*name).into(),
-                template: (*template).into(),
-            })
+            .map(|(name, template)| derive_op(name, template))
             .collect(),
     })
 }
@@ -3483,7 +3550,7 @@ fn new_functions_cannot_exfiltrate_a_secret() {
     for template in refused {
         let policy = with_caller(derive_policy(fields(), template));
         assert!(
-            matches!(device.sign_policy(policy), Err(Error::PolicyInvalid { at, .. }) if at.starts_with("operations[0].template")),
+            matches!(device.sign_policy(policy), Err(Error::PolicyInvalid { at, .. }) if at.starts_with("operations[0].steps[0].template")),
             "{template}"
         );
     }

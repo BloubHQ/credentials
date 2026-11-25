@@ -1,13 +1,15 @@
 //! Signs a JWT (RS256) with an RSA key the caller never sees.
 //!
 //! ```sh
-//! JWT_KEY_FILE=service-account.pem JWT_CLAIMS='{"iss":"me","exp":1900000000}' \
+//! JWT_KEY_FILE=service-account.pem JWT_CLAIMS='{"iss":"svc@example.iam","aud":"https://oauth2.example.com/token"}' \
 //!     cargo run -p transport --example jwt_derive
 //! ```
 //!
-//! A derive operation renders one template and hands its output back: here the header, the
-//! claims the caller sends as `$input`, and an RS256 signature, each base64url-encoded. The
-//! template is analysed before the policy is signed: the output carries a signature of the
+//! An operation with no connection renders one template and hands its output back: here the
+//! header, the claims the caller sends as `$input`, and an RS256 signature, each
+//! base64url-encoded. The input schema bounds what the key signs: `iss` and `aud` are fixed,
+//! `iat` and `exp` are written by the node from its clock (an hour of validity), and no other
+//! member is accepted. The template is analysed before the policy is signed: the output carries a signature of the
 //! key, never the key. A derivation sends nothing, so this example needs no network.
 //!
 //! `JWT_KEY_FILE` is a PKCS#8 PEM RSA private key. Without it, the example uses the public
@@ -21,7 +23,9 @@ use engine::grant::GrantTerms;
 use engine::keys::{CallerKey, DeviceKey, NodeKey, UserKey};
 use engine::log::MemorySink;
 use engine::node::{Node, SystemClock};
-use engine::policy::{Caller, FieldSpec, Operation, Policy};
+use engine::policy::{
+    Caller, FieldSpec, Input, JsonInput, JsonType, Member, NodeTime, Operation, Policy,
+};
 use engine::record::Record;
 use transport::TlsTransport;
 
@@ -29,7 +33,7 @@ use transport::TlsTransport;
 const TEST_KEY: &str = include_str!("../../engine/tests/fixtures/rsa2048.pem");
 
 const DEFAULT_CLAIMS: &str =
-    r#"{"iss":"svc@example.iam","aud":"https://oauth2.example.com/token","exp":1900000000}"#;
+    r#"{"iss":"svc@example.iam","aud":"https://oauth2.example.com/token"}"#;
 
 fn policy(app: &CallerKey) -> Policy {
     let head = r#"b64urlraw("{\"alg\":\"RS256\",\"typ\":\"JWT\"}") + "." + b64urlraw($input)"#;
@@ -37,7 +41,14 @@ fn policy(app: &CallerKey) -> Policy {
         format!("{{{{ {head} + \".\" + b64urlraw(rsa_sign_pkcs1_sha256(pem(key), {head})) }}}}");
     Policy::new()
         .with_field(FieldSpec::secret("key"))
-        .with_operation(Operation::derive("jwt", &jwt))
+        .with_operation(Operation::derive("jwt", &jwt).input(Input::Json(JsonInput {
+            members: vec![
+                Member::equals("/iss", "svc@example.iam").of(JsonType::String),
+                Member::equals("/aud", "https://oauth2.example.com/token").of(JsonType::String),
+                Member::time("/iat", NodeTime::Unix, 0),
+                Member::time("/exp", NodeTime::Unix, 3600),
+            ],
+        })))
         .with_caller(Caller::new("app", app.public(), ["jwt"]))
 }
 

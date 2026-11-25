@@ -69,6 +69,16 @@ pub fn sign_policy(device_key: String, policy_json: String) -> Result<String> {
     to_json(&signed)
 }
 
+/// Converts a policy of the format before steps (signed or not) into the step language.
+/// Returns `{"policy": <unsigned policy>, "notes": [<line>...]}`: show the notes to the owner,
+/// who must sign the policy again ([`sign_policy`]); the old signature does not carry over.
+#[cfg_attr(not(target_arch = "wasm32"), uniffi::export)]
+pub fn upgrade_policy(policy_json: String) -> Result<String> {
+    let upgrade = engine::policy::legacy::upgrade_json(&policy_json)
+        .map_err(ClientError::engine("cannot convert the policy"))?;
+    to_json(&upgrade)
+}
+
 /// Encrypts `fields` under the user key as generation 1 of record `record_id` of `owner`,
 /// bound to `signed_policy_json`. Returns the record JSON: ciphertext the app or an operator
 /// may store anywhere. Pin it ([`pin_record`], or in a [`crate::grant`]) so nodes refuse older

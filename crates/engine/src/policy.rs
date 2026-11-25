@@ -1,22 +1,28 @@
 //! Policies: which fields a record holds, who may use them, and how, as data.
 //!
 //! The engine knows no kind of credential and no protocol flow. A policy names the fields of
-//! its record, the callers that may use it, and a list of named [`Operation`]s:
+//! its record, the callers that may use it, and a list of named [`Operation`]s. Every
+//! operation is one program in the same step language, over one kind of connection:
 //!
-//! - [`Operation::Http`]: one or more HTTP [`Step`]s. A step sends either the request of the
-//!   caller (within the destinations, methods, paths and headers of the operation) or a
-//!   request the policy fixes, puts rendered templates into it, and may capture values from
-//!   its response, either into a secret field of the record (a refreshed token, which the
-//!   node seals into a new record) or into a value later steps read (a session cookie, a
-//!   challenge nonce). The response of the last step goes back to the caller.
-//! - [`Operation::Stream`]: a script of sends and expects over one TLS connection, for
-//!   protocols that are not HTTP (IMAP, SMTP, line protocols), followed by the exchanges of
-//!   the caller on the authenticated connection.
-//! - [`Operation::Derive`]: a template whose output goes back to the caller; it must not be
-//!   tainted.
+//! - [`Step::Open`] opens the connection: [`Connection::Https`] (each `send` is one HTTP/1.1
+//!   request, `receive` reads its response) or [`Connection::Tls`] (a byte stream: `send`
+//!   writes, `receive` reads up to a delimiter). An operation without `open` has no
+//!   connection: it computes from the record and the caller's input (a derivation).
+//! - [`Step::Send`] puts rendered templates on the connection: the caller's request within
+//!   its [`CallerRequest`] contract, or a request the policy fixes, or bytes on a stream.
+//! - [`Step::Receive`] reads and [`Capture`]s values: into a secret field of the record (the
+//!   node seals a new record) or into a temporary value later steps read.
+//! - [`Step::Compute`] renders a template into a temporary value.
+//! - [`Step::Return`] says what goes back to the caller: the declared parts of the last
+//!   response ([`Projection`]), the caller's exchanges on the stream within the patterns of
+//!   a [`Relay`], or the output of a template that must hand no secret back.
 //!
-//! Every call names a [`Caller`] of the policy and carries its signature; a caller may use only
-//! the operations it lists, at most at its [`Limit`].
+//! Loops and branches ([`Step::Repeat`], [`Step::If`]) are part of the syntax and refused
+//! when a policy is checked: they are the next part of the language.
+//!
+//! Every template of every step is checked by the same analysis before the policy is
+//! signed. Every call names a [`Caller`] of the policy and carries its signature; a caller may
+//! use only the operations it lists, at most at its [`Limit`].
 //!
 //! The device of the owner signs the policy, and the policy is bound to the ciphertext of its
 //! record, so the operator can neither widen it nor move it to another record.
@@ -25,31 +31,46 @@ use serde::{Deserialize, Serialize};
 
 use crate::encoding::{b64_array, canonical};
 use crate::keys::{CallerPublicKey, DeviceKey, DevicePublicKey};
-use crate::template::{NameKind, Template, Var};
+use crate::template::{NameKind, Props, Template, Var};
 use crate::{Error, Result};
 
-const POLICY_DOMAIN: &[u8] = b"policy/v3\0";
+mod contract;
+mod input;
+pub mod legacy;
+
+pub(crate) use contract::placeholders;
+pub use contract::{
+    CallerRequest, MAX_QUERY_RULES, QueryRule, RESERVED_PARAMS, path_fault, template_fault,
+    template_matches,
+};
+pub use input::{Input, JsonInput, JsonType, Member, NodeTime, RawInput, RlpInput, RlpItem};
+
+const POLICY_DOMAIN: &[u8] = b"policy/v4\0";
 
 /// Most operations of a policy.
 pub const MAX_OPERATIONS: usize = 16;
 /// Most callers of a policy.
 pub const MAX_CALLERS: usize = 32;
-/// Most destinations of an operation.
+/// Most destinations of a connection.
 pub const MAX_DESTINATIONS: usize = 32;
-/// Most path prefixes of an operation.
+/// Most path templates of a caller request.
 pub const MAX_PATHS: usize = 32;
-/// Most steps of an HTTP operation.
-pub const MAX_STEPS: usize = 8;
-/// Most injections of a step.
+/// Most steps of an operation.
+pub const MAX_STEPS: usize = 64;
+/// Most requests (HTTPS sends) of an operation.
+pub const MAX_REQUESTS: usize = 8;
+/// Most injections of a send.
 pub const MAX_INJECTIONS: usize = 16;
-/// Most captures of a step or an expect.
+/// Most captures of a receive.
 pub const MAX_CAPTURES: usize = 16;
-/// Most entries of a stream script.
-pub const MAX_SCRIPT: usize = 32;
-/// Most delimiters of one expect.
+/// Most delimiters of one receive on a stream.
 pub const MAX_DELIMITERS: usize = 8;
-/// Longest delimiter of an expect, in bytes.
+/// Longest delimiter of a receive on a stream, in bytes.
 pub const MAX_DELIMITER: usize = 256;
+/// Most headers or JSON members of a response projection.
+pub const MAX_PROJECTION: usize = 32;
+/// Most caller send patterns of a relay.
+pub const MAX_RELAY_PATTERNS: usize = 16;
 
 /// Headers the engine sets itself, or that change how a server reads or answers a request;
 /// neither an injection nor a caller may name them.
@@ -71,7 +92,7 @@ pub(crate) const RESERVED_HEADERS: [&str; 15] = [
     "x-method-override",
 ];
 
-fn is_false(b: &bool) -> bool {
+pub(crate) fn is_false(b: &bool) -> bool {
     !*b
 }
 
@@ -175,7 +196,8 @@ pub enum Target {
         /// Parameter name.
         name: String,
     },
-    /// The placeholder `{name}` of the path, percent-encoded by the engine.
+    /// The placeholder `{name}` of the path, a whole path segment, percent-encoded by the
+    /// engine.
     PathParam {
         /// Placeholder name.
         name: String,
@@ -344,31 +366,6 @@ pub struct Identity {
     pub key: String,
 }
 
-/// What request a step sends.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(
-    tag = "from",
-    rename_all = "snake_case",
-    deny_unknown_fields,
-    from = "wire::StepRequest"
-)]
-pub enum StepRequest {
-    /// The request of the caller.
-    #[default]
-    Caller,
-    /// A request the policy fixes; the caller has no say in it.
-    Fixed {
-        /// Method.
-        method: Method,
-        /// Path and query, starting with `/`.
-        path: String,
-        /// Destination (concrete). It may be left out only when the operation has exactly one
-        /// destination and that one is concrete.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        destination: Option<Destination>,
-    },
-}
-
 /// Where a capture reads in a response.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(
@@ -437,12 +434,10 @@ pub enum Source {
 }
 
 /// The forms the tagged enums are read in. Serde ignores unknown members next to the tag of a
-/// variant without fields (`{"from": "caller", "path": "/x"}` would read as `Caller`), so here
-/// every such variant has an empty set of fields, which refuses them.
+/// variant without fields (`{"from": "all", "junk": 1}` would read as `All`), so here every
+/// such variant has an empty set of fields, which refuses them.
 mod wire {
     use serde::Deserialize;
-
-    use super::{Destination, Method};
 
     #[derive(Deserialize)]
     #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
@@ -460,35 +455,6 @@ mod wire {
                 Target::Query { name } => Self::Query { name },
                 Target::PathParam { name } => Self::PathParam { name },
                 Target::Body {} => Self::Body,
-            }
-        }
-    }
-
-    #[derive(Deserialize)]
-    #[serde(tag = "from", rename_all = "snake_case", deny_unknown_fields)]
-    pub(super) enum StepRequest {
-        Caller {},
-        Fixed {
-            method: Method,
-            path: String,
-            #[serde(default)]
-            destination: Option<Destination>,
-        },
-    }
-
-    impl From<StepRequest> for super::StepRequest {
-        fn from(r: StepRequest) -> Self {
-            match r {
-                StepRequest::Caller {} => Self::Caller,
-                StepRequest::Fixed {
-                    method,
-                    path,
-                    destination,
-                } => Self::Fixed {
-                    method,
-                    path,
-                    destination,
-                },
             }
         }
     }
@@ -611,7 +577,7 @@ impl Source {
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Store {
     /// A secret field of the record. The node seals the record again and hands the new one
-    /// back. Only a request the policy fixes may capture into a field.
+    /// back. Only a request the policy fixes, or a stream, may capture into a field.
     Field {
         /// Field name.
         name: String,
@@ -638,119 +604,258 @@ pub struct Capture {
     pub optional: bool,
 }
 
-/// One request of an HTTP operation.
+/// The kind of connection an operation opens. New kinds (WebSocket, SSH, database
+/// handshakes, a browser over CDP) are added here, each with what its `send`, `receive` and
+/// `return` mean; the steps and the analysis stay the same.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Connection {
+    /// HTTPS: each `send` is one HTTP/1.1 request on its own TLS connection, and `receive`
+    /// reads its response.
+    Https,
+    /// A TLS byte stream (IMAP, SMTP, line protocols): `send` writes, `receive` reads up to a
+    /// delimiter.
+    Tls,
+}
+
+/// The `open` step: the connection and where it may go.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct Step {
-    /// What request is sent.
-    #[serde(default)]
-    pub request: StepRequest,
-    /// What the request carries.
-    #[serde(default)]
+pub struct Open {
+    /// The kind of connection.
+    pub connection: Connection,
+    /// Destinations it may reach.
+    pub destinations: Vec<Destination>,
+    /// Client certificate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity: Option<Identity>,
+}
+
+/// What request an HTTPS `send` sends.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "from", rename_all = "snake_case", deny_unknown_fields)]
+pub enum StepRequest {
+    /// The request of the caller, within its contract.
+    Caller(CallerRequest),
+    /// A request the policy fixes; the caller has no say in it.
+    Fixed {
+        /// Method.
+        method: Method,
+        /// Path and query, starting with `/`; a placeholder `{name}` is a whole segment.
+        path: String,
+        /// Destination (concrete). It may be left out only when the connection has exactly
+        /// one destination and that one is concrete.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        destination: Option<Destination>,
+    },
+}
+
+/// The `send` step. On HTTPS it takes `request` and `inject`; on a TLS stream, `template`.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Send {
+    /// The request (HTTPS).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request: Option<StepRequest>,
+    /// What the request carries (HTTPS).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub inject: Vec<Injection>,
-    /// What is taken from the response.
-    #[serde(default)]
+    /// What is written (TLS).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub template: Option<String>,
+}
+
+/// The `receive` step. On HTTPS it reads the response of the `send` just before it; on a TLS
+/// stream it reads up to and including the first of the delimiters `until`.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Receive {
+    /// The delimiters that end the read (TLS).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub until: Vec<String>,
+    /// What is taken from what was read.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub capture: Vec<Capture>,
 }
 
-/// One entry of a stream script.
+/// The `compute` step: a template rendered into a temporary value later steps read by name.
+/// The name has exactly the properties of the template for the analysis.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-pub enum Exchange {
-    /// Writes the rendered template.
-    Send {
-        /// What is written.
-        template: String,
-    },
-    /// Reads up to and including the first of the delimiters `until`.
-    Expect {
-        /// The delimiters that end the read.
-        until: Vec<String>,
-        /// What is taken from the bytes read (only `between` and `all`).
-        #[serde(default)]
-        capture: Vec<Capture>,
-    },
+#[serde(deny_unknown_fields)]
+pub struct Compute {
+    /// The name of the value.
+    pub into: String,
+    /// The template.
+    pub template: String,
 }
 
-/// A named thing a caller may do with a record.
+/// What goes back to the caller of an HTTPS operation, from the last response. The status
+/// always goes back; headers and the body only as declared.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Projection {
+    /// Response headers that go back (case does not matter).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub headers: Vec<String>,
+    /// What of the body goes back; nothing when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body: Option<BodyProjection>,
+}
+
+/// What of a response body goes back.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-pub enum Operation {
-    /// One or more HTTP requests.
-    Http {
-        /// Operation name.
-        name: String,
-        /// Destinations its requests may go to.
-        destinations: Vec<Destination>,
-        /// Methods a request of the caller may use.
-        #[serde(default)]
-        methods: Vec<Method>,
-        /// Path prefixes a request of the caller may use (`/v1/` allows `/v1/x`; `/v1`
-        /// allows `/v1`, `/v1/x` and `/v1?q`, not `/v10`).
-        #[serde(default)]
-        paths: Vec<String>,
-        /// Headers a request of the caller may carry (case does not matter).
-        #[serde(default)]
-        caller_headers: Vec<String>,
-        /// Client certificate.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        identity: Option<Identity>,
-        /// The requests, in order.
-        steps: Vec<Step>,
-    },
-    /// A scripted exchange over one TLS connection, then the exchanges of the caller.
-    Stream {
-        /// Operation name.
-        name: String,
-        /// Destinations it may connect to.
-        destinations: Vec<Destination>,
-        /// Client certificate.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        identity: Option<Identity>,
-        /// The script, in order.
-        script: Vec<Exchange>,
-    },
-    /// A template whose output goes back to the caller; `$input` is the input of the caller.
-    Derive {
-        /// Operation name.
-        name: String,
-        /// The template.
-        template: String,
-    },
+#[serde(rename_all = "snake_case")]
+pub enum BodyProjection {
+    /// The whole body. A summary flags it: whatever the server puts there reaches the caller.
+    All,
+    /// These JSON members, as an object from each pointer to its value. A `*` token stands
+    /// for every element of an array.
+    Json(Vec<String>),
+}
+
+/// The caller's exchanges a TLS operation relays after its steps.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Relay {
+    /// Regular expressions (linear time, ASCII, `.` does not match a line end); each caller
+    /// send must match one of them whole.
+    pub sends: Vec<String>,
+}
+
+/// The `return` step: what goes back to the caller. HTTPS takes `response`, TLS `relay`, an
+/// operation with no connection `template`.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Return {
+    /// The parts of the last response that go back (HTTPS); without it, the status only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response: Option<Projection>,
+    /// The caller's exchanges relayed (TLS); without it, none are.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay: Option<Relay>,
+    /// The output (no connection): it must hand no secret back.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub template: Option<String>,
+}
+
+/// A bounded loop: the syntax of the next part of the language. Refused by
+/// [`Policy::validate`] for now.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Repeat {
+    /// Most iterations.
+    pub times: u32,
+    /// The steps repeated.
+    pub steps: Vec<Step>,
+    /// A public value whose presence ends the loop.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub until: Option<String>,
+}
+
+/// A branch on a captured public value: the syntax of the next part of the language. Refused
+/// by [`Policy::validate`] for now.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Branch {
+    /// The value tested (a public temporary value).
+    pub name: String,
+    /// The value it is compared with.
+    pub equals: String,
+    /// The steps when it is equal.
+    #[serde(default)]
+    pub then: Vec<Step>,
+    /// The steps otherwise.
+    #[serde(default, rename = "else")]
+    pub otherwise: Vec<Step>,
+}
+
+/// One step of an operation.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "do", rename_all = "snake_case")]
+pub enum Step {
+    /// Opens the connection.
+    Open(Open),
+    /// Sends.
+    Send(Send),
+    /// Receives and captures.
+    Receive(Receive),
+    /// Computes a value.
+    Compute(Compute),
+    /// Says what goes back to the caller; the last step.
+    Return(Return),
+    /// A bounded loop (refused for now).
+    Repeat(Repeat),
+    /// A branch (refused for now).
+    If(Branch),
+}
+
+/// A named thing a caller may do with a record: steps over one connection.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Operation {
+    /// Operation name.
+    pub name: String,
+    /// The schema of the caller's input, `$input` to the templates (operations with no
+    /// connection). An operation whose templates read `$input` must declare it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input: Option<Input>,
+    /// The steps, in order.
+    pub steps: Vec<Step>,
 }
 
 impl Operation {
     /// The error for a call that needs another kind of operation.
     pub(crate) fn unknown(&self) -> Error {
         Error::OperationUnknown {
-            name: self.name().to_string(),
+            name: self.name.clone(),
         }
     }
 
     /// The name of the operation.
     pub fn name(&self) -> &str {
-        match self {
-            Operation::Http { name, .. }
-            | Operation::Stream { name, .. }
-            | Operation::Derive { name, .. } => name,
+        &self.name
+    }
+
+    /// The `open` step, when the operation has a connection.
+    pub fn open(&self) -> Option<&Open> {
+        match self.steps.first() {
+            Some(Step::Open(open)) => Some(open),
+            _ => None,
         }
+    }
+
+    /// The kind of connection; `None` for an operation that computes only.
+    pub fn connection(&self) -> Option<Connection> {
+        self.open().map(|o| o.connection)
+    }
+
+    /// The `return` step.
+    pub fn returns(&self) -> Option<&Return> {
+        match self.steps.last() {
+            Some(Step::Return(r)) => Some(r),
+            _ => None,
+        }
+    }
+
+    /// The contracts of the `send` steps that send the caller's request, with their steps.
+    pub fn caller_sends(&self) -> impl Iterator<Item = (&CallerRequest, &Send)> {
+        self.steps.iter().filter_map(|s| match s {
+            Step::Send(send) => match &send.request {
+                Some(StepRequest::Caller(contract)) => Some((contract, send)),
+                _ => None,
+            },
+            _ => None,
+        })
     }
 
     /// The captures that go into temporary values, with their secrecy.
     fn temps(&self) -> Vec<(&str, bool)> {
-        let captures: Vec<&Capture> = match self {
-            Operation::Http { steps, .. } => steps.iter().flat_map(|s| &s.capture).collect(),
-            Operation::Stream { script, .. } => script
-                .iter()
-                .flat_map(|e| match e {
-                    Exchange::Expect { capture, .. } => capture.as_slice(),
-                    Exchange::Send { .. } => &[],
-                })
-                .collect(),
-            Operation::Derive { .. } => Vec::new(),
-        };
-        captures
-            .into_iter()
+        self.steps
+            .iter()
+            .flat_map(|s| match s {
+                Step::Receive(r) => r.capture.as_slice(),
+                _ => &[],
+            })
             .filter_map(|c| match &c.into {
                 Store::Temp { name, secret } => Some((name.as_str(), *secret)),
                 Store::Field { .. } => None,
@@ -758,20 +863,92 @@ impl Operation {
             .collect()
     }
 
-    /// True when the concrete destination is one the operation names.
+    /// True when the concrete destination is one the connection names.
     pub fn allows_destination(&self, destination: &Destination) -> bool {
-        match self {
-            Operation::Http { destinations, .. } | Operation::Stream { destinations, .. } => {
-                destinations.iter().any(|d| d.matches(destination))
-            }
-            Operation::Derive { .. } => false,
-        }
+        self.open()
+            .is_some_and(|o| o.destinations.iter().any(|d| d.matches(destination)))
     }
 
     /// True when a step sends the request of the caller.
     pub fn takes_request(&self) -> bool {
-        matches!(self, Operation::Http { steps, .. }
-            if steps.iter().any(|s| s.request == StepRequest::Caller))
+        self.caller_sends().next().is_some()
+    }
+
+    fn templates(&self) -> Vec<&str> {
+        let mut out = Vec::new();
+        for step in &self.steps {
+            match step {
+                Step::Open(open) => {
+                    if let Some(identity) = &open.identity {
+                        out.push(identity.cert.as_str());
+                        out.push(identity.key.as_str());
+                    }
+                }
+                Step::Send(send) => {
+                    out.extend(send.inject.iter().map(|i| i.template.as_str()));
+                    out.extend(send.template.as_deref());
+                }
+                Step::Compute(c) => out.push(&c.template),
+                Step::Return(r) => out.extend(r.template.as_deref()),
+                Step::Receive(_) | Step::Repeat(_) | Step::If(_) => {}
+            }
+        }
+        out
+    }
+}
+
+/// What each name an operation reads is, for the analysis, with the properties of the values
+/// its `compute` steps define worked out once, in order.
+pub struct Kinds<'p> {
+    policy: &'p Policy,
+    temps: Vec<(&'p str, bool)>,
+    computed: Vec<(&'p str, Props)>,
+}
+
+impl<'p> Kinds<'p> {
+    fn new(policy: &'p Policy, operation: &'p Operation) -> Self {
+        let mut kinds = Kinds {
+            policy,
+            temps: operation.temps(),
+            computed: Vec::new(),
+        };
+        for step in &operation.steps {
+            if let Step::Compute(c) = step {
+                let props = Template::parse(&c.template)
+                    .ok()
+                    .and_then(|t| t.props(&|n| kinds.kind(n)).ok())
+                    .unwrap_or_else(Props::unknown);
+                if kinds.computed.iter().all(|(n, _)| *n != c.into) {
+                    kinds.computed.push((&c.into, props));
+                }
+            }
+        }
+        kinds
+    }
+
+    /// What `name` is. An unknown name counts as a secret field.
+    pub fn kind(&self, name: &str) -> NameKind {
+        if let Some((_, props)) = self.computed.iter().find(|(n, _)| *n == name) {
+            return NameKind::Computed(*props);
+        }
+        if let Some((_, secret)) = self.temps.iter().find(|(n, _)| *n == name) {
+            return if *secret {
+                NameKind::SecretTemp
+            } else {
+                NameKind::PublicTemp
+            };
+        }
+        let fields = &self.policy.fields;
+        if fields
+            .iter()
+            .any(|f| f.name == name && f.secret && f.guessable)
+        {
+            NameKind::GuessableField
+        } else if self.policy.is_secret(name) {
+            NameKind::SecretField
+        } else {
+            NameKind::PublicField
+        }
     }
 }
 
@@ -801,27 +978,6 @@ fn unique<'a>(names: impl Iterator<Item = &'a str>) -> bool {
     names.windows(2).all(|w| w.first() != w.get(1))
 }
 
-/// A path the engine sends: starts with `/`, visible ASCII, no fragment, no `.` or `..`
-/// segment and no encoded `/`, `\` or `.`, so a server cannot read it as another path.
-pub(crate) fn check_path(path: &str) -> bool {
-    let pathname = path.split_once('?').map_or(path, |(p, _)| p);
-    let lower = pathname.to_ascii_lowercase();
-    path.starts_with('/')
-        && path.len() <= crate::request::MAX_PATH
-        && path.bytes().all(|b| b.is_ascii_graphic() && b != b'#')
-        && !pathname.contains('\\')
-        && !["%2f", "%5c", "%2e"].iter().any(|e| lower.contains(e))
-        && !pathname.split('/').any(|s| s == "." || s == "..")
-}
-
-/// True when `path` is under `prefix` on a segment boundary.
-pub(crate) fn under(path: &str, prefix: &str) -> bool {
-    let Some(rest) = path.strip_prefix(prefix) else {
-        return false;
-    };
-    prefix.ends_with('/') || rest.is_empty() || rest.starts_with('/') || rest.starts_with('?')
-}
-
 type Checked = core::result::Result<(), Error>;
 
 fn fail(at: impl Into<String>, rule: &'static str) -> Checked {
@@ -848,6 +1004,44 @@ fn check_destinations(at: &str, destinations: &[Destination]) -> Checked {
     Ok(())
 }
 
+/// A query name a policy may list: visible ASCII without the bytes that end it.
+fn is_query_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 256
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_graphic() && !b"&=#+%".contains(&b))
+}
+
+/// True when every placeholder of a fixed path is a whole path segment, outside the query.
+fn whole_segment_placeholders(path: &str) -> bool {
+    let (pathname, query) = path.split_once('?').unwrap_or((path, ""));
+    !query.contains(['{', '}'])
+        && pathname
+            .split('/')
+            .all(|s| !s.contains(['{', '}']) || contract::placeholder(s).is_some())
+}
+
+fn check_projection(at: &str, projection: &Projection) -> Checked {
+    ensure(
+        projection.headers.len() <= MAX_PROJECTION
+            && projection.headers.iter().all(|h| is_token(h)),
+        || format!("{at}.response.headers"),
+        "at most 32 header names, each a token",
+    )?;
+    if let Some(BodyProjection::Json(pointers)) = &projection.body {
+        ensure(
+            !pointers.is_empty()
+                && pointers.len() <= MAX_PROJECTION
+                && pointers.iter().all(|p| p.is_empty() || p.starts_with('/'))
+                && unique(pointers.iter().map(String::as_str)),
+            || format!("{at}.response.body"),
+            "1 to 32 distinct JSON pointers, each empty or starting with /",
+        )?;
+    }
+    Ok(())
+}
+
 impl Policy {
     /// True when the field is secret (an unknown field counts as secret).
     pub fn is_secret(&self, name: &str) -> bool {
@@ -857,34 +1051,23 @@ impl Policy {
             .is_none_or(|f| f.secret)
     }
 
+    /// What each name `operation` reads is.
+    pub fn kinds<'p>(&'p self, operation: &'p Operation) -> Kinds<'p> {
+        Kinds::new(self, operation)
+    }
+
     /// What a name read in `operation` is. An unknown name counts as a secret field.
     pub fn name_kind(&self, operation: &Operation, name: &str) -> NameKind {
-        if let Some((_, secret)) = operation.temps().into_iter().find(|(n, _)| *n == name) {
-            return if secret {
-                NameKind::SecretTemp
-            } else {
-                NameKind::PublicTemp
-            };
-        }
-        if self
-            .fields
-            .iter()
-            .any(|f| f.name == name && f.secret && f.guessable)
-        {
-            NameKind::GuessableField
-        } else if self.is_secret(name) {
-            NameKind::SecretField
-        } else {
-            NameKind::PublicField
-        }
+        self.kinds(operation).kind(name)
     }
 
     /// True when the name, a field or a temporary value of `operation`, is secret.
     pub fn is_secret_in(&self, operation: &Operation, name: &str) -> bool {
-        matches!(
-            self.name_kind(operation, name),
-            NameKind::SecretField | NameKind::GuessableField | NameKind::SecretTemp
-        )
+        match self.name_kind(operation, name) {
+            NameKind::SecretField | NameKind::GuessableField | NameKind::SecretTemp => true,
+            NameKind::Computed(props) => props.tainted(),
+            NameKind::PublicField | NameKind::PublicTemp => false,
+        }
     }
 
     fn is_field(&self, name: &str) -> bool {
@@ -895,7 +1078,7 @@ impl Policy {
     pub fn operation(&self, name: &str) -> Result<&Operation> {
         self.operations
             .iter()
-            .find(|o| o.name() == name)
+            .find(|o| o.name == name)
             .ok_or_else(|| Error::OperationUnknown {
                 name: name.to_string(),
             })
@@ -913,18 +1096,18 @@ impl Policy {
     }
 
     /// Parses a template, checks its names and variables, and applies the analysis. Returns
-    /// whether its output is tainted.
+    /// the template, and whether its output is tainted.
     fn check_template(
         &self,
         at: &str,
-        operation: &Operation,
+        kinds: &Kinds<'_>,
         text: &str,
-        temps: &[&str],
+        known: &[&str],
         var_ok: fn(Var) -> bool,
-    ) -> Result<bool> {
+    ) -> Result<(Template, bool)> {
         let template = Template::parse(text).map_err(|_| Error::policy(at, "template syntax"))?;
-        let known = |name: &str| self.is_field(name) || temps.contains(&name);
-        if let Some(name) = template.names().into_iter().find(|n| !known(n)) {
+        let known_name = |name: &str| self.is_field(name) || known.contains(&name);
+        if let Some(name) = template.names().into_iter().find(|n| !known_name(n)) {
             return Err(Error::policy(
                 format!("{at} ({name})"),
                 "template reads an unknown or later name",
@@ -936,9 +1119,10 @@ impl Policy {
                 "template reads a variable not available here",
             ));
         }
-        template
-            .analyze(&|name| self.name_kind(operation, name))
-            .map_err(|rule| Error::policy(at, rule))
+        let tainted = template
+            .analyze(&|name| kinds.kind(name))
+            .map_err(|rule| Error::policy(at, rule))?;
+        Ok((template, tainted))
     }
 
     fn check_captures<'a>(
@@ -947,7 +1131,7 @@ impl Policy {
         captures: &'a [Capture],
         stream: bool,
         fixed: bool,
-        temps: &mut Vec<&'a str>,
+        known: &mut Vec<&'a str>,
     ) -> Checked {
         ensure(
             captures.len() <= MAX_CAPTURES,
@@ -979,34 +1163,29 @@ impl Policy {
                 }
                 Store::Temp { name, .. } => {
                     ensure(
-                        is_token(name) && !self.is_field(name) && !temps.contains(&name.as_str()),
+                        is_token(name) && !self.is_field(name) && !known.contains(&name.as_str()),
                         || at.clone(),
                         "temporary name must be a new token",
                     )?;
-                    temps.push(name);
+                    known.push(name);
                 }
             }
         }
         Ok(())
     }
 
-    fn check_identity(
-        &self,
-        at: &str,
-        operation: &Operation,
-        identity: Option<&Identity>,
-    ) -> Checked {
+    fn check_identity(&self, at: &str, kinds: &Kinds<'_>, identity: Option<&Identity>) -> Checked {
         if let Some(identity) = identity {
             self.check_template(
                 &format!("{at}.identity.cert"),
-                operation,
+                kinds,
                 &identity.cert,
                 &[],
                 Var::in_stream,
             )?;
             self.check_template(
                 &format!("{at}.identity.key"),
-                operation,
+                kinds,
                 &identity.key,
                 &[],
                 Var::in_stream,
@@ -1015,44 +1194,166 @@ impl Policy {
         Ok(())
     }
 
-    fn check_step<'a>(
+    fn check_caller_contract(&self, at: &str, contract: &CallerRequest, send: &Send) -> Checked {
+        let at = format!("{at}.request");
+        ensure(
+            !contract.methods.is_empty(),
+            || format!("{at}.methods"),
+            "a caller request lists its methods",
+        )?;
+        ensure(
+            !contract.paths.is_empty() && contract.paths.len() <= MAX_PATHS,
+            || format!("{at}.paths"),
+            "a caller request lists 1 to 32 path templates",
+        )?;
+        let params: Vec<&str> = send
+            .inject
+            .iter()
+            .filter_map(|i| match &i.target {
+                Target::PathParam { name } => Some(name.as_str()),
+                _ => None,
+            })
+            .collect();
+        for (i, template) in contract.paths.iter().enumerate() {
+            if let Some(rule) = template_fault(template) {
+                return fail(format!("{at}.paths[{i}]"), rule);
+            }
+            let found = placeholders(template);
+            let exact = params
+                .iter()
+                .all(|p| found.iter().filter(|f| *f == p).count() == 1)
+                && found.iter().all(|f| params.contains(f));
+            ensure(
+                exact,
+                || format!("{at}.paths[{i}]"),
+                "a path template holds each path parameter of the send once, and no other placeholder",
+            )?;
+        }
+        let injected = |kind: fn(&Target) -> Option<&str>| -> Vec<String> {
+            send.inject
+                .iter()
+                .filter_map(|i| kind(&i.target).map(str::to_ascii_lowercase))
+                .collect()
+        };
+        let injected_headers = injected(|t| match t {
+            Target::Header { name } => Some(name),
+            _ => None,
+        });
+        let injected_query = injected(|t| match t {
+            Target::Query { name } => Some(name),
+            _ => None,
+        });
+        for (i, name) in contract.headers.iter().enumerate() {
+            let lower = name.to_ascii_lowercase();
+            ensure(
+                is_token(name) && !RESERVED_HEADERS.contains(&lower.as_str()),
+                || format!("{at}.headers[{i}]"),
+                "caller header must be a token and not reserved",
+            )?;
+            ensure(
+                !injected_headers.contains(&lower),
+                || format!("{at}.headers[{i}]"),
+                "a caller header is also injected",
+            )?;
+        }
+        ensure(
+            contract.query.len() <= MAX_QUERY_RULES
+                && unique(
+                    contract
+                        .query
+                        .iter()
+                        .map(|q| q.name.to_ascii_lowercase())
+                        .collect::<Vec<_>>()
+                        .iter()
+                        .map(String::as_str),
+                ),
+            || format!("{at}.query"),
+            "at most 32 query parameters, each named once",
+        )?;
+        for (i, rule) in contract.query.iter().enumerate() {
+            let at = format!("{at}.query[{i}]");
+            ensure(
+                is_query_name(&rule.name),
+                || at.clone(),
+                "a query name is visible ASCII without & = # + %",
+            )?;
+            if let Some(fault) = rule.allowed().fault() {
+                return fail(at, fault);
+            }
+            ensure(
+                !injected_query.contains(&rule.name.to_ascii_lowercase()),
+                || at.clone(),
+                "a query parameter the policy injects cannot also come from the caller",
+            )?;
+            ensure(
+                contract.override_params
+                    || !RESERVED_PARAMS
+                        .iter()
+                        .any(|r| r.eq_ignore_ascii_case(&rule.name)),
+                || at.clone(),
+                "a reserved method-override parameter needs override_params",
+            )?;
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn check_https_send<'a>(
         &self,
         at: &str,
-        operation: &Operation,
-        step: &'a Step,
-        destinations: &[Destination],
-        temps: &mut Vec<&'a str>,
+        kinds: &Kinds<'_>,
+        open: &Open,
+        send: &'a Send,
+        known: &[&'a str],
     ) -> Checked {
         ensure(
-            step.inject.len() <= MAX_INJECTIONS,
+            send.template.is_none(),
+            || format!("{at}.template"),
+            "an HTTPS send takes request and inject, not template",
+        )?;
+        let Some(request) = &send.request else {
+            return fail(at, "an HTTPS send needs a request");
+        };
+        ensure(
+            send.inject.len() <= MAX_INJECTIONS,
             || format!("{at}.inject"),
             "at most 16 injections",
         )?;
-        if let StepRequest::Fixed {
-            path, destination, ..
-        } = &step.request
-        {
-            ensure(
-                check_path(path),
-                || format!("{at}.request.path"),
-                "path must start with / and hold no dot segment or encoded separator",
-            )?;
-            match destination {
-                Some(d) => ensure(
-                    d.is_concrete() && destinations.iter().any(|p| p.matches(d)),
-                    || format!("{at}.request.destination"),
-                    "fixed destination must be concrete and one of the operation",
-                )?,
-                None => ensure(
-                    destinations.len() == 1 && destinations.iter().all(Destination::is_concrete),
-                    || format!("{at}.request.destination"),
-                    "fixed request needs a destination unless the operation has one concrete destination",
-                )?,
+        match request {
+            StepRequest::Fixed {
+                path, destination, ..
+            } => {
+                ensure(
+                    path_fault(path, true).is_none(),
+                    || format!("{at}.request.path"),
+                    "path must start with / and hold no dot segment or encoded separator",
+                )?;
+                ensure(
+                    whole_segment_placeholders(path),
+                    || format!("{at}.request.path"),
+                    "a path parameter placeholder is a whole path segment, not in the query",
+                )?;
+                let destinations = &open.destinations;
+                match destination {
+                    Some(d) => ensure(
+                        d.is_concrete() && destinations.iter().any(|p| p.matches(d)),
+                        || format!("{at}.request.destination"),
+                        "fixed destination must be concrete and one of the connection",
+                    )?,
+                    None => ensure(
+                        destinations.len() == 1
+                            && destinations.iter().all(Destination::is_concrete),
+                        || format!("{at}.request.destination"),
+                        "fixed request needs a destination unless the connection has one concrete destination",
+                    )?,
+                }
             }
+            StepRequest::Caller(contract) => self.check_caller_contract(at, contract, send)?,
         }
         let mut headers: Vec<String> = Vec::new();
+        let mut query: Vec<String> = Vec::new();
         let mut bodies = 0;
-        for (i, injection) in step.inject.iter().enumerate() {
+        for (i, injection) in send.inject.iter().enumerate() {
             let at = format!("{at}.inject[{i}]");
             match &injection.target {
                 Target::Header { name } => {
@@ -1067,153 +1368,249 @@ impl Policy {
                     headers.push(lower);
                 }
                 Target::Query { name } => {
-                    ensure(is_token(name), || at.clone(), "query name is not a token")?;
+                    let lower = name.to_ascii_lowercase();
+                    ensure(
+                        is_token(name) && !query.contains(&lower),
+                        || at.clone(),
+                        "query name must be a token, set once",
+                    )?;
+                    query.push(lower);
                 }
                 Target::PathParam { name } => {
-                    let placeholder_ok = match &step.request {
+                    let placeholder_ok = match request {
                         StepRequest::Fixed { path, .. } => {
-                            path.matches(&format!("{{{name}}}")).count() == 1
+                            placeholders(path).iter().filter(|p| **p == name).count() == 1
                         }
-                        StepRequest::Caller => true,
+                        StepRequest::Caller(_) => true,
                     };
                     ensure(
                         is_token(name) && placeholder_ok,
                         || at.clone(),
-                        "path parameter must be a token found once in the path",
+                        "path parameter must be a token found once in the path, as a whole segment",
                     )?;
                 }
                 Target::Body => bodies += 1,
             }
-            self.check_template(&at, operation, &injection.template, temps, Var::in_request)?;
+            self.check_template(&at, kinds, &injection.template, known, Var::in_request)?;
         }
-        ensure(bodies <= 1, || format!("{at}.inject"), "at most one body")?;
-        let fixed = matches!(step.request, StepRequest::Fixed { .. });
-        self.check_captures(at, &step.capture, false, fixed, temps)
+        ensure(bodies <= 1, || format!("{at}.inject"), "at most one body")
     }
 
-    fn check_operation(&self, at: &str, operation: &Operation) -> Checked {
-        ensure(
-            is_token(operation.name()),
-            || format!("{at}.name"),
-            "name is not a token",
-        )?;
-        let mut temps: Vec<&str> = Vec::new();
-        match operation {
-            Operation::Http {
-                destinations,
-                methods,
-                paths,
-                caller_headers,
-                identity,
-                steps,
-                ..
-            } => {
-                check_destinations(at, destinations)?;
+    fn check_return(
+        &self,
+        at: &str,
+        kinds: &Kinds<'_>,
+        connection: Option<Connection>,
+        ret: &Return,
+        known: &[&str],
+        sent: bool,
+    ) -> Checked {
+        match connection {
+            Some(Connection::Https) => {
                 ensure(
-                    !steps.is_empty() && steps.len() <= MAX_STEPS,
-                    || format!("{at}.steps"),
-                    "1 to 8 steps",
-                )?;
-                let has_caller = operation.takes_request();
-                ensure(
-                    has_caller != methods.is_empty(),
-                    || format!("{at}.methods"),
-                    "methods are needed exactly when a step sends the request of the caller",
+                    ret.relay.is_none() && ret.template.is_none(),
+                    || at.to_string(),
+                    "an HTTPS return takes response only",
                 )?;
                 ensure(
-                    has_caller != paths.is_empty() && paths.len() <= MAX_PATHS,
-                    || format!("{at}.paths"),
-                    "paths are needed exactly when a step sends the request of the caller",
+                    sent,
+                    || at.to_string(),
+                    "return needs a request sent before it",
                 )?;
-                for (i, path) in paths.iter().enumerate() {
-                    ensure(
-                        check_path(path) && !path.contains('?'),
-                        || format!("{at}.paths[{i}]"),
-                        "path prefix must start with / and hold no query or dot segment",
-                    )?;
+                if let Some(projection) = &ret.response {
+                    check_projection(at, projection)?;
                 }
-                for (i, name) in caller_headers.iter().enumerate() {
+            }
+            Some(Connection::Tls) => {
+                ensure(
+                    ret.response.is_none() && ret.template.is_none(),
+                    || at.to_string(),
+                    "a TLS return takes relay only",
+                )?;
+                if let Some(relay) = &ret.relay {
                     ensure(
-                        has_caller,
-                        || format!("{at}.caller_headers"),
-                        "caller headers need a step that sends the request of the caller",
-                    )?;
-                    let lower = name.to_ascii_lowercase();
-                    ensure(
-                        is_token(name) && !RESERVED_HEADERS.contains(&lower.as_str()),
-                        || format!("{at}.caller_headers[{i}]"),
-                        "caller header must be a token and not reserved",
-                    )?;
-                }
-                self.check_identity(at, operation, identity.as_ref())?;
-                for (i, step) in steps.iter().enumerate() {
-                    let at = format!("{at}.steps[{i}]");
-                    self.check_step(&at, operation, step, destinations, &mut temps)?;
-                    let injected = step.inject.iter().any(|inj| match &inj.target {
-                        Target::Header { name } => {
-                            caller_headers.iter().any(|h| h.eq_ignore_ascii_case(name))
-                        }
-                        _ => false,
-                    });
-                    ensure(
-                        !(step.request == StepRequest::Caller && injected),
-                        || at.clone(),
-                        "a caller header is also injected",
+                        !relay.sends.is_empty()
+                            && relay.sends.len() <= MAX_RELAY_PATTERNS
+                            && relay
+                                .sends
+                                .iter()
+                                .all(|p| crate::extract::compile_whole(p).is_some()),
+                        || format!("{at}.relay.sends"),
+                        "1 to 16 regular expressions of at most 256 bytes within the size limits",
                     )?;
                 }
             }
-            Operation::Stream {
-                destinations,
-                identity,
-                script,
-                ..
-            } => {
-                check_destinations(at, destinations)?;
+            None => {
                 ensure(
-                    !script.is_empty() && script.len() <= MAX_SCRIPT,
-                    || format!("{at}.script"),
-                    "1 to 32 script entries",
+                    ret.response.is_none() && ret.relay.is_none(),
+                    || at.to_string(),
+                    "a return with no connection takes template only",
                 )?;
-                self.check_identity(at, operation, identity.as_ref())?;
-                for (i, exchange) in script.iter().enumerate() {
-                    let at = format!("{at}.script[{i}]");
-                    match exchange {
-                        Exchange::Send { template } => {
-                            self.check_template(&at, operation, template, &temps, Var::in_stream)?;
-                        }
-                        Exchange::Expect { until, capture } => {
-                            ensure(
-                                !until.is_empty()
-                                    && until.len() <= MAX_DELIMITERS
-                                    && until
-                                        .iter()
-                                        .all(|u| !u.is_empty() && u.len() <= MAX_DELIMITER),
-                                || format!("{at}.until"),
-                                "1 to 8 delimiters of 1 to 256 bytes",
-                            )?;
-                            self.check_captures(&at, capture, true, true, &mut temps)?;
-                        }
-                    }
-                }
-            }
-            Operation::Derive { template, .. } => {
+                let Some(text) = &ret.template else {
+                    return fail(at, "a return with no connection needs a template");
+                };
                 let at = format!("{at}.template");
-                let tainted = self.check_template(&at, operation, template, &[], Var::in_derive)?;
+                let (template, tainted) =
+                    self.check_template(&at, kinds, text, known, Var::in_derive)?;
                 ensure(
                     !tainted,
                     || at.clone(),
                     "a derivation would hand a secret back",
                 )?;
-                let parsed =
-                    Template::parse(template).map_err(|_| Error::policy(&at, "template syntax"))?;
                 ensure(
-                    !parsed.guessable(&|name| self.name_kind(operation, name)),
+                    !template.guessable(&|name| kinds.kind(name)),
                     || at,
                     "a derivation would hand back a check for guesses of a guessable field",
                 )?;
             }
         }
         Ok(())
+    }
+
+    fn check_operation(&self, at: &str, operation: &Operation) -> Checked {
+        ensure(
+            is_token(&operation.name),
+            || format!("{at}.name"),
+            "name is not a token",
+        )?;
+        ensure(
+            !operation.steps.is_empty() && operation.steps.len() <= MAX_STEPS,
+            || format!("{at}.steps"),
+            "1 to 64 steps",
+        )?;
+        let open = operation.open();
+        let connection = open.map(|o| o.connection);
+        if let Some(input) = &operation.input {
+            ensure(
+                connection.is_none(),
+                || format!("{at}.input"),
+                "an input schema is for an operation with no connection",
+            )?;
+            if let Some(rule) = input.fault() {
+                return fail(format!("{at}.input"), rule);
+            }
+        }
+        let kinds = self.kinds(operation);
+        let mut known: Vec<&str> = Vec::new();
+        let mut sends = 0usize;
+        let count = operation.steps.len();
+        for (i, step) in operation.steps.iter().enumerate() {
+            let at = format!("{at}.steps[{i}]");
+            let previous = i.checked_sub(1).and_then(|p| operation.steps.get(p));
+            match (step, open) {
+                (Step::Open(open), _) => {
+                    ensure(
+                        i == 0,
+                        || at.clone(),
+                        "open is the first step; an operation opens one connection",
+                    )?;
+                    check_destinations(&at, &open.destinations)?;
+                    self.check_identity(&at, &kinds, open.identity.as_ref())?;
+                }
+                (Step::Send(_) | Step::Receive(_), None) => {
+                    return fail(at, "send and receive need an open connection");
+                }
+                (Step::Send(send), Some(open)) => match open.connection {
+                    Connection::Https => {
+                        sends += 1;
+                        ensure(sends <= MAX_REQUESTS, || at.clone(), "at most 8 requests")?;
+                        self.check_https_send(&at, &kinds, open, send, &known)?;
+                    }
+                    Connection::Tls => {
+                        ensure(
+                            send.request.is_none() && send.inject.is_empty(),
+                            || at.clone(),
+                            "a TLS send takes template only",
+                        )?;
+                        let Some(template) = &send.template else {
+                            return fail(at, "a TLS send needs a template");
+                        };
+                        self.check_template(
+                            &format!("{at}.template"),
+                            &kinds,
+                            template,
+                            &known,
+                            Var::in_stream,
+                        )?;
+                    }
+                },
+                (Step::Receive(receive), Some(open)) => match open.connection {
+                    Connection::Https => {
+                        let fixed = match previous {
+                            Some(Step::Send(send)) => {
+                                matches!(send.request, Some(StepRequest::Fixed { .. }))
+                            }
+                            _ => return fail(at, "an HTTPS receive follows its send"),
+                        };
+                        ensure(
+                            receive.until.is_empty(),
+                            || format!("{at}.until"),
+                            "an HTTPS receive reads the whole response; until is for streams",
+                        )?;
+                        self.check_captures(&at, &receive.capture, false, fixed, &mut known)?;
+                    }
+                    Connection::Tls => {
+                        ensure(
+                            !receive.until.is_empty()
+                                && receive.until.len() <= MAX_DELIMITERS
+                                && receive
+                                    .until
+                                    .iter()
+                                    .all(|u| !u.is_empty() && u.len() <= MAX_DELIMITER),
+                            || format!("{at}.until"),
+                            "1 to 8 delimiters of 1 to 256 bytes",
+                        )?;
+                        self.check_captures(&at, &receive.capture, true, true, &mut known)?;
+                    }
+                },
+                (Step::Compute(compute), _) => {
+                    ensure(
+                        is_token(&compute.into)
+                            && !self.is_field(&compute.into)
+                            && !known.contains(&compute.into.as_str()),
+                        || format!("{at}.into"),
+                        "compute into a new token name",
+                    )?;
+                    let var_ok = if connection.is_none() {
+                        Var::in_derive
+                    } else {
+                        Var::in_compute
+                    };
+                    self.check_template(
+                        &format!("{at}.template"),
+                        &kinds,
+                        &compute.template,
+                        &known,
+                        var_ok,
+                    )?;
+                    known.push(&compute.into);
+                }
+                (Step::Return(ret), _) => {
+                    ensure(i + 1 == count, || at.clone(), "return is the last step")?;
+                    self.check_return(&at, &kinds, connection, ret, &known, sends > 0)?;
+                }
+                (Step::Repeat(_) | Step::If(_), _) => {
+                    return fail(
+                        at,
+                        "loops and branches are part of the syntax but not run yet; write the steps out",
+                    );
+                }
+            }
+        }
+        ensure(
+            operation.returns().is_some(),
+            || format!("{at}.steps"),
+            "an operation ends with return",
+        )?;
+        let reads_input = operation
+            .templates()
+            .into_iter()
+            .any(|t| Template::parse(t).is_ok_and(|t| t.vars().contains(&Var::Input)));
+        ensure(
+            !reads_input || operation.input.is_some(),
+            || format!("{at}.input"),
+            "an operation that reads $input declares its input",
+        )
     }
 
     fn check_callers(&self) -> Checked {
@@ -1299,50 +1696,21 @@ impl Policy {
         self.check_callers()
     }
 
-    /// What the policy allows, in plain lines, for the owner to read before signing.
+    /// What the policy allows, in plain lines, for the owner to read before signing. Lines
+    /// that start with `  !` flag what widens what a caller can do or see.
     pub fn summary(&self) -> Vec<String> {
         let mut out = Vec::new();
         for field in &self.fields {
             out.push(format!(
-                "field {}: {}{}",
+                "field {}: {}{}{}",
                 field.name,
                 if field.secret { "secret" } else { "public" },
+                if field.guessable { ", guessable" } else { "" },
                 if field.optional { ", optional" } else { "" }
             ));
         }
         for operation in &self.operations {
-            let names = |d: &[Destination]| {
-                d.iter()
-                    .map(|d| format!("{}:{}", d.host, d.port))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            };
-            out.push(match operation {
-                Operation::Http {
-                    name,
-                    destinations,
-                    methods,
-                    paths,
-                    steps,
-                    ..
-                } => format!(
-                    "operation {name}: HTTP to {} ({} steps; caller methods [{}] under [{}])",
-                    names(destinations),
-                    steps.len(),
-                    methods
-                        .iter()
-                        .map(|m| m.as_str())
-                        .collect::<Vec<_>>()
-                        .join(", "),
-                    paths.join(", ")
-                ),
-                Operation::Stream {
-                    name, destinations, ..
-                } => format!("operation {name}: stream to {}", names(destinations)),
-                Operation::Derive { name, template } => {
-                    format!("operation {name}: derive {template}")
-                }
-            });
+            summarize_operation(operation, &mut out);
         }
         for caller in &self.callers {
             out.push(format!(
@@ -1357,6 +1725,181 @@ impl Policy {
             ));
         }
         out
+    }
+}
+
+fn destination_names(destinations: &[Destination]) -> String {
+    destinations
+        .iter()
+        .map(|d| format!("{}:{}", d.host, d.port))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn summarize_send(send: &Send, out: &mut Vec<String>) {
+    let injects = send
+        .inject
+        .iter()
+        .map(|i| match &i.target {
+            Target::Header { name } => format!("header {name}"),
+            Target::Query { name } => format!("query {name}"),
+            Target::PathParam { name } => format!("path {{{name}}}"),
+            Target::Body => "body".into(),
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let injects = if injects.is_empty() {
+        String::new()
+    } else {
+        format!("; injects {injects}")
+    };
+    match &send.request {
+        Some(StepRequest::Fixed {
+            method,
+            path,
+            destination,
+        }) => out.push(format!(
+            "  send {} {path}{}{injects}",
+            method.as_str(),
+            destination
+                .as_ref()
+                .map(|d| format!(" to {}:{}", d.host, d.port))
+                .unwrap_or_default()
+        )),
+        Some(StepRequest::Caller(c)) => {
+            let query = c
+                .query
+                .iter()
+                .map(|q| {
+                    format!(
+                        "{}{} {}",
+                        q.name,
+                        if q.required { " (required)" } else { "" },
+                        q.allowed().describe()
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("; ");
+            out.push(format!(
+                "  send the caller's request: methods [{}], paths [{}], headers [{}], query [{}]{injects}",
+                c.methods
+                    .iter()
+                    .map(|m| m.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                c.paths.join(", "),
+                c.headers.join(", "),
+                query
+            ));
+            if c.encoded_percent {
+                out.push("  ! the caller's path may hold %25".into());
+            }
+            if c.override_params {
+                out.push("  ! the caller may send method-override parameters".into());
+            }
+            if c.query.iter().any(|q| q.allowed().is_any()) {
+                out.push("  ! some query parameters take any value".into());
+            }
+        }
+        None => out.push(format!(
+            "  send {:?}",
+            send.template.as_deref().unwrap_or_default()
+        )),
+    }
+}
+
+fn summarize_operation(operation: &Operation, out: &mut Vec<String>) {
+    let name = &operation.name;
+    match operation.open() {
+        Some(open) => out.push(format!(
+            "operation {name}: {} to {}{}",
+            match open.connection {
+                Connection::Https => "HTTPS",
+                Connection::Tls => "TLS stream",
+            },
+            destination_names(&open.destinations),
+            if open.identity.is_some() {
+                ", with a client certificate"
+            } else {
+                ""
+            }
+        )),
+        None => out.push(format!(
+            "operation {name}: no connection{}",
+            operation
+                .input
+                .as_ref()
+                .map(|i| format!("; input {}", i.describe()))
+                .unwrap_or_default()
+        )),
+    }
+    if matches!(&operation.input, Some(Input::Raw(raw)) if raw.max_len.is_none() && raw.pattern.is_none())
+    {
+        out.push("  ! the caller's input is any bytes".into());
+    }
+    for step in &operation.steps {
+        match step {
+            Step::Open(_) | Step::Repeat(_) | Step::If(_) => {}
+            Step::Send(send) => summarize_send(send, out),
+            Step::Receive(receive) => {
+                let captures = receive
+                    .capture
+                    .iter()
+                    .map(|c| match &c.into {
+                        Store::Field { name } => format!("field {name}"),
+                        Store::Temp { name, secret } => {
+                            format!("{} {name}", if *secret { "secret" } else { "public" })
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                out.push(format!(
+                    "  receive{}{}",
+                    if receive.until.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" until {:?}", receive.until)
+                    },
+                    if captures.is_empty() {
+                        String::new()
+                    } else {
+                        format!("; captures {}", captures.join(", "))
+                    }
+                ));
+            }
+            Step::Compute(c) => out.push(format!("  compute {} = {}", c.into, c.template)),
+            Step::Return(ret) => match (&ret.response, &ret.relay, &ret.template) {
+                (_, _, Some(template)) => out.push(format!("  return {template}")),
+                (_, Some(relay), _) => {
+                    out.push(format!(
+                        "  return: relays caller sends matching {:?}",
+                        relay.sends
+                    ));
+                }
+                (Some(p), _, _) => {
+                    out.push(format!(
+                        "  return: status{}{}",
+                        if p.headers.is_empty() {
+                            String::new()
+                        } else {
+                            format!(", headers [{}]", p.headers.join(", "))
+                        },
+                        match &p.body {
+                            None => String::new(),
+                            Some(BodyProjection::All) => ", the whole body".into(),
+                            Some(BodyProjection::Json(pointers)) =>
+                                format!(", body members [{}]", pointers.join(", ")),
+                        }
+                    ));
+                    if p.body == Some(BodyProjection::All) {
+                        out.push("  ! the whole response body goes back to the caller".into());
+                    }
+                }
+                (None, None, None) => out.push(match operation.connection() {
+                    Some(Connection::Tls) => "  return: no caller exchanges".into(),
+                    _ => "  return: status".into(),
+                }),
+            },
+        }
     }
 }
 
@@ -1405,336 +1948,4 @@ impl DeviceKey {
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::indexing_slicing, clippy::panic)]
-mod tests {
-    use super::*;
-    use crate::keys::CallerKey;
-
-    fn caller(operations: &[&str]) -> Caller {
-        Caller {
-            name: "app".into(),
-            key: CallerKey::generate().public(),
-            operations: operations.iter().map(|o| o.to_string()).collect(),
-            limit: None,
-        }
-    }
-
-    fn bearer() -> Policy {
-        Policy {
-            fields: vec![FieldSpec::secret("token")],
-            callers: vec![caller(&["call"])],
-            operations: vec![Operation::Http {
-                name: "call".into(),
-                destinations: vec![Destination::https("api.example.com")],
-                methods: vec![Method::Get],
-                paths: vec!["/v1/".into()],
-                caller_headers: vec![],
-                identity: None,
-                steps: vec![Step {
-                    request: StepRequest::Caller,
-                    inject: vec![Injection::header("Authorization", "Bearer {{token}}")],
-                    capture: vec![],
-                }],
-            }],
-        }
-    }
-
-    fn derive_only(template: &str) -> Policy {
-        Policy {
-            fields: vec![FieldSpec::secret("key")],
-            callers: vec![caller(&["sign"])],
-            operations: vec![Operation::Derive {
-                name: "sign".into(),
-                template: template.into(),
-            }],
-        }
-    }
-
-    fn step_of(p: &mut Policy) -> &mut Step {
-        match &mut p.operations[0] {
-            Operation::Http { steps, .. } => &mut steps[0],
-            _ => panic!("not http"),
-        }
-    }
-
-    fn rule_of(p: &Policy) -> &'static str {
-        match p.validate() {
-            Err(Error::PolicyInvalid { rule, .. }) => rule,
-            other => panic!("{other:?}"),
-        }
-    }
-
-    #[test]
-    fn valid_policies() {
-        bearer().validate().unwrap();
-        derive_only("{{ hex(hmac_sha256(key, $input)) }}")
-            .validate()
-            .unwrap();
-    }
-
-    #[test]
-    fn derive_must_not_give_a_secret_back() {
-        for template in [
-            "{{key}}",
-            "{{ b64(key) }}",
-            "{{ hexdecode(hex(key)) }}",
-            "x{{ \"a\" + key }}",
-            r#"{{ aes_gcm_encrypt("0123456789abcdef", "000000000000", key) }}"#,
-            r#"{{ len(replace(key, $input, "")) }}"#,
-        ] {
-            assert!(
-                matches!(
-                    derive_only(template).validate(),
-                    Err(Error::PolicyInvalid { .. })
-                ),
-                "{template}"
-            );
-        }
-    }
-
-    #[test]
-    fn unknown_members_are_refused_next_to_every_tag() {
-        for json in [
-            r#"{"from":"caller","path":"/oauth/token"}"#,
-            r#"{"from":"fixed","method":"POST","path":"/","x":1}"#,
-        ] {
-            assert!(serde_json::from_str::<StepRequest>(json).is_err(), "{json}");
-        }
-        for json in [
-            r#"{"from":"all","junk":1}"#,
-            r#"{"from":"status","x":2}"#,
-            r#"{"from":"json","pointer":"/a","x":2}"#,
-        ] {
-            assert!(serde_json::from_str::<Source>(json).is_err(), "{json}");
-        }
-        assert!(serde_json::from_str::<Target>(r#"{"kind":"body","junk":1}"#).is_err());
-        // The plain forms still read, and what is written reads back.
-        for (json, value) in [
-            (r#"{"from":"caller"}"#, StepRequest::Caller),
-            (
-                r#"{"from":"fixed","method":"GET","path":"/a"}"#,
-                StepRequest::Fixed {
-                    method: Method::Get,
-                    path: "/a".into(),
-                    destination: None,
-                },
-            ),
-        ] {
-            assert_eq!(serde_json::from_str::<StepRequest>(json).unwrap(), value);
-            let back = serde_json::to_string(&value).unwrap();
-            assert_eq!(serde_json::from_str::<StepRequest>(&back).unwrap(), value);
-        }
-        for value in [Source::All, Source::Status] {
-            let back = serde_json::to_string(&value).unwrap();
-            assert_eq!(serde_json::from_str::<Source>(&back).unwrap(), value);
-        }
-        let back = serde_json::to_string(&Target::Body).unwrap();
-        assert_eq!(serde_json::from_str::<Target>(&back).unwrap(), Target::Body);
-    }
-
-    #[test]
-    fn html_and_regex_sources_are_checked() {
-        let html = r#"{"from":"html","selector":"input[name=\"_csrf\"]","attribute":"value"}"#;
-        let regex = r#"{"from":"regex","pattern":"sid=([a-z0-9]+)","group":1}"#;
-        for json in [html, regex, r#"{"from":"html","selector":"title"}"#] {
-            let source: Source = serde_json::from_str(json).unwrap();
-            assert_eq!(source.rule(false), None, "{json}");
-            let back = serde_json::to_string(&source).unwrap();
-            assert_eq!(serde_json::from_str::<Source>(&back).unwrap(), source);
-        }
-        assert!(serde_json::from_str::<Source>(r#"{"from":"regex","pattern":"a","x":1}"#).is_err());
-        let html_rule = "html needs a compound selector of at most 256 bytes and a token attribute";
-        let regex_rule = "regex needs a pattern of at most 256 bytes within the size limits, and an existing group";
-        for (source, stream, rule) in [
-            (
-                Source::Html {
-                    selector: "form input".into(),
-                    attribute: None,
-                },
-                false,
-                html_rule,
-            ),
-            (
-                Source::Html {
-                    selector: "input".into(),
-                    attribute: Some("a b".into()),
-                },
-                false,
-                html_rule,
-            ),
-            (
-                Source::Html {
-                    selector: "input".into(),
-                    attribute: None,
-                },
-                true,
-                "source not available on a stream",
-            ),
-            (
-                Source::Regex {
-                    pattern: r"(a)\1".into(),
-                    group: None,
-                },
-                false,
-                regex_rule,
-            ),
-            (
-                Source::Regex {
-                    pattern: "(a)".into(),
-                    group: Some(2),
-                },
-                true,
-                regex_rule,
-            ),
-            (
-                Source::Regex {
-                    pattern: "x".repeat(257),
-                    group: None,
-                },
-                false,
-                regex_rule,
-            ),
-        ] {
-            assert_eq!(source.rule(stream), Some(rule), "{source:?}");
-        }
-        // A regular expression also reads stream bytes.
-        let stream_regex = Source::Regex {
-            pattern: r"\[CAPABILITY ([^\]]+)\]".into(),
-            group: None,
-        };
-        assert_eq!(stream_regex.rule(true), None);
-    }
-
-    #[test]
-    fn errors_name_the_part() {
-        let mut p = bearer();
-        step_of(&mut p).inject[0].template = "Bearer {{other}}".into();
-        assert_eq!(
-            p.validate(),
-            Err(Error::PolicyInvalid {
-                at: "operations[0].steps[0].inject[0] (other)".into(),
-                rule: "template reads an unknown or later name"
-            })
-        );
-    }
-
-    #[test]
-    fn destinations() {
-        let pattern = Destination::https("*.example.com");
-        assert!(pattern.matches(&Destination::https("a.example.com")));
-        assert!(!pattern.matches(&Destination::https("example.com")));
-        assert!(!pattern.matches(&Destination::https("a.b.example.com")));
-        assert!(!pattern.matches(&Destination::https("aexample.com")));
-        assert!(!pattern.matches(&Destination::new("a.example.com", 8443)));
-        assert!(!pattern.matches(&Destination::https("*.example.com")));
-        assert_eq!(
-            Destination::https("API.Example.com").host,
-            "api.example.com"
-        );
-        assert!(!Destination::https("*.com").is_valid_pattern());
-    }
-
-    #[test]
-    fn rejects_bad_shapes() {
-        let mut p = bearer();
-        step_of(&mut p).inject[0].target = Target::Header {
-            name: "Host".into(),
-        };
-        assert_eq!(
-            rule_of(&p),
-            "header must be a token, not reserved, and set once"
-        );
-
-        let mut p = bearer();
-        step_of(&mut p).inject[0].target = Target::Header {
-            name: "X-HTTP-Method-Override".into(),
-        };
-        assert_eq!(
-            rule_of(&p),
-            "header must be a token, not reserved, and set once"
-        );
-
-        let mut p = bearer();
-        step_of(&mut p).inject[0].template = "{{ $input }}".into();
-        assert_eq!(rule_of(&p), "template reads a variable not available here");
-
-        // A temporary value is readable only after the step that captures it.
-        let mut p = bearer();
-        step_of(&mut p).inject[0].template = "{{ later }}".into();
-        step_of(&mut p).capture.push(Capture {
-            source: Source::Header { name: "X".into() },
-            into: Store::Temp {
-                name: "later".into(),
-                secret: false,
-            },
-            optional: false,
-        });
-        assert_eq!(rule_of(&p), "template reads an unknown or later name");
-
-        // A capture into a field from the request of the caller.
-        let mut p = bearer();
-        step_of(&mut p).capture.push(Capture {
-            source: Source::Json {
-                pointer: "/t".into(),
-            },
-            into: Store::Field {
-                name: "token".into(),
-            },
-            optional: false,
-        });
-        assert_eq!(
-            rule_of(&p),
-            "capture into a field from a request of the caller"
-        );
-
-        // An operation without path prefixes.
-        let mut p = bearer();
-        if let Operation::Http { paths, .. } = &mut p.operations[0] {
-            paths.clear();
-        }
-        assert_eq!(
-            rule_of(&p),
-            "paths are needed exactly when a step sends the request of the caller"
-        );
-
-        // Two operations with one name.
-        let mut p = bearer();
-        p.operations.push(p.operations[0].clone());
-        assert_eq!(rule_of(&p), "operation names must be unique");
-
-        // A caller of an unknown operation.
-        let mut p = bearer();
-        p.callers[0].operations.push("nope".into());
-        assert_eq!(
-            rule_of(&p),
-            "operations must be names of operations, each once"
-        );
-        assert!(
-            matches!(p.validate(), Err(Error::PolicyInvalid { at, .. }) if at.ends_with("(nope)"))
-        );
-    }
-
-    #[test]
-    fn paths() {
-        assert!(under("/v1/x", "/v1/"));
-        assert!(under("/v1", "/v1"));
-        assert!(under("/v1?q=1", "/v1"));
-        assert!(under("/v1/x", "/v1"));
-        assert!(!under("/v10", "/v1"));
-        assert!(!check_path("/v1/../admin"));
-        assert!(!check_path("/v1/%2e%2e/admin"));
-        assert!(!check_path("/v1%2Fadmin"));
-        assert!(!check_path("/v1\\admin"));
-        assert!(check_path("/v1/a.b?x=..%2F"));
-    }
-
-    #[test]
-    fn signature_binds_policy() {
-        let device = DeviceKey::generate();
-        let mut signed = device.sign_policy(bearer()).unwrap();
-        signed.verify(&device.public()).unwrap();
-        if let Operation::Http { destinations, .. } = &mut signed.policy.operations[0] {
-            destinations.push(Destination::https("evil.example.net"));
-        }
-        assert_eq!(signed.verify(&device.public()), Err(Error::PolicySignature));
-    }
-}
+mod tests;

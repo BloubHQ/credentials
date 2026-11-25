@@ -213,6 +213,12 @@ pub fn sign_policy(device_key: String, policy_json: String) -> Result<String> {
     Ok(crate::sign_policy(device_key, policy_json)?)
 }
 
+/// See [`crate::upgrade_policy`].
+#[wasm_bindgen(js_name = upgradePolicy)]
+pub fn upgrade_policy(policy_json: String) -> Result<String> {
+    Ok(crate::upgrade_policy(policy_json)?)
+}
+
 /// See [`crate::seal_record`]. `fields` is a `Map<string, Uint8Array>`.
 #[wasm_bindgen(js_name = sealRecord)]
 pub fn seal_record(

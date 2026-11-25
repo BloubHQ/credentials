@@ -7,7 +7,10 @@ it needs a nightly compiler.
 | Target | Input | Checks |
 | --- | --- | --- |
 | `template_parse` | Bytes, read as lossy UTF-8 | `Template::parse`, then `names`, `vars`, `analyze`, `tainted` and `guessable` with every kind of name; a template that breaks a rule must count as tainted and guessable. |
-| `policy_json` | JSON | `Policy` deserialization, `Policy::summary`, and `DeviceKey::sign_policy`, which checks every rule; bad policies must be refused with an error, never a panic. |
+| `policy_json` | JSON | `Policy` deserialization (the step language), `Policy::summary`, and `DeviceKey::sign_policy`, which checks every rule; bad policies must be refused with an error, never a panic. |
+| `policy_upgrade` | JSON of the format before steps | `policy::legacy::upgrade_json`, then `summary` and `sign_policy` on the result; a conversion always has notes, and nothing panics. |
+| `caller_request` | A byte choosing one of two fixed contracts, then the JSON of a `Request` | `Request::validate`, the caller contract (path templates, query rules, override names, injected names); an accepted path holds no dot segment and no encoded `.`, `/` or ``. |
+| `input_schema` | A byte choosing a JSON, RLP or raw schema, then the input | `Input::apply`; what a schema accepts it accepts again once checked. |
 | `html_capture` | Bytes: a selector, an attribute choice and a page | `extract::html`, the `html` capture source: no panic on any selector or page, pages over `MAX_SCAN` refused, texts within `MAX_CAPTURE`. |
 | `regex_capture` | Bytes: a pattern, a group and a text | `extract::regex`, the `regex` capture source: no panic on any pattern or text; a match is a part of the text. |
 | `log_entry` | JSON | `SignedEntry` deserialization, `SignedEntry::hash`, `verify_chain` on a one-entry chain, and that `ChainVerifier` agrees with it. |
