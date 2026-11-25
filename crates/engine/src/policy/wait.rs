@@ -251,10 +251,10 @@ impl SessionRule {
         if !is_token(&self.expires) {
             return Some("expires names a field");
         }
-        if let Renew::Operation { name } = &self.renew {
-            if !is_token(name) {
-                return Some("renew names an operation");
-            }
+        if let Renew::Operation { name } = &self.renew
+            && !is_token(name)
+        {
+            return Some("renew names an operation");
         }
         None
     }

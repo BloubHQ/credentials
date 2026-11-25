@@ -220,6 +220,7 @@ fn setup(clock: &TestClock, policy: Policy) -> Setup<'_> {
     let node = Node::new(NodeKey::generate(), MemorySink::new(), clock);
     let terms = GrantTerms {
         owner: OWNER.into(),
+        allow_successor: true,
         expires_ms: NOW + DAY,
         issued_ms: NOW,
         pins: vec![RecordPin {

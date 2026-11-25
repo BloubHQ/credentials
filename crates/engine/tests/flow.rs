@@ -79,6 +79,7 @@ fn grant_on<S: LogSink, C: Clock>(
 ) -> engine::Result<()> {
     let terms = GrantTerms {
         owner: OWNER.into(),
+        allow_successor: true,
         expires_ms,
         issued_ms: issued(),
         pins: pins
@@ -2563,6 +2564,7 @@ fn a_grant_opens_only_on_its_node_and_only_once() {
     let s = setup(&clock, policy, &[("token", TOKEN)]);
     let terms = || GrantTerms {
         owner: OWNER.into(),
+        allow_successor: true,
         expires_ms: NOW + DAY,
         issued_ms: issued(),
         pins: vec![],
@@ -2865,6 +2867,7 @@ fn a_saved_grant_does_not_open_a_restarted_node() {
     );
     let terms = GrantTerms {
         owner: OWNER.into(),
+        allow_successor: true,
         expires_ms: NOW + DAY,
         issued_ms: issued(),
         pins: vec![RecordPin {
@@ -3226,6 +3229,7 @@ fn a_clock_stepped_back_after_a_restart_opens_nothing_old() {
     );
     let terms = GrantTerms {
         owner: OWNER.into(),
+        allow_successor: true,
         expires_ms: NOW + DAY,
         issued_ms: NOW,
         pins: vec![RecordPin {

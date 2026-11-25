@@ -446,6 +446,42 @@ curl -s "http://127.0.0.1:8700/attestation?nonce=$(head -c 32 /dev/urandom | bas
 연결하지 못하면 멈춥니다. `credentials host`는 [crates/host](../../crates/host)에
 설명되어 있습니다.
 
+### 새 릴리스로 넘겨주기
+
+재시작한 enclave는 새 노드이지만, 새 릴리스가 나왔다고 노드가 소유자를 잃을 필요는 없습니다.
+노드는 상태를 더 새로운 릴리스의 노드에 넘겨줍니다(`docs/design.md` 10절).
+
+```sh
+nitro-cli run-enclave --eif-path enclave-v1.1.0.eif --cpu-count 2 --memory 1024 --enclave-cid 17
+credentials hand-over --from-cid 16 --to-cid 17 \
+  --statement successor.json --bundle successor.sigstore.json
+credentials verify old.jsonl <이전 노드 키> --next new.jsonl --head new.jsonl.head.json
+```
+
+- **후속 진술(successor statement).** 각 릴리스는 `successor.json`("릴리스 X는 릴리스 Y의 이
+  측정값으로 넘겨줄 수 있다")과 `successor.sigstore.json`을 게시합니다. 릴리스 워크플로가
+  Sigstore 키리스 서명으로 서명하고 Rekor에 기록합니다. 두 노드 모두 오프라인으로 검증합니다
+  (`crates/continuity`): 고정된 루트까지의 Fulcio 인증서 체인, 서명자(GitHub 호스트 러너에서
+  Y 태그로 실행된 이 저장소의 릴리스 워크플로), Rekor 서명 항목 타임스탬프와 포함 증명.
+  Y는 X보다 새 버전이어야 합니다.
+- **상호 증명.** 이전 노드는 PCR이 진술의 Y 값인 enclave에만 넘겨주고, 새 노드는 PCR이 X
+  값인 enclave에서만 넘겨받습니다. 각자 자신의 nonce에 대한 상대의 NSM 문서와 노드 식별자
+  바인딩을 확인합니다.
+- **넘어가는 것.** 모든 소유자의 기기, 폐기된 기기, 레코드 하한, 지출 한도, 그리고 후속
+  노드를 허용한 grant의 사용자 키(기본값. `credentials grant --no-successor`나
+  `client::grant_without_successor`로 grant를 그 노드에 묶어 둘 수 있습니다). 상태는 새
+  노드의 키로 봉인(HPKE)되고, 호스트는 vsock 5003 포트로 암호문만 나릅니다.
+- **하나의 로그.** 이전 노드의 마지막 항목은 넘겨주기 항목이고, 새 노드의 첫 항목이 그
+  해시를 가리킵니다. `credentials verify --next`가 두 노드를 잇는 하나의 체인을 검사하고,
+  이전 노드는 넘겨준 뒤 모든 동작을 거부합니다.
+- **이전 노드가 사라졌다면** 앱이 다시 grant합니다. `client::verify_successor`가 소유자가
+  grant했던 릴리스의 진술로 새 노드를 확인하고, `client::regrant`가 소유자 정책에 따라
+  grant합니다.
+- **아직 비활성.** 노드에 컴파일되는 Sigstore 신뢰 루트
+  (`crates/continuity/trust/trusted_root.json`)는 커밋되기 전까지 비어 있어, 그동안 모든
+  진술이 거부됩니다. 넘겨주기는 테스트 루트로만 시험했습니다(테스트에 Nitro 하드웨어나
+  Sigstore 서비스 없음).
+
 ## 보장하는 것
 
 - 비밀 값은 확정된 로그 항목이 생긴 뒤, `Transport`를 통해, 소유자가 서명한 목적지로 가는 요청 하나의
@@ -548,7 +584,7 @@ cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace --locked
 ```
 
-최소 Rust 버전: 1.87(`enclave` 크레이트는 `aws-nitro-enclaves-nsm-api` 때문에 1.92). CI는 `cargo audit`, `cargo deny`, MSRV 테스트, 재현 가능 빌드 검사, 대상별 60초 퍼징도 실행합니다. 변경 기록은 [CHANGELOG](../CHANGELOG.md)에 있습니다.
+최소 Rust 버전: 1.88(`enclave` 크레이트는 `aws-nitro-enclaves-nsm-api` 때문에 1.92). CI는 `cargo audit`, `cargo deny`, MSRV 테스트, 재현 가능 빌드 검사, 대상별 60초 퍼징도 실행합니다. 변경 기록은 [CHANGELOG](../CHANGELOG.md)에 있습니다.
 [CONTRIBUTING.md](../../.github/CONTRIBUTING.md)를 참고하세요.
 
 ## 보안

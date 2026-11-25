@@ -180,21 +180,21 @@ impl Allowed<'_> {
         if self.one_of.len() > MAX_ONE_OF {
             return Some("one_of holds at most 32 values");
         }
-        if let Some(pattern) = self.pattern {
-            if crate::extract::compile_whole(pattern).is_none() {
-                return Some(
-                    "pattern must be a regular expression of at most 256 bytes within the size limits",
-                );
-            }
+        if let Some(pattern) = self.pattern
+            && crate::extract::compile_whole(pattern).is_none()
+        {
+            return Some(
+                "pattern must be a regular expression of at most 256 bytes within the size limits",
+            );
         }
         let bound_ok = |b: Option<&str>| b.is_none_or(is_decimal);
         if !bound_ok(self.min) || !bound_ok(self.max) {
             return Some("min and max are decimal integers of at most 80 digits");
         }
-        if let (Some(min), Some(max)) = (self.min, self.max) {
-            if compare_decimal(min, max) == core::cmp::Ordering::Greater {
-                return Some("min is greater than max");
-            }
+        if let (Some(min), Some(max)) = (self.min, self.max)
+            && compare_decimal(min, max) == core::cmp::Ordering::Greater
+        {
+            return Some("min is greater than max");
         }
         None
     }

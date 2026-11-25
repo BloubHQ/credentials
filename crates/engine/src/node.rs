@@ -45,9 +45,11 @@ use crate::response::{Http, MAX_RESPONSE};
 use crate::template::{Budget, Context, Template, Temps, Var};
 use crate::{Error, Result};
 
+mod handover;
 mod park;
 mod waits;
 
+pub use handover::{HandOver, MAX_PACKAGE, Successor, TakenOver};
 pub use park::{MAX_PARKED, MAX_PARKED_BYTES, MAX_PARKED_PER_OWNER};
 
 pub use crate::caller::{CallerExchange, DESCRIBE};
@@ -248,6 +250,8 @@ fn release_http(mut response: Response, secrets: &Secrets<'_>) -> Result<Respons
 struct Grant {
     user_key: Arc<UserKey>,
     expires_ms: u64,
+    /// The owner lets a hand-over move this grant to a successor release.
+    allow_successor: bool,
 }
 
 /// What a node keeps about an owner after its grants end: the devices it knows and the issue
@@ -278,12 +282,12 @@ impl Nonces {
                 break;
             }
             self.by_expiry.pop_first();
-            if let Some(who) = self.seen.remove(&tag) {
-                if let Some(count) = self.per_caller.get_mut(&who) {
-                    *count = count.saturating_sub(1);
-                    if *count == 0 {
-                        self.per_caller.remove(&who);
-                    }
+            if let Some(who) = self.seen.remove(&tag)
+                && let Some(count) = self.per_caller.get_mut(&who)
+            {
+                *count = count.saturating_sub(1);
+                if *count == 0 {
+                    self.per_caller.remove(&who);
                 }
             }
         }
@@ -326,6 +330,8 @@ struct State<S> {
     parked: park::Registry,
     /// Spending limits and the payments counted against them, per record.
     limits: HashMap<RecordKey, crate::limits::Ledger>,
+    /// Set once this node handed over to a successor: the node takes no act after it.
+    handed_over: Option<handover::Done>,
 }
 
 impl<S: LogSink> State<S> {
@@ -427,6 +433,11 @@ impl<S: LogSink> State<S> {
         who: (&str, &str, &str),
         event: Event,
     ) -> Result<(u64, crate::log::Confirmed)> {
+        // A node that handed over writes nothing more: its chain ended at the hand-over, and
+        // an entry after it would fork the chain its successor continues.
+        if self.handed_over.is_some() {
+            return Err(Error::HandedOver);
+        }
         let (entry, confirmed) = self.log.commit(&mut self.sink, now, who, event)?;
         Ok((entry.entry.seq, confirmed))
     }
@@ -532,6 +543,7 @@ impl<S: LogSink, C: Clock> Node<S, C> {
                 calls: HashMap::new(),
                 parked: park::Registry::default(),
                 limits: HashMap::new(),
+                handed_over: None,
             }),
         }
     }
@@ -612,6 +624,21 @@ impl<S: LogSink, C: Clock> Node<S, C> {
                         state.issued(&e.owner, *issued_ms);
                     }
                     Event::Revoke { issued_ms, .. } => state.issued(&e.owner, *issued_ms),
+                    Event::HandOver { .. } => {
+                        // The chain of this node ended there: it stays stopped.
+                        state.handed_over = Some(handover::Done::restored(signed.hash()?));
+                    }
+                    Event::Continue { .. } => {}
+                    Event::Carry(carried) => {
+                        handover::restore_carry(
+                            &mut state,
+                            &node.state_key,
+                            &e.owner,
+                            (&carried.devices, &carried.retired, carried.issued_ms),
+                            &carried.pins,
+                            &carried.limits,
+                        )?;
+                    }
                     Event::Done { .. } => {}
                 }
             }
@@ -746,6 +773,7 @@ impl<S: LogSink, C: Clock> Node<S, C> {
             Grant {
                 user_key: Arc::new(user_key),
                 expires_ms,
+                allow_successor: terms.allow_successor,
             },
         );
         Ok(())
@@ -1135,12 +1163,12 @@ impl<S: LogSink, C: Clock> Node<S, C> {
         if let Payload::Resume(id) = payload {
             return self.resume(record, name, auth, id, transport, updated);
         }
-        if let Payload::Derive(input) = payload {
-            if input.len() > MAX_INPUT {
-                return Err(Error::RequestInvalid {
-                    rule: "input larger than 1 MiB",
-                });
-            }
+        if let Payload::Derive(input) = payload
+            && input.len() > MAX_INPUT
+        {
+            return Err(Error::RequestInvalid {
+                rule: "input larger than 1 MiB",
+            });
         }
         let now = self.clock.now_ms();
         let (policy, operation, checked) = self.check_call(record, name, auth, &payload, now)?;

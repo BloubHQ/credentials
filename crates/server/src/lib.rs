@@ -295,11 +295,12 @@ impl<S: Sink, T: Transport> Shared<S, T> {
         if !self.node.is_halted() {
             return None;
         }
-        if let Some(stored) = self.node.with_sink(|sink| sink.stored()) {
-            if self.node.reconcile(stored.as_ref()).is_ok() && !self.node.is_halted() {
-                eprintln!("log reconciled after an unconfirmed entry");
-                return None;
-            }
+        if let Some(stored) = self.node.with_sink(|sink| sink.stored())
+            && self.node.reconcile(stored.as_ref()).is_ok()
+            && !self.node.is_halted()
+        {
+            eprintln!("log reconciled after an unconfirmed entry");
+            return None;
         }
         Some((
             503,

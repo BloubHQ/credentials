@@ -242,10 +242,10 @@ pub fn run_with(
         });
     let used = fuel.saturating_sub(store.get_fuel().unwrap_or(0));
     // The memory may hold inputs and whatever the module derived from them.
-    if let Ok(instance) = &called {
-        if let Some(memory) = instance.get_memory(&store, "memory") {
-            memory.data_mut(&mut store).zeroize();
-        }
+    if let Ok(instance) = &called
+        && let Some(memory) = instance.get_memory(&store, "memory")
+    {
+        memory.data_mut(&mut store).zeroize();
     }
     let host = store.data_mut();
     if let Some(fault) = host.fault {

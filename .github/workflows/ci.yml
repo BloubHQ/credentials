@@ -104,13 +104,13 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - run: rustup toolchain install 1.87 --profile minimal
+      - run: rustup toolchain install 1.88 --profile minimal
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
-          key: msrv-1.87
+          key: msrv-1.88
       # The enclave crate needs Rust 1.92 (aws-nitro-enclaves-nsm-api); its image is built with
       # rust-toolchain.toml.
-      - run: cargo +1.87 test --workspace --exclude enclave --locked
+      - run: cargo +1.88 test --workspace --exclude enclave --locked
 
   fuzz:
     runs-on: ubuntu-latest

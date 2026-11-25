@@ -207,4 +207,49 @@ assert.deepEqual(
 const renewed = client.updateRecord(user, record, new Map([["key", new TextEncoder().encode("fedcba9876543210fedcba9876543210")]]));
 assert.equal(JSON.parse(renewed).generation, 2);
 
+// Node continuity: a successor statement that is not one is refused, and spends the nonce.
+const successorNonce = client.nonce();
+assert.deepEqual(
+  code(() =>
+    client.verifySuccessor(new Uint8Array([0]), successorNonce, new Uint8Array([123]), new Uint8Array([123]), "v1.0.0", identity),
+  ),
+  ["successor_refused", "bundle_invalid"],
+);
+assert.deepEqual(
+  code(() => client.verifyNode(new Uint8Array([0, 1]), successorNonce, measurements, identity)),
+  ["nonce_rejected", undefined],
+);
+
+// Key backup: a blob that opens only with its backup key, for its owner.
+const keys = JSON.stringify([
+  { kind: "device", key: device },
+  { kind: "user", key: user },
+]);
+const backupKey = client.generateBackupKey();
+const blob = client.wrapKeys(backupKey, "alice", keys);
+assert.equal(JSON.parse(blob).format, "credentials-key-backup/v1");
+assert.ok(!blob.includes(device) && !blob.includes(user));
+assert.deepEqual(JSON.parse(client.unwrapKeys(backupKey, "alice", blob)), JSON.parse(keys));
+assert.deepEqual(code(() => client.unwrapKeys(client.generateBackupKey(), "alice", blob)), ["backup_refused", undefined]);
+assert.deepEqual(code(() => client.unwrapKeys(backupKey, "bob", blob)), ["backup_refused", undefined]);
+
+// Device transfer with a 6-digit code (SPAKE2): the right code moves the keys...
+const sender = client.startTransfer();
+assert.match(sender.code(), /^[0-9]{6}$/);
+const receiver = client.joinTransfer(sender.code(), sender.offer());
+const sealedKeys = sender.seal(receiver.answer(), "alice", keys);
+assert.ok(!sealedKeys.includes(device) && !sealedKeys.includes(user));
+const moved = JSON.parse(receiver.open(sealedKeys));
+assert.equal(moved.owner, "alice");
+assert.deepEqual(moved.keys, JSON.parse(keys));
+// ...and wrong codes are counted until the code is dead.
+const guarded = client.startTransfer();
+const wrong = guarded.code() === "000000" ? "000001" : "000000";
+for (let left = 2; left >= 0; left--) {
+  const guess = client.joinTransfer(wrong, guarded.offer());
+  assert.deepEqual(code(() => guarded.seal(guess.answer(), "alice", keys)), ["transfer_refused", undefined]);
+  assert.equal(guarded.attemptsLeft(), left);
+}
+assert.deepEqual(code(() => guarded.offer()), ["transfer_refused", undefined]);
+
 console.log("web package: smoke test passed");

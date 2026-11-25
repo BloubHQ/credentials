@@ -62,12 +62,12 @@ fn assert_safe_defaults(name: &str, policy: &Policy) {
             Some(Connection::Https) => {
                 assert_eq!(returns.response, None, "{name}: status only");
                 for step in &operation.steps {
-                    if let Step::Send(send) = step {
-                        if let Some(StepRequest::Caller(contract)) = &send.request {
-                            assert!(contract.query.is_empty(), "{name}: no query");
-                            assert!(!contract.encoded_percent, "{name}: strict");
-                            assert!(!contract.override_params, "{name}: no overrides");
-                        }
+                    if let Step::Send(send) = step
+                        && let Some(StepRequest::Caller(contract)) = &send.request
+                    {
+                        assert!(contract.query.is_empty(), "{name}: no query");
+                        assert!(!contract.encoded_percent, "{name}: strict");
+                        assert!(!contract.override_params, "{name}: no overrides");
                     }
                 }
             }

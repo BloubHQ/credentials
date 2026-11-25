@@ -111,6 +111,15 @@ What the engine protects, against whom, under which assumptions, and what is lef
 | Output of site code leaves its origin (returned, logged, sent to another destination or in the caller's request) | Signing refuses any template that reads the output, a value computed from it, or a temporary value captured from the response of a request that carried it, unless it is injected into a request the policy fixes to the module's origin; `run` needs an HTTPS connection; all `run` steps of an operation share one origin; the output is never a field; responses that echo it are refused; log entries hold only the request's body hash and length, sealed | `policy::run`, `node` |
 | The origin serves other code than the owner approved | The SHA-256 pin is checked before the module runs (`ModuleRefused`, no later request); an unpinned module is flagged `run_unpinned` in the summary | `node`, `policy::summary` |
 | Site code exhausts the node (loop, memory, output, stack) or reaches its host | wasmi interpreter, no JIT; fuel (10⁹), 64 MiB memory, 64 KiB output, strict structural limits; only four host functions (no WASI, clock, randomness or I/O); one engine and store per run; memory erased after; errors are fixed values | `sandbox` |
+| Operator hands the state of a node to its own build, or to an older release (downgrade) | The old node hands over only after its peer's attestation verifies against the `to` measurements of a successor statement, and nothing else; the statement must name the old node's compiled release as `from`, a newer Semantic Version as `to` (a statement that is not is refused before its signature is read), and be signed by the release workflow of this repository at the tag of `to` (Fulcio certificate chained to the pinned root at the Rekor integration time; SAN, issuer, runner, repository and ref extensions), logged in Rekor (signed entry timestamp and inclusion proof to a signed checkpoint, both required). Tested with test roots only: a downgrade, unlisted and debug measurements, another Fulcio root, every signer field, a changed statement, a bent proof, another log's checkpoint | `continuity`, `node` |
+| Operator replays a successor statement or a message of the hand-over | A statement of an earlier hand-over names another `from` release and is refused; each side's nonce is used once, within five minutes, and spent on failure; the package is sealed to the successor's key named in the hand-over entry and is refused by any other node; the old node, once handed over, hands back only the same package to the same successor | `continuity`, `node` |
+| Operator forks the log at a hand-over (keeps the old node acting, or splices another log) | The old node refuses every act after its `HandOver` entry; `ChainVerifier` takes after a hand-over only a `Continue` entry signed by the named successor whose `prev` is the hand-over's hash, and refuses any later entry of the old key; `credentials verify --next` checks one chain across the nodes | `log`, `node`, `verify` |
+| Operator reads or changes the state in transit | HPKE to the successor's attested seal key, with the predecessor, successor, sequence, release and statement hash as additional data; the package hash is in the signed hand-over entry; the host only relays | `node`, `continuity::wire` |
+| A grant moves against the owner's wish | `allow_successor` is in the signed grant terms; a grant with it off stays behind and is erased when the node hands over (`grant_without_successor`, `credentials grant --no-successor`); protective state (devices, retired devices, floors, limits) always moves, so a successor cannot be rolled back | `grant`, `node`, `client` |
+| Operator steers the re-grant after a crash to its own node | `client::verify_successor` checks the statement of the release the owner granted to and the new node's attestation against its `to` measurements only; `client::regrant` takes only a node so verified and follows the owner's `SuccessorPolicy` (`AskOwner` needs the app to report the owner's approval; `Never` refuses) | `client` |
+| A recorded device transfer is used to guess the 6-digit code offline | SPAKE2 (RustCrypto `spake2`, Ed25519 group): the transcript gives no test for a guess (tested: no code, the right one included, reproduces the recorded confirmation); key confirmation by HMAC-SHA256 over the transcript in both directions, before any key is sent | `client::transfer` |
+| An attacker takes part in a transfer and guesses the code online, or changes a message | Every answer counts as a guess before it is checked; three wrong codes end the code, a transfer lasts five minutes, and each side seals or opens once: at most 3 in 10^6 per code shown; a changed offer, answer, session, confirmation, nonce or ciphertext fails confirmation or decryption | `client::transfer` |
+| A key backup is opened by someone else, or moved to another owner | XChaCha20-Poly1305 under a random 32-byte backup key kept only in the platform's end-to-end encrypted store; owner, format and time in the additional data; no passphrase mode (a memorable passphrase would be guessable offline from the blob) | `client::backup` |
 | Memory disclosure of freed buffers | `Secret`/`Zeroizing` everywhere in the engine; exact-size buffers; erasing growth in the transport; zeroizing allocator for dependencies | all |
 
 ## Residual risks
@@ -209,5 +218,19 @@ These remain by design; each is listed in the README.
   body contract yet) cannot declare `payment`; such an operation should require approval
   (`"approval": true`).
 - **Availability.** The operator can always stop the node or the log; the engine fails closed.
+- **Continuity rests on the release workflow and Sigstore.** Whoever can run the release
+  workflow of this repository at a new tag (a maintainer, or anyone who takes over the
+  repository or GitHub Actions) can sign a successor statement for its build; a compromised
+  Fulcio could issue a certificate for that identity (the certificate's SCTs are not checked;
+  the Rekor inclusion makes such a statement public). Owners who do not accept this grant with
+  `grant_without_successor`. The compiled Sigstore trust root is empty in the source until it
+  is committed: until then every node and client refuses every statement.
+- **Untested on hardware.** The hand-over, the take-over and the re-grant are tested with a
+  test Nitro root and a test Sigstore (roots made at run time), never with the NSM, vsock or the
+  real Sigstore root.
+- **A hand-over that does not arrive.** If the package is lost after the old node handed over
+  and the successor is then restarted (a new key), the state carried only in the package (user
+  keys) is gone: owners re-grant (the crash path). The old node hands the same package again
+  to the same successor while it runs.
 - **Dependencies.** ring, rustls and other crates keep internal buffers; the zeroizing
   allocator erases them when freed, not while in use.

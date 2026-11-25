@@ -16,6 +16,7 @@ path = "src/main.rs"
 
 [dependencies]
 engine.workspace = true
+continuity.workspace = true
 server.workspace = true
 relay.workspace = true
 transport.workspace = true

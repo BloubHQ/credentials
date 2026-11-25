@@ -29,7 +29,7 @@ pub const MAX_AGE_MS: u64 = engine::caller::MAX_SKEW_MS;
 pub struct Nonce {
     bytes: [u8; NONCE_LEN],
     created_ms: u64,
-    used: AtomicBool,
+    pub(crate) used: AtomicBool,
 }
 
 impl Nonce {
@@ -42,7 +42,7 @@ impl Nonce {
     }
 
     /// Marks the nonce used and checks it was not used before and is not too old.
-    fn take(&self, now: u64) -> Result<&[u8; NONCE_LEN]> {
+    pub(crate) fn take(&self, now: u64) -> Result<&[u8; NONCE_LEN]> {
         if self.used.swap(true, Ordering::SeqCst) {
             return Err(ClientError::NonceRejected {
                 detail: "this nonce was already used: ask the node again with a new one".into(),
@@ -95,6 +95,8 @@ pub struct VerifiedNode {
     timestamp_ms: u64,
     pcrs: BTreeMap<u8, String>,
     pub(crate) verified_ms: u64,
+    /// For a node verified by [`crate::verify_successor`]: the release it succeeds.
+    pub(crate) successor_of: Option<String>,
 }
 
 impl VerifiedNode {
@@ -110,7 +112,33 @@ impl VerifiedNode {
             timestamp_ms: verified_ms,
             pcrs: BTreeMap::new(),
             verified_ms,
+            successor_of: None,
         }
+    }
+
+    /// A node whose document verified and is bound to `identity`, at `now`.
+    pub(crate) fn from_verified(
+        identity: NodeIdentity,
+        verified: attest::Verified,
+        now: u64,
+        successor_of: Option<String>,
+    ) -> Result<Self> {
+        let identity_json =
+            serde_json::to_string(&identity).map_err(ClientError::json("node identity"))?;
+        Ok(Self {
+            identity,
+            identity_json,
+            release: verified.release,
+            module_id: verified.module_id,
+            timestamp_ms: verified.timestamp_ms,
+            pcrs: verified
+                .pcrs
+                .iter()
+                .map(|(index, pcr)| (*index, attest::to_hex(pcr)))
+                .collect(),
+            verified_ms: now,
+            successor_of,
+        })
     }
 }
 
@@ -150,6 +178,12 @@ impl VerifiedNode {
     pub fn log_key(&self) -> String {
         self.identity.log_key.to_b64()
     }
+
+    /// For a node verified as the successor of a release ([`crate::verify_successor`]):
+    /// that release.
+    pub fn successor_of(&self) -> Option<String> {
+        self.successor_of.clone()
+    }
 }
 
 /// Parses a node identity.
@@ -168,21 +202,7 @@ fn verify(
     let accepted = attest::Measurements::from_json(measurements_json.as_bytes())?;
     let verified = attest::verify(document, nonce, accepted.as_slice(), &[attest::aws_root()])?;
     attest::bind(&identity, &verified)?;
-    let identity_json =
-        serde_json::to_string(&identity).map_err(ClientError::json("node identity"))?;
-    Ok(VerifiedNode {
-        identity,
-        identity_json,
-        release: verified.release,
-        module_id: verified.module_id,
-        timestamp_ms: verified.timestamp_ms,
-        pcrs: verified
-            .pcrs
-            .iter()
-            .map(|(index, pcr)| (*index, attest::to_hex(pcr)))
-            .collect(),
-        verified_ms: now,
-    })
+    VerifiedNode::from_verified(identity, verified, now, None)
 }
 
 /// Verifies the attestation `document` (CBOR, as the Nitro Secure Module wrote it) of the

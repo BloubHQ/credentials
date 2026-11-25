@@ -741,17 +741,17 @@ fn call_info(func: Func, args: &[Info]) -> core::result::Result<Info, Rule> {
     let at = |i: usize| args.get(i).copied().unwrap_or_default();
     let any_tainted = args.iter().any(|i| i.tainted);
     let any_controlled = args.iter().any(|i| i.controlled);
-    if let Some(i) = func.algorithm_arg() {
-        if at(i).tainted || at(i).controlled {
-            return Err("a hash or curve name must be fixed by the policy");
-        }
+    if let Some(i) = func.algorithm_arg()
+        && (at(i).tainted || at(i).controlled)
+    {
+        return Err("a hash or curve name must be fixed by the policy");
     }
-    if let Some(i) = func.public_key_arg() {
-        if at(i).caller {
-            return Err(
-                "an encryption key must come from the policy or the destination, not the caller",
-            );
-        }
+    if let Some(i) = func.public_key_arg()
+        && at(i).caller
+    {
+        return Err(
+            "an encryption key must come from the policy or the destination, not the caller",
+        );
     }
     if func.no_mixing() && any_tainted && any_controlled {
         return Err("a secret and a chosen value meet in a function that compares or cuts them");

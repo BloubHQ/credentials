@@ -10,6 +10,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use aws_nitro_enclaves_nsm_api::api::{Request, Response};
 use aws_nitro_enclaves_nsm_api::driver::{nsm_exit, nsm_init, nsm_process_request};
+use continuity::wire::{HANDOVER_PORT, Service};
 use engine::keys::NodeKey;
 use engine::node::{Node, SystemClock};
 use relay::vsock::{self, Vsock};
@@ -19,7 +20,7 @@ use relay::{
 use server::{Options, Server};
 use transport::{Socket, TlsTransport};
 
-use crate::attestation::{AttestError, Attester, EnclaveHooks};
+use crate::attestation::{AttestError, Attester, EnclaveHooks, ForHandOver};
 
 /// The kernel file that names the active hardware random source.
 const RNG_CURRENT: &str = "/sys/class/misc/hw_random/rng_current";
@@ -132,12 +133,13 @@ pub fn run() -> Result<(), NitroError> {
         return Err(NitroError::LogNotEmpty);
     }
     let link = Arc::new(Mutex::new(link));
+    let nsm = Arc::new(nsm);
     let node = Node::new(key, RelaySink::new(Arc::clone(&link), None), SystemClock);
     let server = Server::new(
         node,
         || TlsTransport::new().connector(RelayConnector::new(|| dial(EGRESS_PORT))),
         Options::default(),
-        EnclaveHooks::new(nsm, link),
+        EnclaveHooks::new(Arc::clone(&nsm), link),
     );
     server.checkpoint();
     let listener = vsock::listen(HTTP_PORT)?;
@@ -145,6 +147,33 @@ pub fn run() -> Result<(), NitroError> {
         "node {} started; listening on vsock port {HTTP_PORT}",
         server.node().public_key().to_b64()
     );
-    server.run(listener.incoming().map(|stream| stream.map(Vsock)));
+    std::thread::scope(|scope| {
+        match crate::hand_over_checks() {
+            Ok(checks) => match vsock::listen(HANDOVER_PORT) {
+                Ok(handover) => {
+                    let service = Service::new(server.node(), ForHandOver(nsm), checks);
+                    scope.spawn(move || serve_hand_over(&service, &handover));
+                }
+                Err(e) => eprintln!("warning: no hand-over port: {e}"),
+            },
+            Err(reason) => eprintln!("hand-over disabled: {reason}"),
+        }
+        server.run(listener.incoming().map(|stream| stream.map(Vsock)));
+    });
     Ok(())
+}
+
+/// Serves the hand-over protocol, one connection of the host at a time.
+fn serve_hand_over<A: continuity::Attester>(
+    service: &Service<'_, RelaySink, SystemClock, A>,
+    listener: &vsock::VsockListener,
+) {
+    for stream in listener.incoming() {
+        let result = stream
+            .map_err(|e| continuity::Error::Transport(e.to_string()))
+            .and_then(|stream| service.serve(&mut Vsock(stream)));
+        if let Err(e) = result {
+            eprintln!("warning: hand-over connection: {e}");
+        }
+    }
 }

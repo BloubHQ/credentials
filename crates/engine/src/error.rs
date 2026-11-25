@@ -285,6 +285,15 @@ pub enum Error {
         /// The sequence number of the entry.
         seq: u64,
     },
+    /// This node handed its state over to a successor: it takes no act any more.
+    #[error("this node handed over to its successor and takes no act")]
+    HandedOver,
+    /// A hand-over was refused: the package, its entry or the state of the node.
+    #[error("hand-over refused: {rule}")]
+    HandOverInvalid {
+        /// Which rule.
+        rule: &'static str,
+    },
     /// The response holds a secret in a form the search knows. It was dropped.
     #[error("response reflects a secret")]
     Reflection,

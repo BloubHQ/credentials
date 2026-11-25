@@ -728,15 +728,15 @@ fn risk_flags(policy: &Policy, origin: Option<&Origin>, flags: &mut Vec<Flag>) {
                         format!("{name} matches any one label there"),
                     );
                 }
-                if let Some(origin) = origin {
-                    if !under(origin, d) {
-                        flag(
-                            flags,
-                            FlagCode::OutsideOrigin,
-                            &at,
-                            format!("{name} is not under {}", origin.text()),
-                        );
-                    }
+                if let Some(origin) = origin
+                    && !under(origin, d)
+                {
+                    flag(
+                        flags,
+                        FlagCode::OutsideOrigin,
+                        &at,
+                        format!("{name} is not under {}", origin.text()),
+                    );
                 }
             }
             if open.identity.is_some() {
@@ -748,44 +748,45 @@ fn risk_flags(policy: &Policy, origin: Option<&Origin>, flags: &mut Vec<Flag>) {
                 );
             }
         }
-        if let Some(Input::Raw(raw)) = &operation.input {
-            if raw.max_len.is_none() && raw.pattern.is_none() {
-                flag(
-                    flags,
-                    FlagCode::RawInput,
-                    &at,
-                    "the caller's input is any bytes",
-                );
-            }
+        if let Some(Input::Raw(raw)) = &operation.input
+            && raw.max_len.is_none()
+            && raw.pattern.is_none()
+        {
+            flag(
+                flags,
+                FlagCode::RawInput,
+                &at,
+                "the caller's input is any bytes",
+            );
         }
         for (c, _) in operation.caller_sends() {
             caller_flags(c, &at, flags);
         }
         for step in &operation.steps {
-            if let Step::Run(run) = step {
-                if run.unpinned() {
-                    flag(
-                        flags,
-                        FlagCode::RunUnpinned,
-                        &at,
-                        format!(
-                            "the module {} runs on secret values without a sha256 pin: the site can change it",
-                            run.module_name()
-                        ),
-                    );
-                }
+            if let Step::Run(run) = step
+                && run.unpinned()
+            {
+                flag(
+                    flags,
+                    FlagCode::RunUnpinned,
+                    &at,
+                    format!(
+                        "the module {} runs on secret values without a sha256 pin: the site can change it",
+                        run.module_name()
+                    ),
+                );
             }
         }
         if let Some(ret) = operation.returns() {
-            if let Some(p) = &ret.response {
-                if p.body == Some(BodyProjection::All) {
-                    flag(
-                        flags,
-                        FlagCode::ResponseAll,
-                        &at,
-                        "the whole response body goes back to the caller",
-                    );
-                }
+            if let Some(p) = &ret.response
+                && p.body == Some(BodyProjection::All)
+            {
+                flag(
+                    flags,
+                    FlagCode::ResponseAll,
+                    &at,
+                    "the whole response body goes back to the caller",
+                );
             }
             if let Some(relay) = &ret.relay {
                 flag(
@@ -806,15 +807,15 @@ fn risk_flags(policy: &Policy, origin: Option<&Origin>, flags: &mut Vec<Flag>) {
                     );
                 }
             }
-            if let Some(template) = &ret.template {
-                if Reads::new(operation).reversible_in(template) {
-                    flag(
-                        flags,
-                        FlagCode::DeriveReversible,
-                        &at,
-                        "the output is an encryption, key agreement or XOR, not a one-way value",
-                    );
-                }
+            if let Some(template) = &ret.template
+                && Reads::new(operation).reversible_in(template)
+            {
+                flag(
+                    flags,
+                    FlagCode::DeriveReversible,
+                    &at,
+                    "the output is an encryption, key agreement or XOR, not a one-way value",
+                );
             }
         }
     }

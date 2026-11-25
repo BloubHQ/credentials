@@ -23,7 +23,7 @@ use sha2::{Digest, Sha256};
 use chacha20poly1305::{ChaCha20Poly1305, KeyInit, Nonce};
 
 use crate::encoding::{b64_array, b64_vec, canonical};
-use crate::grant::RecordPin;
+use crate::grant::{NodeIdentity, RecordPin};
 use crate::keys::{DevicePublicKey, NodeKey, NodePublicKey, UserKey};
 use crate::policy::Method;
 use crate::{Error, Result};
@@ -157,6 +157,38 @@ pub enum Event {
         /// The payment, sealed under the node's own state key.
         sealed: SealedDetail,
     },
+    /// The node handed its grants, devices, floors and limits over to its successor, sealed
+    /// to the successor's key, and stopped: the last entry of its chain. The next entry of the
+    /// chain is the successor's [`Event::Continue`], signed by `successor.log_key`.
+    HandOver {
+        /// The successor: the node the package is sealed to and that continues the chain.
+        successor: Box<NodeIdentity>,
+        /// The release the successor runs, as its successor statement names it.
+        release: String,
+        /// SHA-256 of the successor statement the hand-over was checked against.
+        #[serde(with = "crate::encoding::b64_box_array")]
+        statement_sha256: Box<[u8; 32]>,
+        /// SHA-256 of the sealed package ([`crate::node::HandOver::package_sha256`]).
+        #[serde(with = "crate::encoding::b64_box_array")]
+        package_sha256: Box<[u8; 32]>,
+        /// Owners whose devices, floors and limits the package carries.
+        owners: u64,
+        /// Grants (user keys) the package carries: those whose owners allowed a successor.
+        grants: u64,
+    },
+    /// The first entry of a node that took over from a predecessor: it chains to the
+    /// predecessor's [`Event::HandOver`] entry, so one chain runs across both nodes.
+    Continue {
+        /// The log key of the predecessor.
+        predecessor: NodePublicKey,
+        /// Owners taken over.
+        owners: u64,
+        /// Grants taken over.
+        grants: u64,
+    },
+    /// What a successor took over for one owner from its predecessor (boxed: the largest
+    /// event, and a rare one).
+    Carry(Box<Carried>),
     /// How the act of an earlier entry ended.
     Done {
         /// The sequence number of the act.
@@ -166,6 +198,35 @@ pub enum Event {
         /// True when the result went back to the caller.
         ok: bool,
     },
+}
+
+/// What a successor took over for one owner: the content of [`Event::Carry`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Carried {
+    /// The devices the predecessor knew for the owner.
+    pub devices: Vec<DevicePublicKey>,
+    /// The devices the owner withdrew.
+    pub retired: Vec<DevicePublicKey>,
+    /// The issue time of the owner's last grant, revocation or device change.
+    pub issued_ms: u64,
+    /// The lowest generation of each record of the owner (the predecessor's floors).
+    pub pins: Vec<RecordPin>,
+    /// The end of the grant taken over, if the owner allowed it to move.
+    pub grant_expires_ms: Option<u64>,
+    /// The spending limits and counted payments of each record, sealed under this node's own
+    /// state key.
+    pub limits: Vec<CarriedLimits>,
+}
+
+/// The spending limits of one record a successor took over, sealed so only it reads them.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CarriedLimits {
+    /// The record.
+    pub record_id: String,
+    /// The rules and the counted payments, sealed under the node's own state key.
+    pub sealed: SealedDetail,
 }
 
 /// Where a use went and what it carried, readable by the owner only.
@@ -334,7 +395,8 @@ impl SignedEntry {
         Ok(hasher.finalize().into())
     }
 
-    fn verify(&self, node: &NodePublicKey) -> Result<()> {
+    /// Verifies the signature of `node` over the entry.
+    pub fn verify(&self, node: &NodePublicKey) -> Result<()> {
         node.verify(&canonical(ENTRY_DOMAIN, &self.entry)?, &self.signature)
     }
 }
@@ -426,17 +488,71 @@ impl Log {
 
     /// Continues the chain of `entries` (all of them, from seq 0), which `key` signed. Use it
     /// after a restart, with the entries the sink holds.
+    ///
+    /// A node that took over from a predecessor starts its chain with an [`Event::Continue`]
+    /// entry that chains to the predecessor's hand-over: its `entries` start there.
     pub fn resume(key: NodeKey, entries: &[SignedEntry]) -> Result<Self> {
-        let head = verify_chain(entries, &key.public())?;
+        let mut verifier = match entries.first() {
+            Some(first) if matches!(first.entry.event, Event::Continue { .. }) => {
+                ChainVerifier::continued(key.public(), first)
+            }
+            _ => ChainVerifier::new(key.public()),
+        };
+        let start = verifier.len();
+        for signed in entries {
+            verifier.push(signed)?;
+        }
         let mut log = Self::new(key);
         for signed in entries {
             log.owner_heads
                 .insert(signed.entry.owner.clone(), signed.hash()?);
             log.last_time = signed.entry.time_ms;
         }
-        log.head = head;
-        log.next_seq = u64::try_from(entries.len()).map_err(|_| Error::LogMismatch)?;
+        log.head = verifier.head();
+        log.next_seq = start
+            .checked_add(u64::try_from(entries.len()).map_err(|_| Error::LogMismatch)?)
+            .ok_or(Error::LogMismatch)?;
         Ok(log)
+    }
+
+    /// Number of entries of the chain so far, counted from the first entry of the first node
+    /// of the chain: the sequence number of the next entry.
+    pub fn len(&self) -> u64 {
+        self.next_seq
+    }
+
+    /// True before the first entry of a new chain.
+    pub fn is_empty(&self) -> bool {
+        self.next_seq == 0
+    }
+
+    /// The hash of the last entry of `owner`, if the chain has one.
+    pub fn owner_head(&self, owner: &str) -> Option<[u8; 32]> {
+        self.owner_heads.get(owner).copied()
+    }
+
+    /// Makes an empty chain go on after `hand_over`, the last entry of the predecessor's
+    /// chain: the next entry has the sequence number after it and chains to its hash, and
+    /// the chain of each owner goes on from `owner_heads`.
+    pub(crate) fn rebase(
+        &mut self,
+        hand_over: &SignedEntry,
+        owner_heads: HashMap<String, [u8; 32]>,
+    ) -> Result<()> {
+        if self.next_seq != 0 || self.pending.is_some() {
+            return Err(Error::LogMismatch);
+        }
+        let hash = hand_over.hash()?;
+        self.owner_heads = owner_heads;
+        self.owner_heads.insert(hand_over.entry.owner.clone(), hash);
+        self.head = hash;
+        self.last_time = hand_over.entry.time_ms;
+        self.next_seq = hand_over
+            .entry
+            .seq
+            .checked_add(1)
+            .ok_or(Error::LogMismatch)?;
+        Ok(())
     }
 
     /// The public key that verifies the entries.
@@ -541,12 +657,26 @@ pub fn verify_chain(entries: &[SignedEntry], node: &NodePublicKey) -> Result<[u8
 }
 
 /// Verifies a chain entry by entry, without holding it in memory.
+///
+/// A chain may run across nodes: after an [`Event::HandOver`] entry, the next entry must be
+/// the [`Event::Continue`] of the successor the hand-over names, signed by the successor's
+/// log key and naming this node as its predecessor; every later entry is checked under the
+/// successor's key. An entry of the old node after its hand-over (a fork) breaks the chain.
 pub struct ChainVerifier {
     node: NodePublicKey,
     next_seq: u64,
     prev: [u8; 32],
     last_time: u64,
     owner_heads: HashMap<String, [u8; 32]>,
+    /// The log key of the successor, right after a hand-over entry.
+    successor: Option<NodePublicKey>,
+    /// Started at the [`Event::Continue`] entry of a successor, without the predecessor's
+    /// chain: the first entry is that one, and the chain of an owner is taken from its first
+    /// entry on.
+    continued: bool,
+    /// True before the first entry of a verifier made by [`ChainVerifier::continued`].
+    at_continue: bool,
+    hand_overs: u64,
 }
 
 impl ChainVerifier {
@@ -558,6 +688,28 @@ impl ChainVerifier {
             prev: [0; 32],
             last_time: 0,
             owner_heads: HashMap::new(),
+            successor: None,
+            continued: false,
+            at_continue: false,
+            hand_overs: 0,
+        }
+    }
+
+    /// A verifier of the chain of a successor alone, from its first entry `first` (an
+    /// [`Event::Continue`] signed by `node`) on. It checks that chain from there, not that it
+    /// continues a predecessor's: give the predecessor's entries to a verifier of the whole
+    /// chain ([`ChainVerifier::new`]) for that.
+    pub fn continued(node: NodePublicKey, first: &SignedEntry) -> Self {
+        Self {
+            node,
+            next_seq: first.entry.seq,
+            prev: first.entry.prev,
+            last_time: first.entry.time_ms,
+            owner_heads: HashMap::new(),
+            successor: None,
+            continued: true,
+            at_continue: true,
+            hand_overs: 0,
         }
     }
 
@@ -565,21 +717,44 @@ impl ChainVerifier {
     pub fn push(&mut self, signed: &SignedEntry) -> Result<()> {
         let seq = self.next_seq;
         let entry = &signed.entry;
-        let owner_prev = self
-            .owner_heads
-            .get(&entry.owner)
-            .copied()
-            .unwrap_or([0; 32]);
+        let broken = Error::ChainBroken { seq };
+        let is_continue = matches!(entry.event, Event::Continue { .. });
+        let first_of_continued = std::mem::take(&mut self.at_continue);
+        if first_of_continued && !is_continue {
+            return Err(broken);
+        }
+        let key = match self.successor {
+            // The entry after a hand-over is the successor's first, naming this node.
+            Some(next) => match &entry.event {
+                Event::Continue { predecessor, .. } if *predecessor == self.node => next,
+                _ => return Err(broken),
+            },
+            None if is_continue && !first_of_continued => return Err(broken),
+            None => self.node,
+        };
+        let owner_prev = match self.owner_heads.get(&entry.owner) {
+            Some(head) => Some(*head),
+            None if self.continued => None,
+            None => Some([0; 32]),
+        };
         if entry.seq != seq
             || entry.prev != self.prev
-            || entry.owner_prev != owner_prev
+            || owner_prev.is_some_and(|head| head != entry.owner_prev)
             || entry.time_ms < self.last_time
         {
-            return Err(Error::ChainBroken { seq });
+            return Err(broken);
         }
         signed
-            .verify(&self.node)
+            .verify(&key)
             .map_err(|_| Error::EntrySignature { seq })?;
+        self.node = key;
+        self.successor = match &entry.event {
+            Event::HandOver { successor, .. } => {
+                self.hand_overs = self.hand_overs.saturating_add(1);
+                Some(successor.log_key)
+            }
+            _ => None,
+        };
         self.prev = signed.hash()?;
         self.owner_heads.insert(entry.owner.clone(), self.prev);
         self.last_time = entry.time_ms;
@@ -600,6 +775,23 @@ impl ChainVerifier {
     /// Hash of the last entry checked.
     pub fn head(&self) -> [u8; 32] {
         self.prev
+    }
+
+    /// The log key of the node whose entries come now: the first node's, or the last
+    /// successor's after a hand-over and its first entry.
+    pub fn node(&self) -> NodePublicKey {
+        self.node
+    }
+
+    /// Hand-overs checked so far.
+    pub fn hand_overs(&self) -> u64 {
+        self.hand_overs
+    }
+
+    /// True right after a hand-over entry: the chain of that node ended, and the next entry
+    /// must be its successor's first.
+    pub fn awaits_successor(&self) -> bool {
+        self.successor.is_some()
     }
 
     /// Checks that the chain so far ends at a signed head of the same node.

@@ -325,23 +325,23 @@ pub(super) fn check_confined(at: &str, operation: &Operation) -> Checked {
                         )?;
                     }
                 }
-                if let Some(template) = &send.template {
-                    if reads_any(template, &confined) {
-                        return fail(
-                            format!("{at}.template"),
-                            "the output of a run step goes only into a request the policy fixes to the origin of its module",
-                        );
-                    }
+                if let Some(template) = &send.template
+                    && reads_any(template, &confined)
+                {
+                    return fail(
+                        format!("{at}.template"),
+                        "the output of a run step goes only into a request the policy fixes to the origin of its module",
+                    );
                 }
             }
             Step::Return(ret) => {
-                if let Some(template) = &ret.template {
-                    if reads_any(template, &confined) {
-                        return fail(
-                            format!("{at}.template"),
-                            "the output of a run step never goes back to the caller",
-                        );
-                    }
+                if let Some(template) = &ret.template
+                    && reads_any(template, &confined)
+                {
+                    return fail(
+                        format!("{at}.template"),
+                        "the output of a run step never goes back to the caller",
+                    );
                 }
             }
             Step::Receive(receive) => {

@@ -62,6 +62,7 @@ fn write_log(name: &str) -> Written {
             &node.identity(),
             GrantTerms {
                 owner: "alice".into(),
+                allow_successor: true,
                 expires_ms: now + 60_000,
                 issued_ms: now,
                 pins: vec![RecordPin {

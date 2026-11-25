@@ -111,6 +111,10 @@ enum Command {
     Serve(ServeArgs),
     /// Runs the host side of a node in an AWS Nitro Enclave (Linux parent instance only).
     Host(HostArgs),
+    /// Hands the state of a running enclave over to an enclave of a newer release (Linux
+    /// parent instance only): both enclaves check the signed successor statement and each
+    /// other's attestation; this program only carries the messages.
+    HandOver(HandOverArgs),
     /// Node information.
     #[command(subcommand)]
     Node(NodeCommand),
@@ -263,8 +267,28 @@ struct GrantArgs {
     /// The measurements.json of the releases to accept (one object or an array).
     #[arg(long, value_name = "FILE", requires = "attestation")]
     measurements: Option<PathBuf>,
+    /// Keep this grant from moving to a successor node: by default a node hands it over to a
+    /// node of a newer release signed by the release workflow (docs/design.md, section 10).
+    #[arg(long)]
+    no_successor: bool,
     #[command(flatten)]
     deliver: Deliver,
+}
+
+#[derive(Args)]
+struct HandOverArgs {
+    /// The vsock CID of the running enclave, which hands over.
+    #[arg(long)]
+    from_cid: u32,
+    /// The vsock CID of the enclave of the newer release, which takes over.
+    #[arg(long)]
+    to_cid: u32,
+    /// The successor statement of the newer release (`successor.json` of its release).
+    #[arg(long, value_name = "FILE")]
+    statement: PathBuf,
+    /// Its Sigstore bundle (`successor.sigstore.json`).
+    #[arg(long, value_name = "FILE")]
+    bundle: PathBuf,
 }
 
 #[derive(Args)]
@@ -768,6 +792,9 @@ fn grant(args: &GrantArgs) -> Res<()> {
     }
     let minutes = Duration::from_secs(args.valid.saturating_mul(60));
     let mut terms = GrantTerms::new(&args.owner, minutes);
+    if args.no_successor {
+        terms = terms.without_successor();
+    }
     if args.pins.is_empty() {
         eprintln!(
             "warning: no --pin given: the node refuses every call on a record of {} until the \
@@ -791,6 +818,28 @@ fn grant(args: &GrantArgs) -> Res<()> {
         .grant(&key, &node, terms)
         .map_err(engine("cannot grant"))?;
     deliver(&sealed, &args.deliver, "/grant")
+}
+
+fn hand_over(args: &HandOverArgs) -> Res<()> {
+    let read = |path: &Path| {
+        std::fs::read(path).map_err(|e| Failure::io(format!("{}: {e}", path.display())))
+    };
+    let statement =
+        continuity::SignedStatement::from_files(&read(&args.statement)?, &read(&args.bundle)?)
+            .map_err(|e| Failure::usage(format!("{}: {e}", args.bundle.display())))?;
+    match host::hand_over(args.from_cid, args.to_cid, &statement) {
+        Ok(taken) => {
+            eprintln!(
+                "handed over: {} owners, {} grants; the old node refuses every act from now on",
+                taken.owners, taken.grants
+            );
+            Ok(())
+        }
+        Err(host::HandOverError::Host(e @ host::Error::Unsupported)) => {
+            Err(Failure::usage(e.to_string()))
+        }
+        Err(e) => Err(Failure::new(1, e.to_string())),
+    }
 }
 
 fn revoke(args: &RevokeArgs) -> Res<()> {
@@ -880,17 +929,17 @@ fn call(common: &CallCommon, body: Body) -> Res<()> {
     let json = serde_json::to_vec(&call).map_err(|e| format!("cannot encode JSON: {e}"))?;
     let reply = client::request(url, "POST", "/call", Some(&json))?;
     println!("{}", String::from_utf8_lossy(&reply.body));
-    if let Ok(answer) = serde_json::from_slice::<Value>(&reply.body) {
-        if let Some(record) = answer.get("record").filter(|r| !r.is_null()) {
-            let record: Record = serde_json::from_value(record.clone())
-                .map_err(|e| format!("the node handed back a malformed record: {e}"))?;
-            files::write_json(&common.record, &record)?;
-            eprintln!(
-                "the node sealed the record again: generation {} written to {}",
-                record.generation,
-                common.record.display()
-            );
-        }
+    if let Ok(answer) = serde_json::from_slice::<Value>(&reply.body)
+        && let Some(record) = answer.get("record").filter(|r| !r.is_null())
+    {
+        let record: Record = serde_json::from_value(record.clone())
+            .map_err(|e| format!("the node handed back a malformed record: {e}"))?;
+        files::write_json(&common.record, &record)?;
+        eprintln!(
+            "the node sealed the record again: generation {} written to {}",
+            record.generation,
+            common.record.display()
+        );
     }
     reply.check(url)
 }
@@ -1001,6 +1050,7 @@ fn run(command: Command) -> Res<()> {
             host::Error::Unsupported => Failure::usage(e.to_string()),
             host::Error::Io { .. } => Failure::io(e.to_string()),
         }),
+        Command::HandOver(args) => hand_over(&args),
         Command::Node(NodeCommand::Identity { key, url, out }) => {
             node_identity(key.as_deref(), url.as_deref(), out.as_deref())
         }

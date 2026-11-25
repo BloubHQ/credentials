@@ -17,7 +17,7 @@ cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace --locked
 ```
 
-CI also runs on macOS and Windows, builds with the minimum Rust version (1.87), runs
+CI also runs on macOS and Windows, builds with the minimum Rust version (1.88), runs
 `cargo audit` and `cargo deny --config .github/deny.toml check`, and checks that two builds are
 identical.
 

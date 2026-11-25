@@ -143,6 +143,7 @@ fn setup<'c>(clock: &'c TestClock, policy: Policy, values: &[(&str, &[u8])]) -> 
     let node = Node::new(NodeKey::generate(), MemorySink::new(), clock);
     let terms = GrantTerms {
         owner: OWNER.into(),
+        allow_successor: true,
         expires_ms: NOW + DAY,
         issued_ms: NOW,
         pins: vec![RecordPin {

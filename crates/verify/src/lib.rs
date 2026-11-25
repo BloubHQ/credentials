@@ -2,7 +2,7 @@
 //!
 //! ```text
 //! credentials verify <log.jsonl> <node-public-key> [--head <file>] [--owner <name>]
-//!                    [--user-key <file>] [--json]
+//!                    [--user-key <file>] [--next <log.jsonl>]... [--json]
 //! ```
 //!
 //! Every line of the file is one signed entry. The verifier reads the file as a stream and
@@ -12,7 +12,10 @@
 //! them to that owner (`engine::log::owner_entries`), and the verifier checks the chain of that
 //! owner. With `--user-key` (a file that holds the user key of the owner as unpadded URL-safe
 //! base64), it also prints every entry with its detail (where a value went), which only the
-//! owner can read. `--help` lists every option and the exit codes.
+//! owner can read. With `--next`, the chain goes on in the log of the node the first one
+//! handed over to (node continuity, `docs/design.md` section 10): one chain across nodes, the
+//! key switching at each hand-over entry to the successor it names. `--help` lists every
+//! option and the exit codes.
 //!
 //! [`run`] takes the arguments after `verify`, writes to stdout and stderr, and returns the
 //! exit code.
@@ -22,7 +25,7 @@ use std::io::{BufRead, BufReader};
 
 use engine::encoding::to_b64;
 use engine::keys::{NodePublicKey, UserKey};
-use engine::log::{ChainVerifier, SignedEntry, SignedHead, open_detail, verify_owner_chain};
+use engine::log::{ChainVerifier, Event, SignedEntry, SignedHead, open_detail, verify_owner_chain};
 use serde_json::{Value, json};
 use zeroize::Zeroizing;
 
@@ -33,7 +36,7 @@ pub const EXIT_INVALID: u8 = 1;
 /// Exit code of a usage error, or of a file or key that cannot be read.
 pub const EXIT_USAGE: u8 = 2;
 
-const USAGE: &str = "usage: credentials verify <log.jsonl> <node-public-key> [--head <file>] [--owner <name>] [--user-key <file>] [--json]";
+const USAGE: &str = "usage: credentials verify <log.jsonl> <node-public-key> [--head <file>] [--owner <name>] [--user-key <file>] [--next <log.jsonl>]... [--json]";
 
 /// The help text of `credentials verify`.
 pub const HELP: &str = "\
@@ -60,10 +63,16 @@ Options (in any order, before or after the arguments):
   --user-key <file>    With --owner: a file with the user key of the owner (unpadded
                        URL-safe base64). Every entry is printed with its detail (where
                        a value went, what was sent), one JSON object per line.
+  --next <log.jsonl>   The log of the node this one handed over to (repeat it for each
+                       later hand-over, in order). The chain goes on across the nodes:
+                       the first log must end with a hand-over entry, the next must
+                       start with the successor's continue entry naming its hash, and
+                       the key switches to the successor's. Not with --owner. --head is
+                       then a checkpoint of the last node.
   --json               Print the result as one JSON object on the last line of stdout:
                        {\"valid\": bool, \"entries\": n, \"head\": ..., \"owner\": ...,
                         \"checkpoint\": ..., \"owner_tail_unchecked\": bool,
-                        \"error\": ...}
+                        \"hand_overs\": [...], \"error\": ...}
   -h, --help           Print this help.
 
 Times are printed in milliseconds since the Unix epoch and as RFC 3339 UTC.
@@ -74,6 +83,7 @@ Examples:
   credentials verify --owner alice alice.jsonl <node-public-key>
   credentials verify alice.jsonl <node-public-key> --owner alice --user-key key.txt --json
   credentials verify alice.jsonl <node-public-key> --head head.json --owner alice
+  credentials verify old.jsonl <old-node-public-key> --next new.jsonl --head new-head.json
 
 Exit codes:
   0  the log is valid
@@ -93,6 +103,7 @@ struct Options {
     head: Option<String>,
     owner: Option<String>,
     user_key: Option<String>,
+    next: Vec<String>,
     json: bool,
 }
 
@@ -148,7 +159,9 @@ fn parse(args: &[String]) -> Result<Option<Options>, String> {
             options.json = true;
             continue;
         }
+        let mut next = None;
         let slot = match name {
+            "--next" => &mut next,
             "--head" => &mut options.head,
             "--owner" => &mut options.owner,
             "--user-key" => &mut options.user_key,
@@ -167,6 +180,7 @@ fn parse(args: &[String]) -> Result<Option<Options>, String> {
         if slot.replace(value).is_some() {
             return Err(format!("{name} given twice"));
         }
+        options.next.extend(next);
     }
     let mut positional = positional.into_iter();
     match (positional.next(), positional.next(), positional.next()) {
@@ -179,6 +193,9 @@ fn parse(args: &[String]) -> Result<Option<Options>, String> {
     }
     if options.user_key.is_some() && options.owner.is_none() {
         return Err("--user-key needs --owner".into());
+    }
+    if !options.next.is_empty() && options.owner.is_some() {
+        return Err("--next checks the whole chain across nodes: not with --owner".into());
     }
     Ok(Some(options))
 }
@@ -221,6 +238,8 @@ struct Summary {
     /// With --owner and --head: the checkpoint goes past the last entry of the file, so
     /// later entries of the owner, cut from the file, would not be noticed.
     owner_tail_unchecked: bool,
+    /// The hand-overs the chain went through.
+    hand_overs: Vec<Value>,
 }
 
 fn count(n: usize) -> u64 {
@@ -244,12 +263,50 @@ fn check_chain(
     summary: &mut Summary,
 ) -> Result<(), Failure> {
     let mut verifier = ChainVerifier::new(key);
-    for item in entries(&options.log)? {
-        let (line, signed) = item?;
-        verifier
-            .push(&signed)
-            .map_err(|e| Failure::Invalid(format!("line {line}: {}", entry_error(&e, 0))))?;
-        summary.entries = verifier.len();
+    let files = std::iter::once(&options.log).chain(&options.next);
+    for (index, path) in files.enumerate() {
+        if index > 0 && !verifier.awaits_successor() {
+            return Err(Failure::Invalid(format!(
+                "{path}: the log before it does not end with a hand-over entry"
+            )));
+        }
+        for item in entries(path)? {
+            let (line, signed) = item?;
+            verifier.push(&signed).map_err(|e| {
+                let at = if options.next.is_empty() {
+                    format!("line {line}")
+                } else {
+                    format!("{path}, line {line}")
+                };
+                Failure::Invalid(format!("{at}: {}", entry_error(&e, 0)))
+            })?;
+            if let Event::HandOver {
+                successor,
+                release,
+                statement_sha256,
+                owners,
+                grants,
+                ..
+            } = &signed.entry.event
+            {
+                summary.hand_overs.push(json!({
+                    "seq": signed.entry.seq,
+                    "successor": successor.log_key.to_b64(),
+                    "release": release,
+                    "statement_sha256": hex(&statement_sha256[..]),
+                    "owners": owners,
+                    "grants": grants,
+                }));
+            }
+            summary.entries = verifier.len();
+        }
+    }
+    if verifier.awaits_successor() && !options.next.is_empty() {
+        return Err(Failure::Invalid(
+            "the last log ends with a hand-over: give the successor's log with --next, or leave \
+             out the logs after the one that handed over"
+                .into(),
+        ));
     }
     summary.head = Some(verifier.head());
     if let Some(path) = &options.head {
@@ -260,6 +317,10 @@ fn check_chain(
         summary.checkpoint = Some(head);
     }
     Ok(())
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// Checks the chain of one owner and returns its entries.
@@ -392,6 +453,7 @@ fn summary_json(options: &Options, summary: &Summary, error: Option<&str>) -> Va
             "time": rfc3339(c.time_ms),
         })),
         "owner_tail_unchecked": summary.owner_tail_unchecked,
+        "hand_overs": summary.hand_overs,
         "error": error,
     })
 }
@@ -402,6 +464,12 @@ fn summary_text(options: &Options, summary: &Summary) -> String {
         Some(owner) => format!("ok: {} entries of {owner}, head {head}", summary.entries),
         None => format!("ok: {} entries, head {head}", summary.entries),
     };
+    for hand_over in &summary.hand_overs {
+        text.push_str(&format!(
+            ", handed over at entry {} to release {} (statement sha256 {})",
+            hand_over["seq"], hand_over["release"], hand_over["statement_sha256"]
+        ));
+    }
     if let Some(checkpoint) = &summary.checkpoint {
         text.push_str(&format!(
             ", signed head of {} entries at {} ms ({})",
@@ -436,14 +504,15 @@ pub fn run(args: &[String]) -> u8 {
         }
     }
     let error = result.as_ref().err();
-    if error.is_none() && summary.owner_tail_unchecked {
-        if let Some(checkpoint) = &summary.checkpoint {
-            eprintln!(
-                "warning: the signed head covers {} entries of the node, past the last entry of {} in the file: entries of that owner after it would not be noticed if they were cut (ask for a checkpoint taken right after the owner's last entry)",
-                checkpoint.len,
-                options.owner.as_deref().unwrap_or_default()
-            );
-        }
+    if error.is_none()
+        && summary.owner_tail_unchecked
+        && let Some(checkpoint) = &summary.checkpoint
+    {
+        eprintln!(
+            "warning: the signed head covers {} entries of the node, past the last entry of {} in the file: entries of that owner after it would not be noticed if they were cut (ask for a checkpoint taken right after the owner's last entry)",
+            checkpoint.len,
+            options.owner.as_deref().unwrap_or_default()
+        );
     }
     if options.json {
         println!(
@@ -491,6 +560,10 @@ mod tests {
         assert_eq!(a.owner.as_deref(), Some("alice"));
         assert_eq!(a.head.as_deref(), Some("h.json"));
         assert!(a.json);
+        let b = parse(&args(&["log", "key", "--next", "n1", "--next=n2"]))
+            .unwrap()
+            .unwrap();
+        assert_eq!(b.next, ["n1", "n2"]);
     }
 
     #[test]
@@ -504,6 +577,8 @@ mod tests {
             &["log", "key", "--owner", "a", "--owner", "b"],
             &["log", "key", "--wat"],
             &["log", "key", "--json=1"],
+            &["log", "key", "--next"],
+            &["log", "key", "--owner", "a", "--next", "n"],
         ] {
             assert!(parse(&args(bad)).is_err(), "{bad:?}");
         }

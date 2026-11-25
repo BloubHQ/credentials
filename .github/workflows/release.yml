@@ -180,6 +180,86 @@ jobs:
           cp crates/enclave/enclave.cdx.json "dist/enclave-$GITHUB_REF_NAME.cdx.json"
           ls dist/*.cdx.json
           test "$(find dist -name '*.cdx.json' | wc -l)" -eq 3
+      # Node continuity (docs/design.md, section 10). The successor statement says "the
+      # previous release may hand its nodes over to the measurements of this one". It is
+      # signed keylessly: Fulcio certifies a key for this workflow at this tag (the identity
+      # the nodes and the client compile in: the release workflow of BloubHQ/credentials, run
+      # by GitHub Actions on a GitHub-hosted runner, at refs/tags/<this release>), Rekor logs
+      # the signature, and the bundle carries the certificate, the signed entry timestamp and
+      # the inclusion proof, so nodes verify it offline. A fork signs nothing: its identity is
+      # not the compiled one.
+      - uses: taiki-e/install-action@fe3acb53a98b62c772db35de75ce0e4595e7ca8c # v2.90.8
+        if: github.repository == 'BloubHQ/credentials'
+        with:
+          tool: cosign
+      - name: The successor statement
+        if: github.repository == 'BloubHQ/credentials'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # The newest published release before this one, in Semantic Versioning order (as
+          # crates/continuity/src/release.rs orders releases; prereleases included: a node of
+          # a release candidate hands over too).
+          previous=$(gh release list --repo "$GITHUB_REPOSITORY" --exclude-drafts --limit 100 \
+              --json tagName --jq '.[].tagName' \
+            | python3 -c '
+          import re, sys
+          def key(tag):
+              m = re.fullmatch(r"v(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?", tag)
+              if not m:
+                  return None
+              pre = m.group(4)
+              ids = [] if pre is None else [(0, int(i), "") if i.isdigit() else (1, 0, i) for i in pre.split(".")]
+              return (tuple(int(g) for g in m.groups()[:3]), pre is None, ids)
+          me = key(sys.argv[1])
+          older = [t for t in sys.stdin.read().split() if key(t) is not None and key(t) < me]
+          print(max(older, key=key) if older else "")
+          ' "$GITHUB_REF_NAME")
+          if [ -z "$previous" ]; then
+            echo "no earlier release: no successor statement"
+            exit 0
+          fi
+          gh release download "$previous" --repo "$GITHUB_REPOSITORY" \
+            --pattern measurements.json --output previous-measurements.json
+          pick='{release, git_commit, pcr0, pcr1, pcr2}'
+          jq -n --slurpfile from previous-measurements.json --slurpfile to dist/measurements.json \
+            "{type: \"https://github.com/BloubHQ/credentials/successor/v1\", from: (\$from[0] | $pick), to: (\$to[0] | $pick)}" \
+            > dist/successor.json
+          test "$(jq -er .to.release dist/successor.json)" = "$GITHUB_REF_NAME"
+          test "$(jq -er .from.release dist/successor.json)" = "$previous"
+          cat dist/successor.json
+          cosign sign-blob --yes --new-bundle-format \
+            --bundle dist/successor.sigstore.json dist/successor.json
+          # Verified the way the nodes verify it: this workflow at this tag, from GitHub's
+          # token issuer.
+          cosign verify-blob --new-bundle-format --bundle dist/successor.sigstore.json \
+            --certificate-identity "https://github.com/BloubHQ/credentials/.github/workflows/release.yml@$GITHUB_REF" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            dist/successor.json
+      # The Sigstore trust root compiled into the nodes and the client must be the one
+      # Sigstore's TUF repository serves now: every Fulcio certificate and Rekor key it pins
+      # must be there. An empty root (as in the source until it is filled) only disables
+      # continuity: nodes then refuse every successor statement.
+      - name: The compiled Sigstore trust root
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          compiled=crates/continuity/trust/trusted_root.json
+          gh attestation trusted-root > tuf.jsonl
+          if [ "$(jq '(.tlogs | length) + (.certificateAuthorities | length)' "$compiled")" = 0 ]; then
+            echo "::warning::the compiled Sigstore trust root is empty: nodes of this release refuse every successor statement"
+            exit 0
+          fi
+          jq -r '.tlogs[].publicKey.rawBytes, .certificateAuthorities[].certChain.certificates[].rawBytes' "$compiled" \
+            | sort -u > compiled-keys.txt
+          jq -r '.tlogs[]?.publicKey.rawBytes, .certificateAuthorities[]?.certChain.certificates[].rawBytes' tuf.jsonl \
+            | sort -u > tuf-keys.txt
+          missing=$(comm -23 compiled-keys.txt tuf-keys.txt)
+          if [ -n "$missing" ]; then
+            echo "::error::the compiled Sigstore trust root pins keys Sigstore's TUF repository does not serve"
+            echo "$missing"
+            exit 1
+          fi
       - name: Checksums
         working-directory: dist
         run: |

@@ -20,7 +20,9 @@ impl From<ClientError> for JsValue {
         let js = js_sys::Error::new(&error.to_string());
         // Setting a property of a fresh Error object does not fail.
         let _ = js_sys::Reflect::set(&js, &"code".into(), &error.code().into());
-        if let ClientError::AttestationRefused { reason, .. } = &error {
+        if let ClientError::AttestationRefused { reason, .. }
+        | ClientError::SuccessorRefused { reason, .. } = &error
+        {
             let _ = js_sys::Reflect::set(&js, &"reason".into(), &reason.as_str().into());
         }
         js.into()
@@ -86,6 +88,12 @@ impl JsVerifiedNode {
     #[wasm_bindgen(getter, js_name = identityJson)]
     pub fn identity_json(&self) -> String {
         self.0.identity_json()
+    }
+
+    /// For a node verified as a successor: the release it succeeds.
+    #[wasm_bindgen(getter, js_name = successorOf)]
+    pub fn successor_of(&self) -> Option<String> {
+        self.0.successor_of()
     }
 
     /// The log key of the node.
@@ -167,6 +175,172 @@ pub fn grant(
         u64::from(valid_for_secs),
         pins_json,
     )?)
+}
+
+/// [`crate::grant_without_successor`]: a grant the node never hands over to a successor.
+#[wasm_bindgen(js_name = grantWithoutSuccessor)]
+pub fn grant_without_successor(
+    device_key: String,
+    user_key: String,
+    node: &JsVerifiedNode,
+    owner: String,
+    valid_for_secs: u32,
+    pins_json: Vec<String>,
+) -> Result<String> {
+    Ok(crate::grant_without_successor(
+        device_key,
+        user_key,
+        Arc::clone(&node.0),
+        owner,
+        u64::from(valid_for_secs),
+        pins_json,
+    )?)
+}
+
+/// [`crate::verify_successor`]: a node of a newer release, checked against the signed
+/// successor statement of `previousRelease` (`successor.json`, `successor.sigstore.json`).
+#[wasm_bindgen(js_name = verifySuccessor)]
+pub fn verify_successor(
+    document: Vec<u8>,
+    nonce: &JsNonce,
+    statement: Vec<u8>,
+    bundle: Vec<u8>,
+    previous_release: String,
+    identity_json: String,
+    trusted_root_json: Option<String>,
+) -> Result<JsVerifiedNode> {
+    Ok(JsVerifiedNode(crate::verify_successor(
+        document,
+        Arc::clone(&nonce.0),
+        statement,
+        bundle,
+        previous_release,
+        identity_json,
+        trusted_root_json,
+    )?))
+}
+
+/// [`crate::regrant`]: re-grants to a verified successor under the owner's policy.
+#[wasm_bindgen(js_name = regrant)]
+#[allow(clippy::too_many_arguments)]
+pub fn regrant(
+    device_key: String,
+    user_key: String,
+    node: &JsVerifiedNode,
+    owner: String,
+    valid_for_secs: u32,
+    pins_json: Vec<String>,
+    policy: crate::SuccessorPolicy,
+    owner_approved: bool,
+) -> Result<String> {
+    Ok(crate::regrant(
+        device_key,
+        user_key,
+        Arc::clone(&node.0),
+        owner,
+        u64::from(valid_for_secs),
+        pins_json,
+        policy,
+        owner_approved,
+    )?)
+}
+
+/// Keys as JavaScript passes them: `[{"kind": "device" | "user" | "caller", "key": "..."}]`.
+fn keys_from_json(mut keys_json: String) -> Result<Vec<crate::BackedUpKey>> {
+    let keys = crate::backup::decode_keys(keys_json.as_bytes());
+    keys_json.zeroize();
+    Ok(keys?)
+}
+
+fn keys_to_json(keys: Vec<crate::BackedUpKey>) -> Result<String> {
+    let json = crate::backup::encode_keys(keys)?;
+    Ok(String::from_utf8_lossy(&json).into_owned())
+}
+
+/// [`crate::generate_backup_key`].
+#[wasm_bindgen(js_name = generateBackupKey)]
+pub fn generate_backup_key() -> Result<String> {
+    Ok(crate::generate_backup_key()?)
+}
+
+/// [`crate::wrap_keys`], with the keys as JSON (`[{"kind", "key"}]`).
+#[wasm_bindgen(js_name = wrapKeys)]
+pub fn wrap_keys(backup_key: String, owner: String, keys_json: String) -> Result<String> {
+    Ok(crate::wrap_keys(
+        backup_key,
+        owner,
+        keys_from_json(keys_json)?,
+    )?)
+}
+
+/// [`crate::unwrap_keys`]; the keys come back as JSON (`[{"kind", "key"}]`).
+#[wasm_bindgen(js_name = unwrapKeys)]
+pub fn unwrap_keys(backup_key: String, owner: String, blob: String) -> Result<String> {
+    keys_to_json(crate::unwrap_keys(backup_key, owner, blob)?)
+}
+
+/// The old device's side of a transfer (see [`crate::TransferSender`]).
+#[wasm_bindgen(js_name = TransferSender)]
+pub struct JsTransferSender(Arc<crate::TransferSender>);
+
+#[wasm_bindgen(js_class = TransferSender)]
+impl JsTransferSender {
+    /// The code to show.
+    pub fn code(&self) -> String {
+        self.0.code()
+    }
+
+    /// Message 1.
+    pub fn offer(&self) -> Result<String> {
+        Ok(self.0.offer()?)
+    }
+
+    /// Message 3, with the keys as JSON (`[{"kind", "key"}]`).
+    pub fn seal(&self, answer_json: String, owner: String, keys_json: String) -> Result<String> {
+        Ok(self
+            .0
+            .seal(answer_json, owner, keys_from_json(keys_json)?)?)
+    }
+
+    /// Failed confirmations left for this code.
+    #[wasm_bindgen(js_name = attemptsLeft)]
+    pub fn attempts_left(&self) -> u32 {
+        self.0.attempts_left()
+    }
+}
+
+/// The new device's side of a transfer (see [`crate::TransferReceiver`]).
+#[wasm_bindgen(js_name = TransferReceiver)]
+pub struct JsTransferReceiver(Arc<crate::TransferReceiver>);
+
+#[wasm_bindgen(js_class = TransferReceiver)]
+impl JsTransferReceiver {
+    /// Message 2.
+    pub fn answer(&self) -> String {
+        self.0.answer()
+    }
+
+    /// Message 4: `{"owner": ..., "keys": [{"kind", "key"}]}` as JSON.
+    pub fn open(&self, sealed_json: String) -> Result<String> {
+        let opened = self.0.open(sealed_json)?;
+        let keys = keys_to_json(opened.keys)?;
+        let owner = serde_json::to_string(&opened.owner).map_err(|e| {
+            JsValue::from(ClientError::input(format!("cannot encode the owner: {e}")))
+        })?;
+        Ok(format!("{{\"owner\":{owner},\"keys\":{keys}}}"))
+    }
+}
+
+/// [`crate::start_transfer`].
+#[wasm_bindgen(js_name = startTransfer)]
+pub fn start_transfer() -> Result<JsTransferSender> {
+    Ok(JsTransferSender(crate::start_transfer()?))
+}
+
+/// [`crate::join_transfer`].
+#[wasm_bindgen(js_name = joinTransfer)]
+pub fn join_transfer(code: String, offer_json: String) -> Result<JsTransferReceiver> {
+    Ok(JsTransferReceiver(crate::join_transfer(code, offer_json)?))
 }
 
 /// See [`crate::revoke`].

@@ -29,6 +29,21 @@ pub trait Attester: Send + Sync {
     fn attest(&self, user_data: &[u8], nonce: &[u8]) -> Result<Vec<u8>, AttestError>;
 }
 
+impl<T: Attester + ?Sized> Attester for std::sync::Arc<T> {
+    fn attest(&self, user_data: &[u8], nonce: &[u8]) -> Result<Vec<u8>, AttestError> {
+        (**self).attest(user_data, nonce)
+    }
+}
+
+/// An [`Attester`] as the hand-over protocol takes it.
+pub struct ForHandOver<A>(pub A);
+
+impl<A: Attester> continuity::Attester for ForHandOver<A> {
+    fn attest(&self, user_data: &[u8], nonce: &[u8]) -> Result<Vec<u8>, String> {
+        self.0.attest(user_data, nonce).map_err(|e| e.to_string())
+    }
+}
+
 /// Answers `GET /attestation?nonce=<base64url>` with `{identity, document}`: the identity of
 /// the node and an attestation document (base64url) whose user data is
 /// [`NodeIdentity::report_data`] of that identity and whose nonce is the one given.

@@ -1,0 +1,42 @@
+[package]
+name = "continuity"
+description = "Node continuity: successor statements signed with Sigstore keyless signing, verified offline, and the attested hand-over between two nodes."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+repository.workspace = true
+readme = "../../README.md"
+
+[features]
+# Test roots (Nitro and Sigstore) generated at run time, and an attester that signs with them.
+# For tests only: nothing a production build of the node or the client turns on.
+testing = ["dep:rcgen", "dep:time", "dep:ciborium"]
+
+[dependencies]
+attest.workspace = true
+engine.workspace = true
+base64.workspace = true
+getrandom.workspace = true
+p256.workspace = true
+p384.workspace = true
+rustls-pki-types.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+webpki.workspace = true
+zeroize.workspace = true
+rcgen = { workspace = true, optional = true }
+time = { workspace = true, optional = true }
+ciborium = { workspace = true, optional = true }
+
+[dev-dependencies]
+continuity = { workspace = true, features = ["testing"] }
+rcgen.workspace = true
+time.workspace = true
+ciborium.workspace = true
+
+[lints]
+workspace = true

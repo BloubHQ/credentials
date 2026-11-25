@@ -25,6 +25,13 @@ bindgen = ["uniffi/cli", "uniffi/cargo-metadata"]
 
 [dependencies]
 attest.workspace = true
+continuity.workspace = true
+chacha20poly1305.workspace = true
+hkdf.workspace = true
+hmac.workspace = true
+rustls-pki-types.workspace = true
+sha2.workspace = true
+spake2 = { workspace = true, features = ["getrandom"] }
 engine.workspace = true
 base64.workspace = true
 getrandom.workspace = true
@@ -43,6 +50,9 @@ getrandom = { workspace = true, features = ["wasm_js"] }
 js-sys.workspace = true
 ring = { workspace = true, features = ["wasm32_unknown_unknown_js"] }
 wasm-bindgen.workspace = true
+
+[dev-dependencies]
+continuity = { workspace = true, features = ["testing"] }
 
 [lints]
 workspace = true

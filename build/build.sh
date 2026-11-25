@@ -169,6 +169,7 @@ git archive --format=tar "$GIT_COMMIT" | docker buildx build \
     --sbom=false \
     "${CACHE_OPTIONS[@]}" \
     --build-arg "SOURCE_DATE_EPOCH=$SOURCE_DATE_EPOCH" \
+    --build-arg "CREDENTIALS_RELEASE=$RELEASE" \
     --file build/Dockerfile.enclave \
     --target image \
     --output "type=docker,name=$NODE_IMAGE,rewrite-timestamp=true" \

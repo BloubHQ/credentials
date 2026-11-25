@@ -156,6 +156,50 @@ pub fn run(_: &Config) -> Result<(), Error> {
     Err(Error::Unsupported)
 }
 
+/// Carries the hand-over protocol from the enclave `from_cid` (the running node) to the
+/// enclave `to_cid` (a node of the release `statement` names), over vsock port
+/// [`continuity::wire::HANDOVER_PORT`] of each. The enclaves check everything: the host
+/// only relays (see [`continuity::wire::drive`]).
+#[cfg(target_os = "linux")]
+pub fn hand_over(
+    from_cid: u32,
+    to_cid: u32,
+    statement: &continuity::SignedStatement,
+) -> Result<engine::node::TakenOver, HandOverError> {
+    use continuity::wire::HANDOVER_PORT;
+    use relay::vsock::Vsock;
+    let connect = |cid: u32| {
+        Vsock::connect(cid, HANDOVER_PORT).map_err(|source| Error::Io {
+            context: format!("cannot reach the enclave (cid {cid}, port {HANDOVER_PORT})"),
+            source,
+        })
+    };
+    let mut old = connect(from_cid)?;
+    let mut new = connect(to_cid)?;
+    Ok(continuity::wire::drive(&mut old, &mut new, statement)?)
+}
+
+/// Carries the hand-over protocol: only on the Linux parent instance of the enclaves.
+#[cfg(not(target_os = "linux"))]
+pub fn hand_over(
+    _: u32,
+    _: u32,
+    _: &continuity::SignedStatement,
+) -> Result<engine::node::TakenOver, HandOverError> {
+    Err(HandOverError::Host(Error::Unsupported))
+}
+
+/// Why a hand-over did not complete.
+#[derive(Debug, thiserror::Error)]
+pub enum HandOverError {
+    /// The host could not reach an enclave.
+    #[error(transparent)]
+    Host(#[from] Error),
+    /// An enclave refused, or the protocol failed.
+    #[error(transparent)]
+    Protocol(#[from] continuity::Error),
+}
+
 #[cfg(target_os = "linux")]
 mod linux {
     use std::io;
