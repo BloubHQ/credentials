@@ -436,6 +436,8 @@ curl -s "http://127.0.0.1:8700/attestation?nonce=$(head -c 32 /dev/urandom | bas
 - **流会话**随调用结束。SSH、数据库线协议、gRPC 和 WebSocket 分帧只能在 send/expect
   脚本所能达到的范围内工作。
 - **浏览器登录、推送式 2FA 和硬件密钥**需要人或设备参与，无法委托。
+- **网页弱于应用。** [`client`](../../crates/client) 包在网页中执行与应用相同的检查，但网页的服务器每次加载都可以
+  发送别的代码；请尽量从应用发出授权。其密钥也不是硬件密钥（Secure Enclave 和 StrongBox 只能保存 P-256 密钥）。
 
 ## Crates
 
@@ -449,6 +451,7 @@ curl -s "http://127.0.0.1:8700/attestation?nonce=$(head -c 32 /dev/urandom | bas
 | [`host`](../../crates/host) | 在 enclave 的父实例上运行的程序，以 `credentials host` 运行 |
 | [`verify`](../../crates/verify) | 节点日志验证器，以 `credentials verify` 运行 |
 | [`attest`](../../crates/attest) | AWS Nitro Enclaves 证明文档验证器，以 `credentials attest` 运行 |
+| [`client`](../../crates/client) | 面向 iOS、Android 和 Web 应用的库：密钥、节点证明验证、授权、记录和调用；通过 UniFFI 绑定 Swift 和 Kotlin，通过 wasm-bindgen 绑定 JavaScript |
 | [`cli`](../../crates/cli) | `credentials` 工具：密钥、策略、记录、授权、调用、节点服务器和 `credentials host` |
 
 ## 开发

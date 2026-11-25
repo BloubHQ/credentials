@@ -44,6 +44,59 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - run: cargo test --workspace --locked
 
+  # The client crate for apps: the web package (wasm-bindgen, with a smoke test in Node), the
+  # Android libraries with the Kotlin bindings, and an XCFramework with the Swift bindings
+  # (build/client.sh). Not a required check.
+  client:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: wasm
+            os: ubuntu-latest
+          - platform: android
+            os: ubuntu-latest
+          - platform: ios
+            os: macos-latest
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: client-${{ matrix.platform }}
+      - name: The version of wasm-bindgen in Cargo.lock
+        if: matrix.platform == 'wasm'
+        id: wasm-bindgen
+        run: echo "version=$(awk '/^name = "wasm-bindgen"$/ { getline; gsub(/"/, "", $3); print $3 }' Cargo.lock)" >> "$GITHUB_OUTPUT"
+      - uses: taiki-e/install-action@fe3acb53a98b62c772db35de75ce0e4595e7ca8c # v2.90.8
+        if: matrix.platform == 'wasm'
+        with:
+          tool: wasm-bindgen@${{ steps.wasm-bindgen.outputs.version }}
+      - name: Build
+        shell: bash
+        env:
+          PLATFORM: ${{ matrix.platform }}
+        run: |
+          if [ "$PLATFORM" != ios ]; then
+            # ring has C code: the clang of the NDK compiles it for wasm32 too.
+            export ANDROID_NDK_HOME="$ANDROID_NDK_LATEST_HOME"
+            bin="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
+            export CC_wasm32_unknown_unknown="$bin/clang" AR_wasm32_unknown_unknown="$bin/llvm-ar"
+          fi
+          if [ "$PLATFORM" = wasm ]; then
+            rustup target add wasm32-unknown-unknown
+            cargo clippy -p client --target wasm32-unknown-unknown --locked -- -D warnings
+          fi
+          build/client.sh "$PLATFORM" dist "${GITHUB_SHA::12}"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: client-${{ matrix.platform }}
+          path: dist/*
+          if-no-files-found: error
+
   msrv:
     runs-on: ubuntu-latest
     timeout-minutes: 30

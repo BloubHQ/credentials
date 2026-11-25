@@ -1,0 +1,48 @@
+[package]
+name = "client"
+description = "The app side of the credentials engine for iOS, Android and the web: keys, node attestation, grants, records and calls, bound to Swift and Kotlin (UniFFI) and JavaScript (wasm-bindgen)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+repository.workspace = true
+readme = "README.md"
+
+[lib]
+crate-type = ["lib", "cdylib", "staticlib"]
+
+# Generates the Swift and Kotlin bindings from the built library:
+# `cargo run -p client --features bindgen --bin uniffibindgen -- generate --library <lib> ...`
+[[bin]]
+name = "uniffibindgen"
+path = "bindgen.rs"
+required-features = ["bindgen"]
+
+[features]
+# The binding generator of UniFFI, for the `uniffibindgen` binary only; apps never build it.
+bindgen = ["uniffi/cli", "uniffi/cargo-metadata"]
+
+[dependencies]
+attest.workspace = true
+engine.workspace = true
+base64.workspace = true
+getrandom.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+zeroize.workspace = true
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+uniffi.workspace = true
+
+# The browser has no system random source or clock that Rust std reaches on
+# wasm32-unknown-unknown: both come from JavaScript (crypto.getRandomValues, Date.now).
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { workspace = true, features = ["wasm_js"] }
+js-sys.workspace = true
+ring = { workspace = true, features = ["wasm32_unknown_unknown_js"] }
+wasm-bindgen.workspace = true
+
+[lints]
+workspace = true

@@ -17,6 +17,9 @@ allow = [
   "CDLA-Permissive-2.0",
   "ISC",
   "MIT",
+  # UniFFI (the Swift and Kotlin bindings of the client crate): file-level copyleft; used
+  # unmodified, so nothing of ours falls under it.
+  "MPL-2.0",
   "Unicode-3.0",
   "Unlicense",
 ]
