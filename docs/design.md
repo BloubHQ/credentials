@@ -7,11 +7,12 @@ rows and measurements.
 
 ## 0. Goals
 
-1. **Free and custom everywhere, without rebuilding the node.** Sites, item kinds, policies,
-   templates, flows and protocols are data or signed modules, never a new release: an owner
-   (or an agent, with the owner's signature) can describe anything the node's primitives can
-   express. A rebuild is needed only for a new cryptographic primitive, so the release ships
-   every primitive of the standard registries up front (section 8d) to make that rare.
+1. **Free and custom everywhere; no rebuild for a new feature.** The node is still rebuilt
+   for security fixes, dependency updates and its own maintenance, but never to support a new
+   site, item kind, policy, template, flow or protocol: those are data or signed modules, and
+   an owner (or an agent, with the owner's signature) can describe anything the node's
+   primitives can express. The one exception is a cryptographic primitive the node lacks, so
+   the release ships every primitive of the standard registries up front (section 8d).
 2. **Security at least Pickle's.** Secrets never reach the agent, the model provider, the
    service's servers or the parent instance; values are masked; risky actions wait for the
    owner; the node is attested and reproducible. Freedom never lowers this: whatever is
