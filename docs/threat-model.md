@@ -19,6 +19,7 @@ What the engine protects, against whom, under which assumptions, and what is lef
 | Caller (app or AI agent) | Nothing beyond its policy entry | Extract the secret through requests, inputs and responses; exceed its limits; replay calls; act as another caller |
 | Destination server | Receiving the secret it is meant to receive | Echo the secret back to the caller; hand back values that act as keys; send oversized or malformed responses |
 | Log store | Keeping entries | Read them; drop, cut or edit them |
+| Server of a web page that runs the `client` package | Serving the code the owner expects | Serve other code that reads the owner's keys, or grants to a node of its choosing; swap the measurements list |
 
 ## Assumptions
 
@@ -30,7 +31,9 @@ What the engine protects, against whom, under which assumptions, and what is lef
   against the published measurements of a reproducible release. Outside a TEE, the operator can read node
   memory and every guarantee that relies on the node keeping a secret falls away; the log,
   signatures and policy checks still bind an honest node.
-- **A2.** The owner's device and its keys are not compromised.
+- **A2.** The owner's device and its keys are not compromised. On the device, this includes the
+  code that holds the keys: the owner's app (with the `client` crate), the `credentials` CLI,
+  or a web page (see *Grants from a web page* under Residual risks).
 - **A3.** The standard primitives hold: Ed25519, X25519/HPKE (RFC 9180), ChaCha20-Poly1305,
   SHA-2, HMAC, TLS with WebPKI.
 - **A4.** The destination is the service the owner meant; the engine guarantees the secret
@@ -42,7 +45,7 @@ What the engine protects, against whom, under which assumptions, and what is lef
 | --- | --- | --- |
 | Operator changes where a value goes | Policy signed by a device and bound into the record's AEAD | `policy`, `record` |
 | Operator swaps in an older record (narrower policy undone, revoked token back) | Generations in the AEAD; node floors; pins in grants and `Node::pin`; unpinned records refused | `record`, `node` |
-| Operator impersonates a node: hands the owner an identity whose seal key it holds outside the enclave | The grant is sealed only after the attestation document verifies (chain to the pinned AWS Nitro root at the document's time, ES384 signature, the owner's fresh nonce) and its `user_data` equals `report_data()` of that identity; a document of another node, or replayed from an earlier request, is refused | `attest`, `cli` |
+| Operator impersonates a node: hands the owner an identity whose seal key it holds outside the enclave | The grant is sealed only after the attestation document verifies (chain to the pinned AWS Nitro root at the document's time, ES384 signature, the owner's fresh nonce) and its `user_data` equals `report_data()` of that identity; a document of another node, or replayed from an earlier request, is refused. In the `client` crate a grant takes only a `VerifiedNode`, which only the attestation check makes, from a nonce the app drew itself, used once, within five minutes | `attest`, `cli`, `client` |
 | Operator runs the node in a debug enclave, whose memory the host can read | A document with PCR0, PCR1 and PCR2 all zero is refused even when the owner lists zero measurements | `attest` |
 | Operator runs an old or unknown release (a build with a known flaw, or its own build) | PCR0–2 must equal one entry of the owner's `measurements.json`; the owner drops a release from the list to refuse it | `attest` |
 | Operator reads a grant in transit | HPKE to the node's seal key; the key is bound to the attested identity | `grant` |
@@ -79,6 +82,20 @@ These remain by design; each is listed in the README.
 - **One TEE (A1).** Only AWS Nitro Enclaves are integrated. Elsewhere the node is an ordinary
   process. The attestation document must be verified by the owner (certificate chain, PCRs,
   nonce, `user_data`); the node only produces it.
+- **Grants from a web page are weaker than grants from an app (A2).** The web package of the
+  `client` crate runs the same checks, but a page is code its server sends anew at every
+  load. Whoever controls that server, or its CDN, or injects script into the page, can serve
+  code that reads the device and user keys, skips the attestation check, grants to a node of
+  its choosing, or swaps the measurements list, and the owner cannot tell. An app is code the
+  owner installed once, signed by its publisher and reviewed by a store, and its key storage
+  (Keychain, Android Keystore) is out of reach of other code; a page has no such storage
+  (IndexedDB is readable by any script of the origin). Grant from an app where you can; on the
+  web, serve the page from an origin you control with a strict Content-Security-Policy and
+  Subresource Integrity, and keep grants short.
+- **App keys are not hardware keys.** The device and caller keys are Ed25519 and the user key
+  is handed to nodes, so none of them can live non-exportable in the iOS Secure Enclave or
+  Android StrongBox (P-256 only). Apps keep them wrapped by a hardware key at rest
+  (`crates/client/README.md`), but the key bytes are in the app's memory while it signs.
 - **Nitro: no sealed storage.** A restarted enclave generates a new node key: it is a new node,
   with a new log file, and owners grant to it again. The host can restart it at will (an
   availability matter: nothing granted to the old node opens on the new one), and the floors

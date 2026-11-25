@@ -91,8 +91,53 @@ jobs:
             out/measurements.json
           if-no-files-found: error
 
+  # The packages of the client crate (build/client.sh): client-wasm-<tag>.tgz,
+  # client-android-<tag>.zip and client-ios-<tag>.xcframework.zip.
+  client:
+    needs: test
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - platform: wasm
+            os: ubuntu-latest
+          - platform: android
+            os: ubuntu-latest
+          - platform: ios
+            os: macos-latest
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: The version of wasm-bindgen in Cargo.lock
+        if: matrix.platform == 'wasm'
+        id: wasm-bindgen
+        run: echo "version=$(awk '/^name = "wasm-bindgen"$/ { getline; gsub(/"/, "", $3); print $3 }' Cargo.lock)" >> "$GITHUB_OUTPUT"
+      - uses: taiki-e/install-action@fe3acb53a98b62c772db35de75ce0e4595e7ca8c # v2.90.8
+        if: matrix.platform == 'wasm'
+        with:
+          tool: wasm-bindgen@${{ steps.wasm-bindgen.outputs.version }}
+      - name: Build
+        shell: bash
+        env:
+          PLATFORM: ${{ matrix.platform }}
+        run: |
+          if [ "$PLATFORM" != ios ]; then
+            export ANDROID_NDK_HOME="$ANDROID_NDK_LATEST_HOME"
+            bin="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
+            export CC_wasm32_unknown_unknown="$bin/clang" AR_wasm32_unknown_unknown="$bin/llvm-ar"
+          fi
+          build/client.sh "$PLATFORM" dist "$GITHUB_REF_NAME"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: client-${{ matrix.platform }}
+          path: dist/*
+          if-no-files-found: error
+
   release:
-    needs: [build, enclave]
+    needs: [build, enclave, client]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -111,22 +156,30 @@ jobs:
         with:
           name: enclave
           path: dist
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: client-*
+          path: dist
+          merge-multiple: true
       - uses: taiki-e/install-action@fe3acb53a98b62c772db35de75ce0e4595e7ca8c # v2.90.8
         with:
           tool: cargo-cyclonedx
-      # One SBOM per shipped artifact, each with its whole dependency tree. cargo-cyclonedx
+      # One SBOM per shipped program, each with its whole dependency tree. cargo-cyclonedx
       # writes <package>/<package>.cdx.json for every workspace member; only the packages of
-      # the two artifacts are kept: `cli` (the `credentials` binary, built for Linux, macOS and
-      # Windows, so every target's dependencies) and `enclave` (the program in enclave.eif,
-      # built for x86_64-unknown-linux-musl).
+      # the shipped programs are kept: `cli` (the `credentials` binary, built for Linux, macOS
+      # and Windows, so every target's dependencies), `client` (the one library in the web,
+      # Android and iOS packages, so every target's dependencies too: UniFFI on Android and
+      # iOS, wasm-bindgen on the web) and `enclave` (the program in enclave.eif, built for
+      # x86_64-unknown-linux-musl).
       - name: Generate the SBOMs
         run: |
           cargo cyclonedx --format json --spec-version 1.5 --target all
           cp crates/cli/cli.cdx.json "dist/credentials-$GITHUB_REF_NAME.cdx.json"
+          cp crates/client/client.cdx.json "dist/client-$GITHUB_REF_NAME.cdx.json"
           cargo cyclonedx --format json --spec-version 1.5 --target x86_64-unknown-linux-musl
           cp crates/enclave/enclave.cdx.json "dist/enclave-$GITHUB_REF_NAME.cdx.json"
           ls dist/*.cdx.json
-          test "$(find dist -name '*.cdx.json' | wc -l)" -eq 2
+          test "$(find dist -name '*.cdx.json' | wc -l)" -eq 3
       - name: Checksums
         working-directory: dist
         run: |

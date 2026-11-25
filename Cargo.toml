@@ -5,6 +5,7 @@ exclude = ["crates/fuzz"]
 members = [
     "crates/attest",
     "crates/cli",
+    "crates/client",
     "crates/enclave",
     "crates/engine",
     "crates/host",
@@ -58,6 +59,10 @@ ciborium = { version = "0.2", default-features = false, features = ["std"] }
 rustls-pki-types = { version = "1", features = ["std"] }
 webpki = { package = "rustls-webpki", version = "0.103", default-features = false, features = ["ring", "std"] }
 zeroize = { version = "1", features = ["derive"] }
+# The bindings of the client crate: Swift and Kotlin (UniFFI), JavaScript (wasm-bindgen).
+uniffi = { version = "0.32", default-features = false }
+wasm-bindgen = "0.2"
+js-sys = "0.3"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

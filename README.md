@@ -472,6 +472,10 @@ explains each.
   framing work only as far as a send/expect script can go.
 - **Browser logins, push 2FA and hardware keys** need a person or a device and cannot be
   delegated.
+- **A web page is weaker than an app.** The [`client`](crates/client) package runs in a page
+  as in an app, but the server of the page can send other code at any load; grant from an
+  app where you can. Its keys are not hardware keys either (the Secure Enclave and StrongBox
+  hold P-256 only).
 
 ## Crates
 
@@ -485,6 +489,7 @@ explains each.
 | [`host`](crates/host) | The program on the parent instance of an enclave, run as `credentials host` |
 | [`verify`](crates/verify) | Verifier of node logs, run as `credentials verify` |
 | [`attest`](crates/attest) | Verifier of AWS Nitro Enclaves attestation documents, run as `credentials attest` |
+| [`client`](crates/client) | The app side for iOS, Android and the web: keys, node attestation, grants, records and calls, bound to Swift and Kotlin (UniFFI) and JavaScript (wasm-bindgen) |
 | [`cli`](crates/cli) | The `credentials` tool: keys, policies, records, grants, calls, a node server, and `credentials host` |
 
 ## Development
