@@ -175,11 +175,12 @@ let outcome = node.run(&call, &mut TlsTransport::new());
   哈希、MAC、签名和 `len` 消除污点，但只对密钥本身做的哈希除外：在先哈希密钥再使用的地方（过长的 HMAC 密钥、Ed25519 种子），它与密钥等价。以秘密字段为密钥的加密只隐藏密钥本身：消息、nonce 或附加数据中的
   密钥值仍然是被污染的，因为另一个操作可以用同一密钥加密选定的字节。输出被污染的派生会被拒绝。
 - **预言机（oracle）。** 密钥与调用方或服务器选择的值不得在结果会逐段泄露密钥的位置相遇：
-  `replace`、`xor`、`json_set` 的键、解码器、数字参数或密钥参数中。
-  `len(replace(key, $input, ""))` 会被拒绝。
+  `replace`、`xor`、`slice`、`between`、`add`、`json_set` 的键、解码器、数字参数或密钥参数中。
+  `len(replace(key, $input, ""))` 和 `slice(key, $input, "1")` 会被拒绝。哈希名和曲线名由策略固定，
+  RSA 加密的公钥绝不来自调用方。
 - **可猜测字段。** 派生只能通过 `len` 依赖标记为 `guessable` 的字段（PIN、密码）：
   它的哈希、签名、MAC 或密文都能让调用方验证猜测。
-- **预算。** 一个操作最多可渲染 128 MiB、1,000,000 轮 PBKDF2 和 32 个签名。
+- **预算。** 一个操作最多可渲染 128 MiB、1,000,000 轮 PBKDF2，签名与密钥协商合计 32 次。
 
 | 凭据 | 策略 |
 | --- | --- |
@@ -190,7 +191,10 @@ let outcome = node.run(&call, &mut TlsTransport::new());
 | HTTP Digest | 第 1 步用 `header_param` 捕获 `realm`/`nonce`；第 2 步用 `md5` 应答；RFC 2617 向量 |
 | OAuth 刷新 | `fixed` POST，`json` 捕获到字段：节点返回一条新记录 |
 | 会话登录 | `fixed` POST /login，`cookie` 捕获到临时值，在调用方的请求上加 `Cookie` |
+| 带 CSRF 令牌的登录表单 | `html` 捕获 `input[name=_csrf]`（`value`）到临时值，然后 `fixed` POST /login |
+| 在浏览器中加密的密码 | `ecdh("p256", server_key)` + `sha256` + `aes_cbc_encrypt`，加 `u8(len(…))` 长度前缀和 `ecdh_public("p256")`；或用从服务器捕获的公钥 `rsa_encrypt_oaep("sha256", key, password)` |
 | JWT RS256 | derive `b64urlraw(header) + "." + b64urlraw($input) + "." + b64urlraw(rsa_sign_pkcs1_sha256(pem(key), …))` |
+| 由策略限定有效期的 JWT | 在 derive 中用 `json_set_number(..., "exp", add($unix, "300"))` 和 `rsa_sign_pkcs1("sha512", pem(key), …)`：`iat`/`exp` 由节点填入 |
 | 以太坊 | derive `{{ k256_sign_recoverable(key, keccak256($input)) }}` |
 | IMAP | stream：expect 问候，send `a1 LOGIN {{user}} {{password}}`，expect，转发 |
 | TOTP | derive `{{ totp(b32decode(seed)) }}` |
@@ -415,7 +419,8 @@ curl -s "http://127.0.0.1:8700/attestation?nonce=$(head -c 32 /dev/urandom | bas
 | 1,000 次 HTTP 调用，响应 64 KiB | 0.329 s | 0.338–0.369 s |
 
 还测量了用 RustCrypto `rsa` 0.10 替换 ring：每次签名会留下 11 个持有素数 `p` 的已释放内存块
-（解析和检查密钥时的临时值），因此保留 ring。
+（解析和检查密钥时的临时值），因此保留 ring。ring 不能做 SHA-1 的 PKCS#1 v1.5 签名，所以只有
+`rsa_sign_pkcs1("sha1", …)` 经由 RustCrypto `rsa`，并承担这一代价（未重新测量）；RSA 加密只用公钥。
 
 ## 它不做什么
 
@@ -431,6 +436,8 @@ curl -s "http://127.0.0.1:8700/attestation?nonce=$(head -c 32 /dev/urandom | bas
 - **服务器为捕获而发送的值属于服务器。** 如果服务器交回一个密钥而策略把它用作密钥，
   服务器就知道这个密钥。
 - **低熵密钥**若未标记为 `guessable`，会被当作强密钥对待。
+- **短于 4 字节的截取**（`slice`、密钥的 `u8`）低于反射搜索查找的长度；从哪里截取由策略决定，
+  调用方无法决定。
 - **首次使用即信任**：某个所有者在节点上的第一次授权决定了其设备。丢失所有设备的所有者
   需要使用新的所有者名称重新开始。
 - **流会话**随调用结束。SSH、数据库线协议、gRPC 和 WebSocket 分帧只能在 send/expect
