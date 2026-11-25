@@ -106,5 +106,7 @@ pub mod template;
 mod totp;
 #[cfg(test)]
 mod vectors;
+#[cfg(test)]
+mod vectors_families;
 
 pub use error::{Error, Result};

@@ -408,10 +408,13 @@ reads.
 | Text | `upper` `lower` `trim` `replace(text, from, to)` `json_set(object, key, value)` `json_set_number(object, key, integer)` `canonical_query` `time(unix, format)` `len` `xor(a, b)` `slice(value, start, length)` `between(value, start, end)` |
 | Numbers | `add(a, b)` (signed 64-bit decimal); fixed-width encoders of a decimal number: `u8`, `be16` `be32` `be64`, `le16` `le32` `le64` |
 | Random | `random(n)`: n fresh bytes (1 to 1024), new at every call |
-| Hash and MAC | `md4` `md5` `sha1` `sha256` `sha384` `sha512` `sha512_256` `keccak256` `hmac_md5(key, msg)` `hmac_sha1` `hmac_sha256` `hmac_sha384` `hmac_sha512` `pbkdf2(hash, password, salt, rounds[, length])` `pbkdf2_sha256(password, salt, rounds[, length])` `totp(seed[, digits[, period]])` |
-| Signature | `ed25519_sign(key, msg)` `p256_sign` `p256_sign_der` `p384_sign` `p521_sign` `k256_sign` `k256_sign_recoverable(key, digest32)` `rsa_sign_pkcs1(hash, key, msg)` `rsa_sign_pss(hash, key, msg)` `rsa_sign_pkcs1_sha256(key, msg)` `rsa_sign_pss_sha256(key, msg)` |
+| Hash and MAC | `md4` `md5` `sha1` `sha256` `sha384` `sha512` `sha512_256` `keccak256` `sha3_224` `sha3_256` `sha3_384` `sha3_512` `shake128(msg, length)` `shake256(msg, length)` `hmac_md5(key, msg)` `hmac_sha1` `hmac_sha256` `hmac_sha384` `hmac_sha512` `aes_cmac(key, msg)` `aes_cbc_mac(key, msg)` `pbkdf2(hash, password, salt, rounds[, length])` `pbkdf2_sha256(password, salt, rounds[, length])` `totp(seed[, digits[, period]])` |
+| Key derivation | `hkdf(hash, ikm, salt, info, length)` `hkdf_expand(hash, prk, info, length)` `concat_kdf(hash, z, other_info, length)` `kbkdf_counter(hash, key, fixed_input, length)` `nfold(value, bits)` `kerberos_dk(key, constant)` |
+| Signature | `ed25519_sign(key, msg)` `ed448_sign(key, msg[, context])` `p256_sign` `p256_sign_der` `p384_sign` `p521_sign` `k256_sign` `k256_sign_recoverable(key, digest32)` `ecdsa_sign_prehash(curve, key, digest)` `rsa_sign_pkcs1(hash, key, msg)` `rsa_sign_pss(hash, key, msg)` `rsa_sign_pkcs1_sha256(key, msg)` `rsa_sign_pss_sha256(key, msg)` `dsa_sign(hash, key, msg)` `dsa_sign_der(hash, key, msg)` |
 | Key agreement | `ecdh(curve, peer_public[, private])` `ecdh_public(curve)` |
-| Encryption | `aes_gcm_encrypt(key, nonce12, msg[, aad])` `aes_cbc_encrypt(key, iv16, msg)` `chacha20_poly1305_encrypt(key32, nonce12, msg[, aad])` `rsa_encrypt_oaep(hash, public_key, msg)` `rsa_encrypt_pkcs1(public_key, msg)` |
+| Encryption | `aes_gcm_encrypt(key, nonce12, msg[, aad])` `aes_cbc_encrypt(key, iv16, msg)` `aes_cbc_hmac_encrypt(key, iv16, msg[, aad])` `aes_ccm_encrypt(key, nonce, tag_length, msg[, aad])` `aes_eax_encrypt(key, nonce16, msg[, aad])` `aes_cts_encrypt(key, iv16, msg)` `chacha20_poly1305_encrypt(key32, nonce12, msg[, aad])` `rsa_encrypt_oaep(hash, public_key, msg)` `rsa_encrypt_pkcs1(public_key, msg)` |
+| Key wrapping | `aes_kw_wrap(kek, key)` `aes_kwp_wrap(kek, key)` |
+| CBOR | `cbor_int(n)` `cbor_bytes(value)` `cbor_text(value)` `cbor_array(item, ...)` `cbor_map(key, value, ...)` `cbor_tag(number, item)` |
 
 Keys are raw bytes or PKCS#8 DER (PKCS#1 DER for RSA); use `pem(...)` to read a PEM field.
 Hash names are `sha1`, `sha256`, `sha384` and `sha512`: `pbkdf2` and `rsa_sign_pkcs1` take all
@@ -421,6 +424,43 @@ four, `rsa_sign_pss` the last three (salt of the digest length), `rsa_encrypt_oa
 PKCS#1 `RSAPublicKey` DER, 1024 to 8192 bits; RSA signatures with SHA-256, -384 and -512 use
 ring, the SHA-1 PKCS#1 v1.5 signature and the encryptions use RustCrypto `rsa`.
 
+The second group of families (`docs/design.md` section 8d), each checked against published
+vectors (`crates/engine/src/vectors_families.rs` names the source of each):
+
+- SHA-3 (FIPS 202): `sha3_*` are digests; `shake128` and `shake256` give `length` bytes, 1 to
+  8192.
+- KDFs take `sha256`, `sha384` or `sha512` and a `length` in bytes. `hkdf` is RFC 5869 (an
+  empty salt is a zero salt; at most 255 blocks); `hkdf_expand` is its expand step alone from
+  a PRK. `concat_kdf` is the single-step KDF of NIST SP 800-56A, `H([i]32 || z || other_info)`,
+  as JOSE and COSE ECDH-ES use it: the template builds `other_info` (for JOSE, `be32(len(x)) +
+  x` for the algorithm and both party infos, then `be32` of the key length in bits).
+  `kbkdf_counter` is the counter mode of NIST SP 800-108 with HMAC: `HMAC(key, [i]32 ||
+  fixed_input)`; the template builds the fixed input, usually `label + "\0" + context +
+  be32(bits)` (Kerberos, RFC 8009: `label + "\0" + be32(bits)`). Both KDFs give at most 8192
+  bytes.
+- Kerberos (RFC 3961, RFC 3962): `nfold(value, bits)` is n-fold to a multiple of 8 bits;
+  `kerberos_dk(key, constant)` is DK for AES keys (16 or 32 bytes), the constant n-folded to
+  one block when it is not one already. String-to-key for AES is
+  `kerberos_dk(pbkdf2("sha1", password, salt, rounds, "16"), "kerberos")` (32 for AES-256);
+  a key usage constant (RFC 3961 section 5.3) is `be32(usage) + hexdecode("aa")` for Ke,
+  `"99"` for Kc and `"55"` for Ki.
+- AES modes take 16-, 24- or 32-byte keys and return the ciphertext followed by the tag.
+  `aes_ccm_encrypt` (NIST SP 800-38C) takes a 7- to 13-byte nonce (the length field is 15
+  minus it) and an even tag of 4 to 16 bytes, so COSE's AES-CCM-16-64-128 is nonce 13, tag 8.
+  `aes_cbc_hmac_encrypt` is RFC 7518 section 5.2 with a 32-, 48- or 64-byte key (A128CBC-HS256,
+  A192CBC-HS384, A256CBC-HS512) and a tag of half the key. `aes_eax_encrypt` takes a 16-byte
+  nonce and gives a 16-byte tag. `aes_cts_encrypt` is CBC with ciphertext stealing as Kerberos
+  uses it (CBC-CS3, RFC 3962), for messages of at least 16 bytes. `aes_cmac` is RFC 4493;
+  `aes_cbc_mac` is CBC-MAC with a zero IV and zero padding (16 bytes; cut it with `slice`).
+  `aes_kw_wrap` is RFC 3394 (a key of 16 or more bytes, a multiple of 8), `aes_kwp_wrap`
+  RFC 5649 (any length).
+- `ed448_sign` is Ed448 (RFC 8032) with an optional context of up to 255 bytes; the key is the
+  57-byte secret or PKCS#8 DER. `ecdsa_sign_prehash(curve, key, digest)` signs a digest the
+  template computed (16 to 64 bytes) on `p256`, `p384`, `p521` or `k256`, with the RFC 6979
+  nonce, `r || s`. `dsa_sign` and `dsa_sign_der` are DSA (FIPS 186-4) with `sha1`, `sha256`,
+  `sha384` or `sha512` and the RFC 6979 nonce, `r || s` (each as long as q) or DER; the key is
+  PKCS#8 DER.
+
 `slice` counts bytes from 0 and fails when the range is outside the value. `between` fails when
 a delimiter is missing; an empty `start` means the beginning, an empty `end` the end.
 `json_set_number` writes the integer unquoted (`-?(0|[1-9][0-9]*)`, at most 20 characters).
@@ -429,16 +469,17 @@ a delimiter is missing; an empty `start` means the beginning, an empty `end` the
 #### Key agreement
 
 `ecdh(curve, peer_public)` is the shared secret of the peer's public key and the **ephemeral**
-key of the operation on `curve` (`p256`, `p384`, `p521` or `x25519`): the x-coordinate for the
-NIST curves (the peer key in SEC1 form, compressed or not), the 32 bytes of X25519 (an all-zero
-result, from a low-order point, fails). `ecdh_public(curve)` is that ephemeral key's public
-key: SEC1 uncompressed for the NIST curves, 32 bytes for X25519. The node makes one ephemeral
+key of the operation on `curve` (`p256`, `p384`, `p521`, `x25519` or `x448`): the x-coordinate
+for the NIST curves (the peer key in SEC1 form, compressed or not), the 32 bytes of X25519 or
+the 56 of X448 (an all-zero result, from a low-order point, fails). `ecdh_public(curve)` is that ephemeral key's public
+key: SEC1 uncompressed for the NIST curves, 32 bytes for X25519, 56 for X448. The node makes one ephemeral
 key pair per curve and operation, the first time either function asks for it, and erases it
 when the operation ends; every step and template of the operation sees the same pair, the
 private key never leaves the node, and the next operation has a new one. With a third
 argument, `ecdh(curve, peer_public, private)` uses a static private key instead (a field: the
-raw scalar or PKCS#8 DER for NIST curves, 32 raw bytes for X25519). A key agreement counts as
-a signature in the budget.
+raw scalar or PKCS#8 DER for NIST curves, 32 raw bytes for X25519, 56 for X448). A key
+agreement counts as a signature in the budget, and so does each `ed448_sign`,
+`ecdsa_sign_prehash`, `dsa_sign` and `dsa_sign_der`.
 
 The shared secret is a secret (tainted), the public key is not. For a fresh IV or nonce that
 must appear twice (in the encryption and next to the ciphertext), use `hexdecode($nonce)`
@@ -456,15 +497,40 @@ An envelope that encrypts a password to a server's P-256 key, composed from thes
 (`keys` is a public temp captured as `session,server-public-key-hex`, `session` a second
 capture of its first part.)
 
+#### CBOR
+
+The `cbor_*` functions write RFC 8949 in its deterministic form (section 4.2.1): shortest
+heads, definite lengths, map keys sorted by their encoded bytes and never repeated. Each
+returns one encoded item; `cbor_array`, `cbor_map` and `cbor_tag` take encoded items (up to
+32 arguments, so 16 map pairs) and refuse an argument that is not exactly one well-formed,
+deterministic item. Simple values are literals: `hexdecode("f4")`, `hexdecode("f5")` and
+`hexdecode("f6")` are false, true and null. Floating-point numbers are refused. A `COSE_Sign1` with EdDSA over the caller's payload:
+
+```text
+{{ cbor_tag("18", cbor_array(cbor_bytes(cbor_map(cbor_int("1"), cbor_int("-8"))), cbor_map(),
+     cbor_bytes($input),
+     cbor_bytes(ed448_sign(key, cbor_array(cbor_text("Signature1"),
+       cbor_bytes(cbor_map(cbor_int("1"), cbor_int("-8"))), cbor_bytes(""), cbor_bytes($input)))))) }}
+```
+
+`COSE_Mac0` and `COSE_Encrypt0` are the same shape with `MAC_structure` and `Enc_structure`
+(tags 17 and 16).
+
+TLS channel-binding values (`tls_exporter(label, length)`, `tls_server_end_point`) are not
+template variables yet: an HTTPS `send` renders its request before the connection exists, so
+the exported keying material is not known when the template is rendered. They need the
+request rendered after the handshake, inside the transport; that is the next change of this
+group (`docs/design.md`, Appendix A).
+
 ### The analysis
 
 Every template is analysed before the policy is signed. Each expression has four properties:
 
 | Property | Set by | Kept through | Removed by |
 | --- | --- | --- | --- |
-| *tainted*: holds a secret in reversible form | secret fields (guessable or not), secret temps, every `ecdh` result; a plain hash (`md4` `md5` `sha1` `sha256` `sha384` `sha512` `sha512_256` `keccak256`) of a tainted value with no controlled bytes in it | every function not listed as removing it, and `+`: the encodings, `slice`, `between`, `add`, the fixed-width encoders, `json_set_number`, and encryption to a public key (`rsa_encrypt_*`: whoever holds the private key reads it) | a plain hash of a value that is also controlled; `hmac_*`, `pbkdf2`, `pbkdf2_sha256`, `totp`, the signatures and `len`; symmetric encryption, only as rule 4 says |
-| *controlled*: chosen by the caller or the server | `$method` `$path` `$pathname` `$query` `$body` `$input`, captured values (temps) | everything except `ecdh`, whose result depends on a private key nobody chooses | — |
-| *caller-chosen*: chosen by the caller (not only a server) | `$method` `$path` `$pathname` `$query` `$body` `$input` | everything except `ecdh` | — |
+| *tainted*: holds a secret in reversible form | secret fields (guessable or not), secret temps, every `ecdh` result; a key derived from a tainted value (`hkdf`, `hkdf_expand`, `concat_kdf`, `kbkdf_counter`, `kerberos_dk`: rule 8); a plain hash (`md4` `md5` `sha1` `sha256` `sha384` `sha512` `sha512_256` `keccak256` `sha3_*` `shake128` `shake256`) of a tainted value with no controlled bytes in it | every function not listed as removing it, and `+`: the encodings, `slice`, `between`, `add`, the fixed-width encoders, `json_set_number`, `nfold`, the `cbor_*` functions, and encryption to a public key (`rsa_encrypt_*`: whoever holds the private key reads it) | a plain hash of a value that is also controlled; `hmac_*`, `pbkdf2`, `pbkdf2_sha256`, `totp`, the signatures and `len`; `aes_cmac` and `aes_cbc_mac` under a secret key; symmetric encryption and key wrapping, only as rule 4 says |
+| *controlled*: chosen by the caller or the server | `$method` `$path` `$pathname` `$query` `$body` `$input`, captured values (temps) | everything except `ecdh`, whose result depends on a private key nobody chooses, and a key derived from a tainted value, of which the caller chooses no byte | — |
+| *caller-chosen*: chosen by the caller (not only a server) | `$method` `$path` `$pathname` `$query` `$body` `$input` | everything except `ecdh` and a key derived from a tainted value | — |
 | *secret key*: a strong secret nobody else knows, usable as a key | a secret field that is not guessable | `b64decode` `b32decode` `hexdecode` `pem` `trim` `slice` of it | everything else, including hashes, MACs and `+`: a hash or MAC of a key is a new value some operation may hand back |
 | *guessable*: a guess can be checked against it | guessable fields | every function except `len`, and `+` | `len` |
 
@@ -482,10 +548,15 @@ Rules:
    | `time(unix, format)` | both |
    | `totp(seed, digits, period)` | `digits` and `period` |
    | `pbkdf2_sha256(password, salt, rounds, length)` `pbkdf2(hash, password, salt, rounds, length)` | `rounds` and `length` |
-   | `aes_gcm_encrypt(key, nonce12, ...)` `aes_cbc_encrypt(key, iv16, ...)` `chacha20_poly1305_encrypt(key32, nonce12, ...)` | the key and the nonce or IV |
+   | `aes_gcm_encrypt(key, nonce12, ...)` `aes_cbc_encrypt(key, iv16, ...)` `chacha20_poly1305_encrypt(key32, nonce12, ...)` `aes_cbc_hmac_encrypt(key, iv16, ...)` `aes_eax_encrypt(key, nonce16, ...)` `aes_cts_encrypt(key, iv16, ...)` | the key and the nonce or IV |
+   | `aes_ccm_encrypt(key, nonce, tag_length, ...)` | the key, the nonce and the tag length |
+   | `aes_kw_wrap(kek, key)` `aes_kwp_wrap(kek, key)` `aes_cmac(key, msg)` `aes_cbc_mac(key, msg)` `kerberos_dk(key, constant)` | the key (the KEK) |
+   | `hkdf`, `hkdf_expand`, `concat_kdf`, `kbkdf_counter`, `shake128`, `shake256`, `nfold` | the length |
    | the signatures | the key |
    | `rsa_encrypt_oaep(hash, public_key, msg)` `rsa_encrypt_pkcs1(public_key, msg)` | the public key |
    | `ecdh(curve, peer_public, private)` | the peer key and the private key |
+   | `cbor_int` `cbor_text` | the input |
+   | `cbor_array` `cbor_map` `cbor_tag` | every argument (each is checked to be one item) |
 
    A tainted value in one sensitive argument of `time`, `totp`, `pbkdf2_sha256` or `pbkdf2` and
    a controlled value in another are refused too: `time(secret, $input)` lets the caller pick
@@ -497,6 +568,8 @@ Rules:
    controlled, so these functions cut only public temps and secret fields (with fixed
    numbers and delimiters). In `json_set(object, key, value)`, a tainted object or key may not
    meet a controlled value in any argument (the value itself is only escaped and appended).
+   In `cbor_map`, a tainted key may not meet a controlled key: the order of the pairs, and
+   whether two keys are equal, compare them.
 3. A hash of secret bytes alone is as good as the secret wherever the secret is hashed
    before use (an HMAC key longer than its block, an Ed25519 seed), so it stays tainted:
    `hex(sha256(key))` is refused as a derivation output, `hex(sha256(key + $input))` is not.
@@ -504,19 +577,38 @@ Rules:
    message or the AAD is tainted. A secret in the message stays readable, because another
    operation may encrypt chosen bytes under the same key and a chosen nonce and so give back
    the keystream. Under a key that is not a secret key, the output is tainted when any
-   argument is.
+   argument is. The same holds for `aes_cbc_hmac_encrypt`, `aes_ccm_encrypt`,
+   `aes_eax_encrypt`, `aes_cts_encrypt`, and for `aes_kw_wrap` and `aes_kwp_wrap` (the wrapped
+   key is the message: a fresh `random(16)` wrapped under a secret KEK is not tainted, a secret
+   field wrapped under any KEK is). `aes_cmac` and `aes_cbc_mac` are one-way under a secret
+   key; under any other key they keep the taint, since a one-block CBC-MAC is the block
+   encrypted and whoever knows the key decrypts it.
 5. The output of an operation with no connection (a derivation) may not be tainted or
    guessable. Since only `len` removes
    *guessable*, a derivation may depend on a guessable field only through `len`.
 6. An argument that names a hash or a curve (`pbkdf2`, `rsa_sign_pkcs1`, `rsa_sign_pss`,
-   `rsa_encrypt_oaep`, `ecdh`, `ecdh_public`) must be neither tainted nor controlled: the
-   policy fixes the algorithm, so no caller can downgrade it.
+   `rsa_encrypt_oaep`, `ecdh`, `ecdh_public`, `hkdf`, `hkdf_expand`, `concat_kdf`,
+   `kbkdf_counter`, `ecdsa_sign_prehash`, `dsa_sign`, `dsa_sign_der`) must be neither tainted
+   nor controlled: the policy fixes the algorithm, so no caller can downgrade it.
 7. The public key of `rsa_encrypt_oaep` and `rsa_encrypt_pkcs1` must not be caller-chosen: it
    comes from the policy (a literal or a field) or from a capture of the destination's
    response. A key from `$input`, `$body`, `$query` or another request variable would let the
    caller encrypt the secret to itself.
+8. A key derived from a secret is a secret: the output of `hkdf`, `hkdf_expand`,
+   `concat_kdf`, `kbkdf_counter` and `kerberos_dk` is tainted when any input is, and then not
+   controlled, since the caller chooses no byte of it (as with `ecdh`). So a plain hash of it
+   stays tainted, a derivation cannot hand it back, and it may key an encryption whose
+   output then stays tainted (it is not a *secret key*: some operation may derive the same
+   key and use it where its output is seen). An HMAC or a signature of it is one-way as
+   usual.
+9. An argument that sets the output's length or where a cut falls must not be tainted:
+   `random(n)`, the length of `pbkdf2_sha256`, `pbkdf2`, `hkdf`, `hkdf_expand`, `concat_kdf`,
+   `kbkdf_counter`, `shake128`, `shake256` and `nfold`, the tag length of `aes_ccm_encrypt`,
+   the start and length of `slice`, the delimiters of `between`, and the text `replace` looks
+   for. The length of the output, or whether the call fails, would give the secret back
+   through `len`. The value being cut or searched may be a secret (`slice(key, "0", "4")`).
 
-A template that breaks rule 1, 2, 6 or 7 is refused wherever it appears; rule 5 applies to the
+A template that breaks rule 1, 2, 6, 7 or 9 is refused wherever it appears; rule 5 applies to the
 `return` of an operation with no connection. A computed name carries the properties of its
 template, so the rules hold across steps exactly as they do inside one template.
 

@@ -566,6 +566,12 @@ algorithms, HTTP Digest `SHA-512-256`, ML-DSA and SLH-DSA.
 3. CBOR and channel binding.
 4. Post-quantum and national signature schemes last.
 
+Status: groups 1 and 2 are in, with SHA-3/SHAKE, Ed448, prehashed ECDSA, DSA, X448, AES-CCM,
+EAX, CMAC, CBC-MAC, CTS, SP 800-108 counter mode and Kerberos n-fold/DK, and the CBOR of
+group 3 (`docs/policy.md`). Not yet: `hpke_seal`, `turboshake*`/`kt*`, and TLS channel binding
+(`tls_exporter`, `tls_server_end_point`), which needs an HTTPS request rendered after the
+handshake inside the transport, since `send` renders it before connecting today.
+
 ## Appendix B. Gaps found against further registries (2026-11)
 
 Checked entry by entry: IANA EAP Method Types; Kerberos encryption, checksum and

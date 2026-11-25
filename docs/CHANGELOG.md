@@ -37,6 +37,36 @@ before 1.0, minor versions may break formats and APIs.
   or `json_set_number`; hash and curve names must be fixed by the policy; an RSA encryption
   key may not come from request variables or `$input`; every `ecdh` result is a secret that
   a plain hash does not clean.
+- Template functions, the second group of section 8d, whole families, each with its taint
+  rule (`docs/policy.md`), threat-model rows and an exfiltration test:
+  - hashes: `sha3_224`, `sha3_256`, `sha3_384`, `sha3_512`, `shake128(msg, length)`,
+    `shake256(msg, length)`;
+  - KDFs over SHA-256, -384 and -512: `hkdf(hash, ikm, salt, info, length)`,
+    `hkdf_expand(hash, prk, info, length)`, `concat_kdf(hash, z, other_info, length)`
+    (SP 800-56A, as JOSE and COSE ECDH-ES use it), `kbkdf_counter(hash, key, fixed_input,
+    length)` (SP 800-108 counter mode over HMAC);
+  - Kerberos: `nfold(value, bits)` and `kerberos_dk(key, constant)` (RFC 3961);
+  - AES modes and MACs: `aes_cbc_hmac_encrypt` (RFC 7518 5.2), `aes_ccm_encrypt` (any nonce
+    length 7-13 and even tag 4-16), `aes_eax_encrypt`, `aes_cts_encrypt` (CBC-CS3, RFC 3962),
+    `aes_cmac` (RFC 4493), `aes_cbc_mac`; key wrapping `aes_kw_wrap` (RFC 3394) and
+    `aes_kwp_wrap` (RFC 5649);
+  - signatures: `ed448_sign(key, msg[, context])`, `ecdsa_sign_prehash(curve, key, digest)`
+    on P-256, P-384, P-521 and secp256k1, `dsa_sign` / `dsa_sign_der(hash, key, msg)`
+    (RFC 6979 nonces);
+  - key agreement: X448 in `ecdh` and `ecdh_public`;
+  - CBOR in its deterministic form (RFC 8949 4.2.1): `cbor_int`, `cbor_bytes`, `cbor_text`,
+    `cbor_array`, `cbor_map`, `cbor_tag`, enough for `COSE_Sign1`, `COSE_Mac0`,
+    `COSE_Encrypt0` and their `Sig_structure`, `MAC_structure` and `Enc_structure`.
+- New analysis rules: a key derived from a secret is a secret and not controlled (rule 8); no
+  length argument may depend on a secret (rule 9); block-cipher MACs are one-way only under a
+  secret key; in `cbor_map` a secret key may not meet a chosen key.
+- Known-answer tests from FIPS 202, RFC 3394, 3610, 3961, 3962, 4493, 5649, 5869, 6979,
+  7518, 7748, 8009, 8032, 8949, 9052, NIST SP 800-38A/B/C, NIST CAVP (KBKDF), Wycheproof
+  (HKDF-SHA-384/512) and the EAX paper (`engine/src/vectors_families.rs`); the in-house CCM
+  matches the `ccm` crate on every nonce and tag length.
+- Dependencies: `aes-kw` 0.3, `cmac` 0.8, `eax` 0.6, `cts` 0.7, `shake` 0.1, `dsa` 0.7
+  (`hazmat`, for signing), `ed448-goldilocks` 0.14.0-pre.15 and `x448` 0.14.0-pre.12
+  (pre-releases, pinned exactly); `ccm` 0.6 for tests only.
 - Capture sources `html` (one compound selector over the `html5gum` tokenizer; an attribute
   or the element's text) and `regex` (the `regex` crate, linear time, a chosen group), at most
   2 MiB read, 256-byte selectors and patterns; `regex` also reads stream bytes. Fuzz targets
@@ -199,6 +229,10 @@ before 1.0, minor versions may break formats and APIs.
 
 ### Security
 
+- A secret can no longer set an output's length or a cut: `random(n)`, the length of
+  `pbkdf2_sha256` and `pbkdf2`, the start and length of `slice`, the delimiters of `between`
+  and the text `replace` looks for are refused when tainted, as the new key-derivation lengths
+  are; before, `len(random(key))` returned a number taken from the secret.
 - Closes the gaps of the policy audit; each has a regression test in
   `crates/engine/tests/audit_bounds.rs` that shows the attack refused before the log:
   - a caller could add query parameters to a signed request (another action for the same
