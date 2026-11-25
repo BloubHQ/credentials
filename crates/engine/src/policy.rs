@@ -87,6 +87,12 @@ pub struct FieldSpec {
     /// True when the record may lack the field (one an operation fills in later).
     #[serde(default, skip_serializing_if = "is_false")]
     pub optional: bool,
+    /// True for a secret with few possible values, such as a PIN or a password a person
+    /// chose. A derivation may not hand back anything a guess can be checked against: a hash
+    /// or signature of it, unless a keyed MAC or an encryption under a strong secret key hides
+    /// it.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub guessable: bool,
 }
 
 impl FieldSpec {
@@ -96,6 +102,15 @@ impl FieldSpec {
             name: name.into(),
             secret: true,
             optional: false,
+            guessable: false,
+        }
+    }
+
+    /// A secret field with few possible values (a PIN, a password a person chose).
+    pub fn guessable(name: &str) -> Self {
+        Self {
+            guessable: true,
+            ..Self::secret(name)
         }
     }
 
@@ -105,6 +120,7 @@ impl FieldSpec {
             name: name.into(),
             secret: false,
             optional: false,
+            guessable: false,
         }
     }
 
@@ -666,7 +682,13 @@ impl Policy {
                 NameKind::PublicTemp
             };
         }
-        if self.is_secret(name) {
+        if self
+            .fields
+            .iter()
+            .any(|f| f.name == name && f.secret && f.guessable)
+        {
+            NameKind::GuessableField
+        } else if self.is_secret(name) {
             NameKind::SecretField
         } else {
             NameKind::PublicField
@@ -677,7 +699,7 @@ impl Policy {
     pub fn is_secret_in(&self, operation: &Operation, name: &str) -> bool {
         matches!(
             self.name_kind(operation, name),
-            NameKind::SecretField | NameKind::SecretTemp
+            NameKind::SecretField | NameKind::GuessableField | NameKind::SecretTemp
         )
     }
 
@@ -985,7 +1007,18 @@ impl Policy {
             Operation::Derive { template, .. } => {
                 let at = format!("{at}.template");
                 let tainted = self.check_template(&at, operation, template, &[], Var::in_derive)?;
-                ensure(!tainted, || at, "a derivation would hand a secret back")?;
+                ensure(
+                    !tainted,
+                    || at.clone(),
+                    "a derivation would hand a secret back",
+                )?;
+                let parsed =
+                    Template::parse(template).map_err(|_| Error::policy(&at, "template syntax"))?;
+                ensure(
+                    !parsed.guessable(&|name| self.name_kind(operation, name)),
+                    || at,
+                    "a derivation would hand back a check for guesses of a guessable field",
+                )?;
             }
         }
         Ok(())
@@ -1039,6 +1072,11 @@ impl Policy {
                 is_token(&field.name),
                 || format!("fields[{i}].name"),
                 "name is not a token",
+            )?;
+            ensure(
+                field.secret || !field.guessable,
+                || format!("fields[{i}]"),
+                "only a secret field can be guessable",
             )?;
         }
         ensure(

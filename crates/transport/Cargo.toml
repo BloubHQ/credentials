@@ -1,0 +1,23 @@
+[package]
+name = "transport"
+description = "TLS transport for the credentials engine: rustls with the ring provider, Mozilla roots, client certificates, size and time limits."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+repository.workspace = true
+
+[dependencies]
+engine.workspace = true
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+webpki-roots = "1"
+zeroize.workspace = true
+
+[dev-dependencies]
+rcgen = "0.14"
+serde_json.workspace = true
+zeroizing-alloc = "0.1"
+
+[lints]
+workspace = true

@@ -17,8 +17,9 @@ use engine::caller::{Authorization, Payload};
 use engine::egress::{ClientIdentity, Stream, Transport};
 use engine::error::TransportKind;
 use engine::fields::Fields;
+use engine::grant::{GrantTerms, RecordPin};
 use engine::keys::{CallerKey, DeviceKey, NodeKey, UserKey};
-use engine::log::{Event, MemorySink, SignedEntry, verify_chain};
+use engine::log::{Detail, Event, LogSink, MemorySink, SignedEntry, verify_chain};
 use engine::node::{CallerExchange, Clock, Node, Outcome, Response, StreamOutput};
 use engine::policy::{
     Caller, Capture, Destination, Exchange, FieldSpec, Identity, Injection, Method, Operation,
@@ -52,6 +53,47 @@ impl TestClock {
 
 fn now() -> u64 {
     TIME.with(Cell::get)
+}
+
+thread_local! {
+    static ISSUED: Cell<u64> = const { Cell::new(0) };
+}
+
+/// An issue time for a grant or revocation: now, and later than the one before.
+fn issued() -> u64 {
+    ISSUED.with(|i| {
+        let next = now().max(i.get() + 1);
+        i.set(next);
+        next
+    })
+}
+
+/// Grants `node` the user key `key` of `OWNER` from `device`, pinning `pins`.
+fn grant_on<S: LogSink, C: Clock>(
+    node: &Node<S, C>,
+    device: &DeviceKey,
+    key: [u8; 32],
+    expires_ms: u64,
+    pins: &[(&str, u64)],
+) -> engine::Result<()> {
+    let terms = GrantTerms {
+        owner: OWNER.into(),
+        expires_ms,
+        issued_ms: issued(),
+        pins: pins
+            .iter()
+            .map(|(id, generation)| RecordPin {
+                record_id: (*id).into(),
+                generation: *generation,
+            })
+            .collect(),
+    };
+    let sealed = device.grant(
+        &UserKey::from_bytes(&mut key.clone()),
+        &node.identity(),
+        terms,
+    )?;
+    node.grant(&sealed)
 }
 
 impl Clock for &TestClock {
@@ -122,27 +164,15 @@ fn host() -> Destination {
 }
 
 fn secret(name: &str) -> FieldSpec {
-    FieldSpec {
-        name: name.into(),
-        secret: true,
-        optional: false,
-    }
+    FieldSpec::secret(name)
 }
 
 fn public(name: &str) -> FieldSpec {
-    FieldSpec {
-        name: name.into(),
-        secret: false,
-        optional: false,
-    }
+    FieldSpec::public(name)
 }
 
 fn later(name: &str) -> FieldSpec {
-    FieldSpec {
-        name: name.into(),
-        secret: true,
-        optional: true,
-    }
+    FieldSpec::secret(name).optional()
 }
 
 fn header(name: &str, template: &str) -> Injection {
@@ -357,13 +387,7 @@ fn setup<'c>(clock: &'c TestClock, policy: Policy, values: &[(&str, &[u8])]) -> 
     )
     .unwrap();
     let node = Node::new(NodeKey::generate(), MemorySink::new(), clock);
-    node.grant(
-        OWNER,
-        UserKey::from_bytes(&mut user_key.clone()),
-        device.public(),
-        NOW + DAY,
-    )
-    .unwrap();
+    grant_on(&node, &device, user_key, NOW + DAY, &[("rec-1", 1)]).unwrap();
     Setup {
         node,
         record,
@@ -755,21 +779,18 @@ fn grants_end_and_revokes_erase() {
 
     clock.set(NOW);
     let s = setup(&clock, policy, &[("token", TOKEN)]);
-    s.node.revoke(OWNER).unwrap();
+    let revocation = s
+        .device
+        .revoke(OWNER, &s.node.public_key(), issued())
+        .unwrap();
+    s.node.revoke(&revocation).unwrap();
     assert_eq!(
         forward(&s.node, &s.record, &get("/"), &mut transport),
         Err(Error::NoGrant)
     );
     assert!(transport.sent.is_empty());
 
-    s.node
-        .grant(
-            OWNER,
-            UserKey::from_bytes(&mut [1u8; 32]),
-            s.device.public(),
-            NOW + 365 * DAY,
-        )
-        .unwrap();
+    grant_on(&s.node, &s.device, [1u8; 32], NOW + 365 * DAY, &[]).unwrap();
     match &log_of(&s.node).last().unwrap().entry.event {
         Event::Grant { expires_ms, .. } => assert_eq!(*expires_ms, NOW + 30 * DAY),
         other => panic!("unexpected event {other:?}"),
@@ -921,7 +942,7 @@ fn a_tampered_chain_is_found() {
     // Entries: grant, then a use and its done for each request.
     let mut edited = entries.clone();
     match &mut edited[3].entry.event {
-        Event::Use { path, .. } => *path = "/innocent".into(),
+        Event::Use { operation, .. } => *operation = "innocent".into(),
         other => panic!("unexpected event {other:?}"),
     }
     assert_eq!(
@@ -1478,11 +1499,22 @@ fn a_stream_logs_in_then_carries_the_caller() {
             b"a2 SELECT INBOX\r\n".to_vec()
         ]
     );
-    match last_event(&s.node, |e| matches!(e, Event::Stream { .. })) {
-        Event::Stream { host, port, .. } => {
+    let entries = log_of(&s.node);
+    let stream = entries
+        .iter()
+        .rev()
+        .find(|e| matches!(e.entry.event, Event::Stream { .. }))
+        .unwrap();
+    assert!(
+        !serde_json::to_string(stream)
+            .unwrap()
+            .contains("imap.example.com")
+    );
+    match engine::log::open_detail(&user_key(), &stream.entry).unwrap() {
+        Some(Detail::Stream { host, port, .. }) => {
             assert_eq!((host.as_str(), port), ("imap.example.com", 993));
         }
-        other => panic!("unexpected event {other:?}"),
+        other => panic!("unexpected detail {other:?}"),
     }
 
     // A server that echoes the password: the read is dropped.
@@ -1900,9 +1932,7 @@ fn a_second_device_is_added_not_swapped() {
 
     // The laptop grants the same user key: the phone stays a device.
     let laptop = DeviceKey::generate();
-    s.node
-        .grant(OWNER, user_key(), laptop.public(), NOW + DAY)
-        .unwrap();
+    grant_on(&s.node, &laptop, [7u8; 32], NOW + DAY, &[("rec-2", 1)]).unwrap();
     forward(&s.node, &s.record, &get("/"), &mut transport).unwrap();
     forward(&s.node, &seal(&laptop), &get("/"), &mut transport).unwrap();
 
@@ -1926,19 +1956,12 @@ fn a_second_device_is_added_not_swapped() {
         Err(Error::PolicySignature)
     );
 
-    // A grant with another user key starts over with its own device.
-    s.node
-        .grant(
-            OWNER,
-            UserKey::from_bytes(&mut [8u8; 32]),
-            stranger.public(),
-            NOW + DAY,
-        )
-        .unwrap();
+    // A stranger cannot take the owner over with another user key.
     assert_eq!(
-        forward(&s.node, &s.record, &get("/"), &mut transport).map(|_| ()),
-        Err(Error::PolicySignature)
+        grant_on(&s.node, &stranger, [8u8; 32], NOW + DAY, &[]),
+        Err(Error::GrantDenied)
     );
+    forward(&s.node, &s.record, &get("/"), &mut transport).unwrap();
 }
 
 #[test]
@@ -2157,8 +2180,7 @@ fn a_restarted_node_continues_its_chain_and_its_floors() {
         MemorySink::new(),
         &clock,
     );
-    node.grant(OWNER, user_key(), device.public(), NOW + DAY)
-        .unwrap();
+    grant_on(&node, &device, [7u8; 32], NOW + DAY, &[("rec-1", 1)]).unwrap();
     let mut transport = FakeTransport::default();
     transport
         .replies
@@ -2180,8 +2202,7 @@ fn a_restarted_node_continues_its_chain_and_its_floors() {
         &before,
     )
     .unwrap();
-    node.grant(OWNER, user_key(), device.public(), NOW + DAY)
-        .unwrap();
+    grant_on(&node, &device, [7u8; 32], NOW + DAY, &[("rec-1", 1)]).unwrap();
     assert_eq!(
         call_http(&node, &s.record, "refresh", None, &mut transport)
             .result
@@ -2237,6 +2258,7 @@ impl Clock for FixedClock {
 
 #[test]
 fn one_node_serves_many_threads() {
+    let _clock = TestClock::at(NOW);
     let device = DeviceKey::generate();
     let policy = with_caller(derive_policy(
         vec![secret("key")],
@@ -2251,8 +2273,7 @@ fn one_node_serves_many_threads() {
     )
     .unwrap();
     let node = Node::new(NodeKey::generate(), MemorySink::new(), FixedClock(NOW));
-    node.grant(OWNER, user_key(), device.public(), NOW + DAY)
-        .unwrap();
+    grant_on(&node, &device, [7u8; 32], NOW + DAY, &[("rec-1", 1)]).unwrap();
     std::thread::scope(|scope| {
         for t in 0..8u8 {
             let (node, record) = (&node, &record);
@@ -2320,4 +2341,291 @@ fn renderings_and_responses_have_budgets() {
             rule: "too many headers"
         })
     );
+}
+
+#[test]
+fn p384_keys_sign() {
+    use ring::signature::{
+        ECDSA_P384_SHA384_FIXED, ECDSA_P384_SHA384_FIXED_SIGNING, EcdsaKeyPair, KeyPair as _,
+        UnparsedPublicKey,
+    };
+    let rng = ring::rand::SystemRandom::new();
+    let pkcs8 = EcdsaKeyPair::generate_pkcs8(&ECDSA_P384_SHA384_FIXED_SIGNING, &rng).unwrap();
+    let public = EcdsaKeyPair::from_pkcs8(&ECDSA_P384_SHA384_FIXED_SIGNING, pkcs8.as_ref(), &rng)
+        .unwrap()
+        .public_key()
+        .as_ref()
+        .to_vec();
+    let clock = TestClock::at(NOW);
+    let s = setup(
+        &clock,
+        derive_policy(vec![secret("key")], "{{ p384_sign(key, $input) }}"),
+        &[("key", pkcs8.as_ref())],
+    );
+    let signature = call_derive(&s.node, &s.record, "derive", b"message").unwrap();
+    assert_eq!(signature.len(), 96);
+    UnparsedPublicKey::new(&ECDSA_P384_SHA384_FIXED, &public)
+        .verify(b"message", &signature)
+        .unwrap();
+}
+
+// ---- grants, revocations, pins, log privacy, guessable fields ----
+
+#[test]
+fn a_grant_opens_only_on_its_node_and_only_once() {
+    let clock = TestClock::at(NOW);
+    let policy = request_policy(
+        vec![secret("token")],
+        vec![header("Authorization", "Bearer {{token}}")],
+    );
+    let s = setup(&clock, policy, &[("token", TOKEN)]);
+    let terms = || GrantTerms {
+        owner: OWNER.into(),
+        expires_ms: NOW + DAY,
+        issued_ms: issued(),
+        pins: vec![],
+    };
+
+    // Sealed to another node: this node cannot open it.
+    let other = Node::new(NodeKey::generate(), MemorySink::new(), &clock);
+    let elsewhere = s
+        .device
+        .grant(&user_key(), &other.identity(), terms())
+        .unwrap();
+    assert_eq!(
+        s.node.grant(&elsewhere),
+        Err(Error::GrantInvalid {
+            rule: "not sealed to this node"
+        })
+    );
+
+    // A grant replayed after a newer grant or revocation is refused.
+    let first = s
+        .device
+        .grant(&user_key(), &s.node.identity(), terms())
+        .unwrap();
+    s.node.grant(&first).unwrap();
+    let revocation = s
+        .device
+        .revoke(OWNER, &s.node.public_key(), issued())
+        .unwrap();
+    s.node.revoke(&revocation).unwrap();
+    let stale = Err(Error::GrantInvalid {
+        rule: "issued before the last grant or revocation of the owner",
+    });
+    assert_eq!(s.node.grant(&first), stale);
+    assert_eq!(s.node.revoke(&revocation), stale);
+
+    // A grant made long ago is refused.
+    let mut old = terms();
+    old.issued_ms = NOW - 6 * 60 * 1000;
+    let old = s
+        .device
+        .grant(&user_key(), &s.node.identity(), old)
+        .unwrap();
+    assert_eq!(
+        s.node.grant(&old),
+        Err(Error::GrantInvalid {
+            rule: "issued too long ago or in the future"
+        })
+    );
+
+    // A changed byte of the sealed grant is refused.
+    let mut bent = s
+        .device
+        .grant(&user_key(), &s.node.identity(), terms())
+        .unwrap();
+    let last = bent.ciphertext.len() - 1;
+    bent.ciphertext[last] ^= 1;
+    assert_eq!(
+        s.node.grant(&bent),
+        Err(Error::GrantInvalid {
+            rule: "not sealed to this node"
+        })
+    );
+
+    // The sealed grant does not hold the user key in the clear.
+    let json = serde_json::to_string(&first).unwrap();
+    assert!(!json.contains(&engine::encoding::to_b64(&[7u8; 32])));
+}
+
+#[test]
+fn only_a_known_device_revokes() {
+    let clock = TestClock::at(NOW);
+    let policy = request_policy(
+        vec![secret("token")],
+        vec![header("Authorization", "Bearer {{token}}")],
+    );
+    let s = setup(&clock, policy, &[("token", TOKEN)]);
+    let mut transport = FakeTransport::default();
+    let stranger = DeviceKey::generate();
+    let forged = stranger
+        .revoke(OWNER, &s.node.public_key(), issued())
+        .unwrap();
+    assert_eq!(s.node.revoke(&forged), Err(Error::GrantDenied));
+    let mut swapped = s
+        .device
+        .revoke(OWNER, &s.node.public_key(), issued())
+        .unwrap();
+    swapped.owner = "user-2".into();
+    assert_eq!(
+        s.node.revoke(&swapped),
+        Err(Error::GrantInvalid {
+            rule: "revocation signature does not verify"
+        })
+    );
+    forward(&s.node, &s.record, &get("/"), &mut transport).unwrap();
+    assert_eq!(log_of(&s.node).len(), 3, "grant, use, done: no revoke");
+}
+
+#[test]
+fn a_record_its_owner_never_pinned_is_refused() {
+    let clock = TestClock::at(NOW);
+    let policy = request_policy(
+        vec![secret("token")],
+        vec![header("Authorization", "Bearer {{token}}")],
+    );
+    let s = setup(&clock, policy.clone(), &[("token", TOKEN)]);
+    let mut transport = FakeTransport::default();
+    let unpinned = Record::seal(
+        &user_key(),
+        "rec-9",
+        OWNER,
+        s.device.sign_policy(with_caller(policy)).unwrap(),
+        &fields(&[("token", TOKEN)]),
+    )
+    .unwrap();
+    assert_eq!(
+        forward(&s.node, &unpinned, &get("/"), &mut transport).map(|_| ()),
+        Err(Error::RecordUnpinned)
+    );
+    assert!(transport.sent.is_empty());
+    s.node.pin(&s.device.pin(&unpinned).unwrap()).unwrap();
+    forward(&s.node, &unpinned, &get("/"), &mut transport).unwrap();
+}
+
+#[test]
+fn a_fresh_node_refuses_an_old_record_the_grant_pinned_past() {
+    let clock = TestClock::at(NOW);
+    let policy = request_policy(
+        vec![secret("token")],
+        vec![header("Authorization", "Bearer {{token}}")],
+    );
+    let s = setup(&clock, policy.clone(), &[("token", TOKEN)]);
+    let newer = s
+        .record
+        .rewrap(
+            &user_key(),
+            s.device.sign_policy(with_caller(policy)).unwrap(),
+        )
+        .unwrap();
+    // The operator starts a node that never saw the newer record; the grant pins it.
+    let fresh = Node::new(NodeKey::generate(), MemorySink::new(), &clock);
+    grant_on(
+        &fresh,
+        &s.device,
+        [7u8; 32],
+        NOW + DAY,
+        &[("rec-1", newer.generation)],
+    )
+    .unwrap();
+    let mut transport = FakeTransport::default();
+    assert_eq!(
+        forward(&fresh, &s.record, &get("/"), &mut transport).map(|_| ()),
+        Err(Error::RecordStale { have: 1, need: 2 })
+    );
+    forward(&fresh, &newer, &get("/"), &mut transport).unwrap();
+}
+
+#[test]
+fn the_log_store_cannot_read_where_a_value_went() {
+    let clock = TestClock::at(NOW);
+    let policy = request_policy(
+        vec![secret("token")],
+        vec![header("Authorization", "Bearer {{token}}")],
+    );
+    let s = setup(&clock, policy, &[("token", TOKEN)]);
+    let mut transport = FakeTransport::default();
+    forward(
+        &s.node,
+        &s.record,
+        &post("/v1/patients/8812?full=1", br#"{"q":1}"#),
+        &mut transport,
+    )
+    .unwrap();
+    let entries = log_of(&s.node);
+    let json = serde_json::to_string(&entries).unwrap();
+    assert!(!json.contains("patients"), "{json}");
+    assert!(!json.contains("api.example.com"), "{json}");
+    let used = entries
+        .iter()
+        .find(|e| matches!(e.entry.event, Event::Use { .. }))
+        .unwrap();
+    match engine::log::open_detail(&user_key(), &used.entry).unwrap() {
+        Some(Detail::Use {
+            path,
+            host,
+            body_len,
+            ..
+        }) => {
+            assert_eq!(path, "/v1/patients/8812?full=1");
+            assert_eq!(host, "api.example.com");
+            assert_eq!(body_len, 7);
+        }
+        other => panic!("unexpected detail {other:?}"),
+    }
+    assert_eq!(
+        engine::log::open_detail(&UserKey::from_bytes(&mut [9u8; 32]), &used.entry),
+        Err(Error::RecordOpen)
+    );
+}
+
+#[test]
+fn guessable_fields_give_back_no_check_for_guesses() {
+    let device = DeviceKey::generate();
+    let sign = |template: &str| {
+        let policy = Policy {
+            fields: vec![FieldSpec::guessable("pin"), secret("key")],
+            callers: vec![],
+            operations: vec![Operation::Derive {
+                name: "derive".into(),
+                template: template.into(),
+            }],
+        };
+        device.sign_policy(with_caller(policy)).map(|_| ())
+    };
+    for refused in [
+        "{{ hex(sha256(pin)) }}",
+        r#"{{ hex(pbkdf2_sha256(pin, "salt", "100000", "32")) }}"#,
+        "{{ hex(hmac_sha256(pin, $input)) }}",
+        "{{ ed25519_sign(key, pin) }}",
+        "{{ hex(hmac_sha256(sha256(pin), $input)) }}",
+    ] {
+        assert!(
+            matches!(sign(refused), Err(Error::PolicyInvalid { .. })),
+            "{refused}"
+        );
+    }
+    for allowed in [
+        "{{ hex(hmac_sha256(key, pin)) }}",
+        "{{ len(pin) }}",
+        "{{ hex(sha256(key)) }}",
+    ] {
+        sign(allowed).unwrap_or_else(|e| panic!("{allowed}: {e}"));
+    }
+    let public = Policy {
+        fields: vec![FieldSpec {
+            guessable: true,
+            ..public("user")
+        }],
+        callers: vec![],
+        operations: vec![Operation::Derive {
+            name: "derive".into(),
+            template: "{{ len(user) }}".into(),
+        }],
+    };
+    assert!(matches!(
+        device.sign_policy(with_caller(public)),
+        Err(Error::PolicyInvalid { .. })
+    ));
 }

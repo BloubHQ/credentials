@@ -2,29 +2,30 @@
 //!
 //! ```text
 //! verify <log.jsonl> <node-public-key> [--head <signed-head.json>]
-//! verify <log.jsonl> <node-public-key> --owner <owner>
+//! verify <log.jsonl> <node-public-key> --owner <owner> [--user-key <file>]
 //! ```
 //!
 //! Every line of the file is one signed entry. The tool reads the file as a stream and checks
 //! the chain from its first entry, then prints the number of entries and the hash of the head.
 //! With `--head`, the chain must end exactly at that signed checkpoint of the node (a cut tail
 //! is found). With `--owner`, the file holds only the entries of one owner, as a node hands them
-//! to that owner, and the tool checks the chain of that owner.
+//! to that owner, and the tool checks the chain of that owner. With `--user-key` (a file that
+//! holds the user key of the owner as unpadded URL-safe base64), it also prints every entry
+//! with its detail (where a value went), which only the owner can read.
 
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::process::ExitCode;
 
-use engine::encoding::to_b64;
-use engine::keys::NodePublicKey;
-use engine::log::{ChainVerifier, SignedEntry, SignedHead, verify_owner_chain};
+use engine::encoding::{array_from_b64, to_b64};
+use engine::keys::{NodePublicKey, UserKey};
+use engine::log::{ChainVerifier, SignedEntry, SignedHead, open_detail, verify_owner_chain};
 
-const USAGE: &str =
-    "usage: verify <log.jsonl> <node-public-key> [--head <signed-head.json> | --owner <owner>]";
+const USAGE: &str = "usage: verify <log.jsonl> <node-public-key> [--head <signed-head.json> | --owner <owner> [--user-key <file>]]";
 
 enum Mode {
     Chain(Option<String>),
-    Owner(String),
+    Owner(String, Option<String>),
 }
 
 struct Args {
@@ -51,8 +52,17 @@ fn parse(args: &[String]) -> Result<Option<Args>, String> {
         [path, key, flag, value] if flag == "--owner" => Ok(Some(Args {
             path: path.clone(),
             key: key.clone(),
-            mode: Mode::Owner(value.clone()),
+            mode: Mode::Owner(value.clone(), None),
         })),
+        [path, key, flag, value, key_flag, key_file]
+            if flag == "--owner" && key_flag == "--user-key" =>
+        {
+            Ok(Some(Args {
+                path: path.clone(),
+                key: key.clone(),
+                mode: Mode::Owner(value.clone(), Some(key_file.clone())),
+            }))
+        }
         _ => Err(USAGE.to_string()),
     }
 }
@@ -99,9 +109,22 @@ fn run(args: Args) -> Result<String, String> {
                 to_b64(&verifier.head())
             ))
         }
-        Mode::Owner(owner) => {
+        Mode::Owner(owner, user_key) => {
             let all = entries(&args.path)?.collect::<Result<Vec<_>, _>>()?;
             let head = verify_owner_chain(&all, &owner, &key).map_err(|e| e.to_string())?;
+            if let Some(file) = user_key {
+                let text =
+                    std::fs::read_to_string(&file).map_err(|e| format!("read {file}: {e}"))?;
+                let mut bytes: [u8; 32] =
+                    array_from_b64(text.trim()).map_err(|_| format!("{file}: not a user key"))?;
+                let user_key = UserKey::from_bytes(&mut bytes);
+                for signed in &all {
+                    let detail = open_detail(&user_key, &signed.entry)
+                        .map_err(|e| format!("seq {}: {e}", signed.entry.seq))?;
+                    let line = serde_json::json!({ "entry": signed.entry, "detail": detail });
+                    println!("{line}");
+                }
+            }
             Ok(format!(
                 "ok: {} entries of {owner}, head {}",
                 all.len(),

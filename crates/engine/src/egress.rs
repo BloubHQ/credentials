@@ -21,7 +21,9 @@ pub struct ClientIdentity {
 }
 
 impl ClientIdentity {
-    pub(crate) fn new(cert: Zeroizing<Vec<u8>>, key: Zeroizing<Vec<u8>>) -> Self {
+    /// An identity from a certificate chain and a private key (PEM). The engine makes these
+    /// from the templates of an operation; transports and their tests may make their own.
+    pub fn new(cert: Zeroizing<Vec<u8>>, key: Zeroizing<Vec<u8>>) -> Self {
         Self {
             cert: Secret::new(cert.to_vec()),
             key: Secret::new(key.to_vec()),

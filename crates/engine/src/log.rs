@@ -20,8 +20,11 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::encoding::{b64_array, canonical};
-use crate::keys::{DevicePublicKey, NodeKey, NodePublicKey};
+use chacha20poly1305::{ChaCha20Poly1305, KeyInit, Nonce};
+
+use crate::encoding::{b64_array, b64_vec, canonical};
+use crate::grant::RecordPin;
+use crate::keys::{DevicePublicKey, NodeKey, NodePublicKey, UserKey};
 use crate::policy::Method;
 use crate::{Error, Result};
 
@@ -29,7 +32,9 @@ const ENTRY_DOMAIN: &[u8] = b"entry/v2\0";
 const HASH_DOMAIN: &[u8] = b"entry-hash/v2\0";
 const HEAD_DOMAIN: &[u8] = b"head/v1\0";
 
-/// What an entry records.
+/// What an entry records. The details of a use (where it went, what was sent) are sealed to
+/// the owner ([`SealedDetail`]): the log store sees which record was used, when, by which
+/// caller and for which operation, but not where or with what.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "t", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Event {
@@ -37,16 +42,25 @@ pub enum Event {
     Grant {
         /// End of the grant, Unix milliseconds.
         expires_ms: u64,
-        /// The device the grant came from.
+        /// The device that signed the grant.
         device: DevicePublicKey,
+        /// When the device made the grant.
+        issued_ms: u64,
+        /// The record generations the grant pinned.
+        pins: Vec<RecordPin>,
     },
     /// A device of the grant endorsed another device.
     Device {
         /// The added device.
         device: DevicePublicKey,
     },
-    /// The node erased the user key of the owner.
-    Revoke,
+    /// The node erased the user key of the owner, as a device of the owner signed.
+    Revoke {
+        /// When the device made the revocation.
+        issued_ms: u64,
+        /// The device that signed it.
+        device: DevicePublicKey,
+    },
     /// The owner pinned the lowest generation of a record.
     Pin {
         /// The lowest generation accepted.
@@ -59,19 +73,8 @@ pub enum Event {
         operation: String,
         /// The generation of the record.
         generation: u64,
-        /// Method.
-        method: Method,
-        /// Destination host.
-        host: String,
-        /// Destination port.
-        port: u16,
-        /// Path and query before injections (without the value).
-        path: String,
-        /// SHA-256 of the request body before injections.
-        #[serde(with = "b64_array")]
-        body_sha256: [u8; 32],
-        /// Length of the request body before injections.
-        body_len: u64,
+        /// [`Detail::Use`], sealed to the owner.
+        detail: SealedDetail,
     },
     /// The node opened one connection for a stream operation.
     Stream {
@@ -79,15 +82,8 @@ pub enum Event {
         operation: String,
         /// The generation of the record.
         generation: u64,
-        /// Destination host.
-        host: String,
-        /// Destination port.
-        port: u16,
-        /// SHA-256 over the sends of the caller, each prefixed by its length (u32, big-endian).
-        #[serde(with = "b64_array")]
-        sends_sha256: [u8; 32],
-        /// Number of exchanges of the caller.
-        exchanges: u32,
+        /// [`Detail::Stream`], sealed to the owner.
+        detail: SealedDetail,
     },
     /// The node rendered a derivation and handed the output back.
     Derive {
@@ -95,11 +91,8 @@ pub enum Event {
         operation: String,
         /// The generation of the record.
         generation: u64,
-        /// SHA-256 of the input.
-        #[serde(with = "b64_array")]
-        input_sha256: [u8; 32],
-        /// Length of the input.
-        input_len: u64,
+        /// [`Detail::Derive`], sealed to the owner.
+        detail: SealedDetail,
     },
     /// The node sealed the record again with values an operation captured.
     Update {
@@ -119,6 +112,128 @@ pub enum Event {
         /// True when the result went back to the caller.
         ok: bool,
     },
+}
+
+/// Where a use went and what it carried, readable by the owner only.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "t", rename_all = "snake_case", deny_unknown_fields)]
+pub enum Detail {
+    /// One request.
+    Use {
+        /// Method.
+        method: Method,
+        /// Destination host.
+        host: String,
+        /// Destination port.
+        port: u16,
+        /// Path and query before injections (without the value).
+        path: String,
+        /// SHA-256 of the request body before injections.
+        #[serde(with = "b64_array")]
+        body_sha256: [u8; 32],
+        /// Length of the request body before injections.
+        body_len: u64,
+    },
+    /// One connection.
+    Stream {
+        /// Destination host.
+        host: String,
+        /// Destination port.
+        port: u16,
+        /// SHA-256 over the sends of the caller, each prefixed by its length (u32,
+        /// big-endian).
+        #[serde(with = "b64_array")]
+        sends_sha256: [u8; 32],
+        /// Number of exchanges of the caller.
+        exchanges: u32,
+    },
+    /// One derivation.
+    Derive {
+        /// SHA-256 of the input.
+        #[serde(with = "b64_array")]
+        input_sha256: [u8; 32],
+        /// Length of the input.
+        input_len: u64,
+    },
+}
+
+/// A [`Detail`] encrypted with ChaCha20-Poly1305 under a key derived from the user key of the
+/// owner, bound to the owner and the record.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SealedDetail {
+    /// Random nonce.
+    #[serde(with = "b64_array")]
+    pub nonce: [u8; 12],
+    /// Ciphertext and tag.
+    #[serde(with = "b64_vec")]
+    pub ct: Vec<u8>,
+}
+
+const DETAIL_KEY_INFO: &[u8] = b"log-detail/v1\0";
+
+fn detail_cipher(user_key: &UserKey) -> Result<ChaCha20Poly1305> {
+    let mut okm = zeroize::Zeroizing::new([0u8; 32]);
+    hkdf::Hkdf::<Sha256>::new(None, user_key.bytes())
+        .expand(DETAIL_KEY_INFO, okm.as_mut_slice())
+        .map_err(|_| Error::KeyInvalid)?;
+    ChaCha20Poly1305::new_from_slice(okm.as_slice()).map_err(|_| Error::KeyInvalid)
+}
+
+fn detail_aad(owner: &str, record_id: &str) -> Vec<u8> {
+    let mut aad = Vec::with_capacity(owner.len() + record_id.len() + 1);
+    aad.extend_from_slice(owner.as_bytes());
+    aad.push(0);
+    aad.extend_from_slice(record_id.as_bytes());
+    aad
+}
+
+impl Detail {
+    /// Seals the detail of a use of `record_id` of `owner`.
+    pub(crate) fn seal(
+        &self,
+        user_key: &UserKey,
+        owner: &str,
+        record_id: &str,
+    ) -> Result<SealedDetail> {
+        use chacha20poly1305::aead::{Aead, Payload};
+        let plain = serde_json::to_vec(self).map_err(|_| Error::Encoding)?;
+        let mut nonce = [0u8; 12];
+        rand_core::RngCore::fill_bytes(&mut rand_core::OsRng, &mut nonce);
+        let ct = detail_cipher(user_key)?
+            .encrypt(
+                Nonce::from_slice(&nonce),
+                Payload {
+                    msg: &plain,
+                    aad: &detail_aad(owner, record_id),
+                },
+            )
+            .map_err(|_| Error::Encoding)?;
+        Ok(SealedDetail { nonce, ct })
+    }
+}
+
+/// The detail of `entry`, for its owner. `None` for an entry without one.
+pub fn open_detail(user_key: &UserKey, entry: &Entry) -> Result<Option<Detail>> {
+    use chacha20poly1305::aead::{Aead, Payload};
+    let sealed = match &entry.event {
+        Event::Use { detail, .. } | Event::Stream { detail, .. } | Event::Derive { detail, .. } => {
+            detail
+        }
+        _ => return Ok(None),
+    };
+    let plain = detail_cipher(user_key)?
+        .decrypt(
+            Nonce::from_slice(&sealed.nonce),
+            Payload {
+                msg: &sealed.ct,
+                aad: &detail_aad(&entry.owner, &entry.record_id),
+            },
+        )
+        .map_err(|_| Error::RecordOpen)?;
+    serde_json::from_slice(&plain)
+        .map(Some)
+        .map_err(|_| Error::Encoding)
 }
 
 /// One log entry.

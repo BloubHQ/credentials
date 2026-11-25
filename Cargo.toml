@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/engine", "crates/verify"]
+members = ["crates/engine", "crates/transport", "crates/verify"]
 
 [workspace.package]
 version = "0.1.0"
@@ -8,6 +8,7 @@ edition = "2024"
 rust-version = "1.87"
 license = "Apache-2.0"
 publish = false
+repository = "https://github.com/BloubHQ/credentials"
 
 [workspace.dependencies]
 engine = { path = "crates/engine" }
@@ -18,11 +19,13 @@ k256 = { version = "0.14", features = ["ecdsa", "pkcs8"] }
 md-5 = "0.10"
 pbkdf2 = "0.12"
 ring = "0.17"
+p384 = { version = "0.14", features = ["ecdsa", "pkcs8"] }
 sha3 = "0.10"
 base64 = "0.22"
 chacha20poly1305 = "0.10"
 ed25519-dalek = { version = "2", features = ["rand_core", "zeroize", "pkcs8", "pem"] }
 hkdf = "0.12"
+hpke = { version = "0.15", default-features = false, features = ["alloc", "x25519", "chacha", "getrandom"] }
 hmac = "0.12"
 p256 = { version = "0.14", features = ["ecdsa", "pkcs8", "pem"] }
 rand_core = { version = "0.6", features = ["getrandom"] }

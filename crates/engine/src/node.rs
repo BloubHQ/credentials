@@ -1,8 +1,8 @@
 //! A node: it holds grants and performs the operations of owners.
 //!
 //! Order of every act, and why:
-//! 1. grant in force; record not older than one the node saw or the owner pinned; policy
-//!    signed by a device of the grant;
+//! 1. grant in force; record pinned by its owner and not older than one the node saw or the
+//!    owner pinned; policy signed by a known device of the owner;
 //! 2. the caller is one the policy lists for the operation, its signature over this call
 //!    verifies, the call is fresh and not a replay, and within the limit of the caller;
 //! 3. request within the operation; record opened; templates rendered within the budget
@@ -27,8 +27,9 @@ use zeroize::{Zeroize, Zeroizing};
 use crate::caller::{Authorization, Call, MAX_SKEW_MS, Payload};
 use crate::egress::{ClientIdentity, Transport, dispatch, open_stream};
 use crate::fields::Fields;
+use crate::grant::{NodeIdentity, NodeSealKey, OpenedGrant, Revocation, SealSecret, SealedGrant};
 use crate::keys::{DevicePublicKey, Endorsement, NodeKey, NodePublicKey, UserKey};
-use crate::log::{Event, Log, LogSink, SignedEntry, SignedHead};
+use crate::log::{Detail, Event, Log, LogSink, SignedEntry, SignedHead};
 use crate::policy::{
     Capture, Destination, Exchange, Identity, MAX_DELIMITER, MAX_DELIMITERS, Operation, Policy,
     Store,
@@ -203,8 +204,15 @@ fn release_http(http: Http, log_seqs: Vec<u64>, secrets: &Secrets<'_>) -> Result
 
 struct Grant {
     user_key: Arc<UserKey>,
-    devices: Vec<DevicePublicKey>,
     expires_ms: u64,
+}
+
+/// What a node keeps about an owner after its grants end: the devices it knows and the issue
+/// time of the last grant or revocation, so a stored one cannot be replayed.
+#[derive(Default)]
+struct Owner {
+    devices: Vec<DevicePublicKey>,
+    issued_ms: u64,
 }
 
 type RecordKey = (String, String);
@@ -213,6 +221,7 @@ struct State<S> {
     log: Log,
     sink: S,
     grants: HashMap<String, Grant>,
+    owners: HashMap<String, Owner>,
     floors: HashMap<RecordKey, u64>,
     nonces: HashMap<[u8; 32], u64>,
     calls: HashMap<(String, String, String), VecDeque<u64>>,
@@ -231,11 +240,49 @@ impl<S: LogSink> State<S> {
         self.grants.get(owner).ok_or(Error::NoGrant)
     }
 
-    fn floor(&self, record: &Record) -> u64 {
+    fn floor(&self, record: &Record) -> Option<u64> {
         self.floors
             .get(&(record.owner.clone(), record.id.clone()))
             .copied()
-            .unwrap_or(0)
+    }
+
+    fn devices(&self, owner: &str) -> Vec<DevicePublicKey> {
+        self.owners
+            .get(owner)
+            .map(|o| o.devices.clone())
+            .unwrap_or_default()
+    }
+
+    fn know_device(&mut self, owner: &str, device: DevicePublicKey) {
+        let devices = &mut self.owners.entry(owner.to_string()).or_default().devices;
+        if !devices.contains(&device) {
+            devices.push(device);
+        }
+    }
+
+    fn issued(&mut self, owner: &str, issued_ms: u64) {
+        let owner = self.owners.entry(owner.to_string()).or_default();
+        owner.issued_ms = owner.issued_ms.max(issued_ms);
+    }
+
+    /// Checks the issue time of a grant or revocation against the clock and the last one of
+    /// the owner.
+    fn check_issued(&self, owner: &str, issued_ms: u64, now: u64) -> Result<()> {
+        if issued_ms.abs_diff(now) > MAX_SKEW_MS {
+            return Err(Error::GrantInvalid {
+                rule: "issued too long ago or in the future",
+            });
+        }
+        if self
+            .owners
+            .get(owner)
+            .is_some_and(|o| issued_ms <= o.issued_ms)
+        {
+            return Err(Error::GrantInvalid {
+                rule: "issued before the last grant or revocation of the owner",
+            });
+        }
+        Ok(())
     }
 
     fn raise(&mut self, owner: &str, id: &str, generation: u64) {
@@ -266,6 +313,8 @@ struct Checked {
 /// A node.
 pub struct Node<S: LogSink, C: Clock> {
     public: NodePublicKey,
+    identity: NodeIdentity,
+    seal: SealSecret,
     clock: C,
     state: Mutex<State<S>>,
 }
@@ -273,17 +322,25 @@ pub struct Node<S: LogSink, C: Clock> {
 impl<S: LogSink, C: Clock> Node<S, C> {
     /// A node with a fresh chain.
     pub fn new(key: NodeKey, sink: S, clock: C) -> Self {
-        Self::with_log(Log::new(key), sink, clock)
+        let seal = SealSecret::of(&key);
+        Self::with_log(Log::new(key), seal, sink, clock)
     }
 
-    fn with_log(log: Log, sink: S, clock: C) -> Self {
+    fn with_log(log: Log, seal: (SealSecret, NodeSealKey), sink: S, clock: C) -> Self {
+        let public = log.public_key();
         Self {
-            public: log.public_key(),
+            public,
+            identity: NodeIdentity {
+                log_key: public,
+                seal_key: seal.1,
+            },
+            seal: seal.0,
             clock,
             state: Mutex::new(State {
                 log,
                 sink,
                 grants: HashMap::new(),
+                owners: HashMap::new(),
                 floors: HashMap::new(),
                 nonces: HashMap::new(),
                 calls: HashMap::new(),
@@ -292,23 +349,40 @@ impl<S: LogSink, C: Clock> Node<S, C> {
     }
 
     /// A node that continues its chain after a restart: `entries` are all the entries its
-    /// sink holds, from seq 0. The generations they name become the floors of the records;
-    /// grants are not restored (owners grant again).
+    /// sink holds, from seq 0. The generations they name become the floors of the records, and
+    /// the devices and last issue times of the owners come back. Grants do not: owners grant
+    /// again, and the node holds no user key it did not get after the restart.
     pub fn restore(key: NodeKey, sink: S, clock: C, entries: &[SignedEntry]) -> Result<Self> {
-        let node = Self::with_log(Log::resume(key, entries)?, sink, clock);
+        let seal = SealSecret::of(&key);
+        let node = Self::with_log(Log::resume(key, entries)?, seal, sink, clock);
         {
             let mut state = node.lock();
             for signed in entries {
                 let e = &signed.entry;
-                let generation = match &e.event {
+                match &e.event {
                     Event::Use { generation, .. }
                     | Event::Stream { generation, .. }
                     | Event::Derive { generation, .. }
                     | Event::Update { generation, .. }
-                    | Event::Pin { generation } => *generation,
-                    _ => continue,
-                };
-                state.raise(&e.owner, &e.record_id, generation);
+                    | Event::Pin { generation } => {
+                        state.raise(&e.owner, &e.record_id, *generation);
+                    }
+                    Event::Grant {
+                        device,
+                        issued_ms,
+                        pins,
+                        ..
+                    } => {
+                        state.know_device(&e.owner, *device);
+                        state.issued(&e.owner, *issued_ms);
+                        for pin in pins {
+                            state.raise(&e.owner, &pin.record_id, pin.generation);
+                        }
+                    }
+                    Event::Device { device } => state.know_device(&e.owner, *device),
+                    Event::Revoke { issued_ms, .. } => state.issued(&e.owner, *issued_ms),
+                    Event::Done { .. } => {}
+                }
             }
         }
         Ok(node)
@@ -323,6 +397,11 @@ impl<S: LogSink, C: Clock> Node<S, C> {
     /// The key that verifies the log of this node.
     pub fn public_key(&self) -> NodePublicKey {
         self.public
+    }
+
+    /// The keys an owner needs to grant to this node and to check its log.
+    pub fn identity(&self) -> NodeIdentity {
+        self.identity
     }
 
     /// Runs `f` with the log sink.
@@ -347,47 +426,74 @@ impl<S: LogSink, C: Clock> Node<S, C> {
         self.lock().log.reconcile(stored)
     }
 
-    /// Takes the user key of `owner` until `expires_ms` (at most [`MAX_GRANT_MS`] from now).
-    /// When a grant with the same user key is in force, `device` is added to its devices;
-    /// otherwise the grant replaces it. The entry is confirmed before the key is kept.
-    pub fn grant(
-        &self,
-        owner: &str,
-        user_key: UserKey,
-        device: DevicePublicKey,
-        expires_ms: u64,
-    ) -> Result<()> {
-        check_name(owner)?;
+    /// Opens a grant sealed to this node and takes the user key it carries.
+    ///
+    /// The device that signed it must be one the node knows for the owner, unless the owner
+    /// has none yet (the first grant) or the user key is the one of the grant in force (a new
+    /// device of the owner). The grant must be fresh and newer than the last grant or
+    /// revocation of the owner. The entry is confirmed before the key is kept; the pins of the
+    /// grant raise the floors of its records.
+    pub fn grant(&self, sealed: &SealedGrant) -> Result<()> {
+        let OpenedGrant {
+            terms,
+            device,
+            user_key,
+        } = sealed.open(&self.seal, &self.public)?;
+        check_name(&terms.owner)?;
+        if terms.pins.len() > crate::grant::MAX_PINS {
+            return Err(Error::GrantInvalid {
+                rule: "too many pins",
+            });
+        }
+        for pin in &terms.pins {
+            check_name(&pin.record_id)?;
+        }
         let now = self.clock.now_ms();
-        let expires_ms = expires_ms.min(now.saturating_add(MAX_GRANT_MS));
+        let expires_ms = terms.expires_ms.min(now.saturating_add(MAX_GRANT_MS));
         if expires_ms <= now {
             return Err(Error::GrantExpired);
         }
+        let owner = terms.owner.as_str();
         let mut state = self.lock();
-        state.commit(now, (owner, "", ""), Event::Grant { expires_ms, device })?;
-        let mut devices = match state.grant_of(owner, now) {
-            Ok(old) if old.user_key.same(&user_key) => old.devices.clone(),
-            _ => Vec::new(),
-        };
-        if !devices.contains(&device) {
-            devices.push(device);
+        state.check_issued(owner, terms.issued_ms, now)?;
+        let known = state.devices(owner);
+        let same_key = state
+            .grant_of(owner, now)
+            .is_ok_and(|g| g.user_key.same(&user_key));
+        if !known.is_empty() && !known.contains(&device) && !same_key {
+            return Err(Error::GrantDenied);
+        }
+        state.commit(
+            now,
+            (owner, "", ""),
+            Event::Grant {
+                expires_ms,
+                device,
+                issued_ms: terms.issued_ms,
+                pins: terms.pins.clone(),
+            },
+        )?;
+        state.know_device(owner, device);
+        state.issued(owner, terms.issued_ms);
+        for pin in &terms.pins {
+            state.raise(owner, &pin.record_id, pin.generation);
         }
         state.grants.insert(
             owner.to_string(),
             Grant {
                 user_key: Arc::new(user_key),
-                devices,
                 expires_ms,
             },
         );
         Ok(())
     }
 
-    /// Adds a device a device of the grant endorsed.
+    /// Adds a device a known device of the owner endorsed.
     pub fn add_device(&self, endorsement: &Endorsement) -> Result<()> {
         let now = self.clock.now_ms();
         let mut state = self.lock();
-        endorsement.verify(&state.grant_of(&endorsement.owner, now)?.devices)?;
+        state.grant_of(&endorsement.owner, now)?;
+        endorsement.verify(&state.devices(&endorsement.owner))?;
         state.commit(
             now,
             (&endorsement.owner, "", ""),
@@ -395,21 +501,36 @@ impl<S: LogSink, C: Clock> Node<S, C> {
                 device: endorsement.device,
             },
         )?;
-        if let Some(grant) = state.grants.get_mut(&endorsement.owner) {
-            if !grant.devices.contains(&endorsement.device) {
-                grant.devices.push(endorsement.device);
-            }
-        }
+        state.know_device(&endorsement.owner, endorsement.device);
         Ok(())
     }
 
-    /// Erases the user key of `owner` first, then records the revoke. An operation already
-    /// running finishes with the key it took.
-    pub fn revoke(&self, owner: &str) -> Result<()> {
+    /// Erases the user key of the owner, as a known device of the owner signed, then records
+    /// the revoke. An operation already running finishes with the key it took.
+    pub fn revoke(&self, revocation: &Revocation) -> Result<()> {
+        if revocation.node != self.public {
+            return Err(Error::GrantInvalid {
+                rule: "revocation for another node",
+            });
+        }
+        revocation.verify()?;
         let now = self.clock.now_ms();
+        let owner = revocation.owner.as_str();
         let mut state = self.lock();
+        if !state.devices(owner).contains(&revocation.device) {
+            return Err(Error::GrantDenied);
+        }
+        state.check_issued(owner, revocation.issued_ms, now)?;
         state.grants.remove(owner);
-        state.commit(now, (owner, "", ""), Event::Revoke)?;
+        state.issued(owner, revocation.issued_ms);
+        state.commit(
+            now,
+            (owner, "", ""),
+            Event::Revoke {
+                issued_ms: revocation.issued_ms,
+                device: revocation.device,
+            },
+        )?;
         Ok(())
     }
 
@@ -418,7 +539,8 @@ impl<S: LogSink, C: Clock> Node<S, C> {
     pub fn pin(&self, pin: &Pin) -> Result<()> {
         let now = self.clock.now_ms();
         let mut state = self.lock();
-        pin.verify(&state.grant_of(&pin.owner, now)?.devices)?;
+        state.grant_of(&pin.owner, now)?;
+        pin.verify(&state.devices(&pin.owner))?;
         state.commit(
             now,
             (&pin.owner, &pin.record_id, ""),
@@ -441,9 +563,9 @@ impl<S: LogSink, C: Clock> Node<S, C> {
     ) -> Result<(&'r Policy, &'r Operation, Checked)> {
         let (user_key, devices) = {
             let mut state = self.lock();
-            let need = state.floor(record);
-            let grant = state.grant_of(&record.owner, now)?;
-            let found = (grant.user_key.clone(), grant.devices.clone());
+            let user_key = state.grant_of(&record.owner, now)?.user_key.clone();
+            let need = state.floor(record).ok_or(Error::RecordUnpinned)?;
+            let found = (user_key, state.devices(&record.owner));
             if record.generation < need {
                 return Err(Error::RecordStale {
                     have: record.generation,
@@ -612,15 +734,18 @@ impl<S: LogSink, C: Clock> Node<S, C> {
                 now,
                 &budget,
             )?;
-            let event = Event::Use {
-                operation: name.to_string(),
-                generation: updated.as_ref().unwrap_or(record).generation,
+            let detail = Detail::Use {
                 method: outbound.method,
                 host: outbound.destination.host.clone(),
                 port: outbound.destination.port,
                 path: outbound.path.to_string(),
                 body_sha256: Sha256::digest(outbound.body).into(),
                 body_len: outbound.body.len() as u64,
+            };
+            let event = Event::Use {
+                operation: name.to_string(),
+                generation: updated.as_ref().unwrap_or(record).generation,
+                detail: detail.seal(&user_key, &record.owner, &record.id)?,
             };
             let (seq, confirmed) = self.lock().commit(now, who, event)?;
             log_seqs.push(seq);
@@ -808,13 +933,16 @@ impl<S: LogSink, C: Clock> Node<S, C> {
             checked.caller.as_str(),
         );
 
-        let event = Event::Stream {
-            operation: name.to_string(),
-            generation: record.generation,
+        let detail = Detail::Stream {
             host: destination.host.clone(),
             port: destination.port,
             sends_sha256: payload.sha256(),
             exchanges: u32::try_from(exchanges.len()).unwrap_or(u32::MAX),
+        };
+        let event = Event::Stream {
+            operation: name.to_string(),
+            generation: record.generation,
+            detail: detail.seal(&user_key, &record.owner, &record.id)?,
         };
         let (seq, confirmed) = self.lock().commit(now, who, event)?;
 
@@ -946,11 +1074,14 @@ impl<S: LogSink, C: Clock> Node<S, C> {
             budget: &budget,
         };
         let output = template.render(&ctx)?;
+        let detail = Detail::Derive {
+            input_sha256: Sha256::digest(input).into(),
+            input_len: input.len() as u64,
+        };
         let event = Event::Derive {
             operation: operation.to_string(),
             generation: record.generation,
-            input_sha256: Sha256::digest(input).into(),
-            input_len: input.len() as u64,
+            detail: detail.seal(&checked.policy_owner, &record.owner, &record.id)?,
         };
         self.lock()
             .commit(now, (&record.owner, &record.id, &checked.caller), event)?;

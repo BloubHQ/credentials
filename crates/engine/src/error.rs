@@ -48,6 +48,16 @@ pub enum Error {
     /// The grant of the owner ended.
     #[error("grant expired")]
     GrantExpired,
+    /// A sealed grant or a revocation is malformed, not for this node, or stale.
+    #[error("grant invalid: {rule}")]
+    GrantInvalid {
+        /// Which rule.
+        rule: &'static str,
+    },
+    /// The device that signed a grant or a revocation is not one this node knows for the
+    /// owner.
+    #[error("device not known for this owner")]
+    GrantDenied,
     /// The policy breaks a rule. `at` is the path of the part, such as
     /// `operations[0].steps[1].inject[2]`.
     #[error("policy invalid at {at}: {rule}")]
@@ -70,6 +80,10 @@ pub enum Error {
     /// The record did not decrypt under the user key of the grant.
     #[error("record could not be opened")]
     RecordOpen,
+    /// No device of the owner pinned this record on this node (in a grant or with a pin), so
+    /// the node cannot tell whether it is the newest.
+    #[error("record not pinned by its owner")]
+    RecordUnpinned,
     /// The record is older than one this node saw or the owner pinned (a rollback).
     #[error("record generation {have} is older than {need}")]
     RecordStale {

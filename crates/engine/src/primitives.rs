@@ -419,8 +419,10 @@ fn k256_key(bytes: &[u8]) -> Result<k256::ecdsa::SigningKey> {
     k256::ecdsa::SigningKey::from_pkcs8_der(bytes).map_err(|_| Error::KeyInvalid)
 }
 
-/// RSA signing with ring. ring does not erase the parsed key when it is dropped; see the
-/// README.
+/// RSA signing with ring. ring keeps no copy of the key in memory it frees itself, but its
+/// key structure is not erased on drop: run nodes with a zeroizing allocator (see the README).
+/// RustCrypto `rsa` 0.10 was measured to leave more unerased copies (11 blocks per signature
+/// against 1), from temporaries while it parses and checks the key.
 fn rsa_sign(key: &[u8], message: &[u8], pss: bool) -> Result<Bytes> {
     use ring::signature::{RSA_PKCS1_SHA256, RSA_PSS_SHA256, RsaKeyPair};
     let pair = RsaKeyPair::from_pkcs8(key)
@@ -439,12 +441,15 @@ fn rsa_sign(key: &[u8], message: &[u8], pss: bool) -> Result<Bytes> {
 }
 
 fn p384_sign(key: &[u8], message: &[u8]) -> Result<Bytes> {
-    use ring::signature::{ECDSA_P384_SHA384_FIXED_SIGNING, EcdsaKeyPair};
-    let rng = ring::rand::SystemRandom::new();
-    let pair = EcdsaKeyPair::from_pkcs8(&ECDSA_P384_SHA384_FIXED_SIGNING, key, &rng)
-        .map_err(|_| Error::KeyInvalid)?;
-    let signature = pair.sign(&rng, message).map_err(|_| Error::KeyInvalid)?;
-    Ok(Zeroizing::new(signature.as_ref().to_vec()))
+    use p384::ecdsa::signature::Signer as _;
+    use p384::pkcs8::DecodePrivateKey as _;
+    let key = if key.len() == 48 {
+        p384::ecdsa::SigningKey::from_slice(key).map_err(|_| Error::KeyInvalid)?
+    } else {
+        p384::ecdsa::SigningKey::from_pkcs8_der(key).map_err(|_| Error::KeyInvalid)?
+    };
+    let signature: p384::ecdsa::Signature = key.try_sign(message).map_err(|_| Error::KeyInvalid)?;
+    Ok(Zeroizing::new(signature.to_bytes().to_vec()))
 }
 
 fn aes_gcm(key: &[u8], nonce: &[u8], message: &[u8], aad: &[u8]) -> Result<Bytes> {

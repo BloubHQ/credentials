@@ -1,0 +1,15 @@
+name: Feature
+description: A credential or protocol you cannot express, or another improvement.
+labels: [enhancement]
+body:
+  - type: textarea
+    id: need
+    attributes:
+      label: What do you need to do?
+      description: For a credential, describe the protocol and what a policy would have to say.
+    validations:
+      required: true
+  - type: textarea
+    id: tried
+    attributes:
+      label: What did you try with the current policy language?

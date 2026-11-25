@@ -201,6 +201,10 @@ impl DeviceKey {
 }
 
 impl UserKey {
+    pub(crate) fn bytes(&self) -> &[u8; KEY_LEN] {
+        self.0.expose()
+    }
+
     /// True when both hold the same bytes, compared in constant time.
     pub(crate) fn same(&self, other: &UserKey) -> bool {
         self.0

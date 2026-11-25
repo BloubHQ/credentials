@@ -179,7 +179,7 @@ funcs! {
     Ed25519Sign = "ed25519_sign"(2, 2): "`ed25519_sign(key, message)`; key raw 32 bytes or PKCS#8 DER (one-way).",
     P256Sign = "p256_sign"(2, 2): "ECDSA P-256 SHA-256, `r || s`; key raw 32 bytes or PKCS#8 DER (one-way).",
     P256SignDer = "p256_sign_der"(2, 2): "ECDSA P-256 SHA-256, DER (one-way).",
-    P384Sign = "p384_sign"(2, 2): "ECDSA P-384 SHA-384, `r || s`; key PKCS#8 DER (one-way).",
+    P384Sign = "p384_sign"(2, 2): "ECDSA P-384 SHA-384, `r || s`; key raw 48 bytes or PKCS#8 DER (one-way).",
     K256Sign = "k256_sign"(2, 2): "ECDSA secp256k1 SHA-256, `r || s` with low s; key raw 32 bytes or PKCS#8 DER (one-way).",
     K256SignRecoverable = "k256_sign_recoverable"(2, 2): "`k256_sign_recoverable(key, digest32)`: `r || s || v`, v = 27 + recovery id (one-way).",
     RsaSignPkcs1Sha256 = "rsa_sign_pkcs1_sha256"(2, 2): "RSASSA-PKCS1-v1_5 SHA-256 (RS256); key PKCS#8 or PKCS#1 DER (one-way).",
@@ -259,6 +259,9 @@ impl Func {
 pub enum NameKind {
     /// A secret field.
     SecretField,
+    /// A secret field with few possible values (a PIN, a password): anything computed from
+    /// it without a strong secret key can be found by trying values.
+    GuessableField,
     /// A public field.
     PublicField,
     /// A captured value marked secret.
@@ -273,6 +276,7 @@ struct Info {
     controlled: bool,
     secret_key: bool,
     has_nonce: bool,
+    guessable: bool,
 }
 
 impl Info {
@@ -453,6 +457,11 @@ fn analyze(expr: &Expr, kind: &dyn Fn(&str) -> NameKind) -> core::result::Result
                 secret_key: true,
                 ..Info::default()
             },
+            NameKind::GuessableField => Info {
+                tainted: true,
+                guessable: true,
+                ..Info::default()
+            },
             NameKind::PublicField => Info::default(),
             NameKind::SecretTemp => Info {
                 tainted: true,
@@ -479,6 +488,7 @@ fn analyze(expr: &Expr, kind: &dyn Fn(&str) -> NameKind) -> core::result::Result
                 controlled: infos.iter().any(|i| i.controlled),
                 secret_key: false,
                 has_nonce: infos.iter().any(|i| i.has_nonce),
+                guessable: infos.iter().any(|i| i.guessable),
             }
         }
         Expr::Call(func, args) => {
@@ -534,11 +544,25 @@ fn call_info(func: Func, args: &[Info]) -> core::result::Result<Info, Rule> {
         | Func::Pbkdf2Sha256 => at(0).secret_key,
         _ => false,
     };
+    // A guessable value stays guessable unless a strong secret key hides it with no public
+    // check: a keyed MAC or an encryption. A signature does not hide it (the public key checks
+    // a guess), nor does a slow hash. Its length alone is not the value.
+    let any_guessable = args.iter().any(|i| i.guessable);
+    let guessable = match func {
+        Func::Len => false,
+        Func::HmacSha1
+        | Func::HmacSha256
+        | Func::HmacSha512
+        | Func::AesGcmEncrypt
+        | Func::AesCbcEncrypt => any_guessable && !(at(0).secret_key && !at(0).guessable),
+        _ => any_guessable,
+    };
     Ok(Info {
         tainted,
         controlled: any_controlled,
         secret_key,
         has_nonce: args.iter().any(|i| i.has_nonce),
+        guessable,
     })
 }
 
@@ -626,6 +650,19 @@ impl Template {
             tainted |= analyze(expr, kind)?.tainted;
         }
         Ok(tainted)
+    }
+
+    /// True when the output depends on a guessable field in a way a guess can be checked
+    /// against (a template that breaks a rule counts as guessable).
+    pub fn guessable(&self, kind: &dyn Fn(&str) -> NameKind) -> bool {
+        let mut guessable = false;
+        for expr in self.exprs() {
+            match analyze(expr, kind) {
+                Ok(info) => guessable |= info.guessable,
+                Err(_) => return true,
+            }
+        }
+        guessable
     }
 
     /// True when the output can give a secret back (a template that breaks a rule counts as
