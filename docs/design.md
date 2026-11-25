@@ -373,8 +373,9 @@ Measured example (Naver login page, `login.js?v=20260918`, read 2026-11-25): the
 goes in `eccpw`. The page fetches `/login/dynamicEcKey/<dynamicKey>` (`sessionKey,serverKey`),
 makes an ephemeral P-256 key, hashes the ECDH x-coordinate's hex string with SHA-256 into an
 AES-256-CBC key, and encrypts `len·sessionKey·len·id·len·pw` under a random IV; the form sends
-`ciphertext,iv,ephemeralPublicKey,sessionKey`. That is case 1 with three additions
-(ephemeral ECDH, a one-byte length encoder, a random IV). The anti-bot `wtoken` comes from a
+`ciphertext,iv,ephemeralPublicKey,sessionKey`. That is case 1 once the generic families
+of section 8d are in (ECDH on every standard curve, fixed-width integer encoders, random bytes);
+no function is ever added for one site. The anti-bot `wtoken` comes from a
 separate captcha script whose callback receives no credentials, and the page empties the id
 and password fields before calling it: case 2. `bvsd` is sent empty by this page version.
 
@@ -387,6 +388,10 @@ changes on every load needs the hash left unpinned, which the approval screen fl
 speed and audit surface in its pull request.
 
 ## 8d. Primitives shipped up front
+
+Functions are never added for a site. They are added as whole families (every curve, every
+hash width, every integer width) taken from standards, so that what one site needs is already
+there for the next.
 
 Primitives are the one part that needs a release, so the first release that adds a group
 adds all of it, taken from the registries (IANA JOSE, COSE, SASL, SSH, TLS signature schemes,
