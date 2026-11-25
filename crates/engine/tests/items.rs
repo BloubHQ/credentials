@@ -190,7 +190,10 @@ fn describe_returns_the_masked_view_and_is_logged() {
     // No secret value in any form in what goes back.
     let json = serde_json::to_string(&description).unwrap();
     for secret in ["4242424242424242", "12/27", "737"] {
-        assert!(!json.contains(secret), "{secret} in {json}");
+        assert!(
+            !json.contains(secret),
+            "a secret value is in the description"
+        );
     }
     assert_eq!(describes(&s), 1);
     let entries = s.node.with_sink(|sink| sink.entries().to_vec());

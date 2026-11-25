@@ -1113,7 +1113,10 @@ fn describe_returns_public_and_masked_fields_never_secret_ones() {
     );
     let text = serde_json::to_string(&d).unwrap();
     for secret in ["4242424242424242", "12/27", "123\""] {
-        assert!(!text.contains(secret), "{secret}");
+        assert!(
+            !text.contains(secret),
+            "a secret value is in the description"
+        );
     }
     // A public field of the kind that the policy keeps secret is not described.
     let mut private = card();

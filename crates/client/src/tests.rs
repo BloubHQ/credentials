@@ -710,7 +710,10 @@ fn a_typed_record_is_sealed_described_and_never_read() {
     let text = serde_json::to_string(&description).unwrap();
     assert!(text.contains("visa"), "{text}");
     for secret in ["4242424242424242", "12/40", "737"] {
-        assert!(!text.contains(secret), "{secret}: {text}");
+        assert!(
+            !text.contains(secret),
+            "a secret value is in the description"
+        );
     }
 }
 
