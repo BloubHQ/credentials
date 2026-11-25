@@ -50,21 +50,49 @@ They are visible, by necessity, to: the owner's device; the node; the destinatio
 for browser fills, the cloud browser (Kernel) and the site's own page. Section 9 lists every
 value against every place.
 
-## 2. Layers
+## 2. Architecture: three layers
 
-```
-typed items     card · login · oauth · identity · totp · ssh · database · ftp · mail · api
-sessions        login sessions · protocol sessions · challenges · approvals
-engine          fields · signed policies · templates · captures · log          (exists)
-transports      HTTP/1.1 · HTTP/2 · WebSocket · streamed responses · TLS/mTLS · text streams ·
-                protocol modules · UDP relay · CDP fill
-```
+Security does not come from limiting what the node can compute. It comes from two things:
+where a value derived from a secret may go, and who wrote the code that touches the secret.
+The node is built on those two axes, in three layers.
 
-Everything below *typed items* exists in some form today; the work adds to each layer without
-replacing the engine. A typed item is a record whose fields and policy follow a schema the node
-knows, so an agent asks for "the card item, at this merchant" instead of writing a policy.
+| Layer | What | How it changes |
+| --- | --- | --- |
+| **1. Primitive library** | every cryptographic family of the standards (Appendices A, B), encodings, and protocol codecs: TLS, HTTP/1.1, HTTP/2, HTTP/3, WebSocket, SSH, SASL, database handshakes, mail, EAP, Kerberos | the only compiled part; maintenance releases |
+| **2. Policy IR** | one step language for every operation: open a connection, send, receive, capture, compute, wait for a challenge or approval, relay; bounded loops and branches; a request and response contract on every send and receive (section 2a); exact static taint analysis | data; an agent drafts it, the owner signs the summary |
+| **3. Trusted code sandbox** | WebAssembly (a JavaScript engine runs inside it as a module) that may compute on secret bytes, only when the code comes from the destination's own origin (hash pinned) or from a reviewed library signed in a release; its output goes only to that destination | data; no release |
 
-## 3. Typed items
+One rule joins them: **what an agent writes reaches secrets only as analysable data (layer 2);
+arbitrary code (layer 3) reaches secrets only when it was written by a party already trusted
+with them.**
+
+Today's operation kinds (`http`, `stream`, `derive`) and the planned ones (`socket`,
+`session`, `fill`, `vend`, `verify`, `run`, tunnels) all become step sequences over
+connection kinds of layer 1. Typed items, templates for known sites and approval flows are
+data on top. A typed item is a record whose fields and policy follow a schema, so an agent asks
+for "the card item, at this merchant" instead of writing a policy.
+
+## 2a. Request and response contracts
+
+The signed policy bounds what goes out and what comes back, not only where it goes. Measured
+in the engine on 2026-11-25 (tests in the pull request that fixes them), each of these let a
+caller choose what the owner's policy should have fixed:
+
+| Gap | Contract that closes it |
+| --- | --- |
+| `derive` signs any caller input: a caller-chosen 1000 ETH transfer was signed with the owner's key | input schema per format (JSON, RLP, EIP-712, raw): fixed members, allowed values, numeric bounds, node-set times; spending limits and approvals (section 8b) apply to signatures |
+| query cannot be pinned, and the whole response is returned: an example STS policy signed `GetSessionToken` for 36 hours and handed the new secret key to the caller | `query` allow-list per name (fixed or allowed values, unknown and repeated names refused); response projection: only the declared status, headers and JSON members return to the caller |
+| a caller query parameter placed before the injected one shadows it | injected names may not appear in the caller's query |
+| `..;`, `%252e%252e`, `..%3b` pass the path prefix check | segment check after stripping `;` parameters and after one more decoding; `%25` refused in strict mode |
+| `_method=DELETE` overrides the method through a parameter | reserved parameter names refused by default, as the override headers already are |
+| a path placeholder lands where the caller puts it, also in its query | placeholders only as whole path segments; `paths` as templates matched exactly |
+| after a stream login, caller commands are relayed unchecked (`RCPT TO` anyone) | allowed caller send patterns per stream (linear regular expressions) |
+| JWT `exp` came from the caller | `add` (merged in the primitives pull request) and numeric members, so times are node-set |
+
+Body schemas use the same form as input schemas: JSON pointer to fixed value, allowed values
+or numeric bounds; form and multipart bodies are parsed and checked the same way.
+
+## 3. Typed items## 3. Typed items
 
 Each kind fixes its field names, their **disclosure level**, validation and default policies.
 
@@ -315,40 +343,17 @@ The enclave reaches the network only through TCP connections the host relays (vs
 | Delegation | family members, a colleague's agent | an owner grants another owner's callers a narrower policy on an item; revocable, logged on both sides |
 | Emergency access | when the owner is gone | a delegate whose access opens after a waiting period the owner can cancel from a device |
 
-## 8c. Extension modules: schemes no list names
+## 8c. Flows no list names
 
-Policies are already open: an agent writes one for any site, and any scheme that is a
-composition of the template functions and the step kinds works without a node release. Two
-things are closed: the **primitives** (a scheme needing a function the node lacks, such as
-SEED or SRP arithmetic) and the **control flow** (the template language has no loops,
-branches or binary framing, on purpose, so the taint analysis stays exact). An **auth module**
-opens the second: a WebAssembly module that describes one scheme, run by the node in a sandbox (`wasmtime`-style, fuel and memory limits,
-no clock, no randomness and no I/O of its own).
+Control flow lives in the policy IR (layer 2): bounded loops, branches on captured values,
+binary framing through the codecs, retries on a server nonce. Agent-written flows therefore
+stay analysable, and the earlier idea of agent-written WebAssembly over secret handles is
+dropped: it would duplicate the IR with a weaker analysis.
 
-- **Secrets are handles.** A module never reads a secret's bytes. It gets opaque handles and
-  calls the node's functions with them: the template functions (hashes, MACs, signatures,
-  ciphers, encodings), `send`/`expect` on the connection the policy allows, `capture` into
-  fields or temps. A handle can flow into an output only through a function the template
-  analysis already admits (one-way, encryption under a pinned key, a signature); the same
-  taint rules as section 4 of the policy document apply to every call.
-- **The owner signs the module.** Its hash is part of the policy the owner signs, so a module
-  is as trusted as a policy and no more; the approval screen shows the module's declared
-  destinations and outputs. Reviewed modules ship with the release (in PCR2); others come
-  with a policy like an agent draft, with the risk flags of section 4.
-- **What a module cannot do** is decided by the node, not by the module: destinations, methods,
-  reflection scrubbing, limits and the log stay with the node.
-
-Modules written by an agent or owner never compute on secret bytes themselves: even with the
-output confined to the site, a module could encode the secret in a field the site echoes back
-(a nickname, a search term) under a transform the reflection filter cannot recognise. A site
-that needs a primitive the node lacks is still served without a release: its own script runs
-in the node (section 8e, case 3), since code from the site's own origin is trusted with the
-secret exactly as much as the site is. A native primitive is added in a later maintenance
-release only when measurements show the script path is too slow or too large.
-
-**Implementation.** crate `module` (WASM runtime, the handle table, the host functions mapped
-onto `engine::template`), operation kind `module`; a fuzz target for module inputs; a module
-SDK in Rust that compiles to `wasm32-unknown-unknown`.
+Code that must compute on secret bytes is layer 3 and is never written by an agent or an
+owner: even with the output confined to the site, such code could encode the secret in a field
+the site echoes back (a nickname, a search term) under a transform the reflection filter
+cannot recognise.
 
 ## 8e. Running the site's own code
 
@@ -363,7 +368,7 @@ ways, in order of preference:
    an input; it gives the caller nothing it did not have.
 3. **Site code in the node**: the node fetches the script or module **from the site's own
    origin** (the URL and, optionally, a hash pinned in the signed policy), runs it in a sandbox
-   (a JavaScript engine compiled into the node, or the WASM runtime of section 8c, with no I/O,
+   (the WebAssembly sandbox of layer 3, a JavaScript engine running inside it, with no I/O,
    fuel and memory limits, and only the browser APIs the policy lists, emulated), passes it the
    secret, and treats its whole output as **tainted**: it can only go into the request to that
    same site, never back to the caller. The site already receives the secret, so running its
@@ -383,9 +388,10 @@ Limits: code that needs a real browser environment (DOM, canvas, timing, the own
 cannot be emulated faithfully and goes through a browser fill (section 6); a site whose code
 changes on every load needs the hash left unpinned, which the approval screen flags.
 
-**Implementation.** operation step `run {script, entry, inputs}` in `engine`; the engine choice
-(an embeddable JavaScript interpreter in pure Rust versus QuickJS) is decided by measured size,
-speed and audit surface in its pull request.
+**Implementation.** this is layer 3: IR step `run {module, entry, inputs}`; one WebAssembly
+runtime in the node, and a JavaScript engine compiled to WebAssembly as a reviewed module, so
+there is one sandbox to audit. Runtime and engine are chosen by measured size, speed and audit
+surface in their pull request.
 
 ## 8d. Primitives shipped up front
 
@@ -433,20 +439,17 @@ each, or a node hands its grants to a peer of the same release.
 
 | # | Part | Depends on |
 | --- | --- | --- |
-| 1 | Reflection scrubbing everywhere; algorithm gaps; `rsa_encrypt_*`; `html`/`regex` capture | |
-| 2 | Typed items, disclosure levels, `describe`, reviewed templates | 1 |
-| 3 | Policy JSON Schema, `client::summarize` with risk flags, approval format | 2 |
-| 4 | Sessions and challenges (`await` step, mail-read codes, app answers) | 2 |
-| 5 | Browser fills over CDP (Kernel), card and login items | 3, 4 |
-| 6 | Protocol tunnels: SSH, PostgreSQL, MySQL, Redis, FTP/FTPS first; then MongoDB, MSSQL, LDAP, SMB; RDP/VNC last | 2 |
-| 7 | HTTP/2 and gRPC; WebSocket; streamed responses and long-connection limits | 1 |
-| 7b | Queue and messaging protocols (MQTT, AMQP, Kafka, NATS, STOMP, XMPP), Telnet, Kerberos | 6 |
-| 7c | UDP relay; WireGuard, QUIC, SIP, RADIUS; IPsec last | 6 |
-| 8 | Node hand-over and successor statements | 2 |
-| 9 | Key backup and device transfer in `client` (Keychain, Block Store, 6-digit transfer) | |
-| 10 | Section 8a: payload ciphers and Korean certificates; OAuth 1.0a, DPoP, SigV4A, NTLM, SAML, SRP; software passkeys; generated and rotated secrets; `verify` and `decrypt`; proxies; ssh-agent; OpenPGP | 2 |
-| 11 | Section 8b: spending limits, `vend`, SASL XOAUTH2, delegation, emergency access | 2, 5 |
-| 12 | Section 8c: auth modules (WASM, secrets as handles, signed by the owner) | 1, 3 |
+| 1 | Primitive families, `html`/`regex` captures (done in the primitives pull request) | |
+| 2 | Policy IR: one step language replacing `http`/`stream`/`derive`, with the contracts of section 2a, response projection and the path fixes; existing policies converted by a tool | 1 |
+| 3 | Typed items, disclosure levels, `describe`, custom kinds | 2 |
+| 4 | Policy JSON Schema, `client::summarize` with risk flags, approval format | 2, 3 |
+| 5 | Sessions, challenges, approvals, spending limits | 2 |
+| 6 | Connection kinds in layer 1: HTTP/2, WebSocket, streamed responses, then SSH, databases, FTP, mail, queues; tunnels as an IR relay step | 2 |
+| 7 | Trusted code sandbox (layer 3): WebAssembly runtime, JavaScript module, origin-pinned site code | 2 |
+| 8 | Browser fills over CDP | 4, 5 |
+| 9 | Remaining primitive families (Appendices A, B), UDP relay and its protocols | 1 |
+| 10 | Node hand-over; key backup and device transfer in `client` | 3 |
+| 11 | Section 8a and 8b schemes as IR policies and reviewed modules | 6, 7 |
 
 Each part adds its rows to `docs/threat-model.md`, fuzz targets for any new parser, and
 measured results in its pull request.
