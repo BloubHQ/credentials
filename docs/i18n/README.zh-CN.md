@@ -355,8 +355,9 @@ Rust 1.97.1 镜像中，使用 `--locked`、设为提交时间的 `SOURCE_DATE_E
 Amazon Linux 2023 镜像中，由 `nitro-cli build-enclave` 生成 `enclave.eif`。`measurements.json` 记录发布
 版本、提交、PCR0、PCR1、PCR2，以及每项输入（镜像、提交中的文件、nitro-cli 添加的内核和 init、程序本身）
 的 SHA-256。`build/reproduce.sh` 构建两次，第二次不使用任何缓存，度量值不一致则失败；CI 在 enclave 或其
-构建每次变更时运行它，每个发布版本都附带 `enclave.eif` 和 `measurements.json`（包含在 `SHA256SUMS` 和
-构建来源证明中），并在发布说明中列出度量值。EIF 文件本身每次构建都不同（其元数据包含构建时间）；
+构建每次变更时运行它，每个发布版本都附带 `enclave.eif`、`measurements.json` 和程序的 SBOM
+`enclave-<tag>.cdx.json`（包含在 `SHA256SUMS` 和构建来源证明中；`credentials` 二进制文件的 SBOM 为
+`credentials-<tag>.cdx.json`），并在发布说明中列出度量值。EIF 文件本身每次构建都不同（其元数据包含构建时间）；
 其 PCR 则不变。
 
 ### 运行

@@ -380,8 +380,9 @@ digest で固定し `aws-nitro-enclaves-cli` をバージョンで固定した A
 PCR0、PCR1、PCR2、そしてすべての入力 (イメージ、コミットのファイル、nitro-cli が加えるカーネルと init、
 プログラム) の SHA-256 が入ります。`build/reproduce.sh` は 2 回ビルドし、2 回目はキャッシュを一切使わず、
 計測値が一致しなければ失敗します。CI はエンクレーブやそのビルドが変わるたびにこれを実行し、各リリースは
-`enclave.eif` と `measurements.json` を添付し (`SHA256SUMS` とビルドの来歴 (provenance) アテステーションに
-含まれる)、リリースノートに計測値を載せます。EIF ファイル自体はビルドごとに異なります (メタデータに
+`enclave.eif`、`measurements.json`、プログラムの SBOM `enclave-<tag>.cdx.json` を添付し (`SHA256SUMS`
+とビルドの来歴 (provenance) アテステーションに含まれる。`credentials` バイナリの SBOM は
+`credentials-<tag>.cdx.json`)、リリースノートに計測値を載せます。EIF ファイル自体はビルドごとに異なります (メタデータに
 ビルド時刻が入る) が、PCR は変わりません。
 
 ### 実行する

@@ -92,6 +92,10 @@ before 1.0, minor versions may break formats and APIs.
 
 ### Changed
 
+- Releases attach one CycloneDX SBOM per shipped artifact instead of one per crate:
+  `credentials-<tag>.cdx.json` for the `credentials` binary (every target's dependencies) and
+  `enclave-<tag>.cdx.json` for the enclave program (`x86_64-unknown-linux-musl`), both in
+  `SHA256SUMS` and the provenance attestation.
 - Crate layout: the vsock wire between an enclave and its host (ports, the `CONNECT` tunnel,
   the log protocol, `RelaySink`, vsock) moved from `server::relay` to the new `relay` crate,
   and `credentials host` to the new `host` library crate (`host::run`, its own error type);

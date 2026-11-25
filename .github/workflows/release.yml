@@ -114,13 +114,19 @@ jobs:
       - uses: taiki-e/install-action@fe3acb53a98b62c772db35de75ce0e4595e7ca8c # v2.90.8
         with:
           tool: cargo-cyclonedx
-      - name: Generate the SBOM
+      # One SBOM per shipped artifact, each with its whole dependency tree. cargo-cyclonedx
+      # writes <package>/<package>.cdx.json for every workspace member; only the packages of
+      # the two artifacts are kept: `cli` (the `credentials` binary, built for Linux, macOS and
+      # Windows, so every target's dependencies) and `enclave` (the program in enclave.eif,
+      # built for x86_64-unknown-linux-musl).
+      - name: Generate the SBOMs
         run: |
-          cargo cyclonedx --format json --spec-version 1.5
-          for sbom in $(find crates -name '*.cdx.json'); do
-            cp "$sbom" "dist/$(basename "$sbom" .cdx.json)-$GITHUB_REF_NAME.cdx.json"
-          done
+          cargo cyclonedx --format json --spec-version 1.5 --target all
+          cp crates/cli/cli.cdx.json "dist/credentials-$GITHUB_REF_NAME.cdx.json"
+          cargo cyclonedx --format json --spec-version 1.5 --target x86_64-unknown-linux-musl
+          cp crates/enclave/enclave.cdx.json "dist/enclave-$GITHUB_REF_NAME.cdx.json"
           ls dist/*.cdx.json
+          test "$(find dist -name '*.cdx.json' | wc -l)" -eq 2
       - name: Checksums
         working-directory: dist
         run: |

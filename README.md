@@ -381,9 +381,10 @@ digest, with `--locked`, `SOURCE_DATE_EPOCH` set to the commit time and paths re
 release, the commit, PCR0, PCR1, PCR2 and the SHA-256 of every input (images, files of the
 commit, the kernel and init that nitro-cli adds, the program). `build/reproduce.sh` builds
 twice, the second time without any cache, and fails unless the measurements are the same; CI
-runs it on every change to the enclave or its build, and each release attaches `enclave.eif`
-and `measurements.json` (in `SHA256SUMS` and the build provenance attestation) and prints the
-measurements in its notes. The EIF file itself differs between builds (its metadata holds the
+runs it on every change to the enclave or its build, and each release attaches `enclave.eif`,
+`measurements.json` and the SBOM of the program, `enclave-<tag>.cdx.json` (in `SHA256SUMS` and
+the build provenance attestation; the `credentials` binaries have theirs,
+`credentials-<tag>.cdx.json`), and prints the measurements in its notes. The EIF file itself differs between builds (its metadata holds the
 build time); its PCRs do not.
 
 ### Run it

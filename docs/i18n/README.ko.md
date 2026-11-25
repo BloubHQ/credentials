@@ -374,8 +374,9 @@ build/reproduce.sh --release dev --out out   # needs git and Docker with buildx
 `enclave.eif`를 만듭니다. `measurements.json`에는 릴리스, 커밋, PCR0, PCR1, PCR2, 그리고 모든 입력(이미지,
 커밋의 파일, nitro-cli가 추가하는 커널과 init, 프로그램)의 SHA-256이 담깁니다. `build/reproduce.sh`는 두 번
 빌드하며 두 번째는 캐시 없이 빌드하고, 측정값이 같지 않으면 실패합니다. CI는 enclave나 그 빌드가 바뀔
-때마다 이를 실행하고, 각 릴리스는 `enclave.eif`와 `measurements.json`을 첨부하며(`SHA256SUMS`와 빌드
-출처(provenance) 증명에 포함) 릴리스 노트에 측정값을 싣습니다. EIF 파일 자체는 빌드마다 다르지만(메타데이터에
+때마다 이를 실행하고, 각 릴리스는 `enclave.eif`, `measurements.json`, 프로그램의 SBOM
+`enclave-<tag>.cdx.json`을 첨부하며(`SHA256SUMS`와 빌드 출처(provenance) 증명에 포함, `credentials`
+바이너리의 SBOM은 `credentials-<tag>.cdx.json`) 릴리스 노트에 측정값을 싣습니다. EIF 파일 자체는 빌드마다 다르지만(메타데이터에
 빌드 시각이 들어감), PCR은 같습니다.
 
 ### 실행
