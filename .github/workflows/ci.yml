@@ -78,6 +78,9 @@ jobs:
         working-directory: fuzz
         run: |
           cargo +nightly fuzz build --target x86_64-unknown-linux-gnu
+          # Real attestation documents seed the parser target.
+          mkdir -p corpus/attestation
+          cp ../crates/attest/tests/fixtures/*.cbor corpus/attestation/
           for target in $(cargo +nightly fuzz list); do
             echo "::group::$target"
             cargo +nightly fuzz run --target x86_64-unknown-linux-gnu "$target" -- -max_total_time=60
