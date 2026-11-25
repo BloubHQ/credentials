@@ -31,6 +31,7 @@ use crate::egress::Stream;
 use crate::egress::{ClientIdentity, Transport, dispatch, open_stream};
 use crate::fields::Fields;
 use crate::grant::{NodeIdentity, NodeSealKey, OpenedGrant, Revocation, SealSecret, SealedGrant};
+use crate::item::Description;
 use crate::keys::{DevicePublicKey, Endorsement, NodeKey, NodePublicKey, Retirement, UserKey};
 use crate::log::{Detail, Event, Log, LogSink, SignedEntry, SignedHead};
 use crate::policy::{
@@ -44,7 +45,7 @@ use crate::response::{Http, MAX_RESPONSE};
 use crate::template::{Budget, Context, Template, Temps, Var};
 use crate::{Error, Result};
 
-pub use crate::caller::CallerExchange;
+pub use crate::caller::{CallerExchange, DESCRIBE};
 pub use crate::response::Response;
 
 /// Longest grant: 30 days.
@@ -452,6 +453,16 @@ impl<S: LogSink, C: Clock> Node<S, C> {
                     .map(Output::Derive),
                 record: None,
             },
+            Body::Describe {} => Outcome {
+                result: if operation == DESCRIBE {
+                    self.describe(record, auth).map(Output::Describe)
+                } else {
+                    Err(Error::OperationUnknown {
+                        name: operation.to_string(),
+                    })
+                },
+                record: None,
+            },
         }
     }
 
@@ -505,6 +516,7 @@ impl<S: LogSink, C: Clock> Node<S, C> {
                 let e = &signed.entry;
                 match &e.event {
                     Event::Use { generation, .. }
+                    | Event::Describe { generation }
                     | Event::Stream { generation, .. }
                     | Event::Derive { generation, .. }
                     | Event::Update { generation, .. }
@@ -788,6 +800,23 @@ impl<S: LogSink, C: Clock> Node<S, C> {
         payload: &Payload<'_>,
         now: u64,
     ) -> Result<(&'r Policy, &'r Operation, Checked)> {
+        let (policy, operation, checked) = self.check_auth(record, name, auth, payload, now)?;
+        let operation = operation.ok_or_else(|| Error::OperationUnknown {
+            name: name.to_string(),
+        })?;
+        Ok((policy, operation, checked))
+    }
+
+    /// [`Node::check_call`] for an operation of the policy, or for [`DESCRIBE`] (any caller
+    /// the policy lists, no operation).
+    fn check_auth<'r>(
+        &self,
+        record: &'r Record,
+        name: &str,
+        auth: &Authorization,
+        payload: &Payload<'_>,
+        now: u64,
+    ) -> Result<(&'r Policy, Option<&'r Operation>, Checked)> {
         // The state of the owner (grant, floor) is told only to a caller whose signature
         // verifies; anyone else learns nothing about the owner's grants or records.
         let (grant, floor, devices) = {
@@ -798,20 +827,31 @@ impl<S: LogSink, C: Clock> Node<S, C> {
             (grant, state.floor(record), state.devices(&record.owner))
         };
         let policy = record.policy.verify_any(&devices)?;
-        let operation = policy.operation(name)?;
-        // A call whose payload does not fit the connection of the operation is refused
-        // before it spends a nonce or the rate limit.
-        let kind_ok = matches!(
-            (operation.connection(), payload),
-            (Some(Connection::Https), Payload::Http(_))
-                | (Some(Connection::Tls), Payload::Stream { .. })
-                | (None, Payload::Derive(_))
-        );
-        if !kind_ok {
-            return Err(operation.unknown());
-        }
+        let operation = match payload {
+            Payload::Describe if name == DESCRIBE => None,
+            Payload::Describe => {
+                return Err(Error::OperationUnknown {
+                    name: name.to_string(),
+                });
+            }
+            _ => {
+                let operation = policy.operation(name)?;
+                // A call whose payload does not fit the connection of the operation is
+                // refused before it spends a nonce or the rate limit.
+                let kind_ok = matches!(
+                    (operation.connection(), payload),
+                    (Some(Connection::Https), Payload::Http(_))
+                        | (Some(Connection::Tls), Payload::Stream { .. })
+                        | (None, Payload::Derive(_))
+                );
+                if !kind_ok {
+                    return Err(operation.unknown());
+                }
+                Some(operation)
+            }
+        };
         let caller = policy.caller(&auth.caller)?;
-        if !caller.operations.iter().any(|o| o == name) {
+        if operation.is_some() && !caller.operations.iter().any(|o| o == name) {
             return Err(Error::CallerDenied {
                 caller: auth.caller.clone(),
                 operation: name.to_string(),
@@ -886,7 +926,33 @@ impl<S: LogSink, C: Clock> Node<S, C> {
         let fields = record.open(user_key)?;
         self.lock()
             .raise(&record.owner, &record.id, record.generation);
+        // A typed item is checked against its kind each time, with the clock: an expired card
+        // or a value that no longer equals its pin is refused before anything is logged.
+        crate::item::check_values(&record.policy.policy, &fields, Some(self.clock.now_ms()))?;
         Ok(fields)
+    }
+
+    /// What the caller of `auth` may learn of the typed item `record`: its public fields and
+    /// the projections of its masked ones ([`crate::item::describe`]), never a secret field.
+    /// Any caller the policy lists may ask; the authorization is signed for the operation
+    /// [`DESCRIBE`] with the payload [`Payload::Describe`]. The node logs it like a use.
+    pub fn describe(&self, record: &Record, auth: &Authorization) -> Result<Description> {
+        let now = self.clock.now_ms();
+        let (policy, _, checked) =
+            self.check_auth(record, DESCRIBE, auth, &Payload::Describe, now)?;
+        if policy.item.is_none() {
+            return Err(Error::NotAnItem);
+        }
+        let fields = self.open(record, &checked.policy_owner)?;
+        let description = crate::item::describe(policy, &fields)?;
+        self.lock().commit(
+            now,
+            (&record.owner, &record.id, &checked.caller),
+            Event::Describe {
+                generation: record.generation,
+            },
+        )?;
+        Ok(description)
     }
 
     /// Runs the HTTPS operation `operation` of `record` for the caller of `auth`. `request` is
@@ -1005,6 +1071,7 @@ impl<S: LogSink, C: Clock> Node<S, C> {
         // request leaves no entry and reaches no server.
         let mut input = Vec::new();
         match payload {
+            Payload::Describe => return Err(operation.unknown()),
             Payload::Http(request) => match (request, operation.takes_request()) {
                 (Some(request), true) => request.validate(operation)?,
                 (None, false) => {}
@@ -1073,6 +1140,7 @@ impl<S: LogSink, C: Clock> Node<S, C> {
                 )
                 .map(Output::Stream),
             Payload::Derive(given) => self.run_local(&mut run, given, input).map(Output::Derive),
+            Payload::Describe => Err(operation.unknown()),
         }
     }
 

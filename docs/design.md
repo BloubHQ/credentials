@@ -441,8 +441,8 @@ each, or a node hands its grants to a peer of the same release.
 | --- | --- | --- |
 | 1 | Primitive families, `html`/`regex` captures (done in the primitives pull request) | |
 | 2 | Policy IR: one step language replacing `http`/`stream`/`derive`, with the contracts of section 2a, response projection and the path fixes; existing policies converted by a tool | 1 |
-| 3 | Typed items, disclosure levels, `describe`, custom kinds | 2 |
-| 4 | Policy JSON Schema, `client::summarize` with risk flags, approval format | 2, 3 |
+| 3 | Typed items, disclosure levels, `describe`, custom kinds (done: `docs/policy.md`, Typed items) | 2 |
+| 4 | Policy JSON Schema, `client::summarize` with risk flags, approval format (done: `docs/policy.md`; the approval runtime is part 5) | 2, 3 |
 | 5 | Sessions, challenges, approvals, spending limits | 2 |
 | 6 | Connection kinds in layer 1: HTTP/2, WebSocket, streamed responses, then SSH, databases, FTP, mail, queues; tunnels as an IR relay step | 2 |
 | 7 | Trusted code sandbox (layer 3): WebAssembly runtime, JavaScript module, origin-pinned site code | 2 |

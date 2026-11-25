@@ -215,6 +215,18 @@ let outcome = node.run(&call, &mut TlsTransport::new());
 | TOTP | 无连接：`{{ totp(b32decode(seed)) }}` |
 | 双向 TLS | `open` 的 `"identity": {"cert": "{{cert}}", "key": "{{key}}"}` |
 
+**类型化条目。** 策略可以把记录绑定到一种类型（kind）：`card`、`login`、`oauth`、`identity`、
+`totp`、`ssh`、`database`、`ftp`、`mail`、`queue`、`vpn`、`api`，或由所有者设备签名的自定义
+类型。类型规定每个字段是 secret、masked 还是 public，检查取值（Luhn、按节点时钟判断的有效期、
+按卡品牌的安全码长度、精确的 origin、SSH 主机密钥、未经签署例外则必须 TLS），并限定其策略能做
+什么；即使已签名，节点也会拒绝比类型更宽的类型化策略。调用方可以对类型化记录执行 `describe`，
+只得到公开字段和 `visa ••••4242` 之类的掩码值，绝不会得到 secret 字段。
+
+**签名之前。** `summarize` 按每个 secret 列出它能去哪里、以什么形式、返回什么，以及风险标记
+（条目 origin 之外的目的地、通配符、明文 HTTP、接受任意字节的输入、可逆的输出、中继，以及新
+版本相对旧版本放宽的一切）。该格式有 JSON Schema：`crates/engine/policy.schema.json`。详见
+[docs/policy.md](../policy.md)。
+
 ## 记录、代数与回滚
 
 记录就是那些字段，用 ChaCha20-Poly1305 加密，密钥由用户密钥和记录 id 派生，

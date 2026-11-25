@@ -13,6 +13,7 @@ fn caller() -> Caller {
 
 fn one(fields: Vec<FieldSpec>, operation: Operation) -> Policy {
     Policy {
+        item: None,
         fields,
         callers: vec![caller()],
         operations: vec![operation],

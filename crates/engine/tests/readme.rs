@@ -108,6 +108,7 @@ fn the_policy_reference_parses() {
                     "secret",
                 ];
                 let policy = Policy {
+                    item: None,
                     fields: names
                         .iter()
                         .map(|n| match *n {
@@ -128,6 +129,9 @@ fn the_policy_reference_parses() {
             let parses = serde_json::from_str::<Step>(&value).is_ok()
                 || serde_json::from_str::<FieldSpec>(&value).is_ok()
                 || serde_json::from_str::<QueryRule>(&value).is_ok()
+                || serde_json::from_str::<engine::item::ItemBinding>(&value).is_ok()
+                || serde_json::from_str::<engine::item::KindSchema>(&value)
+                    .is_ok_and(|k| k.validate().is_ok())
                 || serde_json::from_str::<serde_json::Value>(&value)
                     .is_ok_and(|v| v.get("key").is_some() && v.get("operations").is_some());
             assert!(parses, "docs/policy.md block does not parse:\n{value}");

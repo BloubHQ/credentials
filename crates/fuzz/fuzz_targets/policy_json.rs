@@ -12,6 +12,8 @@ fuzz_target!(|data: &[u8]| {
         return;
     };
     let _ = policy.summary();
+    let _ = engine::policy::summarize(&policy, Some(&policy));
+    let _ = engine::policy::summarize(&policy, Some(&Policy::new()));
     // A fixed key keeps runs reproducible; the key does not change which rules are checked.
     let device = DeviceKey::from_bytes(&mut [7u8; 32]);
     let _ = device.sign_policy(policy);

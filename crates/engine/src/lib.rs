@@ -83,6 +83,7 @@
 //! # }
 //! ```
 
+pub mod approval;
 pub mod build;
 pub mod call;
 pub mod caller;
@@ -92,6 +93,7 @@ pub mod error;
 pub mod extract;
 pub mod fields;
 pub mod grant;
+pub mod item;
 pub mod keys;
 pub mod log;
 pub mod node;

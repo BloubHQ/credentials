@@ -30,6 +30,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::encoding::{b64_array, canonical};
+use crate::item::ItemBinding;
 use crate::keys::{CallerPublicKey, DeviceKey, DevicePublicKey};
 use crate::template::{NameKind, Props, Template, Var};
 use crate::{Error, Result};
@@ -37,6 +38,11 @@ use crate::{Error, Result};
 mod contract;
 mod input;
 pub mod legacy;
+mod schema;
+pub mod summary;
+
+pub use schema::JSON_SCHEMA;
+pub use summary::{Summary, summarize};
 
 pub(crate) use contract::placeholders;
 pub use contract::{
@@ -956,6 +962,11 @@ impl<'p> Kinds<'p> {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Policy {
+    /// The kind of item the record is, with the owner's choices: the policy then stays within
+    /// the shape of the kind ([`crate::item::check_policy`]). Absent for a record without a
+    /// kind.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub item: Option<ItemBinding>,
     /// The fields of the record.
     pub fields: Vec<FieldSpec>,
     /// Who may use them.
@@ -1693,7 +1704,11 @@ impl Policy {
         for (i, operation) in self.operations.iter().enumerate() {
             self.check_operation(&format!("operations[{i}]"), operation)?;
         }
-        self.check_callers()
+        self.check_callers()?;
+        match &self.item {
+            Some(binding) => crate::item::check_policy(self, binding),
+            None => Ok(()),
+        }
     }
 
     /// What the policy allows, in plain lines, for the owner to read before signing. Lines
@@ -1928,6 +1943,10 @@ impl SignedPolicy {
             .any(|d| d.verify(&message, &self.signature).is_ok())
         {
             return Err(Error::PolicySignature);
+        }
+        // A custom kind is signed on its own too: a device of the same owner vouches for it.
+        if let Some(custom) = self.policy.item.as_ref().and_then(|i| i.custom.as_ref()) {
+            custom.verify_any(devices)?;
         }
         self.policy.validate()?;
         Ok(&self.policy)

@@ -7,7 +7,8 @@ it needs a nightly compiler.
 | Target | Input | Checks |
 | --- | --- | --- |
 | `template_parse` | Bytes, read as lossy UTF-8 | `Template::parse`, then `names`, `vars`, `analyze`, `tainted` and `guessable` with every kind of name; a template that breaks a rule must count as tainted and guessable. |
-| `policy_json` | JSON | `Policy` deserialization (the step language), `Policy::summary`, and `DeviceKey::sign_policy`, which checks every rule; bad policies must be refused with an error, never a panic. |
+| `policy_json` | JSON | `Policy` deserialization (the step language), `Policy::summary`, `policy::summarize` against itself and an empty policy, and `DeviceKey::sign_policy`, which checks every rule; bad policies must be refused with an error, never a panic. |
+| `kind_schema` | A line of JSON, then a value | `KindSchema` deserialization and `validate`, `check_value` of the value on every field with and without a clock, `sign_kind`, then a policy binding the kind with the value as every pin and field: `validate`, `item::check_values`, `item::describe`, `summarize`; errors, never a panic. |
 | `policy_upgrade` | JSON of the format before steps | `policy::legacy::upgrade_json`, then `summary` and `sign_policy` on the result; a conversion always has notes, and nothing panics. |
 | `caller_request` | A byte choosing one of two fixed contracts, then the JSON of a `Request` | `Request::validate`, the caller contract (path templates, query rules, override names, injected names); an accepted path holds no dot segment and no encoded `.`, `/` or ``. |
 | `input_schema` | A byte choosing a JSON, RLP or raw schema, then the input | `Input::apply`; what a schema accepts it accepts again once checked. |

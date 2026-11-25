@@ -361,6 +361,7 @@ fn f1_the_query_is_pinned_and_the_response_projected() {
         .query(QueryRule::fixed("Action", "GetCallerIdentity"))
         .query(QueryRule::fixed("Version", "2011-06-15"));
     let policy = Policy {
+        item: None,
         fields: vec![
             FieldSpec::public("access_key"),
             FieldSpec::secret("secret_key"),
@@ -439,6 +440,7 @@ fn f2_the_caller_cannot_send_a_name_the_policy_injects() {
     ];
     // An owner cannot list a name it injects for the caller either.
     let listed = Policy {
+        item: None,
         fields: vec![FieldSpec::secret("token")],
         callers: vec![],
         operations: vec![https_op(
@@ -456,6 +458,7 @@ fn f2_the_caller_cannot_send_a_name_the_policy_injects() {
     assert!(matches!(at_signing, Error::PolicyInvalid { .. }));
 
     let policy = Policy {
+        item: None,
         fields: vec![FieldSpec::secret("token")],
         callers: vec![],
         operations: vec![https_op(
@@ -493,6 +496,7 @@ fn f3_path_tricks_are_never_sent() {
     let clock = clock();
     let api = Destination::https("api.example.com");
     let policy = Policy {
+        item: None,
         fields: vec![FieldSpec::secret("token")],
         callers: vec![],
         operations: vec![https_op(
@@ -523,6 +527,7 @@ fn f3_path_tricks_are_never_sent() {
 
     // With `%25` allowed, the second decoding still finds the dot segments.
     let lenient = Policy {
+        item: None,
         fields: vec![FieldSpec::secret("token")],
         callers: vec![],
         operations: vec![https_op(
@@ -549,6 +554,7 @@ fn f4_method_override_parameters_are_refused() {
     let clock = clock();
     let api = Destination::https("api.example.com");
     let policy = Policy {
+        item: None,
         fields: vec![FieldSpec::secret("token")],
         callers: vec![],
         operations: vec![https_op(
@@ -585,6 +591,7 @@ fn f4_method_override_parameters_are_refused() {
 
     // A contract that lists `_method` must also say it allows overrides.
     let listed = Policy {
+        item: None,
         fields: vec![FieldSpec::secret("token")],
         callers: vec![],
         operations: vec![https_op(
@@ -615,6 +622,7 @@ fn f5_path_parameters_go_only_where_the_template_says() {
         "{{account}}",
     )];
     let policy = Policy {
+        item: None,
         fields: vec![FieldSpec::secret("account")],
         callers: vec![],
         operations: vec![https_op(
@@ -684,6 +692,7 @@ fn f5_path_parameters_go_only_where_the_template_says() {
 
     // A placeholder that is not a whole segment of a template is refused at signing.
     let partial = Policy {
+        item: None,
         fields: vec![FieldSpec::secret("account")],
         callers: vec![],
         operations: vec![https_op(
@@ -734,6 +743,7 @@ fn f6_the_input_schema_bounds_what_the_key_signs() {
 
     // Reading `$input` without a schema is refused at signing.
     let undeclared = Policy {
+        item: None,
         fields: vec![FieldSpec::secret("key")],
         callers: vec![],
         operations: vec![Operation::derive("derive", template)],
@@ -745,6 +755,7 @@ fn f6_the_input_schema_bounds_what_the_key_signs() {
     assert!(matches!(at_signing, Error::PolicyInvalid { .. }));
 
     let policy = Policy {
+        item: None,
         fields: vec![FieldSpec::secret("key")],
         callers: vec![],
         operations: vec![Operation::derive("derive", template).input(transfer_schema())],
@@ -809,6 +820,7 @@ fn f7_a_stream_relays_only_the_sends_the_policy_lists() {
     let clock = clock();
     let smtp = Destination::new("smtp.example.com", 465);
     let login = |relay: Return| Policy {
+        item: None,
         fields: vec![FieldSpec::public("user"), FieldSpec::secret("password")],
         callers: vec![],
         operations: vec![

@@ -75,6 +75,7 @@ fn a_node_sends_through_tls_and_hands_back_the_response() {
     let caller = CallerKey::generate();
     let user_key = [7u8; 32];
     let policy = Policy {
+        item: None,
         fields: vec![FieldSpec::secret("token")],
         callers: vec![Caller {
             name: "app".into(),

@@ -71,6 +71,35 @@ pub enum Error {
     /// grant.
     #[error("policy signature invalid")]
     PolicySignature,
+    /// A kind schema breaks a rule. `at` is the path of the part, such as `fields[2].checks[0]`.
+    #[error("kind invalid at {at}: {rule}")]
+    KindInvalid {
+        /// Where.
+        at: String,
+        /// Which rule.
+        rule: &'static str,
+    },
+    /// The signature of a custom kind does not verify under a device of the owner.
+    #[error("kind signature invalid")]
+    KindSignature,
+    /// A value of a typed item fails a check of its kind. `field` is its name (names are not
+    /// secret; the value is never part of the error).
+    #[error("field {field} invalid: {rule}")]
+    FieldInvalid {
+        /// The field.
+        field: String,
+        /// Which rule.
+        rule: &'static str,
+    },
+    /// An approval does not fit the summary the node built, or the summary is malformed.
+    #[error("approval invalid: {rule}")]
+    ApprovalInvalid {
+        /// Which rule.
+        rule: &'static str,
+    },
+    /// The record has no kind, so there is nothing a caller may be told of it.
+    #[error("the record is not a typed item")]
+    NotAnItem,
     /// A key could not be read.
     #[error("key invalid")]
     KeyInvalid,

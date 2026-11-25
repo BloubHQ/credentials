@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::Result;
 use crate::caller::{Authorization, CallerExchange, Payload};
+use crate::item::Description;
 use crate::keys::{CallerKey, NodePublicKey};
 use crate::node::{Clock, Response, StreamOutput, SystemClock};
 use crate::policy::Destination;
@@ -38,6 +39,8 @@ pub enum Body {
         #[serde(with = "crate::encoding::b64_vec")]
         input: Vec<u8>,
     },
+    /// The description of a typed item; the operation is [`crate::caller::DESCRIBE`].
+    Describe {},
 }
 
 impl Body {
@@ -51,6 +54,11 @@ impl Body {
     /// An HTTP call whose steps all send requests the policy fixes.
     pub fn http_fixed() -> Self {
         Body::Http { request: None }
+    }
+
+    /// The description of a typed item: sign it for the operation [`crate::caller::DESCRIBE`].
+    pub fn describe() -> Self {
+        Body::Describe {}
     }
 
     /// A derivation of `input`.
@@ -71,6 +79,7 @@ impl Body {
                 exchanges,
             },
             Body::Derive { input } => Payload::Derive(input),
+            Body::Describe {} => Payload::Describe,
         }
     }
 }
@@ -98,6 +107,8 @@ pub enum Output {
     Stream(StreamOutput),
     /// The output of a derivation.
     Derive(Vec<u8>),
+    /// The description of a typed item.
+    Describe(Description),
 }
 
 impl CallerKey {

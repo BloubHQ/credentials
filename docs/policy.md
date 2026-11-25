@@ -7,10 +7,14 @@ and `{"kind": "body", "junk": 1}` are errors, not the plain forms. A device sign
 the rule, for example `policy invalid at operations[0].steps[1].inject[2]: header must be a
 token, not reserved, and set once`. `Policy::summary()` prints a policy as one line per
 field, caller, operation and step, for the owner to read before signing; a line that starts
-with `!` marks something that widens what the caller may do.
+with `!` marks something that widens what the caller may do; `summarize` gives the same in
+structured form with risk flags ([Summaries and risk flags](#summaries-and-risk-flags)).
+The JSON Schema of the format is `crates/engine/policy.schema.json`
+([JSON Schema](#json-schema)).
 
 ```text
 Policy
+├── item:       ItemBinding          optional: a kind of item (see Typed items)
 ├── fields:     [FieldSpec]          1–32
 ├── callers:    [Caller]             1–32
 └── operations: [Operation]          1–16
@@ -364,6 +368,182 @@ one that gives the caller less:
 | An operation that reads `$input` must declare `input`; JSON and RLP schemas are closed; duplicate JSON keys are refused; the checked JSON is written back. | A key signs what the owner bounded, not what a parser disagreement lets through. |
 | One `open` per operation, first; an HTTPS `receive` directly follows its `send`. | Every response read is the one of the request before it, and every step runs on the connection the log names. |
 | Loops and branches are refused. | The analysis does not cover them yet. |
+| A field the kind marks secret or masked must be `secret: true` in the policy. | Masked values are still secrets in transit: the taint analysis and the reflection search must track them. Only `describe` shows the masked projection. |
+| A public field of the kind that the policy keeps secret is not described. | The owner chose to hide it; `describe` follows the policy, not the kind. |
+| Card number, expiry and code are `guessable`. | Each has few enough values (a code has 1,000 to 10,000) that a hash or MAC of it is a lookup table. |
+| A one-time-code seed has at least 128 bits. | RFC 4226 asks for 128 bits and recommends 160; shorter seeds are guessable offline from a few codes. |
+| The expiry is masked to its year only. | Month and year together narrow a card down; the year tells an agent whether it is current. |
+| `describe` works on typed records only. | An untyped record has no schema saying which fields are public; describing it would guess. |
+| Any caller the policy lists may `describe`; there is no separate permission. | What `describe` returns is public or masked by the kind and logged; a caller that may use the item already learns that much from its results. Listing it per caller would be a widening knob with no narrowing value. |
+| ssh and vpn kinds allow no connection yet. | Their protocols do not exist in the node; a TLS stream to port 22 would send a key to a server whose host key nobody checked. |
+| Wildcards, client certificates, relays and whole response bodies are refused unless the kind allows them; the reviewed kinds allow them only for `api`. | A kind exists to make a typical credential safe without the owner reading every line. |
+| Plain HTTP and plain database, FTP or broker connections need a named sign-off in the binding, and are flagged in the summary. | A sign-off is an explicit, signed act of the owner, visible in every summary and diff. |
+
+## Typed items
+
+A policy may bind its record to a **kind of item**: a schema of fields, each `secret`,
+`masked` or `public`, with checks on its value and a **shape** of what a policy of that kind
+may do. The node re-derives the shape from the kind on every signature check and refuses a
+policy that is wider, so a card policy cannot hand back the number even when a device signed
+it.
+
+```json
+{"kind": "login", "pins": {"origin": "https://shop.example"}}
+```
+
+`pins` holds the value of each `pinned` field of the kind (an origin, a host, a port, a host
+key): the policy fixes it, and the sealed record must hold the same value. `signoff` lists
+the flags the owner signs off (`plain_http` for an `http://` origin, `plain` for an
+unencrypted database, FTP or broker connection).
+
+The reviewed kinds ship in the node (`crates/engine/src/items.json`, or `item_kinds()` in the
+`client` crate):
+
+| Kind | Fields (secret · masked · public) | Shape |
+| --- | --- | --- |
+| `card` | cvc · number (brand and last four), expiry (year) · holder, billing | HTTPS to the owner's destinations; JSON members back |
+| `login` | password, totp, session · username (email) · origin (pinned) | HTTPS to the pinned origin only; may capture `session` |
+| `oauth` | client_secret, refresh_token, access_token · — · provider (pinned), client_id, scopes | HTTPS; JSON members back; captures the tokens |
+| `identity` | national_id · name, birth_date, phone, email, address · — | HTTPS; JSON members back |
+| `totp` | seed (≥128 bits) · account · digits, period, issuer | derivations only |
+| `ssh` | password, private_key · — · host, port, host_key (pinned), user | none yet |
+| `database` | password · — · engine, host, port, tls (pinned), database, user, ca | TLS to the pinned host and port; relay allowed |
+| `ftp` | password · — · host, port, mode (pinned), user | TLS to the pinned host and port; relay allowed |
+| `mail` | password, token · user (email) · protocol, host, port (pinned) | TLS to the pinned host and port; relay allowed |
+| `queue` | password, sasl_secret, nkey_seed, client_key · — · protocol, host, port, tls (pinned), user, client_id | TLS to the pinned host and port; relay allowed |
+| `vpn` | private_key, psk · — · protocol, host, port (pinned), peer_public_key, identity | none yet |
+| `api` | free fields, as an untyped record | anything an untyped policy may do; nothing is described |
+
+The checks a field may carry:
+
+| Check | Holds when |
+| --- | --- |
+| `luhn` | 12 to 19 digits whose Luhn checksum holds. |
+| `expiry` | `MM/YY` or `MM/YYYY`, and the node's clock is before the first day of the next month (UTC). Checked when the device seals (by its clock) and by the node on every use (by its own). |
+| `cvc` (`number`) | 3 digits, or 4 for a brand that uses 4 (IIN 34 and 37); 3 or 4 when the brand is unknown. |
+| `origin` | exactly `https://host[:port]`: lower case, no path, query, fragment, user info, wildcard or leading-zero port; `http://` only with the `plain_http` sign-off. |
+| `host` | a lower-case DNS name. |
+| `integer` (`min`, `max`) | a decimal without leading zeros within the bounds. |
+| `length` (`min`, `max`) | the byte length within the bounds. |
+| `pattern` (`regex`) | the whole value matches (the `regex` crate, at most 256 bytes). |
+| `one_of` (`values`) | one of the values, exactly. |
+| `email` | `local@domain`: a local part of at most 64 printable characters, and a lower-case host name of at least two labels. |
+| `date` | `YYYY-MM-DD`, a real day (leap years included). |
+| `base32` (`min_bits`) | RFC 4648 base32 (spaces and padding ignored) of at least that many bits. |
+| `base64_key` (`bytes`) | standard base64 of exactly that many bytes. |
+| `ssh_host_key` | `algorithm base64` whose blob names the same algorithm (`rsa-sha2-*` keys carry `ssh-rsa`; an Ed25519 key is 32 bytes), or `SHA256:` and a 32-byte fingerprint. |
+| `signoff` (`values`, `flag`) | the value is not one of `values`, or the binding signs off `flag`. |
+
+Card brands follow the IIN ranges of ISO/IEC 7812 (Visa, Mastercard, American Express,
+Discover, JCB, Diners Club, UnionPay, Mir); no kind or check names a company or site
+beyond that standard.
+
+A policy of a kind must, beyond every rule of an untyped policy:
+
+- declare only fields of the kind, keep every required field, keep secret and masked fields
+  secret and guessable fields guessable;
+- pin every pinned field it declares, with a value that passes the field's checks, and sign
+  off only flags the kind's checks name;
+- use only the connections of the shape; send only to the pinned origin (`login`) or the
+  pinned host and port (`database`, `ftp`, `mail`, `queue`), with no wildcard unless the
+  shape allows one; use no client certificate, relay or capture the shape does not allow;
+- return no more than the shape: `status` < `json` (JSON members) < `all` (the whole body).
+
+### Custom kinds
+
+The owner's device can sign a kind of its own (`DeviceKey::sign_kind`, `sign_kind` in the
+`client` crate); a policy binds it with `"custom": <signed kind>`. The node checks the
+signature against the owner's known devices like a policy's, and holds the kind to the same
+rules as a reviewed one, so no node release is needed. A custom kind cannot take the name of
+a reviewed kind.
+
+```json
+{"name": "door", "description": "A door code.",
+ "fields": [{"name": "site", "disclosure": "public", "pinned": true, "checks": [{"check": "origin"}]},
+            {"name": "code", "disclosure": "secret", "guessable": true,
+             "checks": [{"check": "pattern", "regex": "[0-9]{6}"}]}],
+ "shape": {"connections": ["https"], "destinations": {"from": "origin", "field": "site"},
+           "returns": "status"}}
+```
+
+### `describe`
+
+A call of operation `:describe` with body `{"kind": "describe"}` on a typed record returns
+the public fields and the masked projection of masked fields, computed by the node, never a
+secret field:
+
+```text
+{"kind": "card", "fields": [{"name": "number", "disclosure": "masked", "value": "visa ••••4242"},
+                            {"name": "expiry", "disclosure": "masked", "value": "2027"},
+                            {"name": "holder", "disclosure": "public", "value": "Jane Doe"}]}
+```
+
+Any caller the policy lists may ask (`sign_describe_call` in the `client` crate). The node
+checks the call's signature like any other, writes a `describe` entry to the log, then
+answers. A record without a kind is refused (`the record is not a typed item`).
+
+Masks: `card` (brand and last four, from 12 digits), `email` (first character and domain),
+`initial` (first character), `year` (of an expiry or a date), `last2` (from 8 characters),
+`last4` (from 12 characters). Shorter values show bullets only.
+
+## Summaries and risk flags
+
+`summarize(policy, previous)` (`engine::policy::summarize`, and `summarize` in the `client`
+crate, which checks the policy first) gives the owner, in JSON:
+
+- per secret field: each place it goes (scheme, host, port), in what form (a header, a query
+  parameter, a path parameter, the body, a client identity, a stream send, or the output of a
+  derivation and whether that is one-way);
+- per operation: the connection and destinations, each request (fixed, or the caller's
+  methods, path templates, headers and query allow-list), the injections, the response
+  projection or relay patterns, and the input schema;
+- the callers with their operations and limits, and the item with its pins and sign-offs;
+- `lines`, the text of `Policy::summary()`;
+- the risk flags, each with a code, a place and words:
+
+| Code | When |
+| --- | --- |
+| `outside_origin` | A destination is not the item's origin or under it. |
+| `wildcard` | A destination is a `*.` pattern. |
+| `plain_http` | The item's origin is `http://`. |
+| `plain_signoff` | The owner signs off another plain-text connection. |
+| `raw_input` | An operation takes any bytes (`{"raw": {}}`). |
+| `derive_reversible` | An output is not one-way: it holds an encryption, a key agreement or an XOR of a secret. |
+| `relay` | A stream relays the caller's sends. |
+| `relay_broad` | A relay pattern matches broadly (`.*`, `.+`, a negated class). |
+| `response_all` | The whole response body goes back. |
+| `query_any` | A caller's query parameter takes any value. |
+| `encoded_percent` | The caller's path may hold `%25`. |
+| `override_params` | The caller may send method-override parameters. |
+| `client_certificate` | A client certificate goes to a destination. |
+| `wider` | Against `previous`: a new destination, method, path, header, query rule, injection, operation, caller or caller key; more of the response; a looser limit; a field made public or not guessable; the item unbound or its pins and sign-offs changed. |
+| `new_destination` | Against `previous`: a destination it did not have. |
+
+What changed without widening (an operation or a caller removed) is listed in `changes`.
+The diff is conservative: a change it cannot rank counts as wider.
+
+## JSON Schema
+
+`crates/engine/policy.schema.json` (`engine::policy::JSON_SCHEMA`, `policy_json_schema()` in
+the `client` crate) is a JSON Schema (draft 2020-12) of the policy, the item binding and
+kinds. It is written by hand and tested: every policy of the README and its translations,
+every block of this reference, the converted fixtures, typed policies and the reviewed kinds
+hold against it, and a member the parser refuses anywhere in them, the schema refuses too. A
+draft that holds is well formed; signing also runs the checks a schema cannot express (the
+analysis, path templates, the shape of the kind).
+
+## Approvals
+
+An operation that needs the owner's approval (part 5 of `docs/design.md` section 11 runs
+them) is described by the node in an `ApprovalSummary`: a random id, the node, owner, record
+and generation, caller and operation, destination and origin, an amount (a decimal and an
+ISO 4217 code), the item's `describe` view and at most 32 lines, created and expiring at
+most five minutes apart. The caller writes no part of it. The owner's device signs an
+`Approval`: the id, the SHA-256 of the summary's canonical bytes (domain
+`approval-summary/v1`), the device and the time, signed under the domain `approval/v1` with
+the node, owner and record. The node accepts it when the id and hash are those of the summary
+it built, the device is a known device of the owner, and it was issued while the summary was
+open. `approve` in the `client` crate refuses a summary of another node or one that lapsed.
 
 ## Converting a policy
 

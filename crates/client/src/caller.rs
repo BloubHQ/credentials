@@ -52,6 +52,25 @@ pub fn sign_call(
     )
 }
 
+/// [`sign_call`] for `describe` on a typed record: the node answers with the public fields and
+/// the masked view of the item, never a secret field. Any caller the policy lists may ask.
+#[cfg_attr(not(target_arch = "wasm32"), uniffi::export)]
+pub fn sign_describe_call(
+    caller_key: String,
+    caller: String,
+    identity_json: String,
+    record_json: String,
+) -> Result<String> {
+    sign(
+        caller_key,
+        &caller,
+        &identity_json,
+        &record_json,
+        engine::caller::DESCRIBE,
+        Body::describe(),
+    )
+}
+
 /// [`sign_call`] for a derivation of `input` (`$input` of the template of the operation).
 #[cfg_attr(not(target_arch = "wasm32"), uniffi::export)]
 pub fn sign_derive_call(

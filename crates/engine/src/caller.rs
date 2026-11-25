@@ -19,6 +19,10 @@ use crate::{Error, Result};
 
 const AUTH_DOMAIN: &[u8] = b"call/v1\0";
 
+/// The operation name a caller signs to ask for the description of a typed item. It is not a
+/// token, so no operation of a policy can have it.
+pub const DESCRIBE: &str = ":describe";
+
 /// The rule of [`Error::CallerInvalid`] when the signature of a call does not verify.
 pub const BAD_SIGNATURE: &str = concat!(
     "signature does not verify: sign the same record generation, operation and request ",
@@ -57,6 +61,8 @@ pub enum Payload<'a> {
     },
     /// A derivation.
     Derive(&'a [u8]),
+    /// The description of a typed item.
+    Describe,
 }
 
 fn part(hasher: &mut Sha256, bytes: &[u8]) {
@@ -103,6 +109,7 @@ impl Payload<'_> {
                 part(&mut h, b"derive");
                 part(&mut h, input);
             }
+            Payload::Describe => part(&mut h, b"describe"),
         }
         h.finalize().into()
     }

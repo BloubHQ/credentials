@@ -226,6 +226,20 @@ policy is signed, every template is analysed:
 | TOTP | no connection: `{{ totp(b32decode(seed)) }}` |
 | Mutual TLS | `open` with `"identity": {"cert": "{{cert}}", "key": "{{key}}"}` |
 
+**Typed items.** A policy may bind its record to a kind: `card`, `login`, `oauth`,
+`identity`, `totp`, `ssh`, `database`, `ftp`, `mail`, `queue`, `vpn`, `api`, or a custom kind
+the owner's device signs. A kind says which fields are secret, masked or public, checks the
+values (Luhn, expiry by the node's clock, code length per card brand, exact origins, SSH host
+keys, TLS unless signed off) and bounds what its policies may do; the node refuses a typed
+policy wider than its kind, even a signed one. A caller may `describe` a typed record and gets
+the public fields and masks such as `visa ••••4242`, never a secret field.
+
+**Before signing.** `summarize` lists, per secret, where it can go and in what form, what
+comes back, and risk flags (a destination outside the item's origin, wildcards, plain HTTP,
+any-bytes inputs, reversible outputs, relays, and everything a new version widens over the
+last). The format has a JSON Schema, `crates/engine/policy.schema.json`. Details in
+[docs/policy.md](docs/policy.md).
+
 ## Records, generations and rollback
 
 A record is the fields, encrypted with ChaCha20-Poly1305 under a key derived from the user

@@ -113,6 +113,9 @@ impl Record {
         check_name(owner)?;
         policy.policy.validate()?;
         check_fields(&policy.policy, fields)?;
+        // A typed item's values pass the checks of its kind (those that need a clock are
+        // checked by the device that seals and by the node, which have one).
+        crate::item::check_values(&policy.policy, fields, None)?;
         let plain = fields.encode()?;
         let nonce: [u8; 12] = Nonce::generate().into();
         let mut record = Record {

@@ -7,6 +7,35 @@ before 1.0, minor versions may break formats and APIs.
 
 ### Added
 
+- Typed items (`docs/design.md` section 11, part 3): a policy may bind its record to a kind
+  (`"item": {"kind": ..., "pins": {...}, "signoff": [...]}`), a schema of secret, masked
+  and public fields with checks and a shape of what its policies may do. Twelve reviewed
+  kinds ship in the node (`card`, `login`, `oauth`, `identity`, `totp`, `ssh`, `database`,
+  `ftp`, `mail`, `queue`, `vpn`, `api`); custom kinds are signed by the owner's device
+  (`DeviceKey::sign_kind`) and checked like policies. The node re-derives the shape on every
+  signature check and refuses a wider policy. Checks: Luhn, expiry (by the node's clock on
+  every use), security code length per IIN brand, exact origins, hosts, integers, lengths,
+  patterns, lists, e-mail addresses, dates, base32 seeds of at least 128 bits, base64 keys,
+  SSH host keys, and owner sign-offs for plain-text connections.
+- `describe` (operation `:describe`, body `{"kind": "describe"}`): the public fields and
+  the node-computed masked projections of a typed record, never a secret field; any listed
+  caller, logged as a `describe` entry.
+- `engine::policy::summarize(policy, previous)`: per secret, where it can go and in what
+  form; per operation, requests, projections and inputs; risk flags (`outside_origin`,
+  `wildcard`, `plain_http`, `plain_signoff`, `raw_input`, `derive_reversible`, `relay`,
+  `relay_broad`, `response_all`, `query_any`, `encoded_percent`, `override_params`,
+  `client_certificate`, `wider`, `new_destination`) and the diff against a previous version.
+- `crates/engine/policy.schema.json` (`engine::policy::JSON_SCHEMA`): a JSON Schema (draft
+  2020-12) of the policy IR, item bindings and kinds, tested against every policy of the
+  README, its translations, `docs/policy.md`, the converted fixtures and the reviewed kinds.
+- Approvals (`engine::approval`): the format of the node-built `ApprovalSummary`, its
+  SHA-256, the owner device's `Approval` over it and its verification. Parking an operation
+  until the approval arrives is part 5.
+- `client` crate: `summarize`, `policy_json_schema`, `item_kinds`, `sign_kind`,
+  `sign_describe_call`, `approval_hash`, `approve` (UniFFI and wasm); `seal_record` checks a
+  typed record's values against its kind by the device's clock.
+- Fuzz target `kind_schema`; `policy_json` also summarizes.
+
 - `compute` steps: a template rendered into a name later steps read, with exactly the
   properties of its template in the analysis.
 - Input schemas for operations with no connection: `raw` (length, pattern), `json` (closed:
@@ -177,6 +206,11 @@ before 1.0, minor versions may break formats and APIs.
 
 ### Changed
 
+- `Policy` has an optional first member `item`; a policy without it signs and verifies as
+  before. `call::Body::Describe`, `call::Output::Describe`, `caller::Payload::Describe`,
+  `log::Event::Describe` and the errors `KindInvalid`, `KindSignature`, `FieldInvalid`,
+  `ApprovalInvalid` and `NotAnItem` are new variants. `Record::seal` checks a typed record's
+  values against its kind (without a clock); `Node` checks them with its clock on every use.
 - **Policy format (breaking).** Operations are one step language over a connection instead of
   the kinds `http`, `stream` and `derive`: `open` (`https`, `tls`, or none), `send`,
   `receive`, `compute`, `return`; `repeat` and `if` are parsed and refused for now. The policy

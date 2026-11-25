@@ -1,0 +1,216 @@
+{
+  "kinds": [
+    {
+      "name": "card",
+      "description": "A payment card. The number and the code go only to the destinations the owner signs; the caller sees the brand and last four.",
+      "fields": [
+        {"name": "number", "disclosure": "masked", "guessable": true, "mask": "card",
+         "checks": [{"check": "luhn"}]},
+        {"name": "expiry", "disclosure": "masked", "guessable": true, "mask": "year",
+         "checks": [{"check": "expiry"}]},
+        {"name": "cvc", "disclosure": "secret", "guessable": true,
+         "checks": [{"check": "cvc", "number": "number"}]},
+        {"name": "holder", "disclosure": "public", "optional": true,
+         "checks": [{"check": "length", "min": 1, "max": 128}]},
+        {"name": "billing", "disclosure": "public", "optional": true,
+         "checks": [{"check": "length", "min": 1, "max": 512}]}
+      ],
+      "shape": {"connections": ["https"], "destinations": {"from": "owner"}, "returns": "json"}
+    },
+    {
+      "name": "login",
+      "description": "A user name and password for one origin, with an optional one-time-code seed and session.",
+      "fields": [
+        {"name": "origin", "disclosure": "public", "pinned": true,
+         "checks": [{"check": "origin"}]},
+        {"name": "username", "disclosure": "masked", "mask": "email",
+         "checks": [{"check": "length", "min": 1, "max": 256}]},
+        {"name": "password", "disclosure": "secret", "guessable": true},
+        {"name": "totp", "disclosure": "secret", "optional": true,
+         "checks": [{"check": "base32", "min_bits": 128}]},
+        {"name": "session", "disclosure": "secret", "optional": true}
+      ],
+      "shape": {"connections": ["https"], "destinations": {"from": "origin", "field": "origin"},
+                "returns": "all", "captures": ["session"]}
+    },
+    {
+      "name": "oauth",
+      "description": "An OAuth client and its tokens. A refresh captures the new tokens back into the item.",
+      "fields": [
+        {"name": "provider", "disclosure": "public", "pinned": true,
+         "checks": [{"check": "origin"}]},
+        {"name": "client_id", "disclosure": "public",
+         "checks": [{"check": "length", "min": 1, "max": 512}]},
+        {"name": "client_secret", "disclosure": "secret", "optional": true},
+        {"name": "refresh_token", "disclosure": "secret", "optional": true},
+        {"name": "access_token", "disclosure": "secret", "optional": true},
+        {"name": "scopes", "disclosure": "public", "optional": true,
+         "checks": [{"check": "length", "min": 1, "max": 2048}]}
+      ],
+      "shape": {"connections": ["https"], "destinations": {"from": "owner"}, "returns": "json",
+                "captures": ["access_token", "refresh_token"]}
+    },
+    {
+      "name": "identity",
+      "description": "A person's details. Each goes back to the caller masked; the national id never does.",
+      "fields": [
+        {"name": "name", "disclosure": "masked", "mask": "initial",
+         "checks": [{"check": "length", "min": 1, "max": 256}]},
+        {"name": "birth_date", "disclosure": "masked", "optional": true, "guessable": true,
+         "mask": "year", "checks": [{"check": "date"}]},
+        {"name": "phone", "disclosure": "masked", "optional": true, "mask": "last2",
+         "checks": [{"check": "pattern", "regex": "\\+?[0-9 ()-]{4,32}"}]},
+        {"name": "email", "disclosure": "masked", "optional": true, "mask": "email",
+         "checks": [{"check": "email"}]},
+        {"name": "address", "disclosure": "masked", "optional": true, "mask": "initial",
+         "checks": [{"check": "length", "min": 1, "max": 1024}]},
+        {"name": "national_id", "disclosure": "secret", "optional": true, "guessable": true}
+      ],
+      "shape": {"connections": ["https"], "destinations": {"from": "owner"}, "returns": "json"}
+    },
+    {
+      "name": "totp",
+      "description": "A one-time-code seed (RFC 6238). Only derivations read it.",
+      "fields": [
+        {"name": "seed", "disclosure": "secret",
+         "checks": [{"check": "base32", "min_bits": 128}]},
+        {"name": "digits", "disclosure": "public", "optional": true,
+         "checks": [{"check": "integer", "min": 6, "max": 8}]},
+        {"name": "period", "disclosure": "public", "optional": true,
+         "checks": [{"check": "integer", "min": 15, "max": 120}]},
+        {"name": "issuer", "disclosure": "public", "optional": true,
+         "checks": [{"check": "length", "min": 1, "max": 128}]},
+        {"name": "account", "disclosure": "masked", "optional": true, "mask": "email",
+         "checks": [{"check": "length", "min": 1, "max": 256}]}
+      ],
+      "shape": {"connections": ["none"], "destinations": {"from": "owner"}, "returns": "status"}
+    },
+    {
+      "name": "ssh",
+      "description": "An SSH account with the server's host key pinned. No SSH connection kind exists yet, so no operation can use it.",
+      "fields": [
+        {"name": "host", "disclosure": "public", "pinned": true, "checks": [{"check": "host"}]},
+        {"name": "port", "disclosure": "public", "pinned": true,
+         "checks": [{"check": "integer", "min": 1, "max": 65535}]},
+        {"name": "host_key", "disclosure": "public", "pinned": true,
+         "checks": [{"check": "ssh_host_key"}]},
+        {"name": "user", "disclosure": "public",
+         "checks": [{"check": "length", "min": 1, "max": 256}]},
+        {"name": "password", "disclosure": "secret", "optional": true, "guessable": true},
+        {"name": "private_key", "disclosure": "secret", "optional": true}
+      ],
+      "shape": {"connections": [], "destinations": {"from": "host", "host": "host", "port": "port"},
+                "returns": "status"}
+    },
+    {
+      "name": "database",
+      "description": "A database account. TLS is required unless the owner signs off a plain connection.",
+      "fields": [
+        {"name": "engine", "disclosure": "public",
+         "checks": [{"check": "pattern", "regex": "[a-z0-9-]{1,32}"}]},
+        {"name": "host", "disclosure": "public", "pinned": true, "checks": [{"check": "host"}]},
+        {"name": "port", "disclosure": "public", "pinned": true,
+         "checks": [{"check": "integer", "min": 1, "max": 65535}]},
+        {"name": "database", "disclosure": "public", "optional": true,
+         "checks": [{"check": "length", "min": 1, "max": 256}]},
+        {"name": "user", "disclosure": "public",
+         "checks": [{"check": "length", "min": 1, "max": 256}]},
+        {"name": "password", "disclosure": "secret", "guessable": true},
+        {"name": "tls", "disclosure": "public", "pinned": true,
+         "checks": [{"check": "one_of", "values": ["verify-full", "verify-ca", "require", "disable"]},
+                    {"check": "signoff", "values": ["disable"], "flag": "plain"}]},
+        {"name": "ca", "disclosure": "public", "optional": true,
+         "checks": [{"check": "length", "min": 1, "max": 65536}]}
+      ],
+      "shape": {"connections": ["tls"], "destinations": {"from": "host", "host": "host", "port": "port"},
+                "returns": "status", "relay": true}
+    },
+    {
+      "name": "ftp",
+      "description": "An FTP account over TLS (explicit or implicit FTPS). Plain FTP needs the owner's sign-off; SFTP is an ssh item.",
+      "fields": [
+        {"name": "host", "disclosure": "public", "pinned": true, "checks": [{"check": "host"}]},
+        {"name": "port", "disclosure": "public", "pinned": true,
+         "checks": [{"check": "integer", "min": 1, "max": 65535}]},
+        {"name": "mode", "disclosure": "public", "pinned": true,
+         "checks": [{"check": "one_of", "values": ["implicit", "explicit", "plain"]},
+                    {"check": "signoff", "values": ["plain"], "flag": "plain"}]},
+        {"name": "user", "disclosure": "public",
+         "checks": [{"check": "length", "min": 1, "max": 256}]},
+        {"name": "password", "disclosure": "secret", "guessable": true}
+      ],
+      "shape": {"connections": ["tls"], "destinations": {"from": "host", "host": "host", "port": "port"},
+                "returns": "status", "relay": true}
+    },
+    {
+      "name": "mail",
+      "description": "A mailbox over IMAP, SMTP or POP3 with an app password or an OAuth token.",
+      "fields": [
+        {"name": "protocol", "disclosure": "public",
+         "checks": [{"check": "one_of", "values": ["imap", "smtp", "pop3"]}]},
+        {"name": "host", "disclosure": "public", "pinned": true, "checks": [{"check": "host"}]},
+        {"name": "port", "disclosure": "public", "pinned": true,
+         "checks": [{"check": "integer", "min": 1, "max": 65535}]},
+        {"name": "user", "disclosure": "masked", "mask": "email",
+         "checks": [{"check": "length", "min": 1, "max": 256}]},
+        {"name": "password", "disclosure": "secret", "optional": true, "guessable": true},
+        {"name": "token", "disclosure": "secret", "optional": true}
+      ],
+      "shape": {"connections": ["tls"], "destinations": {"from": "host", "host": "host", "port": "port"},
+                "returns": "status", "relay": true}
+    },
+    {
+      "name": "queue",
+      "description": "A message broker account (MQTT, AMQP, Kafka, NATS, STOMP, XMPP). TLS is required unless the owner signs off a plain connection.",
+      "fields": [
+        {"name": "protocol", "disclosure": "public",
+         "checks": [{"check": "one_of", "values": ["mqtt", "amqp", "kafka", "nats", "stomp", "xmpp"]}]},
+        {"name": "host", "disclosure": "public", "pinned": true, "checks": [{"check": "host"}]},
+        {"name": "port", "disclosure": "public", "pinned": true,
+         "checks": [{"check": "integer", "min": 1, "max": 65535}]},
+        {"name": "tls", "disclosure": "public", "pinned": true,
+         "checks": [{"check": "one_of", "values": ["require", "disable"]},
+                    {"check": "signoff", "values": ["disable"], "flag": "plain"}]},
+        {"name": "user", "disclosure": "public", "optional": true,
+         "checks": [{"check": "length", "min": 1, "max": 256}]},
+        {"name": "client_id", "disclosure": "public", "optional": true,
+         "checks": [{"check": "length", "min": 1, "max": 256}]},
+        {"name": "password", "disclosure": "secret", "optional": true, "guessable": true},
+        {"name": "sasl_secret", "disclosure": "secret", "optional": true},
+        {"name": "nkey_seed", "disclosure": "secret", "optional": true},
+        {"name": "client_key", "disclosure": "secret", "optional": true}
+      ],
+      "shape": {"connections": ["tls"], "destinations": {"from": "host", "host": "host", "port": "port"},
+                "returns": "status", "relay": true}
+    },
+    {
+      "name": "vpn",
+      "description": "A WireGuard peer or an IPsec/IKEv2 identity, with its endpoint pinned. No VPN connection kind exists yet, so no operation can use it.",
+      "fields": [
+        {"name": "protocol", "disclosure": "public",
+         "checks": [{"check": "one_of", "values": ["wireguard", "ikev2"]}]},
+        {"name": "host", "disclosure": "public", "pinned": true, "checks": [{"check": "host"}]},
+        {"name": "port", "disclosure": "public", "pinned": true,
+         "checks": [{"check": "integer", "min": 1, "max": 65535}]},
+        {"name": "peer_public_key", "disclosure": "public", "optional": true,
+         "checks": [{"check": "base64_key", "bytes": 32}]},
+        {"name": "private_key", "disclosure": "secret", "optional": true,
+         "checks": [{"check": "base64_key", "bytes": 32}]},
+        {"name": "identity", "disclosure": "public", "optional": true,
+         "checks": [{"check": "length", "min": 1, "max": 256}]},
+        {"name": "psk", "disclosure": "secret", "optional": true}
+      ],
+      "shape": {"connections": [], "destinations": {"from": "host", "host": "host", "port": "port"},
+                "returns": "status"}
+    },
+    {
+      "name": "api",
+      "description": "Free-form fields with a hand-written policy, as records without a kind are. Nothing of it is described to a caller.",
+      "free_fields": true,
+      "fields": [],
+      "shape": {"connections": ["https", "tls", "none"], "destinations": {"from": "owner"},
+                "wildcards": true, "returns": "all", "relay": true, "identity": true,
+                "captures": ["*"]}
+    }
+  ]
+}

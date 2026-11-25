@@ -110,6 +110,10 @@ pub fn seal_record(
             ))
         })?;
     }
+    // A typed record's values are checked against its kind, the expiry of a card by this
+    // device's clock (the node checks it again by its own on every use).
+    engine::item::check_values(&policy.policy, &values, Some(now_ms()))
+        .map_err(ClientError::engine("a value breaks a check of its kind"))?;
     let sealed = Record::seal(&key, &record_id, &owner, policy, &values)
         .map_err(ClientError::engine("cannot seal the record"))?;
     to_json(&sealed)

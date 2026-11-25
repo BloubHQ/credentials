@@ -183,6 +183,7 @@ pub fn upgrade(old: Policy) -> Upgrade {
         .collect();
     Upgrade {
         policy: NewPolicy {
+            item: None,
             fields: old.fields,
             callers: old.callers,
             operations,

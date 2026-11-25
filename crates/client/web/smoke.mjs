@@ -2,7 +2,8 @@
 //
 // It loads the module as a browser would (the `web` target, from bytes), then runs every
 // function that needs no node: keys, nonces, a refused attestation, policies, records, pins,
-// revocations, device changes and calls. Randomness and time come from JavaScript here
+// revocations, device changes, calls, policy summaries, the JSON Schema, kinds of item and
+// approvals. Randomness and time come from JavaScript here
 // (crypto.getRandomValues, Date.now), which is what this test checks beyond the host tests.
 
 import assert from "node:assert/strict";
@@ -96,5 +97,77 @@ const generic = JSON.parse(
   client.signCall(caller, "app", identity, record, "mac", JSON.stringify({ kind: "derive", input: "aGk" })),
 );
 assert.equal(generic.body.input, "aGk");
+
+// A summary of a policy in the step language, with its risk flags: any bytes in, and the
+// whole response body of a wildcard destination back.
+const wide = JSON.stringify({
+  fields: [{ name: "key", secret: true }, { name: "token", secret: true }],
+  callers: [{ name: "app", key: callerPublic, operations: ["mac", "fetch"] }],
+  operations: [
+    {
+      name: "mac",
+      input: { raw: {} },
+      steps: [{ do: "return", template: "{{ hex(hmac_sha256(key, $input)) }}" }],
+    },
+    {
+      name: "fetch",
+      steps: [
+        { do: "open", connection: "https", destinations: [{ host: "*.api.example", port: 443 }] },
+        {
+          do: "send",
+          request: { from: "caller", methods: ["GET"], paths: ["/v1/**"] },
+          inject: [{ target: { kind: "header", name: "Authorization" }, template: "Bearer {{token}}" }],
+        },
+        { do: "return", response: { body: "all" } },
+      ],
+    },
+  ],
+});
+const summary = JSON.parse(client.summarize(wide, policy));
+const flags = summary.flags.map((f) => f.code);
+for (const flag of ["raw_input", "wildcard", "response_all", "wider"]) {
+  assert.ok(flags.includes(flag), `${flag} in ${flags}`);
+}
+const token = summary.secrets.find((s) => s.field === "token");
+assert.deepEqual(token.uses[0].form, { in: "header", name: "Authorization" });
+assert.equal(JSON.parse(client.summarize(policy)).flags.length, 0);
+assert.deepEqual(code(() => client.summarize("{")), ["invalid_input", undefined]);
+
+// The schema, the reviewed kinds, a custom kind.
+assert.equal(JSON.parse(client.policyJsonSchema()).$defs.Policy.type, "object");
+const kinds = JSON.parse(client.itemKinds()).kinds.map((k) => k.name);
+assert.ok(kinds.includes("card") && kinds.includes("ssh"), kinds);
+const kind = {
+  name: "door",
+  description: "A door code.",
+  fields: [{ name: "code", disclosure: "secret", guessable: true }],
+  shape: { connections: ["none"], destinations: { from: "owner" }, returns: "status" },
+};
+assert.equal(JSON.parse(client.signKind(device, JSON.stringify(kind))).kind.name, "door");
+assert.deepEqual(
+  code(() => client.signKind(device, JSON.stringify({ ...kind, name: "card" }))),
+  ["refused", undefined],
+);
+
+// A describe call, and an approval of a summary of this node, now.
+const describe = JSON.parse(client.signDescribeCall(caller, "app", identity, record));
+assert.equal(describe.operation, ":describe");
+assert.deepEqual(describe.body, { kind: "describe" });
+const open = JSON.stringify({
+  id: "AAAAAAAAAAAAAAAAAAAAAA",
+  node: devicePublic,
+  owner: "alice",
+  record_id: "mac",
+  generation: 1,
+  caller: "app",
+  operation: "mac",
+  lines: ["Sign one message"],
+  created_ms: Date.now() - 1000,
+  expires_ms: Date.now() + 60_000,
+});
+assert.equal(client.approvalHash(open).length, 43);
+const approval = JSON.parse(client.approve(device, identity, open));
+assert.equal(approval.device, devicePublic);
+assert.ok(Math.abs(approval.issued_ms - Date.now()) < 60_000);
 
 console.log("web package: smoke test passed");
