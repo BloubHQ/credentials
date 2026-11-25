@@ -277,6 +277,19 @@ The enclave reaches the network only through TCP connections the host relays (vs
 | Secrets made inside the node | new site passwords, rotated API keys, SSH keys | `generate` (random password to a site's rules, key pairs): the value is sealed into the item and never shown; rotation flows change a site's password with the old one and keep only the new |
 | Egress through a proxy | sites that block data-centre addresses, sessions bound to the owner's network | upstream HTTP CONNECT or SOCKS5 (with proxy credentials as secrets), including a relay on the owner's own network |
 
+## 8b. Owner controls and credential vending
+
+| Scheme | Where it is used | Change |
+| --- | --- | --- |
+| Spending limits | real cards, exchange orders, transfers | per item, merchant, day and month limits kept by the node; above them an approval (section 5) |
+| Short-lived credentials handed to the caller | `aws`, `gcloud`, `kubectl`, GitHub Apps, databases with IAM tokens | operation `vend`: the node mints a scoped, short-lived credential from the long-lived secret (STS AssumeRole with a session policy, a GCP downscoped token, a GitHub installation token, an RDS IAM token) and returns only that; the owner's policy sets scope and lifetime |
+| SASL XOAUTH2 / OAUTHBEARER | Gmail, Outlook over IMAP and SMTP | the mail item takes an OAuth token instead of a password |
+| ACME, JWS in general | certificates (Let's Encrypt), any JWS API | account key JWS by derive |
+| Kubernetes | API servers | client certificates and bearer tokens over HTTPS; `exec` credentials through `vend` |
+| SNMPv3 | network devices | USM (HMAC, AES) over the UDP relay |
+| Delegation | family members, a colleague's agent | an owner grants another owner's callers a narrower policy on an item; revocable, logged on both sides |
+| Emergency access | when the owner is gone | a delegate whose access opens after a waiting period the owner can cancel from a device |
+
 ## 9. Who sees what
 
 | Value | Owner device | Node | Destination | Kernel / site page | Service servers | Agent / model |
@@ -322,6 +335,7 @@ each, or a node hands its grants to a peer of the same release.
 | 8 | Node hand-over and successor statements | 2 |
 | 9 | Key backup and device transfer in `client` (Keychain, Block Store, 6-digit transfer) | |
 | 10 | Section 8a: payload ciphers and Korean certificates; OAuth 1.0a, DPoP, SigV4A, NTLM, SAML, SRP; software passkeys; generated and rotated secrets; `verify` and `decrypt`; proxies; ssh-agent; OpenPGP | 2 |
+| 11 | Section 8b: spending limits, `vend`, SASL XOAUTH2, delegation, emergency access | 2, 5 |
 
 Each part adds its rows to `docs/threat-model.md`, fuzz targets for any new parser, and
 measured results in its pull request.
@@ -331,7 +345,9 @@ measured results in its pull request.
 A node in a data centre cannot touch devices near the owner: Bluetooth, NFC, USB security
 keys, smart cards, serial ports. Credentials bound to them (passkeys in a phone's secure
 element, hardware OTP tokens) go through the owner's device each time: an approval or a
-challenge, never a stored secret.
+challenge, never a stored secret. The same holds for proofs that only the owner's phone can
+make: app attestation tokens (Play Integrity, App Attest), Apple Pay and Google Pay, and
+approvals inside another company's app (KakaoTalk, a bank's app push).
 
 ## 13. Open questions
 
