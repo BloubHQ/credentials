@@ -338,9 +338,13 @@ no clock, no randomness and no I/O of its own).
 - **What a module cannot do** is decided by the node, not by the module: destinations, methods,
   reflection scrubbing, limits and the log stay with the node.
 
-Primitives stay closed by design: a module that computed on secret bytes itself could
-return them, so cryptography stays in reviewed node code, and a scheme that needs a new
-primitive waits for the release that adds it.
+Modules written by an agent or owner never compute on secret bytes themselves: even with the
+output confined to the site, a module could encode the secret in a field the site echoes back
+(a nickname, a search term) under a transform the reflection filter cannot recognise. A site
+that needs a primitive the node lacks is still served without a release: its own script runs
+in the node (section 8e, case 3), since code from the site's own origin is trusted with the
+secret exactly as much as the site is. A native primitive is added in a later maintenance
+release only when measurements show the script path is too slow or too large.
 
 **Implementation.** crate `module` (WASM runtime, the handle table, the host functions mapped
 onto `engine::template`), operation kind `module`; a fuzz target for module inputs; a module
