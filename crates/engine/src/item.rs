@@ -910,7 +910,12 @@ fn check_operation(
                 )?;
             }
             // A run step's origin is one of the connection's destinations, checked above.
-            Step::Send(_) | Step::Compute(_) | Step::Run(_) | Step::Repeat(_) | Step::If(_) | Step::Await(_) => {}
+            Step::Send(_)
+            | Step::Compute(_)
+            | Step::Run(_)
+            | Step::Repeat(_)
+            | Step::If(_)
+            | Step::Await(_) => {}
         }
     }
     Ok(())

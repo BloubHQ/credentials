@@ -354,6 +354,20 @@ pub(super) fn check_confined(at: &str, operation: &Operation) -> Checked {
                     }));
                 }
             }
+            // A status request the node polls while it waits is not a request the confined
+            // value may ride on: refused outright.
+            Step::Await(wait) => {
+                if let Some(poll) = &wait.challenge.poll {
+                    for (j, injection) in poll.send.inject.iter().enumerate() {
+                        if reads_any(&injection.template, &confined) {
+                            return fail(
+                                format!("{at}.challenge.poll.send.inject[{j}]"),
+                                "the output of a run step goes only into a request the policy fixes to the origin of its module",
+                            );
+                        }
+                    }
+                }
+            }
             Step::Open(_) | Step::Repeat(_) | Step::If(_) => {}
         }
     }

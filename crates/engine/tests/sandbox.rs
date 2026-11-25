@@ -649,3 +649,38 @@ fn errors_and_echoes_never_carry_the_output() {
         Err(error) => assert_eq!(error, Error::Reflection),
     }
 }
+
+#[test]
+fn the_output_does_not_ride_on_a_status_poll() {
+    // A status request the node polls while it waits is not one the output may go into, even
+    // to the module's own origin.
+    let policy = login_policy(url_module(None), post_login());
+    let mut value = serde_json::to_value(&policy).unwrap();
+    let poll: serde_json::Value = serde_json::json!({
+        "do": "await",
+        "challenge": {
+            "kind": "external",
+            "hint": "Approve the sign-in in the other app",
+            "poll": {
+                "send": {
+                    "request": {"from": "fixed", "method": "GET", "path": "/status",
+                                "destination": serde_json::to_value(login()).unwrap()},
+                    "inject": [{"target": {"kind": "header", "name": "X-Token"},
+                                "template": "{{enc}}"}]
+                },
+                "success": {"source": {"from": "json", "pointer": "/state"},
+                            "one_of": ["approved"]},
+                "every_ms": 3000
+            }
+        }
+    });
+    let steps = value["operations"][0]["steps"].as_array_mut().unwrap();
+    steps.insert(2, poll);
+    let policy: Policy = serde_json::from_value(value).unwrap();
+    let rule = sign_error(policy);
+    assert!(
+        rule.contains("challenge.poll.send.inject[0]")
+            && rule.contains("goes only into a request the policy fixes"),
+        "{rule}"
+    );
+}

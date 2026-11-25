@@ -1574,7 +1574,9 @@ impl<S: LogSink, C: Clock> Node<S, C> {
                         })
                 }
                 Step::Compute(compute) => run.compute(compute, compute_vars(now)),
-                Step::Run(_) | Step::Repeat(_) | Step::If(_) | Step::Await(_) => Err(operation.unknown()),
+                Step::Run(_) | Step::Repeat(_) | Step::If(_) | Step::Await(_) => {
+                    Err(operation.unknown())
+                }
             };
             if let Err(error) = result {
                 steps_result = Err(error);
