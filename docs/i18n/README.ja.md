@@ -33,6 +33,7 @@ JWT 署名、TOTP、IMAP ログイン、mutual TLS (相互 TLS)、Ethereum 署�
 - [レコード、世代、ロールバック](#レコード世代ロールバック)
 - [ログ](#ログ)
 - [ノードの運用](#ノードの運用)
+- [Nitro Enclave での実行](#nitro-enclave-での実行)
 - [保証すること](#保証すること)
 - [計測結果](#計測結果)
 - [しないこと](#しないこと)
@@ -268,8 +269,9 @@ credentials verify log.jsonl <node-public-key> --owner alice --user-key key.txt 
   増えます (下の表を参照)。
 - **アテステーション。** ノードは TEE (SGX、TDX、SEV-SNP、Nitro) で実行してください。
   `NodeIdentity::report_data()` (ログ鍵と封印鍵に対する SHA-512) を quote の report data に入れます。
-  所有者はグラントを封印する前に、quote とその値を検証します。quote の検証はプラットフォーム固有で
-  あり、このリポジトリには含まれません。
+  所有者はグラントを封印する前に、quote とその値を検証します。AWS Nitro Enclaves は統合済みです。
+  [Nitro Enclave での実行](#nitro-enclave-での実行) を参照してください。所有者の検証は
+  [`attest`](../../crates/attest) クレートと `credentials attest` が行います。
 - **鍵と再起動。** `NodeKey::to_bytes()` はエンクレーブに封印して保管してください。再起動後、
   `Node::restore(key, sink, clock, entries)` がチェーンを継続し、レコードの下限世代、既知のデバイス、
   最後のグラント時刻を復元します。所有者はグラントを再度与え、再起動前に発行・署名されたものは受け付けられません。
@@ -280,6 +282,122 @@ credentials verify log.jsonl <node-public-key> --owner alice --user-key key.txt 
   実行します。
 - **並行性。** すべてのメソッドは `&self` を取るので、1 つのノードをスレッド間で共有できます。
   トランスポートの I/O はノードのロックの外で実行されます。
+
+## Nitro Enclave での実行
+
+[`enclave`](../../crates/enclave) プログラムは AWS Nitro Enclave の中でノードを実行し、`credentials host`
+は親インスタンス上でその隣で動きます。エンクレーブにはネットワークもディスクもなく、親への vsock が
+唯一の経路です。
+
+```mermaid
+flowchart LR
+  client[所有者 / 呼び出し元] -- HTTP --> host
+  subgraph parent[親 EC2 インスタンス]
+    host[credentials host]
+    logs[(log-dir/NODE.jsonl)]
+  end
+  subgraph enclave[Nitro Enclave]
+    node[enclave: node + TLS]
+    nsm[NSM]
+  end
+  host -- "vsock 5000: HTTP" --> node
+  node -- "vsock 5001: CONNECT host:port, その後 TLS バイト列" --> host
+  node -- "vsock 5002: ログエントリ、確定前に同期" --> host
+  host --> logs
+  host -- TCP --> dest[宛先]
+  node --- nsm
+```
+
+- **起動。** カーネルが NSM (`nsm-hwrng`) から乱数を得ていなければプログラムは起動を拒否し、その後
+  新しいノード鍵を生成します。Nitro には封印ストレージがありません。**再起動したエンクレーブは新しい
+  ノード**であり、新しいアイデンティティと新しいログファイルを持ちます。所有者はそのノードにグラントを
+  与え直します (グラントは 1 つのノードの鍵に封印されるので、もともと再起動を越えて残りません)。
+- **API。** vsock ポート 5000 で `credentials serve` の HTTP API ([`server`](../../crates/server)
+  クレートの同じサーバーコード) を提供し、加えて `GET /attestation?nonce=<base64url>` があります。
+  応答は `{"identity": <NodeIdentity>, "document": <base64url>}` です。document は COSE で署名された NSM
+  のアテステーションドキュメントで、`user_data` は `NodeIdentity::report_data()`、`nonce` は呼び出し側が
+  渡したもの (1〜512 バイト) です。
+- **グラントの前に**、所有者はドキュメントを検証します。AWS Nitro のルートまでの証明書チェーン、リリースの
+  `measurements.json` と照合した PCR0、PCR1、PCR2 (PCR がすべてゼロならデバッグモードのエンクレーブで、
+  親がそのメモリを読めます)、自分が送った nonce、そして `user_data` がこれからグラントを与えるアイデン
+  ティティの `report_data()` と等しいことです。
+- **外向き通信 (egress)。** TLS はエンクレーブ内にとどまります (vsock の `Connector` 上の `TlsTransport`)。
+  接続ごとに、ノードは署名済みポリシーと宛先を照合した後、ホストに `CONNECT host:port` を送ります。ホストは
+  TCP で接続し (`--allow` が指定されていればその項目にのみ)、その後は暗号文を双方向に運びます。DNS は
+  ホストが解決します。接続を結び付けるのは、エンクレーブがない場合と同じく宛先の証明書の検証です。
+- **ログ。** エントリはホストに送られ、ホストは各エントリを `<log-dir>/<node log key>.jsonl` に追記し、
+  `sync_data` してから確定を返します。ノードはその確定を受けて初めてエントリが保存されたとみなし、そう
+  でなければ停止し、ホストが報告する内容と整合を取ります。チェックポイントは
+  `<node log key>.jsonl.head.json` に書かれます。ログはいつもどおり `credentials verify` で検証してください。
+- **時計。** ノードはエンクレーブのシステム時計を使い、これはホストのハイパーバイザーから来ます
+  ([脅威モデル](../threat-model.md) を参照)。
+
+### グラント前のノード検証
+
+AWS Nitro Enclave 内のノードは、アテステーションドキュメントの `user_data` に
+`NodeIdentity::report_data()` を入れます。所有者はグラントを封印する前に、新しいランダムな nonce
+(32 バイト) をノードに送ってドキュメントを受け取り、受け入れるリリースの `measurements.json`
+(`{"release": ..., "git_commit": ..., "pcr0": ..., "pcr1": ..., "pcr2":
+...}`、オブジェクト 1 つまたは配列。PCR は hex) と照合します。
+
+```sh
+credentials attest --document doc.cbor --nonce <base64url> --measurements measurements.json \
+    --identity identity.json
+credentials grant ... --node identity.json \
+    --attestation doc.cbor --nonce <base64url> --measurements measurements.json
+```
+
+`attest::verify` (と両方のコマンド) は、次をすべて満たさない限りドキュメントを拒否します。
+
+- ES384 で署名された COSE_Sign1 で (protected header はちょうど `{1: -35}`)、ペイロードが Nitro Secure
+  Module のマップであり、`digest` が `SHA384` であること。
+- 証明書が `cabundle` の中間証明書を経て、ピン留めされた AWS Nitro Enclaves Root-G1 (SHA-256
+  `641a0321...79bb5b`) までチェーンし、ドキュメントが示す時刻に有効であること。ドキュメント内のルートの
+  コピーは信頼しません。
+- 署名がその証明書の P-384 鍵で検証できること。
+- nonce が所有者の送ったものであること。これにより古いドキュメントはリプレイできません。
+- PCR0、PCR1、PCR2 がすべてゼロではなく (すべてゼロならホストがメモリを読めるデバッグエンクレーブ)、
+  受け入れるリリースのいずれかと一致すること。これにより古いビルドや未知のビルドは、その計測値がリスト
+  から外れた時点で拒否されます。
+- `--identity` を指定した場合 (`grant --attestation` では常に)、`user_data` がノードのアイデンティティの
+  `report_data()` と等しいこと。これにより、グラントの宛先となる封印鍵はアテストされたエンクレーブの
+  ものになります。
+
+`--attestation` なしの `credentials grant` も引き続き動作しますが、警告を表示します。その場合、どの
+コードが封印鍵を持っているかを示すものが何もないためです。
+
+### エンクレーブイメージファイルのビルド
+
+```sh
+build/reproduce.sh --release dev --out out   # needs git and Docker with buildx
+```
+
+`build/build.sh` はワークツリーではなくコミット `HEAD` をビルドします。`build/Dockerfile.enclave` が、
+digest で固定した Rust 1.97.1 イメージの中で、`--locked`、コミット時刻に設定した `SOURCE_DATE_EPOCH`、
+リマップしたパスを使って `enclave` を `x86_64-unknown-linux-musl` 向けに静的コンパイルします。次に、
+digest で固定し `aws-nitro-enclaves-cli` をバージョンで固定した Amazon Linux 2023 イメージで、
+`nitro-cli build-enclave` が `enclave.eif` を作ります。`measurements.json` には、リリース、コミット、
+PCR0、PCR1、PCR2、そしてすべての入力 (イメージ、コミットのファイル、nitro-cli が加えるカーネルと init、
+プログラム) の SHA-256 が入ります。`build/reproduce.sh` は 2 回ビルドし、2 回目はキャッシュを一切使わず、
+計測値が一致しなければ失敗します。CI はエンクレーブやそのビルドが変わるたびにこれを実行し、各リリースは
+`enclave.eif` と `measurements.json` を添付し (`SHA256SUMS` とビルドの来歴 (provenance) アテステーションに
+含まれる)、リリースノートに計測値を載せます。EIF ファイル自体はビルドごとに異なります (メタデータに
+ビルド時刻が入る) が、PCR は変わりません。
+
+### 実行する
+
+`aws-nitro-enclaves-cli` とアロケーターを設定した Nitro 対応インスタンス上で:
+
+```sh
+nitro-cli run-enclave --eif-path enclave.eif --cpu-count 2 --memory 1024 --enclave-cid 16
+credentials host --enclave-cid 16 --log-dir /var/lib/credentials \
+  --listen 127.0.0.1:8700 --allow api.github.com:443
+curl -s "http://127.0.0.1:8700/attestation?nonce=$(head -c 32 /dev/urandom | basenc --base64url | tr -d '=')"
+```
+
+`credentials host` は先に、または直後に起動してください。ノードは起動時にログライターへ接続し、接続
+できなければ停止します。`credentials host` については [crates/cli](../../crates/cli#the-host-nitro-enclaves)
+で説明しています。
 
 ## 保証すること
 
@@ -332,9 +450,10 @@ ring の代替として RustCrypto `rsa` 0.10 も計測しました。署名 1 �
 これらは設計上の限界であり、未実装のコードではありません。それぞれの説明は
 [脅威モデル](../threat-model.md) にあります。
 
-- **このリポジトリに TEE は含まれません。** ここでのノードは普通のプロセスであり、アテステーションは
-  プラットフォームとの統合です ([ノードの運用](#ノードの運用) を参照)。TEE がなければ、ノードを
-  動かしている者はそのメモリを読めます。
+- **TEE は 1 つだけです。** AWS Nitro Enclaves は統合済みです ([Nitro Enclave
+  での実行](#nitro-enclave-での実行))。それ以外の環境ではノードは普通のプロセスであり、ノードを動かして
+  いる者はそのメモリを読めます。Nitro のノードには封印ストレージがないため、再起動すると新しいノードに
+  なり、所有者はグラントを与え直します。
 - **反射 (reflection) の検索は既知のエンコーディングしか見つけません**: 生データ、base64 (両方の
   アルファベット)、パーセントエンコーディング、JSON と hex、エスケープされた JSON 文字列です。
   エコーするシークレットを分割したり、独自に圧縮したり、暗号化したりするサーバーは検出できません。
@@ -355,9 +474,12 @@ ring の代替として RustCrypto `rsa` 0.10 も計測しました。署名 1 �
 | クレート | |
 | --- | --- |
 | [`engine`](../../crates/engine) | シークレット、ポリシー、テンプレート、レコード、グラント、呼び出し元、ログ、レスポンス、ノード |
-| [`transport`](../../crates/transport) | TLS トランスポート (rustls) とエンドツーエンドの例 |
+| [`transport`](../../crates/transport) | TCP または任意の `Connector` 上の TLS トランスポート (rustls) とエンドツーエンドの例 |
+| [`server`](../../crates/server) | ノードの HTTP サーバーと、エンクレーブとそのホストの間の vsock 中継プロトコル |
+| [`enclave`](../../crates/enclave) | AWS Nitro Enclave 内で動くノードプログラム (NSM アテステーション) |
 | [`verify`](../../crates/verify) | ノードログの検証ツール。`credentials verify` として実行 |
-| [`cli`](../../crates/cli) | `credentials` ツール: 鍵、ポリシー、レコード、グラント、呼び出し、ノードサーバー |
+| [`attest`](../../crates/attest) | AWS Nitro Enclaves のアテステーションドキュメントの検証ツール。`credentials attest` として実行 |
+| [`cli`](../../crates/cli) | `credentials` ツール: 鍵、ポリシー、レコード、グラント、呼び出し、ノードサーバー、エンクレーブのホスト |
 
 ## 開発
 
@@ -367,7 +489,7 @@ cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace --locked
 ```
 
-最小 Rust バージョン: 1.87。CI では `cargo audit`、`cargo deny`、MSRV テスト、ターゲットごとに 60 秒のファジング、再現可能ビルドの
+最小 Rust バージョン: 1.87 (`enclave` クレートは `aws-nitro-enclaves-nsm-api` のため 1.92)。CI では `cargo audit`、`cargo deny`、MSRV テスト、ターゲットごとに 60 秒のファジング、再現可能ビルドの
 チェックも実行します。[CONTRIBUTING.md](../../.github/CONTRIBUTING.md) を参照してください。
 
 ## セキュリティ

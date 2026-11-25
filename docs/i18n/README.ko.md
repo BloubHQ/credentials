@@ -32,6 +32,7 @@ JWT 서명, TOTP, IMAP 로그인, 상호 TLS(mutual TLS), Ethereum 서명은 모
 - [레코드, 세대, 롤백](#레코드-세대-롤백)
 - [로그](#로그)
 - [노드 운영](#노드-운영)
+- [Nitro Enclave에서 실행](#nitro-enclave에서-실행)
 - [보장하는 것](#보장하는-것)
 - [측정 결과](#측정-결과)
 - [하지 않는 것](#하지-않는-것)
@@ -267,8 +268,9 @@ credentials verify log.jsonl <node-public-key> --owner alice --user-key key.txt 
   걸립니다(아래 표).
 - **증명(attestation).** 노드를 TEE(신뢰 실행 환경: SGX, TDX, SEV-SNP, Nitro) 안에서 실행하세요.
   `NodeIdentity::report_data()`(로그 키와 봉인 키에 대한 SHA-512)를 quote의 report data에 넣으면,
-  소유자는 grant를 봉인하기 전에 quote와 그 값을 확인합니다. quote 검증은 플랫폼마다 다르며 이
-  저장소에는 없습니다.
+  소유자는 grant를 봉인하기 전에 quote와 그 값을 확인합니다. AWS Nitro Enclaves는 통합되어
+  있습니다. [Nitro Enclave에서 실행](#nitro-enclave에서-실행)을 참고하세요. 소유자의 확인은
+  [`attest`](../../crates/attest) 크레이트와 `credentials attest`가 합니다.
 - **키와 재시작.** `NodeKey::to_bytes()`는 enclave에 봉인해 보관하세요. 재시작 후
   `Node::restore(key, sink, clock, entries)`가 체인을 이어 가고 레코드 하한(floor), 알려진 기기, 마지막
   grant 시각을 복원합니다. 소유자는 grant를 다시 주며, 재시작 전에 발급되거나 서명된 것은 받지
@@ -279,6 +281,117 @@ credentials verify log.jsonl <node-public-key> --owner alice --user-key key.txt 
   실행합니다.
 - **동시성.** 모든 메서드가 `&self`를 받으므로 노드 하나를 여러 스레드가 공유하면 됩니다. Transport
   I/O는 노드의 락 밖에서 실행됩니다.
+
+## Nitro Enclave에서 실행
+
+[`enclave`](../../crates/enclave) 프로그램은 AWS Nitro Enclave 안에서 노드를 실행하고,
+`credentials host`는 부모 인스턴스에서 그 옆에 붙어 실행됩니다. enclave에는 네트워크도 디스크도 없으며,
+부모로 가는 vsock이 유일한 연결입니다.
+
+```mermaid
+flowchart LR
+  client[소유자 / 호출자] -- HTTP --> host
+  subgraph parent[부모 EC2 인스턴스]
+    host[credentials host]
+    logs[(log-dir/NODE.jsonl)]
+  end
+  subgraph enclave[Nitro Enclave]
+    node[enclave: node + TLS]
+    nsm[NSM]
+  end
+  host -- "vsock 5000: HTTP" --> node
+  node -- "vsock 5001: CONNECT host:port, 이어서 TLS 바이트" --> host
+  node -- "vsock 5002: 로그 항목, 확정 전에 sync" --> host
+  host --> logs
+  host -- TCP --> dest[목적지]
+  node --- nsm
+```
+
+- **부팅.** 프로그램은 커널이 NSM(`nsm-hwrng`)에서 난수를 얻지 않으면 시작을 거부하고, 그다음 새 노드
+  키를 생성합니다. Nitro에는 봉인 저장소가 없으므로 **재시작한 enclave는 새 노드**이며 새 신원(identity)과
+  새 로그 파일을 갖고, 소유자는 그 노드에 grant를 다시 줍니다(grant는 한 노드의 키에 봉인되므로 어차피
+  재시작 후에는 남지 않습니다).
+- **API.** vsock 포트 5000에서 `credentials serve`의 HTTP API([`server`](../../crates/server) 크레이트의 같은
+  서버 코드)를 제공하고, 여기에 `GET /attestation?nonce=<base64url>`이 더해집니다. 이 요청은
+  `{"identity": <NodeIdentity>, "document": <base64url>}`로 답합니다. document는 COSE로 서명된 NSM 증명
+  문서로, `user_data`는 `NodeIdentity::report_data()`이고 `nonce`는 호출한 쪽이 보낸 값(1~512바이트)입니다.
+- **grant 전에** 소유자는 문서를 확인합니다. AWS Nitro 루트까지 이어지는 인증서 체인, 릴리스의
+  `measurements.json`과 비교한 PCR0, PCR1, PCR2(PCR이 모두 0이면 부모가 메모리를 읽을 수 있는 디버그 모드
+  enclave), 자신이 보낸 nonce, 그리고 `user_data`가 지금 grant를 주려는 신원의 `report_data()`와 같은지를
+  봅니다.
+- **외부 연결(egress).** TLS는 enclave 안에 머뭅니다(vsock `Connector` 위의 `TlsTransport`). 연결마다 노드는
+  서명된 정책과 목적지를 대조한 뒤 host에 `CONNECT host:port`를 보내고, host는 TCP로 연결해(`--allow`가
+  주어지면 그 항목에만) 양방향으로 암호문을 나릅니다. DNS는 host가 해석하며, 연결을 묶는 것은 enclave가
+  없을 때와 마찬가지로 목적지의 인증서 확인입니다.
+- **로그.** 항목은 host로 가고, host는 각 항목을 `<log-dir>/<node log key>.jsonl`에 추가하고 `sync_data`한
+  뒤에 확정합니다. 노드는 그 확정을 받은 뒤에만 항목이 저장된 것으로 보고, 그렇지 않으면 멈추며, host가
+  알려 주는 상태와 조정(reconcile)합니다. 체크포인트는 `<node log key>.jsonl.head.json`에 저장됩니다.
+  로그는 평소처럼 `credentials verify`로 검증하세요.
+- **시계.** 노드는 enclave의 시스템 시계를 쓰며, 이 시계는 host 하이퍼바이저에서 옵니다
+  ([위협 모델](../threat-model.md) 참고).
+
+### grant 전에 노드 검증
+
+AWS Nitro Enclave 안의 노드는 증명 문서의 `user_data`에 `NodeIdentity::report_data()`를 넣습니다. 소유자는
+grant를 봉인하기 전에 노드에 새 무작위 nonce(32바이트)를 보내 문서를 돌려받고, 자신이 받아들이는
+릴리스들의 `measurements.json`(`{"release": ..., "git_commit": ..., "pcr0": ..., "pcr1": ..., "pcr2":
+...}`, 객체 하나 또는 배열, PCR은 hex)과 대조해 확인합니다.
+
+```sh
+credentials attest --document doc.cbor --nonce <base64url> --measurements measurements.json \
+    --identity identity.json
+credentials grant ... --node identity.json \
+    --attestation doc.cbor --nonce <base64url> --measurements measurements.json
+```
+
+`attest::verify`(와 두 명령 모두)는 다음을 모두 만족하지 않으면 문서를 거부합니다.
+
+- ES384로 서명된 COSE_Sign1이고(protected header는 정확히 `{1: -35}`), payload는 Nitro Secure Module의
+  맵이며 `digest`가 `SHA384`일 것.
+- 인증서가 `cabundle` 중간 인증서를 거쳐 고정된(pinned) AWS Nitro Enclaves Root-G1(SHA-256
+  `641a0321...79bb5b`)까지 체인되고, 문서가 밝힌 시각에 유효할 것. 문서 안에 든 루트 사본은 신뢰하지
+  않습니다.
+- 서명이 그 인증서의 P-384 키로 검증될 것.
+- nonce가 소유자가 보낸 값일 것. 따라서 옛 문서를 재전송할 수 없습니다.
+- PCR0, PCR1, PCR2가 모두 0은 아니고(모두 0이면 호스트가 메모리를 읽을 수 있는 디버그 enclave), 받아들이는
+  릴리스 하나와 같을 것. 따라서 옛 빌드나 알 수 없는 빌드는 그 측정값이 목록에서 빠지면 거부됩니다.
+- `--identity`가 있으면(그리고 `grant --attestation`에서는 항상), `user_data`가 노드 신원의
+  `report_data()`와 같을 것. 따라서 grant가 가는 봉인 키는 증명된 enclave의 것입니다.
+
+`--attestation` 없는 `credentials grant`도 여전히 동작하지만 경고를 출력합니다. 그 경우 봉인 키를 어떤
+코드가 갖고 있는지 보여 주는 것이 없기 때문입니다.
+
+### enclave 이미지 파일 빌드
+
+```sh
+build/reproduce.sh --release dev --out out   # needs git and Docker with buildx
+```
+
+`build/build.sh`는 작업 트리가 아니라 커밋 `HEAD`를 빌드합니다. `build/Dockerfile.enclave`가 digest로
+고정한 Rust 1.97.1 이미지에서 `--locked`, 커밋 시각으로 설정한 `SOURCE_DATE_EPOCH`, 다시 매핑한 경로로
+`enclave`를 `x86_64-unknown-linux-musl`용으로 정적 컴파일합니다. 그다음 digest로 고정하고
+`aws-nitro-enclaves-cli`를 버전으로 고정한 Amazon Linux 2023 이미지에서 `nitro-cli build-enclave`가
+`enclave.eif`를 만듭니다. `measurements.json`에는 릴리스, 커밋, PCR0, PCR1, PCR2, 그리고 모든 입력(이미지,
+커밋의 파일, nitro-cli가 추가하는 커널과 init, 프로그램)의 SHA-256이 담깁니다. `build/reproduce.sh`는 두 번
+빌드하며 두 번째는 캐시 없이 빌드하고, 측정값이 같지 않으면 실패합니다. CI는 enclave나 그 빌드가 바뀔
+때마다 이를 실행하고, 각 릴리스는 `enclave.eif`와 `measurements.json`을 첨부하며(`SHA256SUMS`와 빌드
+출처(provenance) 증명에 포함) 릴리스 노트에 측정값을 싣습니다. EIF 파일 자체는 빌드마다 다르지만(메타데이터에
+빌드 시각이 들어감), PCR은 같습니다.
+
+### 실행
+
+`aws-nitro-enclaves-cli`와 할당자(allocator)가 설정된 Nitro 지원 인스턴스에서:
+
+```sh
+nitro-cli run-enclave --eif-path enclave.eif --cpu-count 2 --memory 1024 --enclave-cid 16
+credentials host --enclave-cid 16 --log-dir /var/lib/credentials \
+  --listen 127.0.0.1:8700 --allow api.github.com:443
+curl -s "http://127.0.0.1:8700/attestation?nonce=$(head -c 32 /dev/urandom | basenc --base64url | tr -d '=')"
+```
+
+`credentials host`를 먼저 시작하거나 바로 이어서 시작하세요. 노드는 부팅할 때 로그 작성기에 연결하며,
+연결하지 못하면 멈춥니다. `credentials host`는 [crates/cli](../../crates/cli#the-host-nitro-enclaves)에
+설명되어 있습니다.
 
 ## 보장하는 것
 
@@ -332,8 +445,10 @@ ring의 대안으로 RustCrypto `rsa` 0.10도 측정했습니다. 서명 하나�
 아래는 빠진 코드가 아니라 설계상의 한계입니다. 각 항목은 [위협 모델](../threat-model.md)에서
 설명합니다.
 
-- **이 저장소에는 TEE가 없습니다.** 여기서 노드는 평범한 프로세스이며, 증명은 플랫폼 통합의 몫입니다
-  ([노드 운영](#노드-운영) 참고). TEE 없이는 노드를 실행하는 사람이 그 메모리를 읽을 수 있습니다.
+- **TEE는 하나만 지원합니다.** AWS Nitro Enclaves는 통합되어 있습니다([Nitro Enclave에서
+  실행](#nitro-enclave에서-실행)). 그 밖의 환경에서 노드는 평범한 프로세스이며, 노드를 실행하는 사람이
+  그 메모리를 읽을 수 있습니다. Nitro 노드에는 봉인 저장소가 없으므로 재시작하면 새 노드가 되고, 소유자는
+  grant를 다시 줍니다.
 - **반사 검색은 알려진 인코딩만 찾습니다**: 원본(raw), base64(두 알파벳 모두), 퍼센트, JSON, hex,
   그리고 이스케이프된 JSON 문자열. 서버가 되돌려 보내는 비밀 값을 쪼개거나, 자기 방식으로 압축하거나,
   암호화하면 잡아내지 못합니다. 4~7바이트인 비밀 필드는 원본 형태로만 검색하며, 그 바이트가 우연히
@@ -353,9 +468,12 @@ ring의 대안으로 RustCrypto `rsa` 0.10도 측정했습니다. 서명 하나�
 | 크레이트 | |
 | --- | --- |
 | [`engine`](../../crates/engine) | 비밀 값, 정책, 템플릿, 레코드, grant, 호출자, 로그, 응답, 노드 |
-| [`transport`](../../crates/transport) | TLS transport (rustls), 그리고 엔드투엔드 예제 |
+| [`transport`](../../crates/transport) | TCP 또는 임의의 `Connector` 위의 TLS transport (rustls), 그리고 엔드투엔드 예제 |
+| [`server`](../../crates/server) | 노드의 HTTP 서버, 그리고 enclave와 그 host 사이의 vsock 중계 프로토콜 |
+| [`enclave`](../../crates/enclave) | AWS Nitro Enclave 안에서 실행되는 노드 프로그램 (NSM 증명) |
 | [`verify`](../../crates/verify) | 노드 로그 검증기, `credentials verify`로 실행 |
-| [`cli`](../../crates/cli) | `credentials` 도구: 키, 정책, 레코드, grant, 호출, 노드 서버 |
+| [`attest`](../../crates/attest) | AWS Nitro Enclaves 증명 문서 검증기, `credentials attest`로 실행 |
+| [`cli`](../../crates/cli) | `credentials` 도구: 키, 정책, 레코드, grant, 호출, 노드 서버, enclave의 host |
 
 ## 개발
 
@@ -365,7 +483,7 @@ cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace --locked
 ```
 
-최소 Rust 버전: 1.87. CI는 `cargo audit`, `cargo deny`, MSRV 테스트, 재현 가능 빌드 검사, 대상별 60초 퍼징도 실행합니다.
+최소 Rust 버전: 1.87(`enclave` 크레이트는 `aws-nitro-enclaves-nsm-api` 때문에 1.92). CI는 `cargo audit`, `cargo deny`, MSRV 테스트, 재현 가능 빌드 검사, 대상별 60초 퍼징도 실행합니다.
 [CONTRIBUTING.md](../../.github/CONTRIBUTING.md)를 참고하세요.
 
 ## 보안
