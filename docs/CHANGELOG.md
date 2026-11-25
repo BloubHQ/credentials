@@ -229,6 +229,10 @@ before 1.0, minor versions may break formats and APIs.
 
 ### Security
 
+- A secret can no longer set an output's length or a cut: `random(n)`, the length of
+  `pbkdf2_sha256` and `pbkdf2`, the start and length of `slice`, the delimiters of `between`
+  and the text `replace` looks for are refused when tainted, as the new key-derivation lengths
+  are; before, `len(random(key))` returned a number taken from the secret.
 - Closes the gaps of the policy audit; each has a regression test in
   `crates/engine/tests/audit_bounds.rs` that shows the attack refused before the log:
   - a caller could add query parameters to a signed request (another action for the same

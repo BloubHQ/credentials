@@ -331,15 +331,18 @@ impl Func {
         }
     }
 
-    /// The index of a length argument, which may not depend on a secret: the length of the
-    /// output would give it back.
-    fn length_arg(self) -> Option<usize> {
+    /// The arguments that set how long the output is, or where a cut falls: they may not
+    /// depend on a secret, since `len` of the output (or whether it fails) would give it back.
+    fn length_args(self) -> &'static [usize] {
         match self {
-            Func::Shake128 | Func::Shake256 | Func::Nfold => Some(1),
-            Func::AesCcmEncrypt => Some(2),
-            Func::HkdfExpand | Func::ConcatKdf | Func::KbkdfCounter => Some(3),
-            Func::Hkdf => Some(4),
-            _ => None,
+            Func::Random => &[0],
+            Func::Shake128 | Func::Shake256 | Func::Nfold => &[1],
+            Func::Slice | Func::Between => &[1, 2],
+            Func::Replace => &[1],
+            Func::AesCcmEncrypt => &[2],
+            Func::Pbkdf2Sha256 | Func::HkdfExpand | Func::ConcatKdf | Func::KbkdfCounter => &[3],
+            Func::Pbkdf2 | Func::Hkdf => &[4],
+            _ => &[],
         }
     }
 
@@ -761,7 +764,7 @@ fn call_info(func: Func, args: &[Info]) -> core::result::Result<Info, Rule> {
     if func.sensitive_args().any(|i| at(i).mixed()) {
         return Err("a secret mixed with a chosen value reaches a decoder, number or key");
     }
-    if func.length_arg().is_some_and(|i| at(i).tainted) {
+    if func.length_args().iter().any(|&i| at(i).tainted) {
         return Err("a length must not depend on a secret");
     }
     // The order of a map's pairs, and whether two keys are equal, compare the keys: a secret
@@ -1508,6 +1511,28 @@ mod tests {
                 Ok(true),
             ),
             (r#"{{ hkdf("sha256", $input, "", "", key) }}"#, Err(LENGTH)),
+            // The older functions follow the same rule.
+            (r#"{{ len(random(key)) }}"#, Err(LENGTH)),
+            (
+                r#"{{ len(pbkdf2_sha256("p", "s", "1", key)) }}"#,
+                Err(LENGTH),
+            ),
+            (
+                r#"{{ len(pbkdf2("sha256", "p", "s", "1", key)) }}"#,
+                Err(LENGTH),
+            ),
+            (
+                r#"{{ len(slice("0123456789abcdef", "0", key)) }}"#,
+                Err(LENGTH),
+            ),
+            (
+                r#"{{ len(slice("0123456789abcdef", key, "1")) }}"#,
+                Err(LENGTH),
+            ),
+            (r#"{{ len(between("0123456789", key, "")) }}"#, Err(LENGTH)),
+            (r#"{{ len(replace("aaaa", key, "")) }}"#, Err(LENGTH)),
+            (r#"{{ slice(key, "0", "4") }}"#, Ok(true)),
+            (r#"{{ replace("{k}", "{k}", key) }}"#, Ok(true)),
             (r#"{{ shake128($input, key) }}"#, Err(LENGTH)),
             (r#"{{ nfold($input, key) }}"#, Err(LENGTH)),
             (

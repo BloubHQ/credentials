@@ -601,9 +601,12 @@ Rules:
    output then stays tainted (it is not a *secret key*: some operation may derive the same
    key and use it where its output is seen). An HMAC or a signature of it is one-way as
    usual.
-9. A length argument (`hkdf`, `hkdf_expand`, `concat_kdf`, `kbkdf_counter`, `shake128`,
-   `shake256`, `nfold`, the tag length of `aes_ccm_encrypt`) must not be tainted: the length
-   of the output would give the secret back through `len`.
+9. An argument that sets the output's length or where a cut falls must not be tainted:
+   `random(n)`, the length of `pbkdf2_sha256`, `pbkdf2`, `hkdf`, `hkdf_expand`, `concat_kdf`,
+   `kbkdf_counter`, `shake128`, `shake256` and `nfold`, the tag length of `aes_ccm_encrypt`,
+   the start and length of `slice`, the delimiters of `between`, and the text `replace` looks
+   for. The length of the output, or whether the call fails, would give the secret back
+   through `len`. The value being cut or searched may be a secret (`slice(key, "0", "4")`).
 
 A template that breaks rule 1, 2, 6, 7 or 9 is refused wherever it appears; rule 5 applies to the
 `return` of an operation with no connection. A computed name carries the properties of its
