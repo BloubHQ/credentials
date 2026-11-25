@@ -5,5 +5,8 @@
 # The engine: secrets, policies, the template analysis, the log.
 /crates/engine/src/**   @deongdion
 
+# The wire between an enclave node and its host: egress tunnels and log confirmation.
+/crates/relay/          @deongdion
+
 # CI, release and supply-chain configuration.
 /.github/**             @deongdion

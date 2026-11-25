@@ -29,7 +29,7 @@ use engine::log::{LogSink, SignedEntry, SignedHead};
 use serde::{Deserialize, Serialize};
 use transport::{Connector, Socket};
 
-use crate::Sink;
+use server::Sink;
 
 /// The vsock CID of the parent instance, as seen from an enclave.
 pub const PARENT_CID: u32 = 3;
@@ -521,7 +521,7 @@ pub mod vsock {
 
     pub use ::vsock::{VMADDR_CID_ANY, VsockListener, VsockStream};
 
-    /// A vsock stream that is a [`transport::Socket`] and a [`crate::Connection`].
+    /// A vsock stream that is a [`transport::Socket`] and a [`server::Connection`].
     pub struct Vsock(pub VsockStream);
 
     impl Vsock {
@@ -563,7 +563,7 @@ pub mod vsock {
         }
     }
 
-    impl crate::Connection for Vsock {
+    impl server::Connection for Vsock {
         fn set_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
             self.0.set_read_timeout(timeout)
         }

@@ -355,8 +355,9 @@ Rust 1.97.1 镜像中，使用 `--locked`、设为提交时间的 `SOURCE_DATE_E
 Amazon Linux 2023 镜像中，由 `nitro-cli build-enclave` 生成 `enclave.eif`。`measurements.json` 记录发布
 版本、提交、PCR0、PCR1、PCR2，以及每项输入（镜像、提交中的文件、nitro-cli 添加的内核和 init、程序本身）
 的 SHA-256。`build/reproduce.sh` 构建两次，第二次不使用任何缓存，度量值不一致则失败；CI 在 enclave 或其
-构建每次变更时运行它，每个发布版本都附带 `enclave.eif` 和 `measurements.json`（包含在 `SHA256SUMS` 和
-构建来源证明中），并在发布说明中列出度量值。EIF 文件本身每次构建都不同（其元数据包含构建时间）；
+构建每次变更时运行它，每个发布版本都附带 `enclave.eif`、`measurements.json` 和程序的 SBOM
+`enclave-<tag>.cdx.json`（包含在 `SHA256SUMS` 和构建来源证明中；`credentials` 二进制文件的 SBOM 为
+`credentials-<tag>.cdx.json`），并在发布说明中列出度量值。EIF 文件本身每次构建都不同（其元数据包含构建时间）；
 其 PCR 则不变。
 
 ### 运行
@@ -371,7 +372,7 @@ curl -s "http://127.0.0.1:8700/attestation?nonce=$(head -c 32 /dev/urandom | bas
 ```
 
 先启动 `credentials host`，或紧接着启动：节点在启动时会连接其日志写入端，连接不上就会停止。
-`credentials host` 的说明见 [crates/cli](../../crates/cli#the-host-nitro-enclaves)。
+`credentials host` 的说明见 [crates/host](../../crates/host)。
 
 ## 它保证什么
 
@@ -442,11 +443,13 @@ curl -s "http://127.0.0.1:8700/attestation?nonce=$(head -c 32 /dev/urandom | bas
 | --- | --- |
 | [`engine`](../../crates/engine) | 密钥、策略、模板、记录、授权、调用方、日志、响应、节点 |
 | [`transport`](../../crates/transport) | 基于 TCP 或任意 `Connector` 的 TLS 传输（rustls），以及一个端到端示例 |
-| [`server`](../../crates/server) | 节点的 HTTP 服务器，以及 enclave 与其主机之间的 vsock 中继协议 |
+| [`server`](../../crates/server) | 节点的 HTTP 服务器，以及保存在 JSONL 文件中的节点日志 |
+| [`relay`](../../crates/relay) | enclave 与其主机之间的 vsock 线路：端口、出站 `CONNECT` 隧道、日志协议 |
 | [`enclave`](../../crates/enclave) | 在 AWS Nitro Enclave 中运行的节点程序（NSM 远程证明） |
+| [`host`](../../crates/host) | 在 enclave 的父实例上运行的程序，以 `credentials host` 运行 |
 | [`verify`](../../crates/verify) | 节点日志验证器，以 `credentials verify` 运行 |
 | [`attest`](../../crates/attest) | AWS Nitro Enclaves 证明文档验证器，以 `credentials attest` 运行 |
-| [`cli`](../../crates/cli) | `credentials` 工具：密钥、策略、记录、授权、调用、节点服务器和 enclave 的主机 |
+| [`cli`](../../crates/cli) | `credentials` 工具：密钥、策略、记录、授权、调用、节点服务器和 `credentials host` |
 
 ## 开发
 

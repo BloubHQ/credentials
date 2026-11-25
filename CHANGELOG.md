@@ -23,8 +23,8 @@ before 1.0, minor versions may break formats and APIs.
   the measurements in the notes.
 - `server` crate: the HTTP server of a node, shared by `credentials serve` and the enclave,
   over any connection (`Connection`), log sink (`Sink`) and transport, with `Hooks` for
-  checkpoints and extra endpoints; `server::relay` holds the vsock protocol between an enclave
-  and its host.
+  checkpoints and extra endpoints; the `relay` crate holds the vsock protocol between an
+  enclave and its host.
 - `transport`: `TlsTransport` runs over any byte stream a `Connector` opens (`TcpConnector` by
   default; `TlsTransport::connector`).
 
@@ -92,6 +92,17 @@ before 1.0, minor versions may break formats and APIs.
 
 ### Changed
 
+- Fuzz targets moved from `fuzz/` to `crates/fuzz/`.
+- Releases attach one CycloneDX SBOM per shipped artifact instead of one per crate:
+  `credentials-<tag>.cdx.json` for the `credentials` binary (every target's dependencies) and
+  `enclave-<tag>.cdx.json` for the enclave program (`x86_64-unknown-linux-musl`), both in
+  `SHA256SUMS` and the provenance attestation.
+- Crate layout: the vsock wire between an enclave and its host (ports, the `CONNECT` tunnel,
+  the log protocol, `RelaySink`, vsock) moved from `server::relay` to the new `relay` crate,
+  and `credentials host` to the new `host` library crate (`host::run`, its own error type);
+  the `credentials` binary only parses the command line and keeps its exit codes. The JSONL
+  log file and its checkpoint (`FileSink`, `HeadFile`, `head_path`) moved from the `cli`
+  crate to `server::logfile`. `host` depends on neither `attest`, `verify` nor `cli`.
 - Crate directories and package names are `engine`, `transport`, `verify` and `cli`. The log
   verifier is the `credentials verify` subcommand (the `verify` crate is its library); only the
   `credentials` binary ships. The packages are not published to crates.io.

@@ -22,24 +22,24 @@ rustup toolchain install nightly --profile minimal
 cargo install cargo-fuzz
 ```
 
-Then, from the repository root or this directory:
+Then, from the repository root:
 
 ```sh
-cargo +nightly fuzz list
-cargo +nightly fuzz run template_parse                          # until stopped or a crash
-cargo +nightly fuzz run policy_json -- -max_total_time=60      # for 60 seconds
+cargo +nightly fuzz list --fuzz-dir crates/fuzz
+cargo +nightly fuzz run --fuzz-dir crates/fuzz template_parse                          # until stopped or a crash
+cargo +nightly fuzz run --fuzz-dir crates/fuzz policy_json -- -max_total_time=60      # for 60 seconds
 ```
 
 CI runs every target for 60 seconds on each push to `main` and each pull request, and keeps
 crashing inputs as the `fuzz-artifacts` artifact of a failed run.
 
-A crash is written to `artifacts/<target>/`. Reproduce it with
+A crash is written to `crates/fuzz/artifacts/<target>/`. Reproduce it with
 
 ```sh
-cargo +nightly fuzz run <target> artifacts/<target>/<crash-file>
+cargo +nightly fuzz run --fuzz-dir crates/fuzz <target> crates/fuzz/artifacts/<target>/<crash-file>
 ```
 
 and turn it into a regular test in the engine before fixing it. The corpus grows in
 `corpus/<target>/`; neither directory is committed. libFuzzer needs Linux or macOS (on
-Windows use WSL). `cargo check --manifest-path fuzz/Cargo.toml` type-checks the targets on
+Windows use WSL). `cargo check --manifest-path crates/fuzz/Cargo.toml` type-checks the targets on
 stable.

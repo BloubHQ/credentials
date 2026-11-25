@@ -374,8 +374,9 @@ build/reproduce.sh --release dev --out out   # needs git and Docker with buildx
 `enclave.eif`를 만듭니다. `measurements.json`에는 릴리스, 커밋, PCR0, PCR1, PCR2, 그리고 모든 입력(이미지,
 커밋의 파일, nitro-cli가 추가하는 커널과 init, 프로그램)의 SHA-256이 담깁니다. `build/reproduce.sh`는 두 번
 빌드하며 두 번째는 캐시 없이 빌드하고, 측정값이 같지 않으면 실패합니다. CI는 enclave나 그 빌드가 바뀔
-때마다 이를 실행하고, 각 릴리스는 `enclave.eif`와 `measurements.json`을 첨부하며(`SHA256SUMS`와 빌드
-출처(provenance) 증명에 포함) 릴리스 노트에 측정값을 싣습니다. EIF 파일 자체는 빌드마다 다르지만(메타데이터에
+때마다 이를 실행하고, 각 릴리스는 `enclave.eif`, `measurements.json`, 프로그램의 SBOM
+`enclave-<tag>.cdx.json`을 첨부하며(`SHA256SUMS`와 빌드 출처(provenance) 증명에 포함, `credentials`
+바이너리의 SBOM은 `credentials-<tag>.cdx.json`) 릴리스 노트에 측정값을 싣습니다. EIF 파일 자체는 빌드마다 다르지만(메타데이터에
 빌드 시각이 들어감), PCR은 같습니다.
 
 ### 실행
@@ -390,7 +391,7 @@ curl -s "http://127.0.0.1:8700/attestation?nonce=$(head -c 32 /dev/urandom | bas
 ```
 
 `credentials host`를 먼저 시작하거나 바로 이어서 시작하세요. 노드는 부팅할 때 로그 작성기에 연결하며,
-연결하지 못하면 멈춥니다. `credentials host`는 [crates/cli](../../crates/cli#the-host-nitro-enclaves)에
+연결하지 못하면 멈춥니다. `credentials host`는 [crates/host](../../crates/host)에
 설명되어 있습니다.
 
 ## 보장하는 것
@@ -469,11 +470,13 @@ ring의 대안으로 RustCrypto `rsa` 0.10도 측정했습니다. 서명 하나�
 | --- | --- |
 | [`engine`](../../crates/engine) | 비밀 값, 정책, 템플릿, 레코드, grant, 호출자, 로그, 응답, 노드 |
 | [`transport`](../../crates/transport) | TCP 또는 임의의 `Connector` 위의 TLS transport (rustls), 그리고 엔드투엔드 예제 |
-| [`server`](../../crates/server) | 노드의 HTTP 서버, 그리고 enclave와 그 host 사이의 vsock 중계 프로토콜 |
+| [`server`](../../crates/server) | 노드의 HTTP 서버, 그리고 JSONL 파일에 두는 그 로그 |
+| [`relay`](../../crates/relay) | enclave와 그 host 사이의 vsock 연결: 포트, egress `CONNECT` 터널, 로그 프로토콜 |
 | [`enclave`](../../crates/enclave) | AWS Nitro Enclave 안에서 실행되는 노드 프로그램 (NSM 증명) |
+| [`host`](../../crates/host) | enclave의 부모 인스턴스에서 실행되는 프로그램, `credentials host`로 실행 |
 | [`verify`](../../crates/verify) | 노드 로그 검증기, `credentials verify`로 실행 |
 | [`attest`](../../crates/attest) | AWS Nitro Enclaves 증명 문서 검증기, `credentials attest`로 실행 |
-| [`cli`](../../crates/cli) | `credentials` 도구: 키, 정책, 레코드, grant, 호출, 노드 서버, enclave의 host |
+| [`cli`](../../crates/cli) | `credentials` 도구: 키, 정책, 레코드, grant, 호출, 노드 서버, `credentials host` |
 
 ## 개발
 

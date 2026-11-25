@@ -5,8 +5,8 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use engine::encoding::to_b64;
 use engine::grant::NodeIdentity;
 use engine::log::SignedHead;
+use relay::{SharedLink, send_head};
 use serde_json::json;
-use server::relay::{SharedLink, send_head};
 use server::{Hooks, Reply, Request, error_reply};
 
 /// Largest nonce the NSM takes, in bytes.

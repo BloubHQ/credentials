@@ -14,7 +14,6 @@
 mod attestation;
 mod client;
 mod files;
-mod host;
 mod serve;
 
 use std::path::{Path, PathBuf};
@@ -425,13 +424,13 @@ struct HostArgs {
     #[arg(long, value_name = "HOST:PORT", value_parser = host::parse_allow)]
     allow: Vec<String>,
     /// The vsock port of the node server in the enclave.
-    #[arg(long, default_value_t = server::relay::HTTP_PORT)]
+    #[arg(long, default_value_t = relay::HTTP_PORT)]
     http_port: u32,
     /// The vsock port of the egress relay on this host.
-    #[arg(long, default_value_t = server::relay::EGRESS_PORT)]
+    #[arg(long, default_value_t = relay::EGRESS_PORT)]
     egress_port: u32,
     /// The vsock port of the log writer on this host.
-    #[arg(long, default_value_t = server::relay::LOG_PORT)]
+    #[arg(long, default_value_t = relay::LOG_PORT)]
     log_port: u32,
     /// Most client connections open at once; beyond it the host answers 503.
     #[arg(long, default_value_t = serve::DEFAULT_MAX_CONNECTIONS)]
@@ -972,6 +971,10 @@ fn run(command: Command) -> Res<()> {
             log_dir: args.log_dir,
             allow: args.allow,
             max_connections: args.max_connections,
+        })
+        .map_err(|e| match e {
+            host::Error::Unsupported => Failure::usage(e.to_string()),
+            host::Error::Io { .. } => Failure::io(e.to_string()),
         }),
         Command::Node(NodeCommand::Identity { key, url, out }) => {
             node_identity(key.as_deref(), url.as_deref(), out.as_deref())
