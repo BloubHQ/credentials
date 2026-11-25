@@ -469,6 +469,9 @@ ring の代替として RustCrypto `rsa` 0.10 も計測しました。署名 1 �
 - **ストリームセッション**は呼び出しとともに終了します。SSH、データベースのワイヤプロトコル、gRPC、
   WebSocket のフレーミングは、send/expect スクリプトで扱える範囲でしか動作しません。
 - **ブラウザーログイン、プッシュ型 2FA、ハードウェアキー**は人やデバイスを必要とし、委任できません。
+- **Web ページはアプリより弱い。** [`client`](../../crates/client) パッケージはページでもアプリと同じ検証を行いますが、
+  ページのサーバーは読み込みのたびに別のコードを送れます。グラントはできるだけアプリから行ってください。
+  鍵もハードウェア鍵ではありません (Secure Enclave と StrongBox が保持できるのは P-256 だけです)。
 
 ## クレート
 
@@ -482,6 +485,7 @@ ring の代替として RustCrypto `rsa` 0.10 も計測しました。署名 1 �
 | [`host`](../../crates/host) | エンクレーブの親インスタンスで動くプログラム。`credentials host` として実行 |
 | [`verify`](../../crates/verify) | ノードログの検証ツール。`credentials verify` として実行 |
 | [`attest`](../../crates/attest) | AWS Nitro Enclaves のアテステーションドキュメントの検証ツール。`credentials attest` として実行 |
+| [`client`](../../crates/client) | iOS・Android・Web のアプリ側ライブラリ: 鍵、ノードのアテステーション検証、グラント、レコード、呼び出し。Swift と Kotlin (UniFFI)、JavaScript (wasm-bindgen) のバインディング |
 | [`cli`](../../crates/cli) | `credentials` ツール: 鍵、ポリシー、レコード、グラント、呼び出し、ノードサーバー、`credentials host` |
 
 ## 開発

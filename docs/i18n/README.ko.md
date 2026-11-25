@@ -463,6 +463,9 @@ ring의 대안으로 RustCrypto `rsa` 0.10도 측정했습니다. 서명 하나�
 - **Stream 세션**은 호출과 함께 끝납니다. SSH, 데이터베이스 와이어 프로토콜, gRPC, WebSocket
   프레이밍은 send/expect 스크립트로 가능한 범위까지만 동작합니다.
 - **브라우저 로그인, 푸시 2FA, 하드웨어 키**는 사람이나 기기가 필요하므로 위임할 수 없습니다.
+- **웹 페이지는 앱보다 약합니다.** [`client`](../../crates/client) 패키지는 페이지에서도 앱과 같은 검증을 하지만,
+  페이지 서버는 불러올 때마다 다른 코드를 보낼 수 있습니다. grant는 되도록 앱에서 하세요. 키도 하드웨어
+  키가 아닙니다(Secure Enclave와 StrongBox는 P-256 키만 담습니다).
 
 ## 크레이트
 
@@ -476,6 +479,7 @@ ring의 대안으로 RustCrypto `rsa` 0.10도 측정했습니다. 서명 하나�
 | [`host`](../../crates/host) | enclave의 부모 인스턴스에서 실행되는 프로그램, `credentials host`로 실행 |
 | [`verify`](../../crates/verify) | 노드 로그 검증기, `credentials verify`로 실행 |
 | [`attest`](../../crates/attest) | AWS Nitro Enclaves 증명 문서 검증기, `credentials attest`로 실행 |
+| [`client`](../../crates/client) | iOS, Android, 웹 앱 쪽 라이브러리: 키, 노드 증명 검증, grant, 레코드, 호출. Swift와 Kotlin(UniFFI), JavaScript(wasm-bindgen) 바인딩 |
 | [`cli`](../../crates/cli) | `credentials` 도구: 키, 정책, 레코드, grant, 호출, 노드 서버, `credentials host` |
 
 ## 개발
