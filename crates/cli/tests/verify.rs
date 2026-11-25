@@ -32,6 +32,7 @@ fn write_log(name: &str) -> Written {
     let app = CallerKey::generate();
     let user_key = [3u8; 32];
     let policy = Policy {
+        item: None,
         fields: vec![FieldSpec::secret("key")],
         callers: vec![Caller {
             name: "app".into(),

@@ -44,10 +44,18 @@ impl Policy {
     /// and [`Policy::with_operation`].
     pub fn new() -> Self {
         Self {
+            item: None,
             fields: Vec::new(),
             callers: Vec::new(),
             operations: Vec::new(),
         }
+    }
+
+    /// Makes the policy the policy of a typed item.
+    #[must_use]
+    pub fn with_item(mut self, item: crate::item::ItemBinding) -> Self {
+        self.item = Some(item);
+        self
     }
 
     /// Adds a field.

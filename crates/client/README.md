@@ -36,11 +36,18 @@ Rust names; Swift and Kotlin use the same names in camel case (`verifyNode`), Ja
 | `endorse_device(device_key, owner, identity_json, new_device_public_key)` | endorsement JSON | Adds another device of the owner on the node |
 | `retire_device(device_key, owner, identity_json, device_public_key)` | retirement JSON | Withdraws another device |
 | `sign_policy(device_key, policy_json)` | signed policy JSON | Signs a policy ([docs/policy.md](../../docs/policy.md)) |
-| `seal_record(user_key, signed_policy_json, record_id, owner, fields: [Field])` | record JSON | Encrypts the values of a record |
+| `seal_record(user_key, signed_policy_json, record_id, owner, fields: [Field])` | record JSON | Encrypts the values of a record; a typed record's values are checked against its kind first |
 | `rewrap_record(user_key, record_json, signed_policy_json)` | record JSON | The record under a new policy, one generation later |
 | `pin_record(device_key, record_json)` | pin JSON | Nodes refuse older generations of the record |
 | `sign_call(caller_key, caller, identity_json, record_json, operation, body_json)` | signed call JSON | A call of an app on a record |
 | `sign_derive_call(caller_key, caller, identity_json, record_json, operation, input)` | signed call JSON | The same for a derivation of `input` |
+| `sign_describe_call(caller_key, caller, identity_json, record_json)` | signed call JSON | `describe` on a typed record: public fields and masks, never a secret field |
+| `summarize(policy_json, previous_policy_json?)` | summary JSON | Where each secret can go, what comes back, risk flags, and what widens over the previous version |
+| `policy_json_schema()` | `String` | The JSON Schema of the policy format |
+| `item_kinds()` | `String` | The reviewed kinds of item |
+| `sign_kind(device_key, kind_json)` | signed kind JSON | A custom kind of item |
+| `approval_hash(summary_json)` | `String` | The SHA-256 an approval signs |
+| `approve(device_key, identity_json, summary_json)` | approval JSON | Approves a summary that node built, while it is open |
 
 `grant` takes a `VerifiedNode`, never a bare identity, and only `verify_node` and
 `verify_attestation_reply` make one; it must be at most five minutes old. So an app cannot

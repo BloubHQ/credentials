@@ -619,3 +619,301 @@ fn an_old_policy_converts_and_signs_again() {
     sign_policy(device, upgrade["policy"].to_string()).unwrap();
     assert_eq!(code(upgrade_policy("{".into())), "refused");
 }
+
+/// A card policy for the caller `app`, bound to the reviewed kind `card`.
+fn card_policy_json(caller_public: &str) -> String {
+    use engine::policy::{Injection, Method, Return, Send};
+    let caller = engine::keys::CallerPublicKey::from_b64(caller_public).unwrap();
+    let policy = Policy::new()
+        .with_item(engine::item::ItemBinding::reviewed("card"))
+        .with_field(FieldSpec::guessable("number"))
+        .with_field(FieldSpec::guessable("expiry"))
+        .with_field(FieldSpec::guessable("cvc"))
+        .with_field(FieldSpec::public("holder").optional())
+        .with_operation(
+            Operation::https("pay", Destination::https("pay.example"))
+                .then(
+                    Send::fixed(Method::Post, "/v1/charges")
+                        .inject(Injection::body("n={{number}}&e={{expiry}}&c={{cvc}}")),
+                )
+                .then(Return::status()),
+        )
+        .with_caller(Caller::new("app", caller, ["pay"]));
+    serde_json::to_string(&policy).unwrap()
+}
+
+fn card_fields(number: &str, expiry: &str) -> Vec<Field> {
+    [
+        ("number", number),
+        ("expiry", expiry),
+        ("cvc", "737"),
+        ("holder", "Jane Doe"),
+    ]
+    .into_iter()
+    .map(|(name, value)| Field {
+        name: name.into(),
+        value: value.as_bytes().to_vec(),
+    })
+    .collect()
+}
+
+#[test]
+fn a_typed_record_is_sealed_described_and_never_read() {
+    let node = a_node();
+    let identity = node.identity();
+    let ident = identity_json(&identity);
+    let device = generate_key(KeyKind::Device);
+    let user = generate_key(KeyKind::User);
+    let caller = generate_key(KeyKind::Caller);
+    let caller_public = public_key(KeyKind::Caller, caller.clone()).unwrap();
+    let signed = sign_policy(device.clone(), card_policy_json(&caller_public)).unwrap();
+
+    // The values are checked against the kind before anything is sealed.
+    for (number, expiry) in [("4242424242424241", "12/40"), ("4242424242424242", "01/20")] {
+        assert_eq!(
+            code(seal_record(
+                user.clone(),
+                signed.clone(),
+                "card".into(),
+                "alice".into(),
+                card_fields(number, expiry),
+            )),
+            "refused"
+        );
+    }
+    let record = seal_record(
+        user.clone(),
+        signed,
+        "card".into(),
+        "alice".into(),
+        card_fields("4242424242424242", "12/40"),
+    )
+    .unwrap();
+    let verified = Arc::new(VerifiedNode::for_test(identity, now_ms()));
+    let sealed = grant(
+        device,
+        user,
+        verified,
+        "alice".into(),
+        600,
+        vec![record.clone()],
+    )
+    .unwrap();
+    node.grant(&serde_json::from_str(&sealed).unwrap()).unwrap();
+
+    let call = sign_describe_call(caller, "app".into(), ident, record).unwrap();
+    let call: SignedCall = serde_json::from_str(&call).unwrap();
+    assert_eq!(call.operation, ":describe");
+    let Output::Describe(description) = node.run(&call, &mut NoNetwork).result.unwrap() else {
+        panic!("a description");
+    };
+    let text = serde_json::to_string(&description).unwrap();
+    assert!(text.contains("visa"), "{text}");
+    for secret in ["4242424242424242", "12/40", "737"] {
+        assert!(
+            !text.contains(secret),
+            "a secret value is in the description"
+        );
+    }
+}
+
+fn flag_codes(summary: &serde_json::Value) -> Vec<String> {
+    summary["flags"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["code"].as_str().unwrap().to_string())
+        .collect()
+}
+
+#[test]
+fn a_policy_is_summarized_with_its_flags_and_what_it_widens() {
+    let caller_public = public_key(KeyKind::Caller, generate_key(KeyKind::Caller)).unwrap();
+    let narrow = card_policy_json(&caller_public);
+    let summary: serde_json::Value =
+        serde_json::from_str(&summarize(narrow.clone(), None).unwrap()).unwrap();
+    assert_eq!(summary["item"]["kind"], "card");
+    assert_eq!(summary["secrets"].as_array().unwrap().len(), 3);
+    assert_eq!(summary["flags"], serde_json::json!([]));
+
+    // Unbound from its kind, the whole response body goes back: flagged, and wider.
+    let mut wide: serde_json::Value = serde_json::from_str(&narrow).unwrap();
+    wide.as_object_mut().unwrap().remove("item");
+    wide["operations"][0]["steps"][2] =
+        serde_json::json!({"do": "return", "response": {"body": "all"}});
+    let summary: serde_json::Value =
+        serde_json::from_str(&summarize(wide.to_string(), Some(narrow.clone())).unwrap()).unwrap();
+    let codes = flag_codes(&summary);
+    assert!(codes.iter().any(|c| c == "response_all"), "{codes:?}");
+    assert!(codes.iter().any(|c| c == "wider"), "{codes:?}");
+
+    // Signed policies are summarized too; a policy that breaks a rule is not.
+    let signed = sign_policy(generate_key(KeyKind::Device), narrow.clone()).unwrap();
+    summarize(signed, Some(narrow)).unwrap();
+    let mut typed_wide: serde_json::Value =
+        serde_json::from_str(&card_policy_json(&caller_public)).unwrap();
+    typed_wide["operations"][0]["steps"][2] =
+        serde_json::json!({"do": "return", "response": {"body": "all"}});
+    assert_eq!(code(summarize(typed_wide.to_string(), None)), "refused");
+    assert_eq!(code(summarize("{".into(), None)), "invalid_input");
+}
+
+#[test]
+fn the_schema_kinds_and_custom_kinds() {
+    let schema: serde_json::Value = serde_json::from_str(&policy_json_schema()).unwrap();
+    assert_eq!(schema["$defs"]["Policy"]["type"], "object");
+    let kinds: serde_json::Value = serde_json::from_str(&item_kinds()).unwrap();
+    assert_eq!(kinds["kinds"].as_array().unwrap().len(), 12);
+
+    let device = generate_key(KeyKind::Device);
+    let kind = serde_json::json!({
+        "name": "door", "description": "A door code.",
+        "fields": [{"name": "code", "disclosure": "secret", "guessable": true}],
+        "shape": {"connections": ["none"], "destinations": {"from": "owner"}, "returns": "status"}
+    });
+    let signed: serde_json::Value =
+        serde_json::from_str(&sign_kind(device.clone(), kind.to_string()).unwrap()).unwrap();
+    assert_eq!(signed["kind"]["name"], "door");
+    let mut reviewed = kind.clone();
+    reviewed["name"] = "card".into();
+    assert_eq!(
+        code(sign_kind(device.clone(), reviewed.to_string())),
+        "refused"
+    );
+    assert_eq!(code(sign_kind(device, "{}".into())), "invalid_input");
+}
+
+#[test]
+fn an_approval_is_of_one_summary_for_one_node() {
+    use engine::approval::{Amount, Approval, ApprovalSummary};
+    let node = a_node();
+    let identity = node.identity();
+    let device = generate_key(KeyKind::Device);
+    let device_public = engine::keys::DevicePublicKey::from_b64(
+        &public_key(KeyKind::Device, device.clone()).unwrap(),
+    )
+    .unwrap();
+    let now = now_ms();
+    let summary = ApprovalSummary {
+        id: [7; 16],
+        node: identity.log_key,
+        owner: "alice".into(),
+        record_id: "card".into(),
+        generation: 1,
+        caller: "app".into(),
+        operation: "pay".into(),
+        destination: Some("https://pay.example".into()),
+        origin: None,
+        amount: Some(Amount {
+            value: "12.50".into(),
+            currency: "EUR".into(),
+        }),
+        item: None,
+        lines: vec!["Pay 12.50 EUR to pay.example".into()],
+        created_ms: now - 1000,
+        expires_ms: now + 60_000,
+    };
+    let json = serde_json::to_string(&summary).unwrap();
+    let hash = approval_hash(json.clone()).unwrap();
+    assert_eq!(hash, URL_SAFE_NO_PAD.encode(summary.sha256().unwrap()));
+    let approval: Approval = serde_json::from_str(
+        &approve(device.clone(), identity_json(&identity), json.clone()).unwrap(),
+    )
+    .unwrap();
+    approval
+        .verify(&summary, &identity.log_key, &[device_public], now_ms())
+        .unwrap();
+    // Another node's identity, a lapsed summary, one open too long: refused.
+    let other = a_node().identity();
+    assert_eq!(
+        code(approve(device.clone(), identity_json(&other), json)),
+        "invalid_input"
+    );
+    let mut lapsed = summary.clone();
+    lapsed.created_ms = now - 120_000;
+    lapsed.expires_ms = now - 60_000;
+    assert_eq!(
+        code(approve(
+            device.clone(),
+            identity_json(&identity),
+            serde_json::to_string(&lapsed).unwrap()
+        )),
+        "invalid_input"
+    );
+    let mut long = summary;
+    long.expires_ms = long.created_ms + 10 * 60_000;
+    assert_eq!(
+        code(approve(
+            device,
+            identity_json(&identity),
+            serde_json::to_string(&long).unwrap()
+        )),
+        "refused"
+    );
+}
+
+#[test]
+fn the_documents_of_the_web_smoke_test_hold_on_the_host() {
+    // The same JSON as crates/client/web/smoke.mjs, so the smoke test checks the wasm
+    // boundary and not the documents.
+    let device = generate_key(KeyKind::Device);
+    let caller = generate_key(KeyKind::Caller);
+    let caller_public = public_key(KeyKind::Caller, caller.clone()).unwrap();
+    let device_public = public_key(KeyKind::Device, device.clone()).unwrap();
+    let narrow = serde_json::json!({
+        "fields": [{"name": "key", "secret": true}],
+        "callers": [{"name": "app", "key": caller_public, "operations": ["mac"]}],
+        "operations": [{"name": "mac", "input": {"raw": {"max_len": 64}},
+            "steps": [{"do": "return", "template": "{{ hex(hmac_sha256(key, $input)) }}"}]}]
+    })
+    .to_string();
+    let wide = serde_json::json!({
+        "fields": [{"name": "key", "secret": true}, {"name": "token", "secret": true}],
+        "callers": [{"name": "app", "key": caller_public, "operations": ["mac", "fetch"]}],
+        "operations": [
+            {"name": "mac", "input": {"raw": {}},
+             "steps": [{"do": "return", "template": "{{ hex(hmac_sha256(key, $input)) }}"}]},
+            {"name": "fetch", "steps": [
+                {"do": "open", "connection": "https",
+                 "destinations": [{"host": "*.api.example", "port": 443}]},
+                {"do": "send", "request": {"from": "caller", "methods": ["GET"], "paths": ["/v1/**"]},
+                 "inject": [{"target": {"kind": "header", "name": "Authorization"},
+                             "template": "Bearer {{token}}"}]},
+                {"do": "return", "response": {"body": "all"}}
+            ]}
+        ]
+    })
+    .to_string();
+    let summary: serde_json::Value =
+        serde_json::from_str(&summarize(wide, Some(narrow.clone())).unwrap()).unwrap();
+    let codes = flag_codes(&summary);
+    for flag in ["raw_input", "wildcard", "response_all", "wider"] {
+        assert!(codes.iter().any(|c| c == flag), "{flag}: {codes:?}");
+    }
+    let token = summary["secrets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["field"] == "token")
+        .unwrap();
+    assert_eq!(
+        token["uses"][0]["form"],
+        serde_json::json!({"in": "header", "name": "Authorization"})
+    );
+    let plain: serde_json::Value = serde_json::from_str(&summarize(narrow, None).unwrap()).unwrap();
+    assert_eq!(plain["flags"], serde_json::json!([]));
+
+    let identity =
+        serde_json::json!({"log_key": device_public, "seal_key": caller_public}).to_string();
+    let now = now_ms();
+    let open = serde_json::json!({
+        "id": "AAAAAAAAAAAAAAAAAAAAAA", "node": device_public, "owner": "alice",
+        "record_id": "mac", "generation": 1, "caller": "app", "operation": "mac",
+        "lines": ["Sign one message"], "created_ms": now - 1000, "expires_ms": now + 60_000
+    })
+    .to_string();
+    assert_eq!(approval_hash(open.clone()).unwrap().len(), 43);
+    let approval: serde_json::Value =
+        serde_json::from_str(&approve(device, identity, open).unwrap()).unwrap();
+    assert_eq!(approval["device"], device_public.as_str());
+}

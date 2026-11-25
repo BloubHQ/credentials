@@ -91,6 +91,13 @@ What the engine protects, against whom, under which assumptions, and what is lef
 | Server echoes the secret | Captured secrets redacted; reflection search over raw, base64, percent, JSON, hex and decoded JSON strings; the response is dropped on a hit | `reflection`, `node` |
 | Server hides the echo in framing (chunks, encodings, ranges, folded headers) | Strict parsing: chunked joined, `Content-Encoding` other than identity, `206`, `Content-Range`, folded headers and duplicate lengths refused; `Accept-Encoding: identity` sent | `response`, `request` |
 | Server moves one secret into another field | A captured value holding another secret field is refused | `node` |
+| A device signs (by mistake, or under an attacker's control) a typed policy wider than its kind: a card number to a wildcard host, a whole response body, a login sent off its origin | The node re-derives the shape from the kind on every signature check and refuses the policy: connections, destinations (the pinned origin or host and port), wildcards, client certificates, captures, relays and the response projection; secret and masked fields stay secret and guessable ones guessable | `item`, `policy` |
+| Caller reads a secret field of an item through `describe` | `describe` returns only public fields the policy keeps public and the masked projection the node computes; secret fields are never read into the answer; it needs a signed call of a listed caller and is logged before the answer | `item`, `node` |
+| Operator or attacker binds a typed record to a kind of its own | A custom kind verifies only under a known device of the owner, and cannot take a reviewed kind's name; reviewed kinds are compiled into the release the owner attested | `item`, `policy` |
+| A record holds a value that defeats its kind (another origin than the pin, a card number that is not one, an expired card) | Values are checked when sealed and on every use with the node's clock; a pinned field must equal the pin the policy signed | `item`, `record`, `node` |
+| An ssh or VPN key goes to a server nobody authenticated | The ssh and vpn kinds allow no connection until their protocols exist in the node; the ssh host key is a required, checked pin | `item` |
+| Owner signs a new version without seeing what it widens | `summarize` against the previous version flags every new destination, method, path, header, query rule, injection, operation, caller and key, more of the response, looser limits, fields made public, and changed item bindings; anything it cannot rank counts as wider | `policy::summary` |
+| Node shows the owner one summary and acts on another, or a caller replays an approval | An approval signs the SHA-256 of the canonical summary the node built, its random id, the node, owner and record, within a window of at most five minutes; parking and single use are the runtime of part 5 | `approval` |
 | Memory disclosure of freed buffers | `Secret`/`Zeroizing` everywhere in the engine; exact-size buffers; erasing growth in the transport; zeroizing allocator for dependencies | all |
 
 ## Residual risks
@@ -153,6 +160,16 @@ These remain by design; each is listed in the README.
 - **Parser buffers.** The HTML tokenizer and the regex engine keep their own buffers of the
   body they read; the zeroizing allocator erases them when freed, not while in use.
 - **Low entropy without `guessable`.** The owner has to mark such fields.
+- **What masks show.** A masked projection is part of a value: a card's brand and last four
+  digits, the year of its expiry, an e-mail's first character and domain, a phone number's
+  last two digits. Any listed caller may read them through `describe`. A check that fails on
+  use tells an authenticated caller which field failed (an expired card), never its value.
+- **Kinds bound only where the owner binds them.** A record without `item` is an untyped
+  record: the shape of a kind protects only policies that bind it. Apps should create cards,
+  logins and the like as typed items.
+- **The summary's reading of templates is lexical.** `derive_reversible` is raised when a
+  template of an output names an encryption, a key agreement or `xor`, directly or through a
+  `compute` name; the signing-time analysis remains what refuses an oracle.
 - **Trust on first use.** The first grant of an owner on a node decides its devices.
 - **Trusted clock.** Freshness of grants, revocations, endorsements and calls uses the node's clock. A clock set back behind the node's start makes the node refuse everything signed until it catches up; a clock set forward lets grants expire early. In a TEE the clock must come from a source the operator cannot set.
 - **Shared replay cache.** Each caller and owner may hold 100,000 of the 1,000,000 nonces; owners trusted on first use with many callers can still fill it at about 3,300 signed, logged calls per second, which stops calls for everyone until nonces expire (5 minutes).

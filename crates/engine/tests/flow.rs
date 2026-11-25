@@ -297,6 +297,7 @@ fn temp(name: &str, secret: bool) -> Store {
 
 fn request_policy(fields: Vec<FieldSpec>, inject: Vec<Injection>) -> Policy {
     Policy {
+        item: None,
         fields,
         callers: vec![],
         operations: vec![http("call", host(), vec![caller_step(inject)])],
@@ -305,6 +306,7 @@ fn request_policy(fields: Vec<FieldSpec>, inject: Vec<Injection>) -> Policy {
 
 fn derive_policy(fields: Vec<FieldSpec>, derive: &str) -> Policy {
     Policy {
+        item: None,
         fields,
         callers: vec![],
         operations: vec![derive_op("derive", derive)],
@@ -1154,6 +1156,7 @@ fn oauth_refresh_writes_the_new_tokens_into_a_new_record() {
         ],
     };
     let policy = Policy {
+        item: None,
         fields: vec![
             public("client_id"),
             secret("client_secret"),
@@ -1285,6 +1288,7 @@ fn a_session_login_feeds_a_cookie_to_the_caller_request() {
         )],
     };
     let policy = Policy {
+        item: None,
         fields: vec![public("user"), secret("password")],
         callers: vec![],
         operations: vec![http(
@@ -1348,6 +1352,7 @@ fn digest_authentication_answers_the_challenge() {
         ),
     )]);
     let policy = Policy {
+        item: None,
         fields: vec![public("username"), secret("password")],
         callers: vec![],
         operations: vec![http("call", host(), vec![challenge, answer])],
@@ -1390,6 +1395,7 @@ fn aws_signature_v4_is_a_template() {
     );
     let destination = Destination::https("example.amazonaws.com");
     let policy = Policy {
+        item: None,
         fields: vec![public("access_key"), secret("secret_key")],
         callers: vec![],
         operations: vec![http(
@@ -1492,6 +1498,7 @@ fn secp256k1_keys_sign_and_recover() {
     let secret_key = [0x11u8; 32];
     let key = SigningKey::from_slice(&secret_key).unwrap();
     let policy = Policy {
+        item: None,
         fields: vec![secret("key")],
         callers: vec![],
         operations: vec![
@@ -1556,6 +1563,7 @@ fn aes_encrypts_only_under_a_secret_key() {
 
 fn imap_policy() -> Policy {
     Policy {
+        item: None,
         fields: vec![public("user"), secret("password")],
         callers: vec![],
         operations: vec![
@@ -1682,6 +1690,7 @@ fn client_certificates_reach_only_the_transport() {
     let cert = b"-----BEGIN CERTIFICATE-----\nMIIBcert\n-----END CERTIFICATE-----\n";
     let key = b"-----BEGIN PRIVATE KEY-----\nMIIBkey-0123456789\n-----END PRIVATE KEY-----\n";
     let policy = Policy {
+        item: None,
         fields: vec![public("cert"), secret("key")],
         callers: vec![],
         operations: vec![
@@ -1724,6 +1733,7 @@ fn refresh_policy() -> Policy {
         )],
     };
     Policy {
+        item: None,
         fields: vec![secret("refresh_token"), later("access_token")],
         callers: vec![],
         operations: vec![http("refresh", host(), vec![step])],
@@ -1847,6 +1857,7 @@ fn an_echo_split_over_chunks_is_caught_and_framing_headers_are_refused() {
 fn a_stream_keeps_its_captured_field_when_an_exchange_fails() {
     let clock = TestClock::at(NOW);
     let policy = Policy {
+        item: None,
         fields: vec![secret("password"), later("session")],
         callers: vec![],
         operations: vec![
@@ -1965,6 +1976,7 @@ fn a_capture_into_a_public_field_is_refused() {
         },
     ));
     let policy = with_caller(Policy {
+        item: None,
         fields: vec![secret("token"), public("display_name")],
         callers: vec![],
         operations: vec![
@@ -2755,6 +2767,7 @@ fn guessable_fields_give_back_no_check_for_guesses() {
     let device = DeviceKey::generate();
     let sign = |template: &str| {
         let policy = Policy {
+            item: None,
             fields: vec![FieldSpec::guessable("pin"), secret("key")],
             callers: vec![],
             operations: vec![derive_op("derive", template)],
@@ -2780,6 +2793,7 @@ fn guessable_fields_give_back_no_check_for_guesses() {
         sign(allowed).unwrap_or_else(|e| panic!("{allowed}: {e}"));
     }
     let public = Policy {
+        item: None,
         fields: vec![FieldSpec {
             guessable: true,
             ..public("user")
@@ -3103,6 +3117,7 @@ fn grant_terms_take_a_duration_and_pin_records() {
 
 fn derives(fields: Vec<FieldSpec>, ops: &[(&str, &str)]) -> Policy {
     with_caller(Policy {
+        item: None,
         fields,
         callers: vec![],
         operations: ops
@@ -3323,6 +3338,7 @@ fn ephemeral_ecdh_password_envelope() {
         vec![],
     );
     let policy = Policy {
+        item: None,
         fields: vec![public("user"), FieldSpec::guessable("password")],
         callers: vec![],
         operations: vec![http("login", host(), vec![keys, login])],
@@ -3476,6 +3492,7 @@ fn html_and_regex_captures_feed_later_steps() {
         vec![],
     );
     let policy = Policy {
+        item: None,
         fields: vec![public("user"), secret("password")],
         callers: vec![],
         operations: vec![http("login", host(), vec![page, login])],
@@ -3610,6 +3627,7 @@ fn new_captures_are_redacted_and_cut_secrets_are_searched() {
         vec![],
     );
     let policy = Policy {
+        item: None,
         fields: vec![secret("key")],
         callers: vec![],
         operations: vec![http("op", host(), vec![page, use_it])],

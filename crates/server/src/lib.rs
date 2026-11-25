@@ -472,6 +472,10 @@ pub fn output_json(output: &Output) -> Value {
             "output": to_b64(bytes),
             "utf8": std::str::from_utf8(bytes).ok(),
         }),
+        Output::Describe(description) => json!({
+            "kind": "describe",
+            "description": serde_json::to_value(description).unwrap_or(Value::Null),
+        }),
     }
 }
 

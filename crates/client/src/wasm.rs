@@ -318,3 +318,55 @@ pub fn sign_derive_call(
         input,
     )?)
 }
+
+/// See [`crate::sign_describe_call`].
+#[wasm_bindgen(js_name = signDescribeCall)]
+pub fn sign_describe_call(
+    caller_key: String,
+    caller: String,
+    identity_json: String,
+    record_json: String,
+) -> Result<String> {
+    Ok(crate::sign_describe_call(
+        caller_key,
+        caller,
+        identity_json,
+        record_json,
+    )?)
+}
+
+/// See [`crate::summarize`]. `previousPolicyJson` may be `undefined`.
+#[wasm_bindgen(js_name = summarize)]
+pub fn summarize(policy_json: String, previous_policy_json: Option<String>) -> Result<String> {
+    Ok(crate::summarize(policy_json, previous_policy_json)?)
+}
+
+/// See [`crate::policy_json_schema`].
+#[wasm_bindgen(js_name = policyJsonSchema)]
+pub fn policy_json_schema() -> String {
+    crate::policy_json_schema()
+}
+
+/// See [`crate::item_kinds`].
+#[wasm_bindgen(js_name = itemKinds)]
+pub fn item_kinds() -> String {
+    crate::item_kinds()
+}
+
+/// See [`crate::sign_kind`].
+#[wasm_bindgen(js_name = signKind)]
+pub fn sign_kind(device_key: String, kind_json: String) -> Result<String> {
+    Ok(crate::sign_kind(device_key, kind_json)?)
+}
+
+/// See [`crate::approval_hash`].
+#[wasm_bindgen(js_name = approvalHash)]
+pub fn approval_hash(summary_json: String) -> Result<String> {
+    Ok(crate::approval_hash(summary_json)?)
+}
+
+/// See [`crate::approve`].
+#[wasm_bindgen(js_name = approve)]
+pub fn approve(device_key: String, identity_json: String, summary_json: String) -> Result<String> {
+    Ok(crate::approve(device_key, identity_json, summary_json)?)
+}

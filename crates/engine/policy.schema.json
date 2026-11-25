@@ -1,0 +1,452 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/BloubHQ/credentials/blob/main/crates/engine/policy.schema.json",
+  "title": "Policy",
+  "description": "A policy of the credentials engine (docs/policy.md), optionally bound to a kind of item. A draft that validates here is well formed; signing it also runs the checks a schema cannot express (the template analysis, the path templates, the shape of the item's kind).",
+  "$ref": "#/$defs/Policy",
+  "$defs": {
+    "Token": {"type": "string", "pattern": "^[A-Za-z0-9_-]{1,64}$"},
+    "Key": {"type": "string", "pattern": "^[A-Za-z0-9_-]{43}$"},
+    "Signature": {"type": "string", "pattern": "^[A-Za-z0-9_-]{86}$"},
+    "Policy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["fields", "callers", "operations"],
+      "properties": {
+        "item": {"$ref": "#/$defs/ItemBinding"},
+        "fields": {"type": "array", "minItems": 1, "maxItems": 32, "items": {"$ref": "#/$defs/FieldSpec"}},
+        "callers": {"type": "array", "minItems": 1, "maxItems": 32, "items": {"$ref": "#/$defs/Caller"}},
+        "operations": {"type": "array", "minItems": 1, "maxItems": 16, "items": {"$ref": "#/$defs/Operation"}}
+      }
+    },
+    "FieldSpec": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "secret"],
+      "properties": {
+        "name": {"$ref": "#/$defs/Token"},
+        "secret": {"type": "boolean"},
+        "optional": {"type": "boolean"},
+        "guessable": {"type": "boolean"}
+      }
+    },
+    "Caller": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "key", "operations"],
+      "properties": {
+        "name": {"$ref": "#/$defs/Token"},
+        "key": {"$ref": "#/$defs/Key"},
+        "operations": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/Token"}},
+        "limit": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["count", "window_ms"],
+          "properties": {
+            "count": {"type": "integer", "minimum": 1, "maximum": 1000000},
+            "window_ms": {"type": "integer", "minimum": 1}
+          }
+        }
+      }
+    },
+    "Operation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "steps"],
+      "properties": {
+        "name": {"$ref": "#/$defs/Token"},
+        "input": {"$ref": "#/$defs/Input"},
+        "steps": {"type": "array", "minItems": 1, "maxItems": 64, "items": {"$ref": "#/$defs/Step"}}
+      }
+    },
+    "Input": {
+      "oneOf": [
+        {"type": "object", "additionalProperties": false, "required": ["raw"],
+         "properties": {"raw": {"$ref": "#/$defs/RawInput"}}},
+        {"type": "object", "additionalProperties": false, "required": ["json"],
+         "properties": {"json": {"$ref": "#/$defs/JsonInput"}}},
+        {"type": "object", "additionalProperties": false, "required": ["rlp"],
+         "properties": {"rlp": {"$ref": "#/$defs/RlpInput"}}}
+      ]
+    },
+    "RawInput": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "max_len": {"type": "integer", "minimum": 0},
+        "pattern": {"type": "string", "maxLength": 256}
+      }
+    },
+    "JsonInput": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "members": {"type": "array", "maxItems": 64, "items": {"$ref": "#/$defs/Member"}}
+      }
+    },
+    "Member": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["pointer"],
+      "properties": {
+        "pointer": {"type": "string"},
+        "optional": {"type": "boolean"},
+        "type": {"enum": ["string", "number", "boolean", "null", "object", "array"]},
+        "equals": {"type": "string"},
+        "one_of": {"type": "array", "items": {"type": "string"}},
+        "pattern": {"type": "string", "maxLength": 256},
+        "min": {"type": "string"},
+        "max": {"type": "string"},
+        "set": {"enum": ["unix", "unix_ms"]},
+        "offset": {"type": "integer"}
+      }
+    },
+    "RlpInput": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "prefix": {"type": "string"},
+        "items": {"type": "array", "maxItems": 64, "items": {"$ref": "#/$defs/RlpItem"}}
+      }
+    },
+    "RlpItem": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["pointer"],
+      "properties": {
+        "pointer": {"type": "string"},
+        "optional": {"type": "boolean"},
+        "equals": {"type": "string"},
+        "one_of": {"type": "array", "items": {"type": "string"}},
+        "min": {"type": "string"},
+        "max": {"type": "string"}
+      }
+    },
+    "Step": {
+      "oneOf": [
+        {"$ref": "#/$defs/Open"},
+        {"$ref": "#/$defs/Send"},
+        {"$ref": "#/$defs/Receive"},
+        {"$ref": "#/$defs/Compute"},
+        {"$ref": "#/$defs/Return"},
+        {"$ref": "#/$defs/Repeat"},
+        {"$ref": "#/$defs/If"}
+      ]
+    },
+    "Open": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["do", "connection", "destinations"],
+      "properties": {
+        "do": {"const": "open"},
+        "connection": {"enum": ["https", "tls"]},
+        "destinations": {"type": "array", "minItems": 1, "maxItems": 32, "items": {"$ref": "#/$defs/Destination"}},
+        "identity": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["cert", "key"],
+          "properties": {"cert": {"type": "string"}, "key": {"type": "string"}}
+        }
+      }
+    },
+    "Destination": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["host", "port"],
+      "properties": {
+        "host": {"type": "string", "pattern": "^(\\*\\.)?[a-z0-9.-]{1,253}$"},
+        "port": {"type": "integer", "minimum": 1, "maximum": 65535}
+      }
+    },
+    "Send": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["do"],
+      "properties": {
+        "do": {"const": "send"},
+        "request": {"$ref": "#/$defs/StepRequest"},
+        "inject": {"type": "array", "maxItems": 16, "items": {"$ref": "#/$defs/Injection"}},
+        "template": {"type": "string", "maxLength": 8192}
+      }
+    },
+    "Method": {"enum": ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "PROPFIND", "REPORT", "MKCOL", "COPY", "MOVE"]},
+    "StepRequest": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["from", "methods", "paths"],
+          "properties": {
+            "from": {"const": "caller"},
+            "methods": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/Method"}},
+            "paths": {"type": "array", "minItems": 1, "maxItems": 32, "items": {"type": "string", "pattern": "^/"}},
+            "headers": {"type": "array", "items": {"$ref": "#/$defs/Token"}},
+            "query": {"type": "array", "maxItems": 32, "items": {"$ref": "#/$defs/QueryRule"}},
+            "encoded_percent": {"type": "boolean"},
+            "override_params": {"type": "boolean"}
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["from", "method", "path"],
+          "properties": {
+            "from": {"const": "fixed"},
+            "method": {"$ref": "#/$defs/Method"},
+            "path": {"type": "string", "pattern": "^/"},
+            "destination": {"$ref": "#/$defs/Destination"}
+          }
+        }
+      ]
+    },
+    "QueryRule": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name"],
+      "properties": {
+        "name": {"type": "string", "pattern": "^[!-~]{1,256}$"},
+        "required": {"type": "boolean"},
+        "equals": {"type": "string"},
+        "one_of": {"type": "array", "items": {"type": "string"}},
+        "pattern": {"type": "string", "maxLength": 256},
+        "min": {"type": "string", "pattern": "^-?[0-9]{1,80}$"},
+        "max": {"type": "string", "pattern": "^-?[0-9]{1,80}$"}
+      }
+    },
+    "Injection": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["target", "template"],
+      "properties": {
+        "target": {"$ref": "#/$defs/Target"},
+        "template": {"type": "string", "maxLength": 8192}
+      }
+    },
+    "Target": {
+      "oneOf": [
+        {"type": "object", "additionalProperties": false, "required": ["kind", "name"],
+         "properties": {"kind": {"const": "header"}, "name": {"$ref": "#/$defs/Token"}}},
+        {"type": "object", "additionalProperties": false, "required": ["kind", "name"],
+         "properties": {"kind": {"const": "query"}, "name": {"$ref": "#/$defs/Token"}}},
+        {"type": "object", "additionalProperties": false, "required": ["kind", "name"],
+         "properties": {"kind": {"const": "path_param"}, "name": {"$ref": "#/$defs/Token"}}},
+        {"type": "object", "additionalProperties": false, "required": ["kind"],
+         "properties": {"kind": {"const": "body"}}}
+      ]
+    },
+    "Receive": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["do"],
+      "properties": {
+        "do": {"const": "receive"},
+        "until": {"type": "array", "maxItems": 8, "items": {"type": "string", "minLength": 1, "maxLength": 256}},
+        "capture": {"type": "array", "maxItems": 16, "items": {"$ref": "#/$defs/Capture"}}
+      }
+    },
+    "Capture": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["source", "into"],
+      "properties": {
+        "source": {"$ref": "#/$defs/Source"},
+        "into": {"$ref": "#/$defs/Store"},
+        "optional": {"type": "boolean"}
+      }
+    },
+    "Source": {
+      "oneOf": [
+        {"type": "object", "additionalProperties": false, "required": ["from"],
+         "properties": {"from": {"const": "status"}}},
+        {"type": "object", "additionalProperties": false, "required": ["from", "name"],
+         "properties": {"from": {"const": "header"}, "name": {"$ref": "#/$defs/Token"}}},
+        {"type": "object", "additionalProperties": false, "required": ["from", "name", "param"],
+         "properties": {"from": {"const": "header_param"}, "name": {"$ref": "#/$defs/Token"},
+                        "param": {"$ref": "#/$defs/Token"}, "scheme": {"$ref": "#/$defs/Token"}}},
+        {"type": "object", "additionalProperties": false, "required": ["from", "name"],
+         "properties": {"from": {"const": "cookie"}, "name": {"$ref": "#/$defs/Token"}}},
+        {"type": "object", "additionalProperties": false, "required": ["from", "pointer"],
+         "properties": {"from": {"const": "json"}, "pointer": {"type": "string"}}},
+        {"type": "object", "additionalProperties": false, "required": ["from", "start", "end"],
+         "properties": {"from": {"const": "between"},
+                        "start": {"type": "string", "minLength": 1, "maxLength": 256},
+                        "end": {"type": "string", "minLength": 1, "maxLength": 256}}},
+        {"type": "object", "additionalProperties": false, "required": ["from", "selector"],
+         "properties": {"from": {"const": "html"}, "selector": {"type": "string", "minLength": 1, "maxLength": 256},
+                        "attribute": {"$ref": "#/$defs/Token"}}},
+        {"type": "object", "additionalProperties": false, "required": ["from", "pattern"],
+         "properties": {"from": {"const": "regex"}, "pattern": {"type": "string", "minLength": 1, "maxLength": 256},
+                        "group": {"type": "integer", "minimum": 0, "maximum": 255}}},
+        {"type": "object", "additionalProperties": false, "required": ["from"],
+         "properties": {"from": {"const": "all"}}}
+      ]
+    },
+    "Store": {
+      "oneOf": [
+        {"type": "object", "additionalProperties": false, "required": ["kind", "name"],
+         "properties": {"kind": {"const": "field"}, "name": {"$ref": "#/$defs/Token"}}},
+        {"type": "object", "additionalProperties": false, "required": ["kind", "name", "secret"],
+         "properties": {"kind": {"const": "temp"}, "name": {"$ref": "#/$defs/Token"}, "secret": {"type": "boolean"}}}
+      ]
+    },
+    "Compute": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["do", "into", "template"],
+      "properties": {
+        "do": {"const": "compute"},
+        "into": {"$ref": "#/$defs/Token"},
+        "template": {"type": "string", "maxLength": 8192}
+      }
+    },
+    "Return": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["do"],
+      "properties": {
+        "do": {"const": "return"},
+        "response": {"$ref": "#/$defs/Projection"},
+        "relay": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["sends"],
+          "properties": {
+            "sends": {"type": "array", "minItems": 1, "maxItems": 16, "items": {"type": "string", "minLength": 1, "maxLength": 256}}
+          }
+        },
+        "template": {"type": "string", "maxLength": 8192}
+      }
+    },
+    "Projection": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "headers": {"type": "array", "maxItems": 32, "items": {"$ref": "#/$defs/Token"}},
+        "body": {
+          "oneOf": [
+            {"const": "all"},
+            {"type": "object", "additionalProperties": false, "required": ["json"],
+             "properties": {"json": {"type": "array", "minItems": 1, "maxItems": 32, "items": {"type": "string"}}}}
+          ]
+        }
+      }
+    },
+    "Repeat": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["do", "times", "steps"],
+      "properties": {
+        "do": {"const": "repeat"},
+        "times": {"type": "integer", "minimum": 0},
+        "steps": {"type": "array", "items": {"$ref": "#/$defs/Step"}},
+        "until": {"type": "string"}
+      }
+    },
+    "If": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["do", "name", "equals"],
+      "properties": {
+        "do": {"const": "if"},
+        "name": {"type": "string"},
+        "equals": {"type": "string"},
+        "then": {"type": "array", "items": {"$ref": "#/$defs/Step"}},
+        "else": {"type": "array", "items": {"$ref": "#/$defs/Step"}}
+      }
+    },
+    "ItemBinding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind"],
+      "properties": {
+        "kind": {"$ref": "#/$defs/Token"},
+        "custom": {"$ref": "#/$defs/SignedKind"},
+        "pins": {"type": "object", "propertyNames": {"$ref": "#/$defs/Token"},
+                 "additionalProperties": {"type": "string", "maxLength": 4096}},
+        "signoff": {"type": "array", "maxItems": 8, "items": {"$ref": "#/$defs/Token"}}
+      }
+    },
+    "SignedKind": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "signature"],
+      "properties": {
+        "kind": {"$ref": "#/$defs/KindSchema"},
+        "signature": {"$ref": "#/$defs/Signature"}
+      }
+    },
+    "KindSchema": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "description", "fields", "shape"],
+      "properties": {
+        "name": {"$ref": "#/$defs/Token"},
+        "description": {"type": "string", "minLength": 1, "maxLength": 512},
+        "free_fields": {"type": "boolean"},
+        "fields": {"type": "array", "maxItems": 32, "items": {"$ref": "#/$defs/KindField"}},
+        "shape": {"$ref": "#/$defs/Shape"}
+      }
+    },
+    "KindField": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "disclosure"],
+      "properties": {
+        "name": {"$ref": "#/$defs/Token"},
+        "disclosure": {"enum": ["secret", "masked", "public"]},
+        "optional": {"type": "boolean"},
+        "guessable": {"type": "boolean"},
+        "pinned": {"type": "boolean"},
+        "mask": {"enum": ["card", "email", "initial", "year", "last2", "last4"]},
+        "checks": {"type": "array", "maxItems": 8, "items": {"$ref": "#/$defs/Check"}}
+      }
+    },
+    "Check": {
+      "oneOf": [
+        {"type": "object", "additionalProperties": false, "required": ["check"],
+         "properties": {"check": {"enum": ["luhn", "expiry", "origin", "host", "email", "date", "ssh_host_key"]}}},
+        {"type": "object", "additionalProperties": false, "required": ["check", "number"],
+         "properties": {"check": {"const": "cvc"}, "number": {"$ref": "#/$defs/Token"}}},
+        {"type": "object", "additionalProperties": false, "required": ["check", "min", "max"],
+         "properties": {"check": {"enum": ["integer", "length"]},
+                        "min": {"type": "integer", "minimum": 0}, "max": {"type": "integer", "minimum": 0}}},
+        {"type": "object", "additionalProperties": false, "required": ["check", "regex"],
+         "properties": {"check": {"const": "pattern"}, "regex": {"type": "string", "minLength": 1, "maxLength": 256}}},
+        {"type": "object", "additionalProperties": false, "required": ["check", "values"],
+         "properties": {"check": {"const": "one_of"},
+                        "values": {"type": "array", "minItems": 1, "maxItems": 32, "items": {"type": "string", "minLength": 1, "maxLength": 256}}}},
+        {"type": "object", "additionalProperties": false, "required": ["check", "min_bits"],
+         "properties": {"check": {"const": "base32"}, "min_bits": {"type": "integer", "minimum": 1, "maximum": 8192}}},
+        {"type": "object", "additionalProperties": false, "required": ["check", "bytes"],
+         "properties": {"check": {"const": "base64_key"}, "bytes": {"type": "integer", "minimum": 1, "maximum": 1024}}},
+        {"type": "object", "additionalProperties": false, "required": ["check", "values", "flag"],
+         "properties": {"check": {"const": "signoff"},
+                        "values": {"type": "array", "minItems": 1, "maxItems": 32, "items": {"type": "string"}},
+                        "flag": {"$ref": "#/$defs/Token"}}}
+      ]
+    },
+    "Shape": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["connections", "destinations", "returns"],
+      "properties": {
+        "connections": {"type": "array", "maxItems": 3, "items": {"enum": ["https", "tls", "none"]}},
+        "destinations": {
+          "oneOf": [
+            {"type": "object", "additionalProperties": false, "required": ["from"],
+             "properties": {"from": {"const": "owner"}}},
+            {"type": "object", "additionalProperties": false, "required": ["from", "field"],
+             "properties": {"from": {"const": "origin"}, "field": {"$ref": "#/$defs/Token"}}},
+            {"type": "object", "additionalProperties": false, "required": ["from", "host", "port"],
+             "properties": {"from": {"const": "host"}, "host": {"$ref": "#/$defs/Token"}, "port": {"$ref": "#/$defs/Token"}}}
+          ]
+        },
+        "wildcards": {"type": "boolean"},
+        "returns": {"enum": ["status", "json", "all"]},
+        "relay": {"type": "boolean"},
+        "identity": {"type": "boolean"},
+        "captures": {"type": "array", "items": {"type": "string", "pattern": "^([A-Za-z0-9_-]{1,64}|\\*)$"}}
+      }
+    }
+  }
+}

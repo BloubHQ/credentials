@@ -224,6 +224,21 @@ step 이전 형식(`"kind": "http" | "stream" | "derive"`)의 정책은 `credent
 | TOTP | 연결 없음: `{{ totp(b32decode(seed)) }}` |
 | 상호 TLS | `open`의 `"identity": {"cert": "{{cert}}", "key": "{{key}}"}` |
 
+**타입 항목.** 정책은 레코드를 종류(kind)에 묶을 수 있습니다: `card`, `login`, `oauth`,
+`identity`, `totp`, `ssh`, `database`, `ftp`, `mail`, `queue`, `vpn`, `api`, 또는 소유자의
+기기가 서명한 사용자 정의 종류. 종류는 각 필드가 비밀(secret)·마스킹(masked)·공개(public) 중
+무엇인지 정하고, 값을 검사하며(Luhn, 노드 시계 기준 만료일, 카드 브랜드별 보안 코드 길이,
+정확한 origin, SSH 호스트 키, 서명된 예외가 없으면 TLS 필수), 정책이 할 수 있는 범위를
+제한합니다. 노드는 종류보다 넓은 타입 정책을 서명되어 있어도 거부합니다. 호출자는 타입 레코드를
+`describe`해 공개 필드와 `visa ••••4242` 같은 마스킹 값을 받을 뿐, 비밀 필드는 절대 받지
+못합니다.
+
+**서명 전에.** `summarize`는 비밀마다 갈 수 있는 곳과 형태, 돌아오는 것, 위험 플래그(항목의
+origin 밖 목적지, 와일드카드, 평문 HTTP, 아무 바이트나 받는 입력, 되돌릴 수 있는 출력, 릴레이,
+새 버전이 이전보다 넓힌 모든 것)를 보여 줍니다. 형식에는 JSON Schema
+`crates/engine/policy.schema.json`이 있습니다. 자세한 내용은
+[docs/policy.md](../policy.md)에 있습니다.
+
 ## 레코드, 세대, 롤백
 
 레코드는 필드들을 사용자 키와 레코드 id에서 파생한 키로 ChaCha20-Poly1305 암호화한 것이며, id, 소유자,

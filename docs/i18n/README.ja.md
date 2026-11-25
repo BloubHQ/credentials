@@ -226,6 +226,20 @@ let outcome = node.run(&call, &mut TlsTransport::new());
 | TOTP | 接続なし: `{{ totp(b32decode(seed)) }}` |
 | Mutual TLS | `open` の `"identity": {"cert": "{{cert}}", "key": "{{key}}"}` |
 
+**型付きアイテム。** ポリシーはレコードを種類 (kind) に結び付けられます: `card`、`login`、
+`oauth`、`identity`、`totp`、`ssh`、`database`、`ftp`、`mail`、`queue`、`vpn`、`api`、
+または所有者のデバイスが署名した独自の種類。種類は各フィールドが secret・masked・public の
+どれかを定め、値を検査し (Luhn、ノードの時計による有効期限、カードブランドごとのセキュリティ
+コード長、正確なオリジン、SSH ホスト鍵、署名された例外がなければ TLS 必須)、ポリシーにできる
+ことを制限します。ノードは種類より広い型付きポリシーを、署名済みであっても拒否します。呼び出し
+側は型付きレコードを `describe` して公開フィールドと `visa ••••4242` のようなマスク値を
+得るだけで、secret フィールドは決して得られません。
+
+**署名の前に。** `summarize` は secret ごとに送り先と形式、返るもの、リスクフラグ (アイテムの
+オリジン外の宛先、ワイルドカード、平文 HTTP、任意バイトの入力、可逆な出力、リレー、新しい
+バージョンが前より広げたものすべて) を示します。形式には JSON Schema
+`crates/engine/policy.schema.json` があります。詳細は [docs/policy.md](../policy.md)。
+
 ## レコード、世代、ロールバック
 
 レコードとは、ユーザー鍵とレコード ID から導出した鍵のもとで ChaCha20-Poly1305 により暗号化された

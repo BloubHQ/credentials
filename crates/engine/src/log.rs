@@ -103,6 +103,11 @@ pub enum Event {
         /// [`Detail::Derive`], sealed to the owner.
         detail: SealedDetail,
     },
+    /// The node told a caller the public fields and masked projections of a typed item.
+    Describe {
+        /// The generation of the record.
+        generation: u64,
+    },
     /// The node sealed the record again with values an operation captured.
     Update {
         /// The operation.
