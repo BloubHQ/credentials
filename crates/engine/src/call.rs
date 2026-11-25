@@ -49,6 +49,13 @@ pub enum Body {
         #[serde(with = "crate::encoding::b64_array")]
         id: [u8; 16],
     },
+    /// A WebSocket operation, run on a streaming call ([`crate::node::Node::relay`]), with
+    /// the caller's handshake request when its first send takes one.
+    Socket {
+        /// The handshake request of the caller.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        request: Option<Request>,
+    },
 }
 
 impl Body {
@@ -89,6 +96,7 @@ impl Body {
             Body::Derive { input } => Payload::Derive(input),
             Body::Describe {} => Payload::Describe,
             Body::Resume { id } => Payload::Resume(id),
+            Body::Socket { request } => Payload::Socket(request.as_ref()),
         }
     }
 
@@ -125,6 +133,8 @@ pub enum Output {
     Describe(Description),
     /// The operation waits for a challenge or the owner's approval; resume it with the id.
     Pending(Pending),
+    /// A connection that stayed open ended (its parts went to the caller as they came).
+    Closed(crate::node::Closed),
 }
 
 impl CallerKey {

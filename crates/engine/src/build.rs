@@ -358,6 +358,7 @@ impl Return {
         Self {
             relay: Some(Relay {
                 sends: patterns.into_iter().map(Into::into).collect(),
+                ..Relay::default()
             }),
             ..Self::default()
         }
@@ -457,6 +458,8 @@ impl Operation {
                 connection,
                 destinations: vec![destination],
                 identity: None,
+                protocol: None,
+                limits: None,
             })],
             payment: None,
             approval: false,

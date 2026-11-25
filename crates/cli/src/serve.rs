@@ -91,6 +91,7 @@ pub fn serve(config: &Config) -> Res<()> {
             threads: config.threads,
             max_connections: config.max_connections,
             max_body: config.max_body,
+            streams: server::DEFAULT_STREAMS,
         },
         HeadFile(head_path(&config.log)),
     );

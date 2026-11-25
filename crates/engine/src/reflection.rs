@@ -231,10 +231,274 @@ pub(crate) fn release(mut bytes: Vec<u8>, s: &Secrets<'_>) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
+/// The longest raw run one decoded byte of a JSON escape comes from (`A` is six bytes
+/// for one).
+const ESCAPE_RATIO: usize = 6;
+/// The longest JSON escape: a surrogate pair, `😀`.
+const LONGEST_ESCAPE: usize = 12;
+
+/// The bytes of `window` with every JSON escape decoded (`\"`, `\\`, `\/`, `\b`, `\f`, `\n`,
+/// `\r`, `\t`, `\uXXXX` and surrogate pairs), wherever it stands, and the offsets in
+/// `window` where each token (a byte or an escape) starts. A backslash that starts no valid
+/// escape is a byte of its own.
+fn unescape(window: &[u8]) -> (Bytes, Vec<usize>) {
+    let mut out = Zeroizing::new(Vec::with_capacity(window.len()));
+    let mut starts = Vec::with_capacity(window.len() + 1);
+    let mut i = 0;
+    let hex4 = |at: usize| -> Option<u32> {
+        let digits = window.get(at..at + 4)?;
+        let text = core::str::from_utf8(digits).ok()?;
+        u32::from_str_radix(text, 16).ok()
+    };
+    while let Some(&byte) = window.get(i) {
+        starts.push(i);
+        let next = window.get(i + 1).copied();
+        let simple = match (byte, next) {
+            (b'\\', Some(b'"')) => Some(b'"'),
+            (b'\\', Some(b'\\')) => Some(b'\\'),
+            (b'\\', Some(b'/')) => Some(b'/'),
+            (b'\\', Some(b'b')) => Some(0x08),
+            (b'\\', Some(b'f')) => Some(0x0c),
+            (b'\\', Some(b'n')) => Some(b'\n'),
+            (b'\\', Some(b'r')) => Some(b'\r'),
+            (b'\\', Some(b't')) => Some(b'\t'),
+            _ => None,
+        };
+        if let Some(decoded) = simple {
+            out.push(decoded);
+            i += 2;
+            continue;
+        }
+        if byte == b'\\'
+            && next == Some(b'u')
+            && let Some(high) = hex4(i + 2)
+        {
+            let pair = (0xd800..0xdc00).contains(&high)
+                && window.get(i + 6) == Some(&b'\\')
+                && window.get(i + 7) == Some(&b'u');
+            let low = if pair { hex4(i + 8) } else { None };
+            let (code, len) = match low {
+                Some(low) if (0xdc00..0xe000).contains(&low) => {
+                    (0x10000 + ((high - 0xd800) << 10) + (low - 0xdc00), 12)
+                }
+                _ => (high, 6),
+            };
+            if let Some(c) = char::from_u32(code) {
+                let mut utf8 = [0u8; 4];
+                out.extend_from_slice(c.encode_utf8(&mut utf8).as_bytes());
+                i += len;
+                continue;
+            }
+        }
+        out.push(byte);
+        i += 1;
+    }
+    starts.push(window.len());
+    (out, starts)
+}
+
+/// The reflection search over a response that arrives in parts (a streamed body, the
+/// messages of a WebSocket): each part is searched together with the last `n - 1` bytes
+/// before it, where `n` is the longest form of any secret the search knows (its encodings,
+/// and its JSON-escaped form at six bytes per byte), and those bytes are held back until the
+/// next part or the end. A secret split across parts is therefore found before any byte of
+/// it is released.
+///
+/// The search finds every needle of the whole-response check (secret fields raw and in
+/// base64, percent, JSON and hex forms; rendered values; captured secrets) in the bytes as
+/// they are and with JSON escapes decoded. Captured secrets are not redacted in a stream:
+/// one stops it.
+pub struct Scrubber {
+    needles: Vec<Bytes>,
+    hold: usize,
+    tail: Bytes,
+}
+
+impl Scrubber {
+    pub(crate) fn new(secrets: &Secrets<'_>) -> Result<Self> {
+        Ok(Self::with_needles(needles(secrets)?))
+    }
+
+    /// A scrubber that searches for these byte strings.
+    pub fn with_needles(needles: Vec<Zeroizing<Vec<u8>>>) -> Self {
+        let needles: Vec<Bytes> = needles.into_iter().filter(|n| !n.is_empty()).collect();
+        let longest = needles.iter().map(|n| n.len()).max().unwrap_or(0);
+        let hold = if longest == 0 {
+            0
+        } else {
+            longest
+                .saturating_mul(ESCAPE_RATIO)
+                .max(LONGEST_ESCAPE)
+                .saturating_sub(1)
+        };
+        Self {
+            needles,
+            hold,
+            tail: Zeroizing::new(Vec::new()),
+        }
+    }
+
+    /// How many bytes are held back at most (`n - 1`), less one escape.
+    pub fn hold(&self) -> usize {
+        self.hold
+    }
+
+    /// Searches `chunk` with the bytes held back before it, and releases what can no longer
+    /// be part of a secret. Fails with [`Error::Reflection`] when a secret is found; nothing
+    /// of the window is released then.
+    pub fn push(&mut self, chunk: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
+        let mut window = Zeroizing::new(Vec::with_capacity(self.tail.len() + chunk.len()));
+        window.extend_from_slice(&self.tail);
+        window.extend_from_slice(chunk);
+        self.tail.zeroize();
+        if self.needles.is_empty() {
+            return Ok(window);
+        }
+        let (decoded, starts) = unescape(&window);
+        let found = self
+            .needles
+            .iter()
+            .any(|n| contains(&window, n) || contains(&decoded, n));
+        drop(decoded);
+        if found {
+            window.zeroize();
+            return Err(Error::Reflection);
+        }
+        let target = window.len().saturating_sub(self.hold);
+        // The cut is at the start of a token, so the bytes held back start where the decoding
+        // of the next window is in step with this one.
+        let cut = starts
+            .iter()
+            .rev()
+            .find(|s| **s <= target)
+            .copied()
+            .unwrap_or(0);
+        let released = Zeroizing::new(window.get(..cut).unwrap_or_default().to_vec());
+        self.tail = Zeroizing::new(window.get(cut..).unwrap_or_default().to_vec());
+        Ok(released)
+    }
+
+    /// The bytes still held back, at the end of the response (they were searched).
+    pub fn finish(&mut self) -> Zeroizing<Vec<u8>> {
+        core::mem::take(&mut self.tail)
+    }
+
+    /// Searches one whole message (a WebSocket message goes back whole or not at all) with
+    /// the end of the messages before it, and keeps its end for the next one. A secret split
+    /// across two messages is found when the second arrives; the first was released, but it
+    /// held only part of the secret.
+    pub fn message(&mut self, data: &[u8]) -> Result<()> {
+        self.push(data).map(drop)
+    }
+
+    /// Searches for one more value from now on (a frame template rendered a secret).
+    pub(crate) fn add(&mut self, needle: Zeroizing<Vec<u8>>) {
+        if needle.is_empty() || self.needles.contains(&needle) {
+            return;
+        }
+        let hold = needle
+            .len()
+            .saturating_mul(ESCAPE_RATIO)
+            .max(LONGEST_ESCAPE)
+            .saturating_sub(1);
+        self.hold = self.hold.max(hold);
+        self.needles.push(needle);
+    }
+}
+
+/// Every form of `secret` the stream search knows, as [`Scrubber`] builds them for a secret
+/// field (for tests and the fuzz target).
+pub fn forms(secret: &[u8]) -> Result<Vec<Zeroizing<Vec<u8>>>> {
+    let mut out = vec![Zeroizing::new(secret.to_vec())];
+    if secret.len() >= MIN_ENCODED {
+        out.push(b64_with(&STANDARD_NO_PAD, secret)?);
+        out.push(b64_with(&URL_SAFE_NO_PAD, secret)?);
+        let escaped = json_escape(secret);
+        if escaped.as_slice() != secret {
+            out.push(escaped);
+        }
+        let encoded = pct(secret);
+        if encoded.as_slice() != secret {
+            out.push(encoded);
+        }
+        let lower = hex(secret);
+        out.push(Zeroizing::new(lower.to_ascii_uppercase()));
+        out.push(lower);
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::unwrap_used, clippy::indexing_slicing)]
 mod tests {
     use super::*;
+
+    /// `secret` with every byte written as a `\u00XX` JSON escape.
+    fn u_escaped(secret: &[u8]) -> Vec<u8> {
+        secret
+            .iter()
+            .flat_map(|b| format!("\\u{:04x}", b).into_bytes())
+            .collect()
+    }
+
+    #[test]
+    fn a_secret_split_at_every_offset_in_every_form_is_caught() {
+        let secret = b"s3cr3t-T0KEN/+=\"value";
+        let mut written = forms(secret).unwrap();
+        assert_eq!(written.len(), 7);
+        written.push(Zeroizing::new(u_escaped(secret)));
+        // In the middle of an SSE stream: before and after it, other bytes.
+        for form in &written {
+            let mut stream = b"data: {\"a\":\"".to_vec();
+            let start = stream.len();
+            stream.extend_from_slice(form);
+            stream.extend_from_slice(b"\"}\n\n");
+            for split in 1..form.len() {
+                let mut s = Scrubber::with_needles(forms(secret).unwrap());
+                let first = s.push(&stream[..start + split]).unwrap();
+                // Nothing of the secret's form left with the first part.
+                assert!(first.len() <= start, "released into the secret");
+                assert_eq!(
+                    s.push(&stream[start + split..]),
+                    Err(Error::Reflection),
+                    "split not caught"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn clean_streams_pass_whole_and_in_order() {
+        let secret = b"0123456789abcdef";
+        let mut s = Scrubber::with_needles(forms(secret).unwrap());
+        let text: Vec<u8> = (0..5000u32)
+            .flat_map(|i| format!("data: {i} \\u0041 \\\\ x\n").into_bytes())
+            .collect();
+        let mut out = Vec::new();
+        for chunk in text.chunks(37) {
+            out.extend_from_slice(&s.push(chunk).unwrap());
+        }
+        out.extend_from_slice(&s.finish());
+        assert_eq!(out, text);
+        assert_eq!(s.hold(), 6 * 32 - 1);
+    }
+
+    #[test]
+    fn escapes_cut_at_the_hold_stay_in_step() {
+        // An escaped backslash just before an escape of the secret's first byte: a decoding
+        // that started between the two backslashes would miss it.
+        let secret = b"ZZZZZZZZ";
+        let mut stream = vec![b'x'; 200];
+        stream.extend_from_slice(b"\\\\");
+        stream.extend_from_slice(&u_escaped(secret));
+        for split in 1..stream.len() {
+            let mut s = Scrubber::with_needles(forms(secret).unwrap());
+            let found = s
+                .push(&stream[..split])
+                .and_then(|_| s.push(&stream[split..]));
+            assert_eq!(found, Err(Error::Reflection));
+        }
+    }
 
     #[test]
     fn redacts_every_written_form() {

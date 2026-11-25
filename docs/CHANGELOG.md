@@ -43,6 +43,42 @@ before 1.0, minor versions may break formats and APIs.
 - Fuzz targets `sigstore_bundle`, `fulcio_certificate`, `successor_statement`,
   `handover_package`, `key_transfer`.
 
+- Connections that stay open (`docs/design.md` section 11, part 6, first half;
+  `docs/policy.md`, HTTP versions and gRPC, WebSocket):
+  - HTTP/2 by ALPN (`h2`, then `http/1.1`) in the transport: an own synchronous client
+    (`transport::h2`) and HPACK decoder with Huffman (`transport::hpack`), strict frame and
+    field checks; answers are handed to the engine in HTTP/1.1 form with trailers. `open`
+    takes `protocol` (`h2` or `http1`) to pin the version: a server that does not agree fails
+    the call before anything is written (`TransportKind::Downgrade`, checked again by the
+    engine). Chosen over `h2` 0.4.21, which needs tokio: in a size probe (same release
+    profile, Windows host) `h2` + tokio 1.54.1 add 538,112 bytes and `tungstenite` 0.28.0
+    196,608 bytes, while this whole part adds 351,232 bytes to `credentials.exe`.
+  - Unary gRPC: `send` takes `grpc: true` (needs `protocol: "h2"`, a POST): the body is
+    length-prefixed, `te: trailers` set, the one message of the answer unframed. Responses
+    carry trailers: `return.response.trailers` and the capture source `trailer`.
+  - Streamed responses: `"body": "stream"` hands the body on as it arrives (server-sent
+    events, chunked) on `POST /stream` (`Node::relay`); the stream search
+    (`reflection::Scrubber`) holds back one less than the longest searched form of a secret
+    (×6 for JSON escapes), so a secret split across chunks is found before any byte of it
+    leaves.
+  - The `websocket` connection: a handshake `send` (the node sets the WebSocket fields and
+    checks the answer: 101, accept value, no extension), message `send`s with `frame` and a
+    template (first-message authentication), `receive` of the next message, and
+    `return.relay` with `frames` (per kind, a closed JSON schema or a pattern, and a template)
+    and `server`. Caller frames are signed per call and in sequence
+    (`CallerKey::sign_frame`); a frame outside the rules closes the connection. Server
+    messages go back only with `server: true`, each searched with the tail of the one before.
+  - Limits per open connection (`limits`: idle, duration, bytes) and at most 4 open per caller,
+    16 per owner, 256 per node (`Error::StreamsFull`, HTTP 429); a log entry `closed` with
+    the reason, status and the messages and bytes each way. Errors `FrameRefused`,
+    `TransportKind::Protocol`.
+  - The server's `/stream` endpoint speaks a framed protocol
+    (`application/vnd.credentials.stream`, `server::stream`); open connections have their own
+    pool (16 by default). Everything stays synchronous: one thread per open connection. The
+    Nitro host relay needs no change.
+  - Summaries flag `frames_unpinned` and `server_frames`; the JSON Schema covers the new
+    members. Fuzz targets `h2_response` (HTTP/2 framing and HPACK), `websocket_frames` and
+    `stream_scrubber`.
 - Trusted code sandbox (`docs/design.md` section 11, part 7; `docs/sandbox.md`): the IR step
   `run {module, entry, inputs, into}` runs a WebAssembly module fetched from the
   destination's own origin (`{"url": ..., "sha256": ...}`, fetched as a logged `GET` over the

@@ -17,6 +17,7 @@ engine = { path = "../engine" }
 continuity = { path = "../continuity" }
 client = { path = "../client" }
 sandbox = { path = "../sandbox" }
+transport = { path = "../transport" }
 libfuzzer-sys = "0.4"
 serde_json = "1"
 
@@ -142,6 +143,27 @@ bench = false
 [[bin]]
 name = "key_transfer"
 path = "fuzz_targets/key_transfer.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "h2_response"
+path = "fuzz_targets/h2_response.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "websocket_frames"
+path = "fuzz_targets/websocket_frames.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "stream_scrubber"
+path = "fuzz_targets/stream_scrubber.rs"
 test = false
 doc = false
 bench = false

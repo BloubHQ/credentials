@@ -93,6 +93,7 @@ pub mod error;
 pub mod extract;
 pub mod fields;
 pub mod grant;
+pub mod grpc;
 pub mod item;
 pub mod keys;
 pub mod limits;
@@ -112,5 +113,6 @@ mod totp;
 mod vectors;
 #[cfg(test)]
 mod vectors_families;
+pub mod websocket;
 
 pub use error::{Error, Result};

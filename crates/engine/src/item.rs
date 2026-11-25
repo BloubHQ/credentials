@@ -846,6 +846,13 @@ fn check_operation(
     let connection = match operation.connection() {
         Some(Connection::Https) => ShapeConnection::Https,
         Some(Connection::Tls) => ShapeConnection::Tls,
+        Some(Connection::Websocket) => {
+            return shape_ensure(
+                false,
+                || at.to_string(),
+                "a typed item has no WebSocket operation",
+            );
+        }
         None => ShapeConnection::None,
     };
     shape_ensure(
@@ -892,9 +899,11 @@ fn check_operation(
             Step::Return(ret) => {
                 if let Some(projection) = &ret.response {
                     let needs = match &projection.body {
-                        Some(BodyProjection::All) => Returns::All,
+                        Some(BodyProjection::All | BodyProjection::Stream) => Returns::All,
                         Some(BodyProjection::Json(_)) => Returns::Json,
-                        None if projection.headers.is_empty() => Returns::Status,
+                        None if projection.headers.is_empty() && projection.trailers.is_empty() => {
+                            Returns::Status
+                        }
                         None => Returns::Json,
                     };
                     shape_ensure(

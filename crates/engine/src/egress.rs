@@ -6,6 +6,9 @@
 //! and only for the destination of that entry. An implementation must speak TLS that ends at
 //! `destination` and nowhere else, and must not keep the identity after the connection.
 
+use std::time::Duration;
+
+use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
 use crate::error::TransportKind;
@@ -47,6 +50,52 @@ impl core::fmt::Debug for ClientIdentity {
     }
 }
 
+/// The HTTP versions an HTTPS request may go over: the pin of the policy (`open.protocol`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Versions {
+    /// HTTP/2 when the server offers it (ALPN `h2`), else HTTP/1.1.
+    #[default]
+    Any,
+    /// HTTP/1.1 only (ALPN `http/1.1`).
+    #[serde(rename = "http1")]
+    Http1,
+    /// HTTP/2 only (ALPN `h2`): a server that does not agree to it is refused.
+    #[serde(rename = "h2")]
+    Http2,
+}
+
+impl Versions {
+    /// True when a request may go over `version`.
+    pub fn allows(self, version: Version) -> bool {
+        match self {
+            Versions::Any => true,
+            Versions::Http1 => version == Version::Http1,
+            Versions::Http2 => version == Version::Http2,
+        }
+    }
+}
+
+/// The HTTP version a request went over.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Version {
+    /// HTTP/1.1.
+    Http1,
+    /// HTTP/2.
+    Http2,
+}
+
+/// What a read of a live connection found.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Arrived {
+    /// Bytes that came.
+    Bytes(Vec<u8>),
+    /// Nothing came within the wait.
+    Nothing,
+    /// The peer ended the connection (or the response) cleanly.
+    End,
+}
+
 /// An open TLS connection.
 pub trait Stream {
     /// Writes all of `bytes`.
@@ -54,6 +103,13 @@ pub trait Stream {
     /// Reads until one of `delimiters` was read and returns it with what came before. Fails
     /// with [`TransportKind::TooLarge`] after `max` bytes without a delimiter.
     fn read_until(&mut self, delimiters: &[&[u8]], max: usize) -> Result<Vec<u8>>;
+
+    /// Reads at most `max` bytes of what arrives within `wait`. Bytes a [`Stream::read_until`]
+    /// read past its delimiter come first. The default refuses.
+    fn read_some(&mut self, max: usize, wait: Duration) -> Result<Arrived> {
+        let _ = (max, wait);
+        Err(Error::transport(TransportKind::Unsupported, true))
+    }
 
     /// Ends the connection. The default does nothing; the connection ends when dropped.
     fn close(&mut self) -> Result<()> {
@@ -84,6 +140,43 @@ pub trait Transport {
         let _ = (destination, identity);
         Err(Error::transport(TransportKind::Unsupported, false))
     }
+
+    /// Sends one HTTP request over a version `versions` allows and returns the response with
+    /// the version used. `wire` is the request in HTTP/1.1 form, as the engine built it; the
+    /// response comes back in HTTP/1.1 form too (an HTTP/2 response is written as HTTP/1.1
+    /// with a chunked body and its trailers), so one parser reads both.
+    ///
+    /// The default sends over HTTP/1.1 with [`Transport::send`] and refuses a request the
+    /// policy pins to HTTP/2.
+    fn exchange(
+        &mut self,
+        destination: &Destination,
+        identity: Option<&ClientIdentity>,
+        wire: &[u8],
+        max_response: usize,
+        versions: Versions,
+    ) -> Result<(Vec<u8>, Version)> {
+        if !versions.allows(Version::Http1) {
+            return Err(Error::transport(TransportKind::Downgrade, false));
+        }
+        self.send(destination, identity, wire, max_response)
+            .map(|bytes| (bytes, Version::Http1))
+    }
+
+    /// Sends one HTTP request like [`Transport::exchange`] and hands back the connection, so
+    /// the response is read as it arrives ([`Stream::read_some`], [`Stream::read_until`]),
+    /// in HTTP/1.1 form. Over HTTP/1.1 the connection stays usable both ways after the
+    /// response head (a WebSocket upgrade). The default refuses.
+    fn exchange_streamed(
+        &mut self,
+        destination: &Destination,
+        identity: Option<&ClientIdentity>,
+        wire: &[u8],
+        versions: Versions,
+    ) -> Result<(Box<dyn Stream + '_>, Version)> {
+        let _ = (destination, identity, wire, versions);
+        Err(Error::transport(TransportKind::Unsupported, false))
+    }
 }
 
 /// Hands the bytes to the transport. Consumes the confirmation: one entry, one request.
@@ -93,15 +186,42 @@ pub(crate) fn dispatch<T: Transport>(
     destination: &Destination,
     identity: Option<&ClientIdentity>,
     wire: &Secret<Vec<u8>>,
+    versions: Versions,
 ) -> Result<(u64, Vec<u8>)> {
     let seq = confirmed.seq();
     let max = crate::response::MAX_RESPONSE;
-    let mut response = transport.send(destination, identity, wire.expose(), max)?;
+    let (mut response, version) =
+        transport.exchange(destination, identity, wire.expose(), max, versions)?;
+    // The transport is checked too: a response over a version the policy does not allow is
+    // dropped unread.
+    if !versions.allows(version) {
+        zeroize::Zeroize::zeroize(&mut response);
+        return Err(Error::transport(TransportKind::Downgrade, true));
+    }
     if response.len() > max {
         zeroize::Zeroize::zeroize(&mut response);
         return Err(Error::transport(TransportKind::TooLarge, true));
     }
     Ok((seq, response))
+}
+
+/// Sends one request and hands back the connection its response arrives on. Consumes the
+/// confirmation: one entry, one request.
+pub(crate) fn dispatch_streamed<'t, T: Transport>(
+    confirmed: Confirmed,
+    transport: &'t mut T,
+    destination: &Destination,
+    identity: Option<&ClientIdentity>,
+    wire: &Secret<Vec<u8>>,
+    versions: Versions,
+) -> Result<(u64, Box<dyn Stream + 't>)> {
+    let seq = confirmed.seq();
+    let (stream, version) =
+        transport.exchange_streamed(destination, identity, wire.expose(), versions)?;
+    if !versions.allows(version) {
+        return Err(Error::transport(TransportKind::Downgrade, true));
+    }
+    Ok((seq, stream))
 }
 
 /// Opens the connection of a stream operation. Consumes the confirmation: one entry, one

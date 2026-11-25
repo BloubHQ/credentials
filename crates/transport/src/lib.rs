@@ -18,13 +18,22 @@
 //! TLS runs over any byte stream a [`Connector`] opens: TCP by default ([`TcpConnector`]),
 //! or a relay such as the vsock link of a Nitro Enclave to its parent instance. TLS ends in
 //! this process either way, so whatever carries the bytes sees only ciphertext.
+//!
+//! HTTPS requests offer HTTP/2 and HTTP/1.1 by ALPN (`h2` first), or only the version the
+//! policy pins; a server that agrees on another is refused before anything is sent
+//! ([`TransportKind::Downgrade`]). HTTP/2 is the synchronous client of [`h2`] with the HPACK
+//! of [`hpack`]: it reads the request the engine built in HTTP/1.1 form and hands the
+//! response back in that form, checked, so one parser of the engine reads both versions.
+
+pub mod h2;
+pub mod hpack;
 
 use std::io::{self, Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpStream, ToSocketAddrs};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use engine::egress::{ClientIdentity, Stream, Transport};
+use engine::egress::{Arrived, ClientIdentity, Stream, Transport, Version, Versions};
 use engine::error::TransportKind;
 use engine::policy::Destination;
 use engine::{Error, Result};
@@ -157,12 +166,44 @@ fn push_erasing(out: &mut Vec<u8>, bytes: &[u8], limit: usize) {
     out.extend_from_slice(bytes);
 }
 
+/// The ALPN names of HTTP/2 and HTTP/1.1.
+const H2: &[u8] = b"h2";
+const HTTP1: &[u8] = b"http/1.1";
+
+fn alpn_of(versions: Versions) -> &'static [&'static [u8]] {
+    match versions {
+        Versions::Any => &[H2, HTTP1],
+        Versions::Http1 => &[HTTP1],
+        Versions::Http2 => &[H2],
+    }
+}
+
+type Tls = StreamOwned<ClientConnection, Box<dyn Socket>>;
+
+impl h2::Io for Tls {
+    fn set_wait(&mut self, wait: Duration) -> io::Result<()> {
+        self.sock.set_timeouts(Some(wait))
+    }
+}
+
+fn h2_fault(error: h2::H2Error) -> Error {
+    let kind = match error {
+        h2::H2Error::Protocol(_) | h2::H2Error::Hpack(_) => TransportKind::Protocol,
+        h2::H2Error::Closed | h2::H2Error::Reset => TransportKind::Closed,
+        h2::H2Error::Io(_) => TransportKind::Io,
+        h2::H2Error::Timeout => TransportKind::Timeout,
+        h2::H2Error::TooLarge => TransportKind::TooLarge,
+    };
+    fault(kind, true)
+}
+
 /// Sends requests and opens connections over TLS.
 pub struct TlsTransport {
     roots: Arc<RootCertStore>,
     connect_timeout: Duration,
     io_timeout: Duration,
     total_timeout: Duration,
+    stream_timeout: Duration,
     connector: Box<dyn Connector>,
 }
 
@@ -174,7 +215,9 @@ impl Default for TlsTransport {
 
 impl TlsTransport {
     /// A transport that trusts the Mozilla root store, with deadlines of 10 s to connect, 30 s
-    /// per read or write and 120 s per request or stream.
+    /// per read or write, 120 s per request or TLS stream, and one hour for a response read
+    /// as it arrives or a WebSocket (the engine ends those sooner, by the limits of the
+    /// policy).
     pub fn new() -> Self {
         let roots = RootCertStore {
             roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
@@ -189,6 +232,7 @@ impl TlsTransport {
             connect_timeout: Duration::from_secs(10),
             io_timeout: Duration::from_secs(30),
             total_timeout: Duration::from_secs(120),
+            stream_timeout: Duration::from_secs(3600),
             connector: Box::new(TcpConnector::new()),
         }
     }
@@ -198,6 +242,12 @@ impl TlsTransport {
         self.connect_timeout = connect;
         self.io_timeout = io;
         self.total_timeout = total;
+        self
+    }
+
+    /// Sets the deadline of a response read as it arrives and of a WebSocket.
+    pub fn stream_timeout(mut self, total: Duration) -> Self {
+        self.stream_timeout = total;
         self
     }
 
@@ -215,7 +265,11 @@ impl TlsTransport {
         self
     }
 
-    fn config(&self, identity: Option<&ClientIdentity>, alpn: bool) -> Result<Arc<ClientConfig>> {
+    fn config(
+        &self,
+        identity: Option<&ClientIdentity>,
+        alpn: &[&[u8]],
+    ) -> Result<Arc<ClientConfig>> {
         let tls = |_| fault(TransportKind::Tls, false);
         let builder =
             ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
@@ -236,9 +290,7 @@ impl TlsTransport {
                 builder.with_client_auth_cert(chain, key).map_err(tls)?
             }
         };
-        if alpn {
-            config.alpn_protocols = vec![b"http/1.1".to_vec()];
-        }
+        config.alpn_protocols = alpn.iter().map(|p| p.to_vec()).collect();
         Ok(Arc::new(config))
     }
 
@@ -246,9 +298,9 @@ impl TlsTransport {
         &self,
         destination: &Destination,
         identity: Option<&ClientIdentity>,
-        alpn: bool,
+        alpn: &[&[u8]],
         deadline: Instant,
-    ) -> Result<StreamOwned<ClientConnection, Box<dyn Socket>>> {
+    ) -> Result<Tls> {
         let name = ServerName::try_from(destination.host.clone())
             .map_err(|_| fault(TransportKind::Connect, false))?;
         if deadline.saturating_duration_since(Instant::now()).is_zero() {
@@ -284,6 +336,28 @@ impl TlsTransport {
         }
         Ok(StreamOwned::new(tls, tcp))
     }
+
+    /// Connects offering the versions `versions` allows, and says which one the server took.
+    /// A server that takes none of them is refused before anything is sent.
+    fn connect_http(
+        &self,
+        destination: &Destination,
+        identity: Option<&ClientIdentity>,
+        versions: Versions,
+        deadline: Instant,
+    ) -> Result<(Tls, Version)> {
+        let mut stream = self.connect(destination, identity, alpn_of(versions), deadline)?;
+        let version = match stream.conn.alpn_protocol() {
+            Some(H2) => Version::Http2,
+            // A server that ignores ALPN speaks HTTP/1.1.
+            Some(_) | None => Version::Http1,
+        };
+        if !versions.allows(version) {
+            close_tls(&mut stream);
+            return Err(fault(TransportKind::Downgrade, false));
+        }
+        Ok((stream, version))
+    }
 }
 
 /// Sets the read and write timeouts to what is left before `deadline`, at most `io`.
@@ -297,6 +371,43 @@ fn set_timeouts(socket: &dyn Socket, io: Duration, deadline: Instant, sent: bool
         .map_err(|_| fault(TransportKind::Io, sent))
 }
 
+/// Writes `wire` and reads to the end of the connection, at most `max` bytes.
+fn http1_exchange(
+    stream: &mut Tls,
+    wire: &[u8],
+    max: usize,
+    io_timeout: Duration,
+    deadline: Instant,
+) -> Result<Vec<u8>> {
+    set_timeouts(stream.sock.as_ref(), io_timeout, deadline, true)?;
+    stream
+        .write_all(wire)
+        .and_then(|()| stream.flush())
+        .map_err(|e| fault(io_kind(&e), true))?;
+    let mut out = Vec::with_capacity(CHUNK);
+    let mut chunk = Zeroizing::new([0u8; CHUNK]);
+    loop {
+        set_timeouts(stream.sock.as_ref(), io_timeout, deadline, true)?;
+        let n = match stream.read(chunk.as_mut_slice()) {
+            Ok(0) => break,
+            Ok(n) => n,
+            // A server that closes without close_notify: the engine checks the framing
+            // of what came.
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
+            Err(e) => {
+                out.zeroize();
+                return Err(fault(io_kind(&e), true));
+            }
+        };
+        if out.len().saturating_add(n) > max {
+            out.zeroize();
+            return Err(fault(TransportKind::TooLarge, true));
+        }
+        push_erasing(&mut out, chunk.get(..n).unwrap_or_default(), max);
+    }
+    Ok(out)
+}
+
 impl Transport for TlsTransport {
     fn send(
         &mut self,
@@ -306,34 +417,65 @@ impl Transport for TlsTransport {
         max_response: usize,
     ) -> Result<Vec<u8>> {
         let deadline = Instant::now() + self.total_timeout;
-        let mut stream = self.connect(destination, identity, true, deadline)?;
-        set_timeouts(stream.sock.as_ref(), self.io_timeout, deadline, true)?;
-        stream
-            .write_all(wire)
-            .and_then(|()| stream.flush())
-            .map_err(|e| fault(io_kind(&e), true))?;
-        let mut out = Vec::with_capacity(CHUNK);
-        let mut chunk = Zeroizing::new([0u8; CHUNK]);
-        loop {
-            set_timeouts(stream.sock.as_ref(), self.io_timeout, deadline, true)?;
-            let n = match stream.read(chunk.as_mut_slice()) {
-                Ok(0) => break,
-                Ok(n) => n,
-                // A server that closes without close_notify: the engine checks the framing
-                // of what came.
-                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
-                Err(e) => {
-                    out.zeroize();
-                    return Err(fault(io_kind(&e), true));
-                }
-            };
-            if out.len().saturating_add(n) > max_response {
-                out.zeroize();
-                return Err(fault(TransportKind::TooLarge, true));
+        let mut stream = self.connect(destination, identity, &[HTTP1], deadline)?;
+        http1_exchange(&mut stream, wire, max_response, self.io_timeout, deadline)
+    }
+
+    fn exchange(
+        &mut self,
+        destination: &Destination,
+        identity: Option<&ClientIdentity>,
+        wire: &[u8],
+        max_response: usize,
+        versions: Versions,
+    ) -> Result<(Vec<u8>, Version)> {
+        let deadline = Instant::now() + self.total_timeout;
+        let (mut stream, version) = self.connect_http(destination, identity, versions, deadline)?;
+        let response = match version {
+            Version::Http1 => {
+                http1_exchange(&mut stream, wire, max_response, self.io_timeout, deadline)?
             }
-            push_erasing(&mut out, chunk.get(..n).unwrap_or_default(), max_response);
-        }
-        Ok(out)
+            Version::Http2 => {
+                let mut conn =
+                    h2::Conn::start(stream, wire, self.io_timeout, deadline).map_err(h2_fault)?;
+                let all = conn.finish_all(max_response).map_err(h2_fault);
+                close_tls(conn.io_mut());
+                all?
+            }
+        };
+        Ok((response, version))
+    }
+
+    fn exchange_streamed(
+        &mut self,
+        destination: &Destination,
+        identity: Option<&ClientIdentity>,
+        wire: &[u8],
+        versions: Versions,
+    ) -> Result<(Box<dyn Stream + '_>, Version)> {
+        let deadline = Instant::now() + self.stream_timeout;
+        let (mut stream, version) = self.connect_http(destination, identity, versions, deadline)?;
+        let opened: Box<dyn Stream> = match version {
+            Version::Http1 => {
+                set_timeouts(stream.sock.as_ref(), self.io_timeout, deadline, true)?;
+                stream
+                    .write_all(wire)
+                    .and_then(|()| stream.flush())
+                    .map_err(|e| fault(io_kind(&e), true))?;
+                Box::new(TlsStream {
+                    inner: stream,
+                    pending: Vec::new(),
+                    io_timeout: self.io_timeout,
+                    deadline,
+                })
+            }
+            Version::Http2 => Box::new(H2Stream {
+                conn: h2::Conn::start(stream, wire, self.io_timeout, deadline).map_err(h2_fault)?,
+                pending: Vec::new(),
+                io_timeout: self.io_timeout,
+            }),
+        };
+        Ok((opened, version))
     }
 
     fn open(
@@ -342,7 +484,7 @@ impl Transport for TlsTransport {
         identity: Option<&ClientIdentity>,
     ) -> Result<Box<dyn Stream + '_>> {
         let deadline = Instant::now() + self.total_timeout;
-        let stream = self.connect(destination, identity, false, deadline)?;
+        let stream = self.connect(destination, identity, &[], deadline)?;
         Ok(Box::new(TlsStream {
             inner: stream,
             pending: Vec::new(),
@@ -352,12 +494,10 @@ impl Transport for TlsTransport {
     }
 }
 
-/// An open TLS connection of a stream operation.
-struct TlsStream {
-    inner: StreamOwned<ClientConnection, Box<dyn Socket>>,
-    pending: Vec<u8>,
-    io_timeout: Duration,
-    deadline: Instant,
+fn close_tls(stream: &mut Tls) {
+    stream.conn.send_close_notify();
+    let _ = stream.flush();
+    let _ = stream.sock.shutdown();
 }
 
 /// The end of the first delimiter found in `bytes` at or after `from`.
@@ -374,6 +514,96 @@ fn first_end(bytes: &[u8], delimiters: &[&[u8]], from: usize) -> Option<usize> {
                 .map(|i| start + i + d.len())
         })
         .min()
+}
+
+/// Takes the bytes up to the end of the first delimiter in `pending`, leaving the rest.
+fn take_until(pending: &mut Vec<u8>, delimiters: &[&[u8]], from: usize) -> Option<Vec<u8>> {
+    let end = first_end(pending, delimiters, from)?;
+    // Both parts are copied to buffers of their exact size and the old buffer is erased, so
+    // no copy of the bytes after the delimiter stays in spare capacity.
+    let read = pending.get(..end).unwrap_or_default().to_vec();
+    let rest = pending.get(end..).unwrap_or_default().to_vec();
+    pending.zeroize();
+    *pending = rest;
+    Some(read)
+}
+
+/// Takes at most `max` bytes from the front of `pending`.
+fn take_front(pending: &mut Vec<u8>, max: usize) -> Vec<u8> {
+    let take = pending.len().min(max.max(1));
+    let read = pending.get(..take).unwrap_or_default().to_vec();
+    let rest = pending.get(take..).unwrap_or_default().to_vec();
+    pending.zeroize();
+    *pending = rest;
+    read
+}
+
+/// The response of an HTTP/2 request, read as it arrives in HTTP/1.1 form.
+struct H2Stream {
+    conn: h2::Conn<Tls>,
+    pending: Vec<u8>,
+    io_timeout: Duration,
+}
+
+impl Stream for H2Stream {
+    fn write(&mut self, _: &[u8]) -> Result<()> {
+        // The request went with the exchange; this stream carries nothing more.
+        Err(fault(TransportKind::Unsupported, true))
+    }
+
+    fn read_until(&mut self, delimiters: &[&[u8]], max: usize) -> Result<Vec<u8>> {
+        let mut searched = 0;
+        loop {
+            if let Some(read) = take_until(&mut self.pending, delimiters, searched) {
+                return Ok(read);
+            }
+            searched = self.pending.len();
+            if self.pending.len() > max {
+                return Err(fault(TransportKind::TooLarge, true));
+            }
+            match self.conn.poll(CHUNK, self.io_timeout).map_err(h2_fault)? {
+                None => return Err(fault(TransportKind::Closed, true)),
+                Some(bytes) if bytes.is_empty() => {
+                    return Err(fault(TransportKind::Timeout, true));
+                }
+                Some(bytes) => {
+                    let limit = max.saturating_add(CHUNK);
+                    push_erasing(&mut self.pending, &bytes, limit);
+                }
+            }
+        }
+    }
+
+    fn read_some(&mut self, max: usize, wait: Duration) -> Result<Arrived> {
+        if !self.pending.is_empty() {
+            return Ok(Arrived::Bytes(take_front(&mut self.pending, max)));
+        }
+        Ok(match self.conn.poll(max, wait).map_err(h2_fault)? {
+            None => Arrived::End,
+            Some(bytes) if bytes.is_empty() => Arrived::Nothing,
+            Some(bytes) => Arrived::Bytes(bytes),
+        })
+    }
+
+    fn close(&mut self) -> Result<()> {
+        close_tls(self.conn.io_mut());
+        Ok(())
+    }
+}
+
+impl Drop for H2Stream {
+    fn drop(&mut self) {
+        self.pending.zeroize();
+    }
+}
+
+/// An open TLS connection of a stream operation, or of an HTTP/1.1 response read as it
+/// arrives.
+struct TlsStream {
+    inner: Tls,
+    pending: Vec<u8>,
+    io_timeout: Duration,
+    deadline: Instant,
 }
 
 impl Stream for TlsStream {
@@ -394,13 +624,7 @@ impl Stream for TlsStream {
         let mut searched = 0;
         let mut chunk = Zeroizing::new([0u8; CHUNK]);
         loop {
-            if let Some(end) = first_end(&self.pending, delimiters, searched) {
-                // Both parts are copied to buffers of their exact size and the old buffer is
-                // erased, so no copy of the bytes after the delimiter stays in spare capacity.
-                let read = self.pending.get(..end).unwrap_or_default().to_vec();
-                let rest = self.pending.get(end..).unwrap_or_default().to_vec();
-                self.pending.zeroize();
-                self.pending = rest;
+            if let Some(read) = take_until(&mut self.pending, delimiters, searched) {
                 return Ok(read);
             }
             searched = self.pending.len();
@@ -423,10 +647,38 @@ impl Stream for TlsStream {
         }
     }
 
+    fn read_some(&mut self, max: usize, wait: Duration) -> Result<Arrived> {
+        if !self.pending.is_empty() {
+            return Ok(Arrived::Bytes(take_front(&mut self.pending, max)));
+        }
+        let left = self.deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(fault(TransportKind::Timeout, true));
+        }
+        let wait = wait
+            .min(self.io_timeout)
+            .min(left)
+            .max(Duration::from_millis(1));
+        self.inner
+            .sock
+            .set_timeouts(Some(wait))
+            .map_err(|_| fault(TransportKind::Io, true))?;
+        let mut chunk = Zeroizing::new(vec![0u8; max.clamp(1, CHUNK)]);
+        match self.inner.read(chunk.as_mut_slice()) {
+            Ok(0) => Ok(Arrived::End),
+            Ok(n) => Ok(Arrived::Bytes(chunk.get(..n).unwrap_or_default().to_vec())),
+            // A server that closes without close_notify ends what it sent; the engine checks
+            // the framing.
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => Ok(Arrived::End),
+            Err(e) => match io_kind(&e) {
+                TransportKind::Timeout => Ok(Arrived::Nothing),
+                kind => Err(fault(kind, true)),
+            },
+        }
+    }
+
     fn close(&mut self) -> Result<()> {
-        self.inner.conn.send_close_notify();
-        let _ = self.inner.flush();
-        let _ = self.inner.sock.shutdown();
+        close_tls(&mut self.inner);
         Ok(())
     }
 }

@@ -14,7 +14,7 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use engine::egress::{ClientIdentity, Transport};
+use engine::egress::{ClientIdentity, Transport, Version, Versions};
 use engine::error::TransportKind;
 use engine::policy::Destination;
 use engine::{Error, Result};
@@ -305,4 +305,72 @@ fn a_stream_stops_at_its_limit_without_a_delimiter() {
         stream.read_until(&[b"\r\n"], 1000).map(|_| ()),
         Err(Error::transport(TransportKind::TooLarge, true))
     );
+}
+
+fn with_alpn(server: &Leaf, protocols: &[&[u8]]) -> ServerConfig {
+    let mut config = server_config(server, None);
+    config.alpn_protocols = protocols.iter().map(|p| p.to_vec()).collect();
+    config
+}
+
+fn exchange(address: SocketAddr, versions: Versions) -> Result<(Vec<u8>, Version)> {
+    let wire =
+        b"GET / HTTP/1.1\r\nHost: api.test\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+    transport(address).exchange(
+        &Destination::https("api.test"),
+        None,
+        wire,
+        1 << 20,
+        versions,
+    )
+}
+
+#[test]
+fn a_pinned_http2_is_not_downgraded_by_the_server() {
+    // A server that ignores ALPN (it would speak HTTP/1.1) is refused by the transport; one
+    // that knows only HTTP/1.1 ends the handshake itself. Either way nothing is written.
+    let only_http1: &[&[u8]] = &[b"http/1.1"];
+    for (protocols, kind) in [
+        (&[][..], TransportKind::Downgrade),
+        (only_http1, TransportKind::Tls),
+    ] {
+        let (address, got) = serve(with_alpn(&load("api"), protocols), http(OK.to_vec()));
+        assert_eq!(
+            exchange(address, Versions::Http2).err(),
+            Some(Error::transport(kind, false))
+        );
+        assert!(got.recv().unwrap().is_empty(), "the request was not sent");
+    }
+    // Unpinned, the same server answers over HTTP/1.1.
+    let (address, _got) = serve(with_alpn(&load("api"), only_http1), http(OK.to_vec()));
+    let (response, version) = exchange(address, Versions::Any).unwrap();
+    assert_eq!(response, OK);
+    assert_eq!(version, Version::Http1);
+}
+
+#[test]
+fn http2_is_taken_when_the_server_offers_it() {
+    use transport::h2::frame;
+    let (address, got) = serve(with_alpn(&load("api"), &[b"h2"]), |stream: &mut Server| {
+        let mut preface = [0u8; 24];
+        stream.read_exact(&mut preface).unwrap();
+        let mut answer = frame(4, 0, 0, &[]);
+        answer.extend(frame(4, 1, 0, &[]));
+        let block = transport::hpack::encode(&[(b":status", b"200"), (b"x-a", b"1")]);
+        answer.extend(frame(1, 4, 1, &block));
+        answer.extend(frame(0, 1, 1, b"hi"));
+        stream.write_all(&answer).unwrap();
+        stream.flush().unwrap();
+        // Read until the client closes, so the answer is not cut short by a reset.
+        let mut rest = Vec::new();
+        let _ = stream.read_to_end(&mut rest);
+        preface
+    });
+    let (response, version) = exchange(address, Versions::Http2).unwrap();
+    assert_eq!(version, Version::Http2);
+    let text = String::from_utf8(response).unwrap();
+    assert!(text.starts_with("HTTP/1.1 200 \r\n"), "{text}");
+    assert!(text.contains("x-a: 1\r\n"), "{text}");
+    assert!(text.ends_with("hi\r\n0\r\n\r\n"), "{text}");
+    assert_eq!(&got.recv().unwrap(), b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n");
 }

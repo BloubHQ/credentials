@@ -173,8 +173,25 @@ pub(crate) struct Inputs<'a> {
     pub budget: &'a Budget,
 }
 
+/// What kind of request a build makes.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum Wire<'k> {
+    /// A request on its own connection (`Connection: close`).
+    Plain,
+    /// A unary gRPC call: the body framed as one message, `content-type: application/grpc`
+    /// and `te: trailers`.
+    Grpc,
+    /// The opening handshake of a WebSocket, with this `Sec-WebSocket-Key`.
+    Upgrade(&'k str),
+}
+
 /// Renders the injections of `send` and builds the HTTP/1.1 bytes.
-pub(crate) fn build(send: &Send, request: &Outbound<'_>, inputs: &Inputs<'_>) -> Result<Built> {
+pub(crate) fn build(
+    send: &Send,
+    request: &Outbound<'_>,
+    inputs: &Inputs<'_>,
+    wire_kind: Wire<'_>,
+) -> Result<Built> {
     let ctx = Context {
         fields: inputs.fields,
         temps: inputs.temps,
@@ -226,6 +243,13 @@ pub(crate) fn build(send: &Send, request: &Outbound<'_>, inputs: &Inputs<'_>) ->
     }
 
     let body_bytes: &[u8] = body.as_deref().map_or(request.body, |b| b.as_slice());
+    let framed;
+    let body_bytes: &[u8] = if matches!(wire_kind, Wire::Grpc) {
+        framed = crate::grpc::frame(body_bytes)?;
+        &framed
+    } else {
+        body_bytes
+    };
     if body_bytes.len() > MAX_BODY {
         return Err(Error::Budget { what: "body" });
     }
@@ -236,6 +260,17 @@ pub(crate) fn build(send: &Send, request: &Outbound<'_>, inputs: &Inputs<'_>) ->
     };
     let length_line = format!("Content-Length: {}\r\n", body_bytes.len());
     const FIXED: &[u8] = b"Accept-Encoding: identity\r\nConnection: close\r\n\r\n";
+    let upgrade;
+    let fixed: &[u8] = match wire_kind {
+        Wire::Plain => FIXED,
+        Wire::Grpc => crate::grpc::HEADERS,
+        Wire::Upgrade(key) => {
+            upgrade = format!(
+                "Upgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: {key}\r\n\r\n"
+            );
+            upgrade.as_bytes()
+        }
+    };
     let capacity = 32
         + request.method.as_str().len()
         + path.len()
@@ -255,7 +290,7 @@ pub(crate) fn build(send: &Send, request: &Outbound<'_>, inputs: &Inputs<'_>) ->
             .map(|(n, v)| n.len() + v.len() + 4)
             .sum::<usize>()
         + length_line.len()
-        + FIXED.len()
+        + fixed.len()
         + body_bytes.len();
 
     let mut wire = Secret::new(Vec::with_capacity(capacity));
@@ -288,7 +323,7 @@ pub(crate) fn build(send: &Send, request: &Outbound<'_>, inputs: &Inputs<'_>) ->
         out.extend_from_slice(b"\r\n");
     }
     out.extend_from_slice(length_line.as_bytes());
-    out.extend_from_slice(FIXED);
+    out.extend_from_slice(fixed);
     out.extend_from_slice(body_bytes);
     Ok(Built { wire, tainted })
 }

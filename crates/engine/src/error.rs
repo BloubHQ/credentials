@@ -20,6 +20,12 @@ pub enum TransportKind {
     Closed,
     /// The transport cannot do this (for example, no streams).
     Unsupported,
+    /// The server agreed on an HTTP version the policy does not allow (it pins HTTP/2 and the
+    /// server chose HTTP/1.1, or the reverse).
+    Downgrade,
+    /// The peer broke the framing of HTTP/2 or of a WebSocket (a malformed frame, a header
+    /// block HPACK cannot decode, a forbidden header).
+    Protocol,
 }
 
 /// A failure of a [`crate::egress::Transport`].
@@ -297,6 +303,20 @@ pub enum Error {
     /// The response holds a secret in a form the search knows. It was dropped.
     #[error("response reflects a secret")]
     Reflection,
+    /// A frame of the caller on a live connection was refused: its signature or sequence
+    /// number is wrong, or it matches no shape the policy declares.
+    #[error("frame refused: {rule}")]
+    FrameRefused {
+        /// Which rule.
+        rule: &'static str,
+    },
+    /// Too many live connections (streams, WebSockets) are open for the caller, the owner or
+    /// the node.
+    #[error("too many live connections are open: {who}")]
+    StreamsFull {
+        /// `caller`, `owner` or `node`.
+        who: &'static str,
+    },
     /// The module of a `run` step was refused: its origin did not answer 200, it is too
     /// large, it does not match its pin, or the library is unknown.
     #[error("module refused: {rule}")]
@@ -333,7 +353,10 @@ impl Error {
     pub fn is_retryable(&self) -> bool {
         match self {
             Error::Transport(fault) => !fault.sent,
-            Error::RateLimited | Error::LogUnconfirmed | Error::ParkedFull => true,
+            Error::RateLimited
+            | Error::LogUnconfirmed
+            | Error::ParkedFull
+            | Error::StreamsFull { .. } => true,
             _ => false,
         }
     }
@@ -352,6 +375,7 @@ impl Error {
                 | Error::RequestInvalid { .. }
                 | Error::InputInvalid { .. }
                 | Error::ParkedUnknown
+                | Error::FrameRefused { .. }
         )
     }
 }

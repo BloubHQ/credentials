@@ -82,6 +82,8 @@ fn the_shape_of_an_operation_is_checked() {
                 connection: Connection::Https,
                 destinations: vec![api()],
                 identity: None,
+                protocol: None,
+                limits: None,
             }),
         ],
         payment: None,

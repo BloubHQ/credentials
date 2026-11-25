@@ -250,6 +250,7 @@ fn steps_to_ir(steps: Vec<Step>, contract: &CallerRequest, ret: Return) -> Vec<I
             request: Some(request),
             inject: step.inject,
             template: None,
+            ..Send::default()
         }));
         if !step.capture.is_empty() {
             out.push(IrStep::Receive(Receive {
