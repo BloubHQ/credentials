@@ -18,7 +18,7 @@ cargo test --workspace --locked
 ```
 
 CI also runs on macOS and Windows, builds with the minimum Rust version (1.87), runs
-`cargo audit` and `cargo deny check --config .github/deny.toml`, and checks that two builds are
+`cargo audit` and `cargo deny --config .github/deny.toml check`, and checks that two builds are
 identical.
 
 ## Rules of the code

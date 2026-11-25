@@ -92,7 +92,7 @@ before 1.0, minor versions may break formats and APIs.
 
 ### Changed
 
-- `CHANGELOG.md` moved to `docs/`, `deny.toml` to `.github/` (`cargo deny check --config .github/deny.toml`).
+- `CHANGELOG.md` moved to `docs/`, `deny.toml` to `.github/` (`cargo deny --config .github/deny.toml check`).
 - Fuzz targets moved from `fuzz/` to `crates/fuzz/`.
 - Releases attach one CycloneDX SBOM per shipped artifact instead of one per crate:
   `credentials-<tag>.cdx.json` for the `credentials` binary (every target's dependencies) and
