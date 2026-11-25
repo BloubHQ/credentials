@@ -13,7 +13,7 @@ use std::cell::Cell;
 use std::collections::VecDeque;
 
 use engine::Error;
-use engine::caller::{Authorization, Payload};
+use engine::caller::{Authorization, BAD_SIGNATURE, Payload};
 use engine::egress::{ClientIdentity, Stream, Transport};
 use engine::error::TransportKind;
 use engine::fields::Fields;
@@ -653,8 +653,18 @@ fn requests_outside_the_policy_are_refused_before_the_log() {
         .push(("Host".into(), "evil.example.net".into()));
 
     for (request, error) in [
-        (other_host, Error::DestinationDenied),
-        (delete, Error::MethodDenied),
+        (
+            other_host,
+            Error::DestinationDenied {
+                host: "evil.example.net:443".into(),
+            },
+        ),
+        (
+            delete,
+            Error::MethodDenied {
+                method: "DELETE".into(),
+            },
+        ),
         (
             own_header,
             Error::RequestInvalid {
@@ -728,9 +738,11 @@ fn a_policy_cannot_be_widened_or_swapped() {
 
     let mut wrong_owner = s.record.clone();
     wrong_owner.owner = "user-2".into();
+    // The node knows no device of user-2, so the policy does not verify; it says nothing
+    // about grants before a signature checks.
     assert_eq!(
         forward(&s.node, &wrong_owner, &get("/"), &mut transport),
-        Err(Error::NoGrant)
+        Err(Error::PolicySignature)
     );
     assert!(transport.sent.is_empty());
 }
@@ -855,7 +867,9 @@ fn derivations_hand_back_only_one_way_outputs() {
     );
     assert_eq!(
         forward(&s.node, &s.record, &get("/"), &mut transport),
-        Err(Error::OperationUnknown)
+        Err(Error::OperationUnknown {
+            name: "call".into()
+        })
     );
 
     use hmac::{Hmac, Mac};
@@ -1055,7 +1069,9 @@ fn oauth_refresh_writes_the_new_tokens_into_a_new_record() {
     // No access token yet: the template fails before anything is logged or sent.
     assert_eq!(
         forward(&s.node, &s.record, &get("/me"), &mut transport),
-        Err(Error::FieldMissing)
+        Err(Error::FieldMissing {
+            field: "access_token".into()
+        })
     );
     assert!(transport.sent.is_empty());
 
@@ -1550,7 +1566,12 @@ fn a_stream_logs_in_then_carries_the_caller() {
         &exchanges,
         &mut FakeTransport::default(),
     );
-    assert_eq!(outcome.result, Err(Error::DestinationDenied));
+    assert_eq!(
+        outcome.result,
+        Err(Error::DestinationDenied {
+            host: "evil.example.net:993".into()
+        })
+    );
     assert_eq!(log_of(&s.node).len(), before);
 }
 
@@ -1823,13 +1844,21 @@ fn templates_read_every_token_name_and_end_with_braces() {
 #[test]
 fn a_clock_that_goes_back_keeps_the_chain_valid() {
     let clock = TestClock::at(NOW);
-    let policy = derive_policy(vec![secret("key")], "{{ hex(sha256(key)) }}");
+    let policy = derive_policy(vec![secret("key")], "{{ hex(hmac_sha256(key, $input)) }}");
     let s = setup(&clock, policy, &[("key", b"0123456789abcdef")]);
-    clock.set(NOW - 1000);
+    clock.set(NOW + 5000);
+    call_derive(&s.node, &s.record, "derive", b"x").unwrap();
+    clock.set(NOW + 4000);
     call_derive(&s.node, &s.record, "derive", b"x").unwrap();
     let entries = log_of(&s.node);
     verify_chain(&entries, &s.node.public_key()).unwrap();
-    assert_eq!(entries.last().unwrap().entry.time_ms, NOW);
+    assert_eq!(entries.last().unwrap().entry.time_ms, NOW + 5000);
+    // Behind the time the node started, nothing signed is accepted.
+    clock.set(NOW - 1000);
+    assert!(matches!(
+        call_derive(&s.node, &s.record, "derive", b"x"),
+        Err(Error::CallerInvalid { .. })
+    ));
 }
 
 #[test]
@@ -1901,7 +1930,9 @@ fn an_older_record_is_refused_after_a_newer_one_or_a_pin() {
     );
     assert_eq!(
         forward(&s.node, &narrow, &post("/x", b""), &mut transport).map(|_| ()),
-        Err(Error::MethodDenied)
+        Err(Error::MethodDenied {
+            method: "POST".into()
+        })
     );
     forward(&s.node, &narrow, &get("/x"), &mut transport).unwrap();
 
@@ -1922,7 +1953,7 @@ fn a_second_device_is_added_not_swapped() {
     let seal = |device: &DeviceKey| {
         Record::seal(
             &user_key(),
-            "rec-2",
+            "rec-1",
             OWNER,
             device.sign_policy(with_caller(policy.clone())).unwrap(),
             &fields(&[("token", TOKEN)]),
@@ -1930,11 +1961,18 @@ fn a_second_device_is_added_not_swapped() {
         .unwrap()
     };
 
-    // The laptop grants the same user key: the phone stays a device.
+    // A laptop with the same user key but no endorsement is no device of the owner: the user
+    // key alone would let a retired or stolen device come back under a fresh key.
     let laptop = DeviceKey::generate();
-    grant_on(&s.node, &laptop, [7u8; 32], NOW + DAY, &[("rec-2", 1)]).unwrap();
+    assert_eq!(
+        grant_on(&s.node, &laptop, [7u8; 32], NOW + DAY, &[("rec-2", 1)]),
+        Err(Error::GrantDenied)
+    );
     forward(&s.node, &s.record, &get("/"), &mut transport).unwrap();
-    forward(&s.node, &seal(&laptop), &get("/"), &mut transport).unwrap();
+    assert_eq!(
+        forward(&s.node, &seal(&laptop), &get("/"), &mut transport).map(|_| ()),
+        Err(Error::PolicySignature)
+    );
 
     // A tablet the phone endorses.
     let tablet = DeviceKey::generate();
@@ -1944,15 +1982,22 @@ fn a_second_device_is_added_not_swapped() {
         Err(Error::PolicySignature)
     );
     s.node
-        .add_device(&s.device.endorse(OWNER, &tablet.public()).unwrap())
+        .add_device(
+            &s.device
+                .endorse(OWNER, &s.node.public_key(), &tablet.public(), issued())
+                .unwrap(),
+        )
         .unwrap();
     forward(&s.node, &record, &get("/"), &mut transport).unwrap();
 
     // An endorsement by a stranger is refused.
     let stranger = DeviceKey::generate();
     assert_eq!(
-        s.node
-            .add_device(&stranger.endorse(OWNER, &stranger.public()).unwrap()),
+        s.node.add_device(
+            &stranger
+                .endorse(OWNER, &s.node.public_key(), &stranger.public(), issued())
+                .unwrap()
+        ),
         Err(Error::PolicySignature)
     );
 
@@ -1973,7 +2018,7 @@ fn calls_need_a_listed_caller_and_a_fresh_signature() {
     );
     policy.operations.push(Operation::Derive {
         name: "hash".into(),
-        template: "{{ hex(sha256(token)) }}".into(),
+        template: "{{ hex(hmac_sha256(token, $input)) }}".into(),
     });
     let reader = CallerKey::from_bytes(&mut [6u8; 32]);
     policy.callers = vec![
@@ -2008,13 +2053,22 @@ fn calls_need_a_listed_caller_and_a_fresh_signature() {
     let cases = [
         (
             sign(&caller_key(), "nobody", &payload, NOW),
-            Error::CallerDenied,
+            Error::CallerDenied {
+                caller: "nobody".into(),
+                operation: String::new(),
+            },
         ),
-        (sign(&reader, "reader", &payload, NOW), Error::CallerDenied),
+        (
+            sign(&reader, "reader", &payload, NOW),
+            Error::CallerDenied {
+                caller: "reader".into(),
+                operation: "call".into(),
+            },
+        ),
         (
             sign(&reader, "app", &payload, NOW),
             Error::CallerInvalid {
-                rule: "signature does not verify",
+                rule: BAD_SIGNATURE,
             },
         ),
         (
@@ -2026,7 +2080,7 @@ fn calls_need_a_listed_caller_and_a_fresh_signature() {
         (
             sign(&caller_key(), "app", &Payload::Http(Some(&get("/b"))), NOW),
             Error::CallerInvalid {
-                rule: "signature does not verify",
+                rule: BAD_SIGNATURE,
             },
         ),
     ];
@@ -2067,7 +2121,10 @@ fn calls_need_a_listed_caller_and_a_fresh_signature() {
 #[test]
 fn a_caller_is_held_to_its_limit() {
     let clock = TestClock::at(NOW);
-    let mut policy = with_caller(derive_policy(vec![secret("key")], "{{ hex(sha256(key)) }}"));
+    let mut policy = with_caller(derive_policy(
+        vec![secret("key")],
+        "{{ hex(hmac_sha256(key, $input)) }}",
+    ));
     policy.callers[0].limit = Some(engine::policy::Limit {
         count: 2,
         window_ms: 1000,
@@ -2080,6 +2137,39 @@ fn a_caller_is_held_to_its_limit() {
         Err(Error::RateLimited)
     );
     clock.set(NOW + 1000);
+    call_derive(&s.node, &s.record, "derive", b"").unwrap();
+}
+
+#[test]
+fn a_call_of_the_wrong_kind_spends_no_limit() {
+    let clock = TestClock::at(NOW);
+    let mut policy = with_caller(derive_policy(
+        vec![secret("key")],
+        "{{ hex(hmac_sha256(key, $input)) }}",
+    ));
+    policy.callers[0].limit = Some(engine::policy::Limit {
+        count: 1,
+        window_ms: 1000,
+    });
+    let s = setup(&clock, policy, &[("key", b"0123456789abcdef")]);
+    let unknown = Error::OperationUnknown {
+        name: "derive".into(),
+    };
+    for _ in 0..3 {
+        let auth = authorize(&s.node, &s.record, "derive", &Payload::Http(None));
+        let result = s
+            .node
+            .http(
+                &s.record,
+                "derive",
+                &auth,
+                None,
+                &mut FakeTransport::default(),
+            )
+            .result
+            .map(|_| ());
+        assert_eq!(result, Err(unknown.clone()));
+    }
     call_derive(&s.node, &s.record, "derive", b"").unwrap();
 }
 
@@ -2115,13 +2205,14 @@ fn caller_paths_and_headers_are_allowlisted() {
     }
     let mut other = get("/v1/x");
     other.headers.push(("X-Other".into(), "1".into()));
+    let denied = |path: &str| Error::PathDenied { path: path.into() };
     let path_rule = Error::RequestInvalid {
         rule: "path must start with / and hold no fragment, dot segment or encoded separator",
     };
     for (request, error) in [
-        (get("/v2/x"), Error::PathDenied),
-        (get("/healthz"), Error::PathDenied),
-        (get("/v1"), Error::PathDenied),
+        (get("/v2/x"), denied("/v2/x")),
+        (get("/healthz"), denied("/healthz")),
+        (get("/v1"), denied("/v1")),
         (get("/v1/../admin"), path_rule.clone()),
         (get("/v1/%2e%2e/admin"), path_rule.clone()),
         (get("/v1%2Fadmin"), path_rule),
@@ -2159,7 +2250,9 @@ fn a_wildcard_destination_matches_one_label() {
     for host in ["example.com", "a.b.example.com", "evil-example.com"] {
         assert_eq!(
             forward(&s.node, &s.record, &to(host), &mut transport).map(|_| ()),
-            Err(Error::DestinationDenied),
+            Err(Error::DestinationDenied {
+                host: format!("{host}:443")
+            }),
             "{host}"
         );
     }
@@ -2202,6 +2295,7 @@ fn a_restarted_node_continues_its_chain_and_its_floors() {
         &before,
     )
     .unwrap();
+    clock.set(now() + 2);
     grant_on(&node, &device, [7u8; 32], NOW + DAY, &[("rec-1", 1)]).unwrap();
     assert_eq!(
         call_http(&node, &s.record, "refresh", None, &mut transport)
@@ -2600,17 +2694,16 @@ fn guessable_fields_give_back_no_check_for_guesses() {
         "{{ hex(hmac_sha256(pin, $input)) }}",
         "{{ ed25519_sign(key, pin) }}",
         "{{ hex(hmac_sha256(sha256(pin), $input)) }}",
+        // A keyed MAC does not hide it either: another operation could compute the same MAC on
+        // chosen input, which checks a guess.
+        "{{ hex(hmac_sha256(key, pin)) }}",
     ] {
         assert!(
             matches!(sign(refused), Err(Error::PolicyInvalid { .. })),
             "{refused}"
         );
     }
-    for allowed in [
-        "{{ hex(hmac_sha256(key, pin)) }}",
-        "{{ len(pin) }}",
-        "{{ hex(sha256(key)) }}",
-    ] {
+    for allowed in ["{{ len(pin) }}", "{{ hex(hmac_sha256(key, $input)) }}"] {
         sign(allowed).unwrap_or_else(|e| panic!("{allowed}: {e}"));
     }
     let public = Policy {
@@ -2628,4 +2721,460 @@ fn guessable_fields_give_back_no_check_for_guesses() {
         device.sign_policy(with_caller(public)),
         Err(Error::PolicyInvalid { .. })
     ));
+}
+
+// ---- regressions: the second review ----
+
+fn signed_record(policy: Policy, values: &[(&str, &[u8])]) -> (DeviceKey, Record) {
+    let device = DeviceKey::generate();
+    let signed = device.sign_policy(with_caller(policy)).unwrap();
+    let record = Record::seal(&user_key(), "rec-1", OWNER, signed, &fields(values)).unwrap();
+    (device, record)
+}
+
+fn hmac_record() -> (DeviceKey, Record) {
+    signed_record(
+        derive_policy(vec![secret("key")], "{{ hex(hmac_sha256(key, $input)) }}"),
+        &[("key", b"0123456789abcdef")],
+    )
+}
+
+fn sink_of(entries: &[SignedEntry]) -> MemorySink {
+    let mut sink = MemorySink::new();
+    for entry in entries {
+        sink.append(entry).unwrap();
+    }
+    sink
+}
+
+#[test]
+fn a_derivation_cannot_hand_back_a_key_and_what_it_encrypts() {
+    let device = DeviceKey::generate();
+    for template in [
+        // The key and a ciphertext under it.
+        r#"{{ hex(sha256(key)) }}.{{ hex(aes_gcm_encrypt(sha256(key), "000000000000", msg)) }}"#,
+        // A nonce that only looks fresh: a constant.
+        r#"{{ aes_gcm_encrypt(key, "0000000000" + len($nonce), $input + msg) }}"#,
+        // A fresh nonce: another operation could still encrypt chosen bytes under it.
+        r#"{{ aes_gcm_encrypt(key, hexdecode(replace($nonce, "00000000", "")), msg) }}"#,
+    ] {
+        let policy = derive_policy(vec![secret("key"), secret("msg")], template);
+        assert!(
+            matches!(
+                device.sign_policy(with_caller(policy)),
+                Err(Error::PolicyInvalid { .. })
+            ),
+            "{template}"
+        );
+    }
+}
+
+#[test]
+fn a_saved_grant_does_not_open_a_restarted_node() {
+    let clock = TestClock::at(NOW);
+    let (device, record) = hmac_record();
+    let node_key = [9u8; 32];
+    let node = Node::new(
+        NodeKey::from_bytes(&mut node_key.clone()),
+        MemorySink::new(),
+        &clock,
+    );
+    let terms = GrantTerms {
+        owner: OWNER.into(),
+        expires_ms: NOW + DAY,
+        issued_ms: issued(),
+        pins: vec![RecordPin {
+            record_id: "rec-1".into(),
+            generation: 1,
+        }],
+    };
+    let sealed = device.grant(&user_key(), &node.identity(), terms).unwrap();
+    node.grant(&sealed).unwrap();
+    let auth = authorize(&node, &record, "derive", &Payload::Derive(b"x"));
+    clock.set(NOW + 1000);
+    node.revoke(&device.revoke(OWNER, &node.public_key(), issued()).unwrap())
+        .unwrap();
+    let full = log_of(&node);
+    drop(node);
+
+    // The operator restarts with the log cut before the grant, or with all of it.
+    clock.set(NOW + 2000);
+    for cut in [0, full.len()] {
+        let node = Node::restore(
+            NodeKey::from_bytes(&mut node_key.clone()),
+            sink_of(&full[..cut]),
+            &clock,
+            &full[..cut],
+        )
+        .unwrap();
+        assert!(
+            matches!(node.grant(&sealed), Err(Error::GrantInvalid { .. })),
+            "cut {cut}"
+        );
+        // A call authorized before the restart is refused too: its nonce is forgotten.
+        clock.set(now() + 2);
+        grant_on(&node, &device, [7u8; 32], NOW + DAY, &[("rec-1", 1)]).unwrap();
+        assert!(matches!(
+            node.derive(&record, "derive", &auth, b"x"),
+            Err(Error::CallerInvalid { .. })
+        ));
+    }
+}
+
+#[test]
+fn an_anchored_restore_refuses_a_cut_log() {
+    let clock = TestClock::at(NOW);
+    let (device, record) = hmac_record();
+    let node_key = [9u8; 32];
+    let key = || NodeKey::from_bytes(&mut node_key.clone());
+    let node = Node::new(key(), MemorySink::new(), &clock);
+    grant_on(&node, &device, [7u8; 32], NOW + DAY, &[("rec-1", 1)]).unwrap();
+    call_derive(&node, &record, "derive", b"x").unwrap();
+    let anchor = node.checkpoint().unwrap();
+    let full = log_of(&node);
+    let restore = |entries: &[SignedEntry], anchor| {
+        Node::restore_anchored(key(), sink_of(entries), &clock, entries, anchor).map(|_| ())
+    };
+    restore(&full, &anchor).unwrap();
+    let len = full.len() as u64;
+    assert_eq!(
+        restore(&full[..full.len() - 1], &anchor),
+        Err(Error::LogBehindAnchor {
+            len: len - 1,
+            anchor: len
+        })
+    );
+    assert_eq!(
+        restore(&[], &anchor),
+        Err(Error::LogBehindAnchor {
+            len: 0,
+            anchor: len
+        })
+    );
+    // A checkpoint of another node is no anchor.
+    let other = Node::new(NodeKey::generate(), MemorySink::new(), &clock)
+        .checkpoint()
+        .unwrap();
+    assert!(restore(&full, &other).is_err());
+}
+
+#[test]
+fn a_retired_device_signs_nothing_more() {
+    let clock = TestClock::at(NOW);
+    let s = setup(
+        &clock,
+        request_policy(
+            vec![secret("token")],
+            vec![header("X-Api-Key", "{{token}}")],
+        ),
+        &[("token", TOKEN)],
+    );
+    let node = s.node.public_key();
+    let tablet = DeviceKey::generate();
+    s.node
+        .add_device(
+            &s.device
+                .endorse(OWNER, &node, &tablet.public(), issued())
+                .unwrap(),
+        )
+        .unwrap();
+    // An endorsement for another node, or an old one, is refused.
+    let elsewhere = s
+        .device
+        .endorse(
+            OWNER,
+            &NodeKey::generate().public(),
+            &tablet.public(),
+            issued(),
+        )
+        .unwrap();
+    assert!(matches!(
+        s.node.add_device(&elsewhere),
+        Err(Error::GrantInvalid { .. })
+    ));
+    let old = s
+        .device
+        .endorse(OWNER, &node, &DeviceKey::generate().public(), NOW - 1)
+        .unwrap();
+    assert!(matches!(
+        s.node.add_device(&old),
+        Err(Error::GrantInvalid { .. })
+    ));
+
+    // A device cannot retire itself; another device can.
+    assert_eq!(
+        s.node.retire_device(
+            &tablet
+                .retire(OWNER, &node, &tablet.public(), issued())
+                .unwrap()
+        ),
+        Err(Error::PolicySignature)
+    );
+    s.node
+        .retire_device(
+            &s.device
+                .retire(OWNER, &node, &tablet.public(), issued())
+                .unwrap(),
+        )
+        .unwrap();
+    assert_eq!(
+        grant_on(&s.node, &tablet, [7u8; 32], NOW + DAY, &[]),
+        Err(Error::GrantDenied)
+    );
+    assert!(matches!(
+        last_event(&s.node, |e| matches!(e, Event::Retire { .. })),
+        Event::Retire { device, .. } if device == tablet.public()
+    ));
+}
+
+#[test]
+fn one_caller_cannot_fill_the_replay_cache() {
+    let clock = TestClock::at(NOW);
+    let (device, record) = hmac_record();
+    let node = Node::new(NodeKey::generate(), MemorySink::new(), &clock);
+    grant_on(&node, &device, [7u8; 32], NOW + DAY, &[("rec-1", 1)]).unwrap();
+    // Dated far ahead, an authorization would stay in the cache longer: refused.
+    let ahead = caller_key()
+        .authorize(
+            "app",
+            &node.public_key(),
+            &record,
+            "derive",
+            &Payload::Derive(b"x"),
+            NOW + engine::node::MAX_FUTURE_MS + 1,
+        )
+        .unwrap();
+    assert!(matches!(
+        node.derive(&record, "derive", &ahead, b"x"),
+        Err(Error::CallerInvalid { .. })
+    ));
+    let mut refused = None;
+    for i in 0..=engine::node::MAX_NONCES_PER_CALLER {
+        if let Err(e) = call_derive(&node, &record, "derive", b"x") {
+            refused = Some((i, e));
+            break;
+        }
+    }
+    assert_eq!(
+        refused,
+        Some((engine::node::MAX_NONCES_PER_CALLER, Error::RateLimited))
+    );
+    // Once the window has passed, the caller may call again.
+    clock.set(NOW + 5 * 60 * 1000 + 1);
+    call_derive(&node, &record, "derive", b"x").unwrap();
+}
+
+#[test]
+fn a_user_key_round_trips_through_base64() {
+    let key = UserKey::generate();
+    let text = key.to_b64();
+    assert_eq!(text.len(), 43);
+    let back = UserKey::from_b64(&text).unwrap();
+    assert_eq!(*back.to_bytes(), *key.to_bytes());
+    let longer = format!("{}AAAA", text.as_str());
+    for bad in ["", "AAAA", longer.as_str(), "!!!"] {
+        assert!(UserKey::from_b64(bad).is_err(), "{bad}");
+    }
+}
+
+#[test]
+fn a_signed_call_travels_as_json_and_runs() {
+    use engine::call::{Body, Output, SignedCall};
+    let clock = TestClock::at(NOW);
+    let policy = request_policy(
+        vec![secret("token")],
+        vec![header("X-Api-Key", "{{token}}")],
+    );
+    let s = setup(&clock, policy, &[("token", TOKEN)]);
+    let call = caller_key()
+        .sign_call_at(
+            "app",
+            &s.node.public_key(),
+            s.record.clone(),
+            "call",
+            Body::http(get("/")),
+            NOW,
+        )
+        .unwrap();
+    // Over the wire and back.
+    let json = serde_json::to_string(&call).unwrap();
+    let call: SignedCall = serde_json::from_str(&json).unwrap();
+    let mut transport = FakeTransport::default();
+    transport.replies.push_back(reply("200 OK", "hello"));
+    let outcome = s.node.run(&call, &mut transport);
+    assert!(outcome.record.is_none());
+    let Ok(Output::Http(response)) = outcome.result else {
+        panic!("{:?}", outcome.result);
+    };
+    assert_eq!(response.body(), b"hello");
+    let json = serde_json::to_string(&response).unwrap();
+    assert!(!json.contains(std::str::from_utf8(TOKEN).unwrap()));
+
+    // A changed request no longer matches the signature.
+    let mut changed = call.clone();
+    changed.body = Body::http(get("/other"));
+    assert!(matches!(
+        s.node.run(&changed, &mut transport).result,
+        Err(Error::CallerInvalid { .. })
+    ));
+}
+
+#[test]
+fn grant_terms_take_a_duration_and_pin_records() {
+    let clock = TestClock::at(NOW);
+    let (device, record) = hmac_record();
+    let node = Node::new(NodeKey::generate(), MemorySink::new(), &clock);
+    let terms = GrantTerms::at(OWNER, issued(), std::time::Duration::from_secs(600)).pin(&record);
+    assert_eq!(terms.expires_ms, terms.issued_ms + 600_000);
+    node.grant(&device.grant(&user_key(), &node.identity(), terms).unwrap())
+        .unwrap();
+    call_derive(&node, &record, "derive", b"x").unwrap();
+}
+
+fn derives(fields: Vec<FieldSpec>, ops: &[(&str, &str)]) -> Policy {
+    with_caller(Policy {
+        fields,
+        callers: vec![],
+        operations: ops
+            .iter()
+            .map(|(name, template)| Operation::Derive {
+                name: (*name).into(),
+                template: (*template).into(),
+            })
+            .collect(),
+    })
+}
+
+#[test]
+fn a_hash_of_a_secret_alone_is_not_handed_back() {
+    // An HMAC key longer than its block is hashed first: its SHA-256 is the key.
+    let refused = derives(
+        vec![secret("k")],
+        &[
+            ("fp", "{{ hex(sha256(k)) }}"),
+            ("mac", "{{ hex(hmac_sha256(k, $input)) }}"),
+        ],
+    );
+    assert!(matches!(
+        refused.validate(),
+        Err(Error::PolicyInvalid { .. })
+    ));
+    for template in ["{{ hex(sha512(trim(k))) }}", "{{ hex(md5(b64decode(k))) }}"] {
+        assert!(
+            derives(vec![secret("k")], &[("fp", template)])
+                .validate()
+                .is_err(),
+            "{template}"
+        );
+    }
+    // A hash that covers chosen bytes too hides the secret.
+    derives(vec![secret("k")], &[("h", "{{ hex(sha256(k + $input)) }}")])
+        .validate()
+        .unwrap();
+}
+
+#[test]
+fn a_chosen_time_format_cannot_pick_digits_of_a_secret() {
+    let policy = derives(
+        vec![secret("acct")],
+        &[("t", "{{ hex(sha256(time(acct, $input))) }}")],
+    );
+    assert!(matches!(
+        policy.validate(),
+        Err(Error::PolicyInvalid { .. })
+    ));
+}
+
+#[test]
+fn a_retired_device_cannot_return_under_a_fresh_key() {
+    let clock = TestClock::at(NOW);
+    let s = setup(
+        &clock,
+        request_policy(
+            vec![secret("token")],
+            vec![header("X-Api-Key", "{{token}}")],
+        ),
+        &[("token", TOKEN)],
+    );
+    let node = s.node.public_key();
+    let tablet = DeviceKey::generate();
+    s.node
+        .add_device(
+            &s.device
+                .endorse(OWNER, &node, &tablet.public(), issued())
+                .unwrap(),
+        )
+        .unwrap();
+    s.node
+        .retire_device(
+            &s.device
+                .retire(OWNER, &node, &tablet.public(), issued())
+                .unwrap(),
+        )
+        .unwrap();
+    assert_eq!(
+        grant_on(&s.node, &tablet, [7u8; 32], NOW + DAY, &[]),
+        Err(Error::GrantDenied)
+    );
+    // Whoever holds the tablet's user key makes a fresh device key: still no way in.
+    let fresh = DeviceKey::generate();
+    assert_eq!(
+        grant_on(&s.node, &fresh, [7u8; 32], NOW + DAY, &[("rec-1", 1)]),
+        Err(Error::GrantDenied)
+    );
+    assert!(
+        s.node
+            .retire_device(
+                &fresh
+                    .retire(OWNER, &node, &s.device.public(), issued())
+                    .unwrap()
+            )
+            .is_err()
+    );
+}
+
+#[test]
+fn a_clock_stepped_back_after_a_restart_opens_nothing_old() {
+    let clock = TestClock::at(NOW);
+    let (device, record) = hmac_record();
+    let node = Node::new(
+        NodeKey::from_bytes(&mut [9u8; 32]),
+        MemorySink::new(),
+        &clock,
+    );
+    let terms = GrantTerms {
+        owner: OWNER.into(),
+        expires_ms: NOW + DAY,
+        issued_ms: NOW,
+        pins: vec![RecordPin {
+            record_id: "rec-1".into(),
+            generation: 1,
+        }],
+    };
+    let saved = device.grant(&user_key(), &node.identity(), terms).unwrap();
+    node.grant(&saved).unwrap();
+    let auth = authorize(&node, &record, "derive", &Payload::Derive(b"x"));
+    node.derive(&record, "derive", &auth, b"x").unwrap();
+    clock.set(NOW + 1000);
+    node.revoke(
+        &device
+            .revoke(OWNER, &node.public_key(), NOW + 1000)
+            .unwrap(),
+    )
+    .unwrap();
+    // The operator restarts with an empty log, then steps the clock back.
+    clock.set(NOW + 2000);
+    let node = Node::restore(
+        NodeKey::from_bytes(&mut [9u8; 32]),
+        MemorySink::new(),
+        &clock,
+        &[],
+    )
+    .unwrap();
+    clock.set(NOW);
+    assert!(matches!(
+        node.grant(&saved),
+        Err(Error::GrantInvalid { .. })
+    ));
+    assert!(node.derive(&record, "derive", &auth, b"x").is_err());
 }

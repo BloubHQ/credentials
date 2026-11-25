@@ -49,10 +49,19 @@ pub enum Event {
         /// The record generations the grant pinned.
         pins: Vec<RecordPin>,
     },
-    /// A device of the grant endorsed another device.
+    /// A known device endorsed another device.
     Device {
         /// The added device.
         device: DevicePublicKey,
+        /// When the endorsement was made.
+        issued_ms: u64,
+    },
+    /// A known device withdrew another device.
+    Retire {
+        /// The withdrawn device.
+        device: DevicePublicKey,
+        /// When the retirement was made.
+        issued_ms: u64,
     },
     /// The node erased the user key of the owner, as a device of the owner signed.
     Revoke {
@@ -587,6 +596,20 @@ pub fn verify_owner_chain(
     Ok(prev)
 }
 
+/// The entries of `owner`, in the order of the chain: what a node operator hands an owner,
+/// so the owner can check its own chain without seeing the entries of other owners.
+///
+/// The owner checks them with [`verify_owner_chain`], or offline with
+/// `credentials verify <file> <node-public-key> --owner <owner>` after writing them one JSON
+/// entry per line (add `--user-key <file>` to read the details).
+pub fn owner_entries(entries: &[SignedEntry], owner: &str) -> Vec<SignedEntry> {
+    entries
+        .iter()
+        .filter(|signed| signed.entry.owner == owner)
+        .cloned()
+        .collect()
+}
+
 /// A sink in memory, for tests and development. It can be told to fail.
 #[derive(Default)]
 pub struct MemorySink {
@@ -627,5 +650,52 @@ impl LogSink for MemorySink {
             return Err(Error::LogUnconfirmed);
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use super::*;
+
+    #[test]
+    fn owner_entries_form_the_chain_of_one_owner() {
+        let key = NodeKey::generate();
+        let node = key.public();
+        let mut log = Log::new(key);
+        let mut sink = MemorySink::new();
+        for (time, owner) in [
+            (1, "alice"),
+            (2, "bob"),
+            (3, "alice"),
+            (4, "bob"),
+            (5, "alice"),
+        ] {
+            log.commit(
+                &mut sink,
+                time,
+                (owner, "rec", ""),
+                Event::Pin { generation: 1 },
+            )
+            .unwrap();
+        }
+        let all = sink.entries();
+        let alice = owner_entries(all, "alice");
+        assert_eq!(
+            alice.iter().map(|s| s.entry.seq).collect::<Vec<_>>(),
+            [0, 2, 4]
+        );
+        let last = all.last().unwrap().hash().unwrap();
+        assert_eq!(verify_owner_chain(&alice, "alice", &node).unwrap(), last);
+        let bob = owner_entries(all, "bob");
+        assert_eq!(bob.len(), 2);
+        verify_owner_chain(&bob, "bob", &node).unwrap();
+        assert!(owner_entries(all, "carol").is_empty());
+        // The whole log is not the chain of one owner.
+        assert_eq!(
+            verify_owner_chain(all, "alice", &node),
+            Err(Error::ChainBroken { seq: 1 })
+        );
     }
 }

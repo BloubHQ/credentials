@@ -18,16 +18,27 @@ use crate::{Error, Result};
 
 const AUTH_DOMAIN: &[u8] = b"call/v1\0";
 
+/// The rule of [`Error::CallerInvalid`] when the signature of a call does not verify.
+pub const BAD_SIGNATURE: &str = concat!(
+    "signature does not verify: sign the same record generation, operation and request ",
+    "the node is given (a SignedCall keeps them together)"
+);
+
 /// Largest difference between the time of an authorization and the clock of the node.
 pub const MAX_SKEW_MS: u64 = 5 * 60 * 1000;
 
 /// One exchange of the caller on an authenticated stream: bytes written, then bytes read up to
 /// and including the first of the delimiters `until`.
-#[derive(Clone, Debug, PartialEq, Eq)]
+///
+/// In JSON the bytes are base64url.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CallerExchange {
     /// What is written.
+    #[serde(with = "crate::encoding::b64_vec")]
     pub send: Vec<u8>,
     /// The delimiters that end the read.
+    #[serde(with = "crate::encoding::b64_list")]
     pub until: Vec<Vec<u8>>,
 }
 
@@ -156,7 +167,7 @@ impl Authorization {
     pub(crate) fn verify(&self, key: &CallerPublicKey, call: &Call<'_>) -> Result<()> {
         key.verify(&self.message(call)?, &self.signature)
             .map_err(|_| Error::CallerInvalid {
-                rule: "signature does not verify",
+                rule: BAD_SIGNATURE,
             })
     }
 }

@@ -82,7 +82,7 @@ macro_rules! public_key {
             pub(crate) fn verify(&self, message: &[u8], signature: &[u8; 64]) -> Result<()> {
                 let key = VerifyingKey::from_bytes(&self.0).map_err(|_| Error::KeyInvalid)?;
                 key.verify_strict(message, &Signature::from_bytes(signature))
-                    .map_err(|_| Error::KeyInvalid)
+                    .map_err(|_| Error::SignatureInvalid)
             }
         }
     };
@@ -148,70 +148,192 @@ signing_key!(
     "The signing key of a caller (an application or agent)."
 );
 
-const ENDORSE_DOMAIN: &[u8] = b"endorse/v1\0";
+const ENDORSE_DOMAIN: &[u8] = b"endorse/v2\0";
+const RETIRE_DOMAIN: &[u8] = b"retire/v1\0";
 
-/// A device of the owner vouching for another device, so a node accepts the policies and pins
-/// the new device signs.
+/// A device of the owner vouching for another device on one node, so the node accepts the
+/// policies, pins and grants the new device signs.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Endorsement {
     /// The owner.
     pub owner: String,
+    /// The node it is for.
+    pub node: NodePublicKey,
     /// The new device.
     pub device: DevicePublicKey,
+    /// When it was made, Unix milliseconds. A node takes it only within five minutes of its
+    /// clock and after the last grant, revocation or device change of the owner.
+    pub issued_ms: u64,
     /// Ed25519 signature of a device the node already accepts for the owner.
     #[serde(with = "b64_array")]
     pub signature: [u8; 64],
 }
 
+/// A device of the owner withdrawing another device (lost, sold, replaced) on one node.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Retirement {
+    /// The owner.
+    pub owner: String,
+    /// The node it is for.
+    pub node: NodePublicKey,
+    /// The device withdrawn.
+    pub device: DevicePublicKey,
+    /// When it was made, Unix milliseconds, as for an [`Endorsement`].
+    pub issued_ms: u64,
+    /// Ed25519 signature of another device the node accepts for the owner.
+    #[serde(with = "b64_array")]
+    pub signature: [u8; 64],
+}
+
 #[derive(Serialize)]
-struct EndorseBody<'a> {
+struct DeviceChangeBody<'a> {
     owner: &'a str,
+    node: &'a NodePublicKey,
     device: &'a DevicePublicKey,
+    issued_ms: u64,
+}
+
+fn change_message(
+    domain: &[u8],
+    owner: &str,
+    node: &NodePublicKey,
+    device: &DevicePublicKey,
+    issued_ms: u64,
+) -> Result<Vec<u8>> {
+    encoding::canonical(
+        domain,
+        &DeviceChangeBody {
+            owner,
+            node,
+            device,
+            issued_ms,
+        },
+    )
+}
+
+/// The device of `devices` whose signature over `message` verifies.
+fn signer(
+    devices: &[DevicePublicKey],
+    message: &[u8],
+    signature: &[u8; 64],
+) -> Result<DevicePublicKey> {
+    devices
+        .iter()
+        .find(|d| d.verify(message, signature).is_ok())
+        .copied()
+        .ok_or(Error::PolicySignature)
 }
 
 impl Endorsement {
-    fn message(owner: &str, device: &DevicePublicKey) -> Result<Vec<u8>> {
-        encoding::canonical(ENDORSE_DOMAIN, &EndorseBody { owner, device })
+    /// Verifies the signature under one of `devices` and returns that device.
+    pub(crate) fn verify(&self, devices: &[DevicePublicKey]) -> Result<DevicePublicKey> {
+        let message = change_message(
+            ENDORSE_DOMAIN,
+            &self.owner,
+            &self.node,
+            &self.device,
+            self.issued_ms,
+        )?;
+        signer(devices, &message, &self.signature)
     }
+}
 
-    /// Verifies the signature under one of `devices`.
-    pub(crate) fn verify(&self, devices: &[DevicePublicKey]) -> Result<()> {
-        let message = Self::message(&self.owner, &self.device)?;
-        if devices
+impl Retirement {
+    /// Verifies the signature under one of `devices` other than the one withdrawn.
+    pub(crate) fn verify(&self, devices: &[DevicePublicKey]) -> Result<DevicePublicKey> {
+        let message = change_message(
+            RETIRE_DOMAIN,
+            &self.owner,
+            &self.node,
+            &self.device,
+            self.issued_ms,
+        )?;
+        let others: Vec<_> = devices
             .iter()
-            .any(|d| d.verify(&message, &self.signature).is_ok())
-        {
-            Ok(())
-        } else {
-            Err(Error::PolicySignature)
-        }
+            .copied()
+            .filter(|d| *d != self.device)
+            .collect();
+        signer(&others, &message, &self.signature)
     }
 }
 
 impl DeviceKey {
-    /// Vouches for `device` as another device of `owner`.
-    pub fn endorse(&self, owner: &str, device: &DevicePublicKey) -> Result<Endorsement> {
+    /// Vouches for `device` as another device of `owner` on `node`, at `issued_ms`.
+    pub fn endorse(
+        &self,
+        owner: &str,
+        node: &NodePublicKey,
+        device: &DevicePublicKey,
+        issued_ms: u64,
+    ) -> Result<Endorsement> {
         Ok(Endorsement {
             owner: owner.to_string(),
+            node: *node,
             device: *device,
-            signature: self.sign(&Endorsement::message(owner, device)?),
+            issued_ms,
+            signature: self.sign(&change_message(
+                ENDORSE_DOMAIN,
+                owner,
+                node,
+                device,
+                issued_ms,
+            )?),
+        })
+    }
+
+    /// Withdraws `device` of `owner` on `node`, at `issued_ms`. A device cannot withdraw
+    /// itself, and the last device of an owner cannot be withdrawn.
+    pub fn retire(
+        &self,
+        owner: &str,
+        node: &NodePublicKey,
+        device: &DevicePublicKey,
+        issued_ms: u64,
+    ) -> Result<Retirement> {
+        Ok(Retirement {
+            owner: owner.to_string(),
+            node: *node,
+            device: *device,
+            issued_ms,
+            signature: self.sign(&change_message(
+                RETIRE_DOMAIN,
+                owner,
+                node,
+                device,
+                issued_ms,
+            )?),
         })
     }
 }
 
 impl UserKey {
-    pub(crate) fn bytes(&self) -> &[u8; KEY_LEN] {
-        self.0.expose()
+    /// The 32 secret bytes, to store the key (encrypted, on the device of the owner) and
+    /// restore it with [`UserKey::from_bytes`].
+    pub fn to_bytes(&self) -> zeroize::Zeroizing<[u8; KEY_LEN]> {
+        zeroize::Zeroizing::new(*self.0.expose())
     }
 
-    /// True when both hold the same bytes, compared in constant time.
-    pub(crate) fn same(&self, other: &UserKey) -> bool {
-        self.0
-            .expose()
-            .iter()
-            .zip(other.0.expose())
-            .fold(0u8, |acc, (a, b)| acc | (a ^ b))
-            == 0
+    /// The key as base64url, the form `credentials verify --user-key` reads.
+    pub fn to_b64(&self) -> zeroize::Zeroizing<String> {
+        zeroize::Zeroizing::new(crate::encoding::to_b64(self.0.expose()))
+    }
+
+    /// Reads a key written by [`UserKey::to_b64`].
+    pub fn from_b64(text: &str) -> Result<Self> {
+        use base64::Engine;
+        let mut bytes = zeroize::Zeroizing::new([0u8; KEY_LEN]);
+        let written = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode_slice(text.trim(), bytes.as_mut_slice())
+            .map_err(|_| Error::KeyInvalid)?;
+        if written != KEY_LEN {
+            return Err(Error::KeyInvalid);
+        }
+        Ok(Self::from_bytes(&mut bytes))
+    }
+
+    pub(crate) fn bytes(&self) -> &[u8; KEY_LEN] {
+        self.0.expose()
     }
 }

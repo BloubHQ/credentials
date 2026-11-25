@@ -68,17 +68,18 @@ pub(crate) fn check_name(name: &str) -> Result<()> {
 /// The fields hold every required field of the policy and no field it does not list.
 fn check_fields(policy: &Policy, fields: &Fields) -> Result<()> {
     let have = fields.names();
-    let listed = have
+    let unlisted = have
         .iter()
-        .all(|n| policy.fields.iter().any(|f| f.name == *n));
-    let complete = policy
+        .find(|n| !policy.fields.iter().any(|f| f.name == **n))
+        .map(|n| n.to_string());
+    let missing = policy
         .fields
         .iter()
-        .all(|f| f.optional || have.contains(&f.name.as_str()));
-    if listed && complete {
-        Ok(())
-    } else {
-        Err(Error::FieldMissing)
+        .find(|f| !f.optional && !have.contains(&f.name.as_str()))
+        .map(|f| f.name.clone());
+    match unlisted.or(missing) {
+        None => Ok(()),
+        Some(field) => Err(Error::FieldMissing { field }),
     }
 }
 

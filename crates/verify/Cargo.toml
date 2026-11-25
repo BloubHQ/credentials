@@ -1,18 +1,18 @@
 [package]
 name = "verify"
-description = "Independent verifier of a node log."
+description = "Independent verifier of a node log, run as `credentials verify`."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
+repository.workspace = true
+readme = "../../README.md"
 
 [dependencies]
 engine.workspace = true
 serde_json.workspace = true
+zeroize.workspace = true
 
 [lints]
 workspace = true
-
-[dev-dependencies]
-serde_json.workspace = true

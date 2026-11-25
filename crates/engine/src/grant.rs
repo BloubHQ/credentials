@@ -131,6 +131,35 @@ pub struct GrantTerms {
     pub pins: Vec<RecordPin>,
 }
 
+impl GrantTerms {
+    /// Terms for `owner`, issued now by the system clock and ending `valid_for` later, with no
+    /// pins yet.
+    pub fn new(owner: &str, valid_for: std::time::Duration) -> Self {
+        Self::at(owner, crate::node::now_ms(), valid_for)
+    }
+
+    /// [`GrantTerms::new`] issued at `issued_ms` (Unix milliseconds).
+    pub fn at(owner: &str, issued_ms: u64, valid_for: std::time::Duration) -> Self {
+        let valid_ms = u64::try_from(valid_for.as_millis()).unwrap_or(u64::MAX);
+        Self {
+            owner: owner.to_string(),
+            expires_ms: issued_ms.saturating_add(valid_ms),
+            issued_ms,
+            pins: Vec::new(),
+        }
+    }
+
+    /// Pins `record` at its generation: the node will refuse any older copy of it.
+    #[must_use]
+    pub fn pin(mut self, record: &crate::record::Record) -> Self {
+        self.pins.push(RecordPin {
+            record_id: record.id.clone(),
+            generation: record.generation,
+        });
+        self
+    }
+}
+
 #[derive(Serialize)]
 struct GrantMessage<'a> {
     terms: &'a GrantTerms,

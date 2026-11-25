@@ -1,0 +1,33 @@
+[package]
+name = "cli"
+description = "Command-line tool for owners and callers, and a node server over HTTP."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+readme = "README.md"
+repository.workspace = true
+
+[[bin]]
+name = "credentials"
+path = "src/main.rs"
+
+[dependencies]
+engine.workspace = true
+transport.workspace = true
+verify = { path = "../verify" }
+base64.workspace = true
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+zeroize.workspace = true
+zeroizing-alloc = "0.1"
+
+[dev-dependencies]
+hmac.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+
+[lints]
+workspace = true

@@ -74,6 +74,9 @@ pub enum Error {
     /// A key could not be read.
     #[error("key invalid")]
     KeyInvalid,
+    /// A signature does not verify under the key it was checked with.
+    #[error("signature does not verify")]
+    SignatureInvalid,
     /// The fields of a record are malformed.
     #[error("record invalid")]
     RecordInvalid,
@@ -114,18 +117,27 @@ pub enum Error {
         what: &'static str,
     },
     /// A field the policy needs is missing, or the record holds a field the policy does not
-    /// list.
-    #[error("record fields do not match the policy")]
-    FieldMissing,
+    /// list. `field` is its name (names are not secret).
+    #[error("record fields do not match the policy: {field}")]
+    FieldMissing {
+        /// The field missing, or not listed.
+        field: String,
+    },
     /// The request breaks a rule of the operation.
     #[error("request invalid: {rule}")]
     RequestInvalid {
         /// Which rule.
         rule: &'static str,
     },
-    /// The caller is not one the policy lists for this operation.
-    #[error("caller not allowed")]
-    CallerDenied,
+    /// The caller is not one the policy lists, or not for this operation. Names are not
+    /// secret; `operation` is empty when the caller is unknown to the policy.
+    #[error("caller {caller} not allowed{}", if operation.is_empty() { String::new() } else { format!(" to call {operation}") })]
+    CallerDenied {
+        /// The caller named in the authorization.
+        caller: String,
+        /// The operation asked for.
+        operation: String,
+    },
     /// The authorization of the caller does not verify, is too old, or was seen before.
     #[error("caller authorization invalid: {rule}")]
     CallerInvalid {
@@ -136,17 +148,29 @@ pub enum Error {
     #[error("rate limit reached")]
     RateLimited,
     /// The destination of the request is not one of the operation.
-    #[error("destination not allowed by policy")]
-    DestinationDenied,
+    #[error("destination {host} not allowed by policy")]
+    DestinationDenied {
+        /// The destination asked for, `host:port`.
+        host: String,
+    },
     /// The method of the request is not one of the operation.
-    #[error("method not allowed by policy")]
-    MethodDenied,
+    #[error("method {method} not allowed by policy")]
+    MethodDenied {
+        /// The method asked for.
+        method: String,
+    },
     /// The path of the request is not under a path of the operation.
-    #[error("path not allowed by policy")]
-    PathDenied,
+    #[error("path {path} not allowed by policy")]
+    PathDenied {
+        /// The path asked for, without its query.
+        path: String,
+    },
     /// The policy has no operation of this name, or of this kind.
-    #[error("operation unknown")]
-    OperationUnknown,
+    #[error("operation {name} unknown, or not of this kind")]
+    OperationUnknown {
+        /// The operation asked for.
+        name: String,
+    },
     /// A capture the policy requires found nothing in the response.
     #[error("captured value missing from the response")]
     CaptureMissing,
@@ -166,6 +190,17 @@ pub enum Error {
     /// The entry given to resume or reconcile a log does not fit its state.
     #[error("log state does not match the entry given")]
     LogMismatch,
+    /// The log given to [`crate::node::Node::restore_anchored`] is shorter than the checkpoint,
+    /// or does not end in the entry it covers: entries were cut or replaced.
+    #[error(
+        "log has {len} entries but the checkpoint covers {anchor}: entries were cut or replaced"
+    )]
+    LogBehindAnchor {
+        /// Entries in the log given.
+        len: u64,
+        /// Entries the checkpoint covers.
+        anchor: u64,
+    },
     /// The chain of entries is broken at this sequence number.
     #[error("log chain broken at seq {seq}")]
     ChainBroken {
@@ -217,12 +252,12 @@ impl Error {
     pub fn is_caller_error(&self) -> bool {
         matches!(
             self,
-            Error::CallerDenied
+            Error::CallerDenied { .. }
                 | Error::CallerInvalid { .. }
-                | Error::DestinationDenied
-                | Error::MethodDenied
-                | Error::PathDenied
-                | Error::OperationUnknown
+                | Error::DestinationDenied { .. }
+                | Error::MethodDenied { .. }
+                | Error::PathDenied { .. }
+                | Error::OperationUnknown { .. }
                 | Error::RequestInvalid { .. }
         )
     }

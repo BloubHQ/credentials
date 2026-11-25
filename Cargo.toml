@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/engine", "crates/transport", "crates/verify"]
+members = ["crates/cli", "crates/engine", "crates/transport", "crates/verify"]
 
 [workspace.package]
 version = "0.1.0"
@@ -12,6 +12,7 @@ repository = "https://github.com/BloubHQ/credentials"
 
 [workspace.dependencies]
 engine = { path = "crates/engine" }
+transport = { path = "crates/transport" }
 aes = "0.8"
 aes-gcm = "0.10"
 cbc = { version = "0.1", features = ["alloc"] }
@@ -23,6 +24,7 @@ p384 = { version = "0.14", features = ["ecdsa", "pkcs8"] }
 sha3 = "0.10"
 base64 = "0.22"
 chacha20poly1305 = "0.10"
+clap = { version = "4.5", default-features = false, features = ["std", "derive", "help", "usage", "error-context"] }
 ed25519-dalek = { version = "2", features = ["rand_core", "zeroize", "pkcs8", "pem"] }
 hkdf = "0.12"
 hpke = { version = "0.15", default-features = false, features = ["alloc", "x25519", "chacha", "getrandom"] }
@@ -54,3 +56,11 @@ dbg_macro = "deny"
 codegen-units = 1
 lto = true
 panic = "unwind"
+
+# Dependencies (crypto) optimized in debug builds: tests make many signatures.
+[profile.dev.package."*"]
+opt-level = 2
+
+# The engine itself, lightly: one test makes 100,000 signed calls.
+[profile.dev.package.engine]
+opt-level = 1

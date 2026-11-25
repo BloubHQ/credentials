@@ -33,8 +33,10 @@ fn invalid(rule: &'static str) -> Error {
     Error::RequestInvalid { rule }
 }
 
-/// A request the caller asks a node to send with the values of a record.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// A request the caller asks a node to send with the values of a record. In JSON the body is
+/// base64url.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Request {
     /// Method.
     pub method: Method,
@@ -43,8 +45,10 @@ pub struct Request {
     /// Path and query, starting with `/`; it holds `{name}` once for each path parameter.
     pub path: String,
     /// Further headers; each must be one the operation lists.
+    #[serde(default)]
     pub headers: Vec<(String, String)>,
     /// Body; `$body` to the templates.
+    #[serde(default, with = "crate::encoding::b64_vec")]
     pub body: Vec<u8>,
 }
 
@@ -71,13 +75,15 @@ impl Request {
             ..
         } = operation
         else {
-            return Err(Error::OperationUnknown);
+            return Err(operation.unknown());
         };
         if !operation.allows_destination(&self.destination) {
-            return Err(Error::DestinationDenied);
+            return Err(self.destination.denied());
         }
         if !methods.contains(&self.method) {
-            return Err(Error::MethodDenied);
+            return Err(Error::MethodDenied {
+                method: self.method.as_str().to_string(),
+            });
         }
         if !check_path(&self.path) {
             return Err(invalid(
@@ -85,7 +91,9 @@ impl Request {
             ));
         }
         if !paths.iter().any(|p| under(&self.path, p)) {
-            return Err(Error::PathDenied);
+            return Err(Error::PathDenied {
+                path: self.path.split('?').next().unwrap_or_default().to_string(),
+            });
         }
         let caller_steps = || steps.iter().filter(|s| s.request == StepRequest::Caller);
         let params_ok = caller_steps()

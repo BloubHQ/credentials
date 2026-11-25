@@ -30,10 +30,15 @@ fn invalid(rule: &'static str) -> Error {
 /// The response of an operation, as the caller gets it: after redaction and the reflection
 /// check. The body is decoded (no chunked framing); `Content-Length` and `Transfer-Encoding`
 /// are not among the headers.
-#[derive(Clone, Debug, PartialEq, Eq)]
+///
+/// In JSON, header values and the body are base64url.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Response {
     pub(crate) status: u16,
+    #[serde(with = "crate::encoding::b64_pairs")]
     pub(crate) headers: Vec<(String, Vec<u8>)>,
+    #[serde(with = "crate::encoding::b64_vec")]
     pub(crate) body: Vec<u8>,
     pub(crate) log_seqs: Vec<u64>,
 }

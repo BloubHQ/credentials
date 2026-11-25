@@ -43,6 +43,70 @@ pub mod b64_array {
     }
 }
 
+/// Serde form of a list of byte vectors as a list of base64 strings.
+pub mod b64_list {
+    use base64::Engine;
+    use serde::ser::SerializeSeq;
+    use serde::{Deserialize, Deserializer, Serializer, de};
+
+    /// Serializes the list.
+    pub fn serialize<S: Serializer>(value: &[Vec<u8>], serializer: S) -> Result<S::Ok, S::Error> {
+        let mut seq = serializer.serialize_seq(Some(value.len()))?;
+        for item in value {
+            seq.serialize_element(&super::to_b64(item))?;
+        }
+        seq.end()
+    }
+
+    /// Deserializes the list.
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Vec<Vec<u8>>, D::Error> {
+        Vec::<String>::deserialize(deserializer)?
+            .into_iter()
+            .map(|text| {
+                super::URL_SAFE_NO_PAD
+                    .decode(text)
+                    .map_err(|_| de::Error::custom("invalid base64"))
+            })
+            .collect()
+    }
+}
+
+/// Serde form of header pairs whose values are bytes: `[name, base64 value]`.
+pub mod b64_pairs {
+    use base64::Engine;
+    use serde::ser::SerializeSeq;
+    use serde::{Deserialize, Deserializer, Serializer, de};
+
+    /// Serializes the pairs.
+    pub fn serialize<S: Serializer>(
+        value: &[(String, Vec<u8>)],
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        let mut seq = serializer.serialize_seq(Some(value.len()))?;
+        for (name, bytes) in value {
+            seq.serialize_element(&(name, super::to_b64(bytes)))?;
+        }
+        seq.end()
+    }
+
+    /// Deserializes the pairs.
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Vec<(String, Vec<u8>)>, D::Error> {
+        Vec::<(String, String)>::deserialize(deserializer)?
+            .into_iter()
+            .map(|(name, text)| {
+                super::URL_SAFE_NO_PAD
+                    .decode(text)
+                    .map(|bytes| (name, bytes))
+                    .map_err(|_| de::Error::custom("invalid base64"))
+            })
+            .collect()
+    }
+}
+
 /// Serde form of a byte vector as base64.
 pub mod b64_vec {
     use base64::Engine;

@@ -275,7 +275,6 @@ struct Info {
     tainted: bool,
     controlled: bool,
     secret_key: bool,
-    has_nonce: bool,
     guessable: bool,
 }
 
@@ -475,7 +474,6 @@ fn analyze(expr: &Expr, kind: &dyn Fn(&str) -> NameKind) -> core::result::Result
         },
         Expr::Var(v) => Info {
             controlled: v.controlled(),
-            has_nonce: *v == Var::Nonce,
             ..Info::default()
         },
         Expr::Concat(parts) => {
@@ -487,7 +485,6 @@ fn analyze(expr: &Expr, kind: &dyn Fn(&str) -> NameKind) -> core::result::Result
                 tainted: infos.iter().any(|i| i.tainted),
                 controlled: infos.iter().any(|i| i.controlled),
                 secret_key: false,
-                has_nonce: infos.iter().any(|i| i.has_nonce),
                 guessable: infos.iter().any(|i| i.guessable),
             }
         }
@@ -516,52 +513,56 @@ fn call_info(func: Func, args: &[Info]) -> core::result::Result<Info, Rule> {
     if func.sensitive_args().any(|i| at(i).mixed()) {
         return Err("a secret mixed with a chosen value reaches a decoder, number or key");
     }
-    let tainted = if func.one_way() {
+    // A secret in one number argument and a chosen value in another is the same oracle as
+    // both in one: `time(secret, $input)` picks which digits of the secret come out.
+    if matches!(func, Func::Time | Func::Totp | Func::Pbkdf2Sha256)
+        && func.sensitive_args().any(|i| at(i).tainted)
+        && func.sensitive_args().any(|i| at(i).controlled)
+    {
+        return Err("a secret and a chosen value meet in the number arguments of a function");
+    }
+    let plain_hash = matches!(
+        func,
+        Func::Md5 | Func::Sha1 | Func::Sha256 | Func::Sha512 | Func::Keccak256
+    );
+    let tainted = if plain_hash {
+        // A hash of nothing but secret bytes is as good as the secret where the secret is
+        // hashed first: an HMAC key longer than its block, an Ed25519 seed, a password hash.
+        // Only a hash that also covers bytes the caller or server chooses hides the secret.
+        at(0).tainted && !at(0).controlled
+    } else if func.one_way() {
         false
     } else if matches!(func, Func::AesGcmEncrypt | Func::AesCbcEncrypt) {
         let (key, nonce, message, aad) = (at(0), at(1), at(2), at(3));
         if key.secret_key {
-            // Under a secret key only a secret in the nonce or the associated data, or a
-            // secret next to chosen bytes under a fixed nonce (the keystream repeats), can be
-            // read back.
-            nonce.tainted || aad.tainted || (message.mixed() && !nonce.has_nonce)
+            // A secret key hides only itself. A secret in the message stays readable: another
+            // operation of the policy may encrypt chosen bytes under the same key and a chosen
+            // nonce (an encryption oracle), which gives back the keystream of any nonce the
+            // caller has seen, and a nonce that only looks fresh may be constant.
+            nonce.tainted || message.tainted || aad.tainted
         } else {
             any_tainted
         }
     } else {
         any_tainted
     };
+    // Only a secret field itself, or a decoding of it, is a key nobody else knows. A hash or
+    // MAC of it is a new value that some operation may hand back, after which it hides
+    // nothing.
     let secret_key = match func {
         Func::B64Decode | Func::B32Decode | Func::HexDecode | Func::Pem | Func::Trim => {
             at(0).secret_key
         }
-        Func::Sha256
-        | Func::Sha512
-        | Func::Keccak256
-        | Func::HmacSha1
-        | Func::HmacSha256
-        | Func::HmacSha512
-        | Func::Pbkdf2Sha256 => at(0).secret_key,
         _ => false,
     };
-    // A guessable value stays guessable unless a strong secret key hides it with no public
-    // check: a keyed MAC or an encryption. A signature does not hide it (the public key checks
-    // a guess), nor does a slow hash. Its length alone is not the value.
-    let any_guessable = args.iter().any(|i| i.guessable);
-    let guessable = match func {
-        Func::Len => false,
-        Func::HmacSha1
-        | Func::HmacSha256
-        | Func::HmacSha512
-        | Func::AesGcmEncrypt
-        | Func::AesCbcEncrypt => any_guessable && !(at(0).secret_key && !at(0).guessable),
-        _ => any_guessable,
-    };
+    // A guessable value stays guessable through every function but `len`. A signature or a
+    // hash lets anyone check a guess, and a keyed MAC or an encryption does too as soon as
+    // another operation of the policy computes it on chosen input under the same key.
+    let guessable = func != Func::Len && args.iter().any(|i| i.guessable);
     Ok(Info {
         tainted,
         controlled: any_controlled,
         secret_key,
-        has_nonce: args.iter().any(|i| i.has_nonce),
         guessable,
     })
 }
@@ -773,7 +774,9 @@ fn eval(expr: &Expr, ctx: &Context<'_>) -> Result<Bytes> {
                 .fields
                 .get(name)
                 .or_else(|| ctx.temps.get(name).map(|v| v.as_slice()))
-                .ok_or(Error::FieldMissing)?;
+                .ok_or_else(|| Error::FieldMissing {
+                    field: name.clone(),
+                })?;
             ctx.budget.bytes(value.len())?;
             Zeroizing::new(value.to_vec())
         }
@@ -967,11 +970,19 @@ mod tests {
         assert!(tainted(
             r#"{{ aes_gcm_encrypt(key, "000000000000", "x", msg) }}"#
         ));
-        assert!(!tainted(
+        // A secret key hides only itself: a secret message stays readable.
+        assert!(tainted(
             r#"{{ aes_gcm_encrypt(key, "000000000000", msg) }}"#
         ));
+        assert!(tainted(
+            r#"{{ aes_gcm_encrypt(key, hexdecode(replace($nonce, "00000000", "")), msg) }}"#
+        ));
+        // A hash of a secret is not a secret key: some operation may hand it back.
+        assert!(tainted(
+            r#"{{ hex(sha256(key)) + aes_cbc_encrypt(sha256(key), $input, msg) }}"#
+        ));
         assert!(!tainted(
-            r#"{{ aes_gcm_encrypt(sha256(key), hexdecode(replace($nonce, "00000000", "")), msg + $input) }}"#
+            r#"{{ aes_gcm_encrypt(b64decode(key), hexdecode(replace($nonce, "00000000", "")), $input) }}"#
         ));
         assert!(!tainted("{{ hex(hmac_sha256(key, $input)) }}"));
         assert!(!tainted("{{ b64(rsa_sign_pkcs1_sha256(key, $input)) }}"));

@@ -158,7 +158,12 @@ pub struct Caller {
 
 /// Where an injection puts its rendered template.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+#[serde(
+    tag = "kind",
+    rename_all = "snake_case",
+    deny_unknown_fields,
+    from = "wire::Target"
+)]
 pub enum Target {
     /// A header with this name.
     Header {
@@ -259,6 +264,15 @@ pub struct Destination {
     pub port: u16,
 }
 
+impl Destination {
+    /// The error for a request to this destination where the operation allows none like it.
+    pub(crate) fn denied(&self) -> Error {
+        Error::DestinationDenied {
+            host: format!("{}:{}", self.host, self.port),
+        }
+    }
+}
+
 fn is_label(label: &[u8]) -> bool {
     !label.is_empty()
         && label.len() <= 63
@@ -332,7 +346,12 @@ pub struct Identity {
 
 /// What request a step sends.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "from", rename_all = "snake_case", deny_unknown_fields)]
+#[serde(
+    tag = "from",
+    rename_all = "snake_case",
+    deny_unknown_fields,
+    from = "wire::StepRequest"
+)]
 pub enum StepRequest {
     /// The request of the caller.
     #[default]
@@ -352,7 +371,12 @@ pub enum StepRequest {
 
 /// Where a capture reads in a response.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "from", rename_all = "snake_case", deny_unknown_fields)]
+#[serde(
+    tag = "from",
+    rename_all = "snake_case",
+    deny_unknown_fields,
+    from = "wire::Source"
+)]
 pub enum Source {
     /// The status code, as decimal text.
     Status,
@@ -392,6 +416,112 @@ pub enum Source {
     },
     /// The whole body.
     All,
+}
+
+/// The forms the tagged enums are read in. Serde ignores unknown members next to the tag of a
+/// variant without fields (`{"from": "caller", "path": "/x"}` would read as `Caller`), so here
+/// every such variant has an empty set of fields, which refuses them.
+mod wire {
+    use serde::Deserialize;
+
+    use super::{Destination, Method};
+
+    #[derive(Deserialize)]
+    #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+    pub(super) enum Target {
+        Header { name: String },
+        Query { name: String },
+        PathParam { name: String },
+        Body {},
+    }
+
+    impl From<Target> for super::Target {
+        fn from(t: Target) -> Self {
+            match t {
+                Target::Header { name } => Self::Header { name },
+                Target::Query { name } => Self::Query { name },
+                Target::PathParam { name } => Self::PathParam { name },
+                Target::Body {} => Self::Body,
+            }
+        }
+    }
+
+    #[derive(Deserialize)]
+    #[serde(tag = "from", rename_all = "snake_case", deny_unknown_fields)]
+    pub(super) enum StepRequest {
+        Caller {},
+        Fixed {
+            method: Method,
+            path: String,
+            #[serde(default)]
+            destination: Option<Destination>,
+        },
+    }
+
+    impl From<StepRequest> for super::StepRequest {
+        fn from(r: StepRequest) -> Self {
+            match r {
+                StepRequest::Caller {} => Self::Caller,
+                StepRequest::Fixed {
+                    method,
+                    path,
+                    destination,
+                } => Self::Fixed {
+                    method,
+                    path,
+                    destination,
+                },
+            }
+        }
+    }
+
+    #[derive(Deserialize)]
+    #[serde(tag = "from", rename_all = "snake_case", deny_unknown_fields)]
+    pub(super) enum Source {
+        Status {},
+        Header {
+            name: String,
+        },
+        HeaderParam {
+            name: String,
+            param: String,
+            #[serde(default)]
+            scheme: Option<String>,
+        },
+        Cookie {
+            name: String,
+        },
+        Json {
+            pointer: String,
+        },
+        Between {
+            start: String,
+            end: String,
+        },
+        All {},
+    }
+
+    impl From<Source> for super::Source {
+        fn from(s: Source) -> Self {
+            match s {
+                Source::Status {} => Self::Status,
+                Source::Header { name } => Self::Header { name },
+                Source::HeaderParam {
+                    name,
+                    param,
+                    scheme,
+                } => Self::HeaderParam {
+                    name,
+                    param,
+                    scheme,
+                },
+                Source::Cookie { name } => Self::Cookie { name },
+                Source::Json { pointer } => Self::Json { pointer },
+                Source::Between { start, end } => Self::Between { start, end },
+                Source::All {} => Self::All,
+            }
+        }
+    }
 }
 
 impl Source {
@@ -543,6 +673,13 @@ pub enum Operation {
 }
 
 impl Operation {
+    /// The error for a call that needs another kind of operation.
+    pub(crate) fn unknown(&self) -> Error {
+        Error::OperationUnknown {
+            name: self.name().to_string(),
+        }
+    }
+
     /// The name of the operation.
     pub fn name(&self) -> &str {
         match self {
@@ -712,7 +849,9 @@ impl Policy {
         self.operations
             .iter()
             .find(|o| o.name() == name)
-            .ok_or(Error::OperationUnknown)
+            .ok_or_else(|| Error::OperationUnknown {
+                name: name.to_string(),
+            })
     }
 
     /// The caller with this name.
@@ -720,7 +859,10 @@ impl Policy {
         self.callers
             .iter()
             .find(|c| c.name == name)
-            .ok_or(Error::CallerDenied)
+            .ok_or_else(|| Error::CallerDenied {
+                caller: name.to_string(),
+                operation: String::new(),
+            })
     }
 
     /// Parses a template, checks its names and variables, and applies the analysis. Returns
@@ -735,8 +877,11 @@ impl Policy {
     ) -> Result<bool> {
         let template = Template::parse(text).map_err(|_| Error::policy(at, "template syntax"))?;
         let known = |name: &str| self.is_field(name) || temps.contains(&name);
-        if !template.names().into_iter().all(known) {
-            return Err(Error::policy(at, "template reads an unknown or later name"));
+        if let Some(name) = template.names().into_iter().find(|n| !known(n)) {
+            return Err(Error::policy(
+                format!("{at} ({name})"),
+                "template reads an unknown or later name",
+            ));
         }
         if !template.vars().into_iter().all(var_ok) {
             return Err(Error::policy(
@@ -1042,11 +1187,18 @@ impl Policy {
                 || format!("{at}.name"),
                 "name is not a token",
             )?;
+            let unknown = caller
+                .operations
+                .iter()
+                .find(|o| self.operation(o).is_err());
             ensure(
                 !caller.operations.is_empty()
-                    && caller.operations.iter().all(|o| self.operation(o).is_ok())
+                    && unknown.is_none()
                     && unique(caller.operations.iter().map(String::as_str)),
-                || format!("{at}.operations"),
+                || match unknown {
+                    Some(name) => format!("{at}.operations ({name})"),
+                    None => format!("{at}.operations"),
+                },
                 "operations must be names of operations, each once",
             )?;
             if let Some(limit) = caller.limit {
@@ -1293,13 +1445,53 @@ mod tests {
     }
 
     #[test]
+    fn unknown_members_are_refused_next_to_every_tag() {
+        for json in [
+            r#"{"from":"caller","path":"/oauth/token"}"#,
+            r#"{"from":"fixed","method":"POST","path":"/","x":1}"#,
+        ] {
+            assert!(serde_json::from_str::<StepRequest>(json).is_err(), "{json}");
+        }
+        for json in [
+            r#"{"from":"all","junk":1}"#,
+            r#"{"from":"status","x":2}"#,
+            r#"{"from":"json","pointer":"/a","x":2}"#,
+        ] {
+            assert!(serde_json::from_str::<Source>(json).is_err(), "{json}");
+        }
+        assert!(serde_json::from_str::<Target>(r#"{"kind":"body","junk":1}"#).is_err());
+        // The plain forms still read, and what is written reads back.
+        for (json, value) in [
+            (r#"{"from":"caller"}"#, StepRequest::Caller),
+            (
+                r#"{"from":"fixed","method":"GET","path":"/a"}"#,
+                StepRequest::Fixed {
+                    method: Method::Get,
+                    path: "/a".into(),
+                    destination: None,
+                },
+            ),
+        ] {
+            assert_eq!(serde_json::from_str::<StepRequest>(json).unwrap(), value);
+            let back = serde_json::to_string(&value).unwrap();
+            assert_eq!(serde_json::from_str::<StepRequest>(&back).unwrap(), value);
+        }
+        for value in [Source::All, Source::Status] {
+            let back = serde_json::to_string(&value).unwrap();
+            assert_eq!(serde_json::from_str::<Source>(&back).unwrap(), value);
+        }
+        let back = serde_json::to_string(&Target::Body).unwrap();
+        assert_eq!(serde_json::from_str::<Target>(&back).unwrap(), Target::Body);
+    }
+
+    #[test]
     fn errors_name_the_part() {
         let mut p = bearer();
         step_of(&mut p).inject[0].template = "Bearer {{other}}".into();
         assert_eq!(
             p.validate(),
             Err(Error::PolicyInvalid {
-                at: "operations[0].steps[0].inject[0]".into(),
+                at: "operations[0].steps[0].inject[0] (other)".into(),
                 rule: "template reads an unknown or later name"
             })
         );
@@ -1395,6 +1587,9 @@ mod tests {
         assert_eq!(
             rule_of(&p),
             "operations must be names of operations, each once"
+        );
+        assert!(
+            matches!(p.validate(), Err(Error::PolicyInvalid { at, .. }) if at.ends_with("(nope)"))
         );
     }
 

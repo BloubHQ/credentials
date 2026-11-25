@@ -294,9 +294,12 @@ impl Stream for TlsStream {
         let mut chunk = Zeroizing::new([0u8; CHUNK]);
         loop {
             if let Some(end) = first_end(&self.pending, delimiters, searched) {
+                // Both parts are copied to buffers of their exact size and the old buffer is
+                // erased, so no copy of the bytes after the delimiter stays in spare capacity.
+                let read = self.pending.get(..end).unwrap_or_default().to_vec();
                 let rest = self.pending.get(end..).unwrap_or_default().to_vec();
-                let mut read = core::mem::replace(&mut self.pending, rest);
-                read.truncate(end);
+                self.pending.zeroize();
+                self.pending = rest;
                 return Ok(read);
             }
             searched = self.pending.len();

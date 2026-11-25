@@ -24,11 +24,12 @@ use rand_core::{OsRng, RngCore};
 use sha2::{Digest, Sha256};
 use zeroize::{Zeroize, Zeroizing};
 
+use crate::call::{Body, Output, SignedCall};
 use crate::caller::{Authorization, Call, MAX_SKEW_MS, Payload};
 use crate::egress::{ClientIdentity, Transport, dispatch, open_stream};
 use crate::fields::Fields;
 use crate::grant::{NodeIdentity, NodeSealKey, OpenedGrant, Revocation, SealSecret, SealedGrant};
-use crate::keys::{DevicePublicKey, Endorsement, NodeKey, NodePublicKey, UserKey};
+use crate::keys::{DevicePublicKey, Endorsement, NodeKey, NodePublicKey, Retirement, UserKey};
 use crate::log::{Detail, Event, Log, LogSink, SignedEntry, SignedHead};
 use crate::policy::{
     Capture, Destination, Exchange, Identity, MAX_DELIMITER, MAX_DELIMITERS, Operation, Policy,
@@ -54,11 +55,23 @@ pub const MAX_EXCHANGES: usize = 64;
 pub const MAX_TEMPS: usize = 1024 * 1024;
 /// Most nonces a node remembers.
 pub const MAX_NONCES: usize = 1_000_000;
+/// The most owners one node keeps state for.
+pub const MAX_OWNERS: usize = 1_000_000;
+/// Calls one caller may make on one owner within the replay window (five minutes), whatever
+/// its policy limit: a caller cannot fill the replay cache all owners share.
+pub const MAX_NONCES_PER_CALLER: usize = 100_000;
+/// How far ahead of the node clock an authorization may be dated.
+pub const MAX_FUTURE_MS: u64 = 60 * 1000;
 
 /// A source of time.
 pub trait Clock {
     /// Now, Unix milliseconds.
     fn now_ms(&self) -> u64;
+}
+
+/// Now by the system clock, Unix milliseconds: the time unit of every `_ms` value.
+pub fn now_ms() -> u64 {
+    SystemClock.now_ms()
 }
 
 /// The system clock.
@@ -74,8 +87,10 @@ impl Clock for SystemClock {
 }
 
 /// The result of an operation, and the record sealed again when the operation captured a
-/// value into a field. The new record replaces the old one even when `result` is an error.
+/// value into a field. The new record replaces the old one even when `result` is an error:
+/// store it, or the next call fails with [`Error::RecordStale`].
 #[derive(Debug)]
+#[must_use = "a new record in `record` must replace the old one, even when `result` is an error"]
 pub struct Outcome<T> {
     /// What the operation handed back.
     pub result: Result<T>,
@@ -212,10 +227,61 @@ struct Grant {
 #[derive(Default)]
 struct Owner {
     devices: Vec<DevicePublicKey>,
+    /// Devices withdrawn: they cannot come back by granting, only by a new endorsement.
+    retired: Vec<DevicePublicKey>,
     issued_ms: u64,
 }
 
 type RecordKey = (String, String);
+
+/// The one-time nonces of recent authorizations, expired in time order, with a quota for
+/// each caller of each owner.
+#[derive(Default)]
+struct Nonces {
+    seen: HashMap<[u8; 32], [u8; 32]>,
+    by_expiry: std::collections::BTreeSet<(u64, [u8; 32])>,
+    per_caller: HashMap<[u8; 32], usize>,
+}
+
+impl Nonces {
+    fn expire(&mut self, now: u64) {
+        while let Some(&(expires, tag)) = self.by_expiry.first() {
+            if expires > now {
+                break;
+            }
+            self.by_expiry.pop_first();
+            if let Some(who) = self.seen.remove(&tag) {
+                if let Some(count) = self.per_caller.get_mut(&who) {
+                    *count = count.saturating_sub(1);
+                    if *count == 0 {
+                        self.per_caller.remove(&who);
+                    }
+                }
+            }
+        }
+    }
+
+    fn insert(&mut self, tag: [u8; 32], who: [u8; 32], expires: u64, now: u64) -> Result<()> {
+        self.expire(now);
+        if self.seen.contains_key(&tag) {
+            return Err(Error::CallerInvalid {
+                rule: "authorization used before",
+            });
+        }
+        if self.per_caller.get(&who).copied().unwrap_or(0) >= MAX_NONCES_PER_CALLER {
+            return Err(Error::RateLimited);
+        }
+        if self.seen.len() >= MAX_NONCES {
+            return Err(Error::CallerInvalid {
+                rule: "too many recent calls to check for replay",
+            });
+        }
+        self.seen.insert(tag, who);
+        self.by_expiry.insert((expires, tag));
+        *self.per_caller.entry(who).or_default() += 1;
+        Ok(())
+    }
+}
 
 struct State<S> {
     log: Log,
@@ -223,7 +289,10 @@ struct State<S> {
     grants: HashMap<String, Grant>,
     owners: HashMap<String, Owner>,
     floors: HashMap<RecordKey, u64>,
-    nonces: HashMap<[u8; 32], u64>,
+    nonces: Nonces,
+    /// When this node started (or restarted). Grants and authorizations made before it are
+    /// refused: a restart loses the replay state of those.
+    started_ms: u64,
     calls: HashMap<(String, String, String), VecDeque<u64>>,
 }
 
@@ -253,11 +322,33 @@ impl<S: LogSink> State<S> {
             .unwrap_or_default()
     }
 
-    fn know_device(&mut self, owner: &str, device: DevicePublicKey) {
-        let devices = &mut self.owners.entry(owner.to_string()).or_default().devices;
-        if !devices.contains(&device) {
-            devices.push(device);
+    fn forget_device(&mut self, owner: &str, device: &DevicePublicKey) {
+        let o = self.owners.entry(owner.to_string()).or_default();
+        o.devices.retain(|d| d != device);
+        if !o.retired.contains(device) {
+            o.retired.push(*device);
         }
+    }
+
+    fn know_device(&mut self, owner: &str, device: DevicePublicKey) {
+        let o = self.owners.entry(owner.to_string()).or_default();
+        o.retired.retain(|d| *d != device);
+        if !o.devices.contains(&device) {
+            o.devices.push(device);
+        }
+    }
+
+    fn is_retired(&self, owner: &str, device: &DevicePublicKey) -> bool {
+        self.owners
+            .get(owner)
+            .is_some_and(|o| o.retired.contains(device))
+    }
+
+    /// The earliest time a grant, endorsement or authorization may carry: when this node
+    /// started. If the clock steps back behind it, nothing new is accepted until the clock
+    /// passes it again, so what was signed before a restart never opens the node.
+    fn since(&self, _now: u64) -> u64 {
+        self.started_ms
     }
 
     fn issued(&mut self, owner: &str, issued_ms: u64) {
@@ -271,6 +362,11 @@ impl<S: LogSink> State<S> {
         if issued_ms.abs_diff(now) > MAX_SKEW_MS {
             return Err(Error::GrantInvalid {
                 rule: "issued too long ago or in the future",
+            });
+        }
+        if issued_ms < self.since(now) {
+            return Err(Error::GrantInvalid {
+                rule: "issued before this node started",
             });
         }
         if self
@@ -320,6 +416,37 @@ pub struct Node<S: LogSink, C: Clock> {
 }
 
 impl<S: LogSink, C: Clock> Node<S, C> {
+    /// Runs a [`SignedCall`]: the HTTP, stream or derive operation it names, with the record
+    /// and payload its caller signed.
+    pub fn run<T: Transport>(&self, call: &SignedCall, transport: &mut T) -> Outcome<Output> {
+        let (record, operation, auth) = (&call.record, call.operation.as_str(), &call.auth);
+        match &call.body {
+            Body::Http { request } => {
+                let o = self.http(record, operation, auth, request.as_ref(), transport);
+                Outcome {
+                    result: o.result.map(Output::Http),
+                    record: o.record,
+                }
+            }
+            Body::Stream {
+                destination,
+                exchanges,
+            } => {
+                let o = self.stream(record, operation, auth, destination, exchanges, transport);
+                Outcome {
+                    result: o.result.map(Output::Stream),
+                    record: o.record,
+                }
+            }
+            Body::Derive { input } => Outcome {
+                result: self
+                    .derive(record, operation, auth, input)
+                    .map(Output::Derive),
+                record: None,
+            },
+        }
+    }
+
     /// A node with a fresh chain.
     pub fn new(key: NodeKey, sink: S, clock: C) -> Self {
         let seal = SealSecret::of(&key);
@@ -328,6 +455,7 @@ impl<S: LogSink, C: Clock> Node<S, C> {
 
     fn with_log(log: Log, seal: (SealSecret, NodeSealKey), sink: S, clock: C) -> Self {
         let public = log.public_key();
+        let started_ms = clock.now_ms();
         Self {
             public,
             identity: NodeIdentity {
@@ -342,7 +470,8 @@ impl<S: LogSink, C: Clock> Node<S, C> {
                 grants: HashMap::new(),
                 owners: HashMap::new(),
                 floors: HashMap::new(),
-                nonces: HashMap::new(),
+                nonces: Nonces::default(),
+                started_ms,
                 calls: HashMap::new(),
             }),
         }
@@ -351,12 +480,19 @@ impl<S: LogSink, C: Clock> Node<S, C> {
     /// A node that continues its chain after a restart: `entries` are all the entries its
     /// sink holds, from seq 0. The generations they name become the floors of the records, and
     /// the devices and last issue times of the owners come back. Grants do not: owners grant
-    /// again, and the node holds no user key it did not get after the restart.
+    /// again, and the node takes no grant, endorsement or authorization made before it
+    /// restarted.
+    ///
+    /// The operator supplies `entries` and could cut them. Where the platform keeps state the
+    /// operator cannot roll back (a TEE monotonic counter or sealed storage), store
+    /// [`Node::checkpoint`] there and use [`Node::restore_anchored`].
     pub fn restore(key: NodeKey, sink: S, clock: C, entries: &[SignedEntry]) -> Result<Self> {
         let seal = SealSecret::of(&key);
         let node = Self::with_log(Log::resume(key, entries)?, seal, sink, clock);
         {
             let mut state = node.lock();
+            // Something signed in the very millisecond of the restart may predate it.
+            state.started_ms = state.started_ms.saturating_add(1);
             for signed in entries {
                 let e = &signed.entry;
                 match &e.event {
@@ -379,13 +515,47 @@ impl<S: LogSink, C: Clock> Node<S, C> {
                             state.raise(&e.owner, &pin.record_id, pin.generation);
                         }
                     }
-                    Event::Device { device } => state.know_device(&e.owner, *device),
+                    Event::Device { device, issued_ms } => {
+                        state.know_device(&e.owner, *device);
+                        state.issued(&e.owner, *issued_ms);
+                    }
+                    Event::Retire { device, issued_ms } => {
+                        state.forget_device(&e.owner, device);
+                        state.issued(&e.owner, *issued_ms);
+                    }
                     Event::Revoke { issued_ms, .. } => state.issued(&e.owner, *issued_ms),
                     Event::Done { .. } => {}
                 }
             }
         }
         Ok(node)
+    }
+
+    /// [`Node::restore`], refusing `entries` that end before `anchor`, the last checkpoint
+    /// this node signed and the platform kept where the operator cannot roll it back.
+    pub fn restore_anchored(
+        key: NodeKey,
+        sink: S,
+        clock: C,
+        entries: &[SignedEntry],
+        anchor: &SignedHead,
+    ) -> Result<Self> {
+        anchor.verify(&key.public())?;
+        let len = usize::try_from(anchor.len).map_err(|_| Error::LogMismatch)?;
+        let reaches = match len.checked_sub(1) {
+            None => true,
+            Some(last) => match entries.get(last) {
+                Some(entry) => entry.hash()? == anchor.head,
+                None => false,
+            },
+        };
+        if !reaches {
+            return Err(Error::LogBehindAnchor {
+                len: u64::try_from(entries.len()).unwrap_or(u64::MAX),
+                anchor: anchor.len,
+            });
+        }
+        Self::restore(key, sink, clock, entries)
     }
 
     fn lock(&self) -> MutexGuard<'_, State<S>> {
@@ -456,11 +626,16 @@ impl<S: LogSink, C: Clock> Node<S, C> {
         let owner = terms.owner.as_str();
         let mut state = self.lock();
         state.check_issued(owner, terms.issued_ms, now)?;
+        // Once an owner has devices, a new one joins only through an endorsement by a known
+        // device: the user key alone does not make a device known, or a retired device could
+        // come back under a fresh key.
+        if !state.owners.contains_key(owner) && state.owners.len() >= MAX_OWNERS {
+            // Anyone may become an owner (the first device is trusted on first use); the
+            // number of owners is bounded so the state and the log cannot grow without end.
+            return Err(Error::GrantDenied);
+        }
         let known = state.devices(owner);
-        let same_key = state
-            .grant_of(owner, now)
-            .is_ok_and(|g| g.user_key.same(&user_key));
-        if !known.is_empty() && !known.contains(&device) && !same_key {
+        if state.is_retired(owner, &device) || (!known.is_empty() && !known.contains(&device)) {
             return Err(Error::GrantDenied);
         }
         state.commit(
@@ -488,20 +663,62 @@ impl<S: LogSink, C: Clock> Node<S, C> {
         Ok(())
     }
 
-    /// Adds a device a known device of the owner endorsed.
+    /// Adds a device a known device of the owner endorsed for this node.
     pub fn add_device(&self, endorsement: &Endorsement) -> Result<()> {
+        if endorsement.node != self.public {
+            return Err(Error::GrantInvalid {
+                rule: "endorsement for another node",
+            });
+        }
         let now = self.clock.now_ms();
+        let owner = endorsement.owner.as_str();
         let mut state = self.lock();
-        state.grant_of(&endorsement.owner, now)?;
-        endorsement.verify(&state.devices(&endorsement.owner))?;
+        state.grant_of(owner, now)?;
+        endorsement.verify(&state.devices(owner))?;
+        state.check_issued(owner, endorsement.issued_ms, now)?;
         state.commit(
             now,
-            (&endorsement.owner, "", ""),
+            (owner, "", ""),
             Event::Device {
                 device: endorsement.device,
+                issued_ms: endorsement.issued_ms,
             },
         )?;
-        state.know_device(&endorsement.owner, endorsement.device);
+        state.know_device(owner, endorsement.device);
+        state.issued(owner, endorsement.issued_ms);
+        Ok(())
+    }
+
+    /// Withdraws a device of the owner, as another known device signed for this node. The
+    /// node then takes no policy, pin, grant or revocation that device signs. The last
+    /// device of an owner cannot be withdrawn.
+    pub fn retire_device(&self, retirement: &Retirement) -> Result<()> {
+        if retirement.node != self.public {
+            return Err(Error::GrantInvalid {
+                rule: "retirement for another node",
+            });
+        }
+        let now = self.clock.now_ms();
+        let owner = retirement.owner.as_str();
+        let mut state = self.lock();
+        let devices = state.devices(owner);
+        retirement.verify(&devices)?;
+        if !devices.contains(&retirement.device) {
+            return Err(Error::GrantInvalid {
+                rule: "the device is not known for the owner",
+            });
+        }
+        state.check_issued(owner, retirement.issued_ms, now)?;
+        state.commit(
+            now,
+            (owner, "", ""),
+            Event::Retire {
+                device: retirement.device,
+                issued_ms: retirement.issued_ms,
+            },
+        )?;
+        state.forget_device(owner, &retirement.device);
+        state.issued(owner, retirement.issued_ms);
         Ok(())
     }
 
@@ -521,8 +738,8 @@ impl<S: LogSink, C: Clock> Node<S, C> {
             return Err(Error::GrantDenied);
         }
         state.check_issued(owner, revocation.issued_ms, now)?;
-        state.grants.remove(owner);
-        state.issued(owner, revocation.issued_ms);
+        // Logged first, like every act: a revocation the sink did not take changes nothing,
+        // and the owner sends it again.
         state.commit(
             now,
             (owner, "", ""),
@@ -531,6 +748,8 @@ impl<S: LogSink, C: Clock> Node<S, C> {
                 device: revocation.device,
             },
         )?;
+        state.grants.remove(owner);
+        state.issued(owner, revocation.issued_ms);
         Ok(())
     }
 
@@ -561,26 +780,37 @@ impl<S: LogSink, C: Clock> Node<S, C> {
         payload: &Payload<'_>,
         now: u64,
     ) -> Result<(&'r Policy, &'r Operation, Checked)> {
-        let (user_key, devices) = {
+        // The state of the owner (grant, floor) is told only to a caller whose signature
+        // verifies; anyone else learns nothing about the owner's grants or records.
+        let (grant, floor, devices) = {
             let mut state = self.lock();
-            let user_key = state.grant_of(&record.owner, now)?.user_key.clone();
-            let need = state.floor(record).ok_or(Error::RecordUnpinned)?;
-            let found = (user_key, state.devices(&record.owner));
-            if record.generation < need {
-                return Err(Error::RecordStale {
-                    have: record.generation,
-                    need,
-                });
-            }
-            found
+            let grant = state
+                .grant_of(&record.owner, now)
+                .map(|g| g.user_key.clone());
+            (grant, state.floor(record), state.devices(&record.owner))
         };
         let policy = record.policy.verify_any(&devices)?;
         let operation = policy.operation(name)?;
+        // A call of the wrong kind is refused before it spends a nonce or the rate limit.
+        let kind_ok = matches!(
+            (operation, payload),
+            (Operation::Http { .. }, Payload::Http(_))
+                | (Operation::Stream { .. }, Payload::Stream { .. })
+                | (Operation::Derive { .. }, Payload::Derive(_))
+        );
+        if !kind_ok {
+            return Err(operation.unknown());
+        }
         let caller = policy.caller(&auth.caller)?;
         if !caller.operations.iter().any(|o| o == name) {
-            return Err(Error::CallerDenied);
+            return Err(Error::CallerDenied {
+                caller: auth.caller.clone(),
+                operation: name.to_string(),
+            });
         }
-        if auth.time_ms.abs_diff(now) > MAX_SKEW_MS {
+        if now.saturating_sub(auth.time_ms) > MAX_SKEW_MS
+            || auth.time_ms.saturating_sub(now) > MAX_FUTURE_MS
+        {
             return Err(Error::CallerInvalid {
                 rule: "authorization too old or from the future",
             });
@@ -592,24 +822,33 @@ impl<S: LogSink, C: Clock> Node<S, C> {
             payload: payload.sha256(),
         };
         auth.verify(&caller.key, &call)?;
+        let user_key = grant?;
+        let need = floor.ok_or(Error::RecordUnpinned)?;
+        if record.generation < need {
+            return Err(Error::RecordStale {
+                have: record.generation,
+                need,
+            });
+        }
         let mut tag = Sha256::new();
         tag.update(caller.key.to_b64().as_bytes());
         tag.update(auth.nonce);
         let tag: [u8; 32] = tag.finalize().into();
+        let mut who = Sha256::new();
+        who.update(record.owner.as_bytes());
+        who.update([0]);
+        who.update(caller.key.to_b64().as_bytes());
+        let who: [u8; 32] = who.finalize().into();
         let mut state = self.lock();
-        if state.nonces.len() >= MAX_NONCES / 2 {
-            state.nonces.retain(|_, expires| *expires > now);
-        }
-        if state.nonces.len() >= MAX_NONCES {
+        if auth.time_ms < state.since(now) {
+            // The replay cache of calls before a restart is gone.
             return Err(Error::CallerInvalid {
-                rule: "too many recent calls to check for replay",
+                rule: "authorization made before this node started",
             });
         }
-        if state.nonces.contains_key(&tag) {
-            return Err(Error::CallerInvalid {
-                rule: "authorization used before",
-            });
-        }
+        state
+            .nonces
+            .insert(tag, who, auth.time_ms.saturating_add(MAX_SKEW_MS), now)?;
         if let Some(limit) = caller.limit {
             let key = (record.owner.clone(), record.id.clone(), caller.name.clone());
             let calls = state.calls.entry(key).or_default();
@@ -624,9 +863,6 @@ impl<S: LogSink, C: Clock> Node<S, C> {
             }
             calls.push_back(now);
         }
-        state
-            .nonces
-            .insert(tag, auth.time_ms.saturating_add(MAX_SKEW_MS));
         Ok((
             policy,
             operation,
@@ -682,7 +918,7 @@ impl<S: LogSink, C: Clock> Node<S, C> {
             ..
         } = operation
         else {
-            return Err(Error::OperationUnknown);
+            return Err(operation.unknown());
         };
         match request {
             Some(request) if operation.takes_request() => request.validate(operation)?,
@@ -713,7 +949,7 @@ impl<S: LogSink, C: Clock> Node<S, C> {
         for (index, step) in steps.iter().enumerate() {
             let outbound = Outbound::of(step, destinations, request)?;
             if !operation.allows_destination(outbound.destination) {
-                return Err(Error::DestinationDenied);
+                return Err(outbound.destination.denied());
             }
             let built = request::build(
                 step,
@@ -811,7 +1047,7 @@ impl<S: LogSink, C: Clock> Node<S, C> {
             }
             self.done(now, who, seq, Some(status), true);
         }
-        Err(Error::OperationUnknown)
+        Err(operation.unknown())
     }
 
     /// Records how an act ended. A failure halts the log, so the next act fails; the result of
@@ -903,10 +1139,10 @@ impl<S: LogSink, C: Clock> Node<S, C> {
             identity, script, ..
         } = operation
         else {
-            return Err(Error::OperationUnknown);
+            return Err(operation.unknown());
         };
         if !operation.allows_destination(destination) {
-            return Err(Error::DestinationDenied);
+            return Err(destination.denied());
         }
         let exchanges_ok = exchanges.len() <= MAX_EXCHANGES
             && exchanges.iter().all(|e| {
@@ -1057,7 +1293,7 @@ impl<S: LogSink, C: Clock> Node<S, C> {
         let (_, operation_ref, checked) =
             self.check_call(record, operation, auth, &Payload::Derive(input), now)?;
         let Operation::Derive { template, .. } = operation_ref else {
-            return Err(Error::OperationUnknown);
+            return Err(operation_ref.unknown());
         };
         let template = Template::parse(template)?;
         let fields = self.open(record, &checked.policy_owner)?;
