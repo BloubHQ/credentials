@@ -19,7 +19,7 @@ aes = "0.8"
 aes-gcm = "0.10"
 cbc = { version = "0.1", features = ["alloc"] }
 k256 = { version = "0.14", features = ["ecdsa", "pkcs8"] }
-md-5 = "0.10"
+md-5 = "0.11"
 pbkdf2 = "0.12"
 ring = "0.17"
 p384 = { version = "0.14", features = ["ecdsa", "pkcs8"] }
