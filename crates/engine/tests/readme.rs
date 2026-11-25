@@ -11,7 +11,8 @@ use engine::policy::Policy;
 
 #[test]
 fn the_readme_policy_signs() {
-    let readme = include_str!("../../../README.md");
+    // A checkout on Windows may turn line ends into CRLF.
+    let readme = include_str!("../../../README.md").replace("\r\n", "\n");
     let start = readme.find("```json\n").expect("a json block") + "```json\n".len();
     let end = start + readme[start..].find("```").expect("its end");
     let key = CallerKey::generate().public().to_b64();

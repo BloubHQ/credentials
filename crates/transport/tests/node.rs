@@ -24,8 +24,8 @@ use engine::policy::{
 };
 use engine::record::Record;
 use engine::request::Request;
-use rcgen::{BasicConstraints, CertificateParams, CertifiedIssuer, IsCa, KeyPair};
-use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
+use rustls::pki_types::pem::PemObject;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::{RootCertStore, ServerConfig, ServerConnection, StreamOwned};
 use transport::TlsTransport;
 
@@ -33,23 +33,15 @@ const TOKEN: &[u8] = b"tok_live_9f8e7d6c5b4a";
 
 #[test]
 fn a_node_sends_through_tls_and_hands_back_the_response() {
-    // A server with a certificate for api.test from a test authority.
-    let mut ca_params = CertificateParams::new(Vec::<String>::new()).unwrap();
-    ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
-    let ca = CertifiedIssuer::self_signed(ca_params, KeyPair::generate().unwrap()).unwrap();
-    let key = KeyPair::generate().unwrap();
-    let cert = CertificateParams::new(vec!["api.test".to_string()])
-        .unwrap()
-        .signed_by(&key, &ca)
-        .unwrap();
+    // A server with a certificate for api.test from the test authority of the fixtures.
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let config = ServerConfig::builder_with_provider(provider)
         .with_safe_default_protocol_versions()
         .unwrap()
         .with_no_client_auth()
         .with_single_cert(
-            vec![cert.der().clone()],
-            PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key.serialize_der())),
+            vec![CertificateDer::from_pem_slice(include_bytes!("fixtures/api.pem")).unwrap()],
+            PrivateKeyDer::from_pem_slice(include_bytes!("fixtures/api.key")).unwrap(),
         )
         .unwrap();
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -136,7 +128,9 @@ fn a_node_sends_through_tls_and_hands_back_the_response() {
 
     // The caller asks for GET /user; the node adds the token and sends it over TLS.
     let mut roots = RootCertStore::empty();
-    roots.add(ca.der().clone()).unwrap();
+    roots
+        .add(CertificateDer::from_pem_slice(include_bytes!("fixtures/ca.pem")).unwrap())
+        .unwrap();
     let mut transport = TlsTransport::with_roots(roots).resolver(move |_, _| Ok(vec![address]));
     let request = Request::new(Method::Get, Destination::https("api.test"), "/user");
     let auth = caller

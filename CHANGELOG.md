@@ -9,7 +9,7 @@ before 1.0, minor versions may break formats and APIs.
 
 - `transport` crate: a TLS transport on rustls (ring provider, Mozilla roots, client
   certificates, connect/read/total deadlines, size limits, erasing buffers), tests against
-  local TLS servers, and the `github_user` example.
+  local TLS servers with fixed test certificates, and the `github_user` example.
 - Sealed grants: a device signs the terms of a grant and seals them with the user key to the
   node (HPKE, RFC 9180). Nodes accept grants only from devices they know for the owner
   (first use trusted) and refuse replays. `NodeIdentity::report_data()` for TEE quotes.

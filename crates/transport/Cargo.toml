@@ -15,7 +15,6 @@ webpki-roots = "1"
 zeroize.workspace = true
 
 [dev-dependencies]
-rcgen = "0.14"
 serde_json.workspace = true
 zeroizing-alloc = "0.1"
 

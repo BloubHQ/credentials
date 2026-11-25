@@ -18,8 +18,8 @@ use engine::egress::{ClientIdentity, Transport};
 use engine::error::TransportKind;
 use engine::policy::Destination;
 use engine::{Error, Result};
-use rcgen::{BasicConstraints, CertificateParams, CertifiedIssuer, IsCa, KeyPair};
-use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+use rustls::pki_types::pem::PemObject;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::server::WebPkiClientVerifier;
 use rustls::{RootCertStore, ServerConfig, ServerConnection, StreamOwned};
 use transport::TlsTransport;
@@ -34,29 +34,45 @@ struct Leaf {
     key_pem: String,
 }
 
-fn ca() -> CertifiedIssuer<'static, KeyPair> {
-    let mut params = CertificateParams::new(Vec::<String>::new()).unwrap();
-    params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
-    CertifiedIssuer::self_signed(params, KeyPair::generate().unwrap()).unwrap()
-}
-
-fn leaf(ca: &CertifiedIssuer<'static, KeyPair>, name: &str) -> Leaf {
-    let key = KeyPair::generate().unwrap();
-    let cert = CertificateParams::new(vec![name.to_string()])
-        .unwrap()
-        .signed_by(&key, ca)
-        .unwrap();
+/// A certificate and key of `tests/fixtures`, made once with openssl (P-256, valid to 2126).
+fn load(name: &str) -> Leaf {
+    let (cert_pem, key_pem) = match name {
+        "api" => (
+            include_str!("fixtures/api.pem"),
+            include_str!("fixtures/api.key"),
+        ),
+        "other" => (
+            include_str!("fixtures/other.pem"),
+            include_str!("fixtures/other.key"),
+        ),
+        "imap" => (
+            include_str!("fixtures/imap.pem"),
+            include_str!("fixtures/imap.key"),
+        ),
+        "client" => (
+            include_str!("fixtures/client.pem"),
+            include_str!("fixtures/client.key"),
+        ),
+        "stranger-api" => (
+            include_str!("fixtures/stranger-api.pem"),
+            include_str!("fixtures/stranger-api.key"),
+        ),
+        other => panic!("no fixture {other}"),
+    };
     Leaf {
-        der: cert.der().clone(),
-        key: PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key.serialize_der())),
-        cert_pem: cert.pem(),
-        key_pem: key.serialize_pem(),
+        der: CertificateDer::from_pem_slice(cert_pem.as_bytes()).unwrap(),
+        key: PrivateKeyDer::from_pem_slice(key_pem.as_bytes()).unwrap(),
+        cert_pem: cert_pem.to_string(),
+        key_pem: key_pem.to_string(),
     }
 }
 
-fn roots(ca: &CertifiedIssuer<'static, KeyPair>) -> RootCertStore {
+/// The test authority that issued every fixture but `stranger-api`.
+fn roots() -> RootCertStore {
     let mut roots = RootCertStore::empty();
-    roots.add(ca.der().clone()).unwrap();
+    roots
+        .add(CertificateDer::from_pem_slice(include_bytes!("fixtures/ca.pem")).unwrap())
+        .unwrap();
     roots
 }
 
@@ -116,8 +132,8 @@ fn http(reply: Vec<u8>) -> impl FnOnce(&mut Server) -> Vec<u8> {
     }
 }
 
-fn transport(ca: &CertifiedIssuer<'static, KeyPair>, address: SocketAddr) -> TlsTransport {
-    TlsTransport::with_roots(roots(ca)).resolver(move |_, _| Ok(vec![address]))
+fn transport(address: SocketAddr) -> TlsTransport {
+    TlsTransport::with_roots(roots()).resolver(move |_, _| Ok(vec![address]))
 }
 
 fn send(
@@ -134,10 +150,9 @@ const OK: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi";
 
 #[test]
 fn sends_a_request_and_reads_the_response() {
-    let ca = ca();
-    let server = leaf(&ca, "api.test");
+    let server = load("api");
     let (address, got) = serve(server_config(&server, None), http(OK.to_vec()));
-    let response = send(&mut transport(&ca, address), "api.test", None, 1 << 20).unwrap();
+    let response = send(&mut transport(address), "api.test", None, 1 << 20).unwrap();
     assert_eq!(response, OK);
     let request = got.recv().unwrap();
     assert!(request.starts_with(b"GET / HTTP/1.1\r\nHost: api.test\r\n"));
@@ -145,11 +160,10 @@ fn sends_a_request_and_reads_the_response() {
 
 #[test]
 fn refuses_a_certificate_for_another_host() {
-    let ca = ca();
-    let server = leaf(&ca, "other.test");
+    let server = load("other");
     let (address, got) = serve(server_config(&server, None), http(OK.to_vec()));
     assert_eq!(
-        send(&mut transport(&ca, address), "api.test", None, 1 << 20),
+        send(&mut transport(address), "api.test", None, 1 << 20),
         Err(Error::transport(TransportKind::Tls, false))
     );
     assert!(
@@ -160,12 +174,10 @@ fn refuses_a_certificate_for_another_host() {
 
 #[test]
 fn refuses_a_server_the_roots_do_not_trust() {
-    let ca = ca();
-    let stranger = self::ca();
-    let server = leaf(&stranger, "api.test");
+    let server = load("stranger-api");
     let (address, got) = serve(server_config(&server, None), http(OK.to_vec()));
     assert_eq!(
-        send(&mut transport(&ca, address), "api.test", None, 1 << 20),
+        send(&mut transport(address), "api.test", None, 1 << 20),
         Err(Error::transport(TransportKind::Tls, false))
     );
     assert!(got.recv().unwrap().is_empty());
@@ -173,27 +185,25 @@ fn refuses_a_server_the_roots_do_not_trust() {
 
 #[test]
 fn stops_at_the_size_limit() {
-    let ca = ca();
-    let server = leaf(&ca, "api.test");
+    let server = load("api");
     let mut big = b"HTTP/1.1 200 OK\r\n\r\n".to_vec();
     big.resize(100 * 1024, b'x');
     let (address, _got) = serve(server_config(&server, None), http(big));
     assert_eq!(
-        send(&mut transport(&ca, address), "api.test", None, 10 * 1024),
+        send(&mut transport(address), "api.test", None, 10 * 1024),
         Err(Error::transport(TransportKind::TooLarge, true))
     );
 }
 
 #[test]
 fn presents_the_client_certificate_of_the_operation() {
-    let ca = ca();
-    let server = leaf(&ca, "api.test");
-    let client = leaf(&ca, "client.test");
+    let server = load("api");
+    let client = load("client");
     let identity = ClientIdentity::new(
         Zeroizing::new(client.cert_pem.clone().into_bytes()),
         Zeroizing::new(client.key_pem.clone().into_bytes()),
     );
-    let (address, got) = serve(server_config(&server, Some(roots(&ca))), |stream| {
+    let (address, got) = serve(server_config(&server, Some(roots())), |stream| {
         let request = http(OK.to_vec())(stream);
         let presented = stream
             .conn
@@ -203,7 +213,7 @@ fn presents_the_client_certificate_of_the_operation() {
         (request, presented)
     });
     let response = send(
-        &mut transport(&ca, address),
+        &mut transport(address),
         "api.test",
         Some(&identity),
         1 << 20,
@@ -215,22 +225,21 @@ fn presents_the_client_certificate_of_the_operation() {
     assert_eq!(presented, vec![client.der.clone()]);
 
     // Without the identity the server refuses the connection.
-    let (address, got) = serve(server_config(&server, Some(roots(&ca))), http(OK.to_vec()));
-    let result = send(&mut transport(&ca, address), "api.test", None, 1 << 20);
+    let (address, got) = serve(server_config(&server, Some(roots())), http(OK.to_vec()));
+    let result = send(&mut transport(address), "api.test", None, 1 << 20);
     assert!(result.is_err(), "{result:?}");
     assert!(got.recv().unwrap().is_empty());
 }
 
 #[test]
 fn a_silent_server_times_out() {
-    let ca = ca();
-    let server = leaf(&ca, "api.test");
+    let server = load("api");
     let (address, _got) = serve(server_config(&server, None), |stream| {
         let mut buf = [0u8; 1024];
         let _ = stream.read(&mut buf);
         thread::sleep(Duration::from_secs(3));
     });
-    let mut transport = transport(&ca, address).timeouts(
+    let mut transport = transport(address).timeouts(
         Duration::from_secs(2),
         Duration::from_millis(300),
         Duration::from_secs(5),
@@ -245,8 +254,7 @@ fn a_silent_server_times_out() {
 
 #[test]
 fn a_stream_reads_up_to_each_delimiter() {
-    let ca = ca();
-    let server = leaf(&ca, "imap.test");
+    let server = load("imap");
     let (address, got) = serve(server_config(&server, None), |stream| {
         stream.write_all(b"* OK ready\r\na1 OK done\r\n").unwrap();
         stream.flush().unwrap();
@@ -260,7 +268,7 @@ fn a_stream_reads_up_to_each_delimiter() {
         stream.flush().unwrap();
         line
     });
-    let mut transport = transport(&ca, address);
+    let mut transport = transport(address);
     let mut stream = transport
         .open(&Destination::new("imap.test", 993), None)
         .unwrap();
@@ -283,14 +291,13 @@ fn a_stream_reads_up_to_each_delimiter() {
 
 #[test]
 fn a_stream_stops_at_its_limit_without_a_delimiter() {
-    let ca = ca();
-    let server = leaf(&ca, "imap.test");
+    let server = load("imap");
     let (address, _got) = serve(server_config(&server, None), |stream| {
         stream.write_all(&[b'z'; 4096]).unwrap();
         stream.flush().unwrap();
         thread::sleep(Duration::from_millis(500));
     });
-    let mut transport = transport(&ca, address);
+    let mut transport = transport(address);
     let mut stream = transport
         .open(&Destination::new("imap.test", 993), None)
         .unwrap();

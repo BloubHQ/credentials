@@ -83,7 +83,7 @@ sequenceDiagram
     C->>N: record + operation + request + Authorization
     N->>N: grant in force? record pinned and not stale?<br/>policy signed by a known device?
     N->>N: caller listed for the operation? signature,<br/>±5 min, one-time nonce, rate limit
-    N->>N: request within the operation (host, method,<br/>path prefix, headers); decrypt; render within budget
+    N->>N: request within the operation (host, method,<br/>path prefix, headers), decrypt, render within budget
     N->>L: entry (seq, prev hash, owner chain, caller, sealed detail)
     L-->>N: confirmed
     N->>D: TLS request with the injected secret
