@@ -6,6 +6,11 @@
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
+    // The first byte says how much of the input is the nonce; the rest is the document.
+    let Some((&len, rest)) = data.split_first() else {
+        return;
+    };
+    let (nonce, document) = rest.split_at(usize::from(len).min(rest.len()));
     let measurement = attest::Measurement {
         release: "fuzz".into(),
         git_commit: None,
@@ -13,6 +18,6 @@ fuzz_target!(|data: &[u8]| {
         pcr1: [1; attest::PCR_LEN],
         pcr2: [1; attest::PCR_LEN],
     };
-    let verified = attest::verify(data, b"nonce", &[measurement], &[attest::aws_root()]);
+    let verified = attest::verify(document, nonce, &[measurement], &[attest::aws_root()]);
     assert!(verified.is_err());
 });

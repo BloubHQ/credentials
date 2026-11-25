@@ -19,7 +19,17 @@ use sha2::{Digest, Sha256};
 
 /// A production enclave, 2026-10-01T04:26:30Z.
 const DOCUMENT: &[u8] = include_bytes!("fixtures/nitro-attestation-prerelease.cbor");
-const NONCE: &[u8] = include_bytes!("fixtures/nitro-attestation-prerelease.nonce");
+/// The nonce the production document was asked for, read at run time.
+fn fixture_nonce() -> &'static [u8] {
+    static NONCE: std::sync::LazyLock<Vec<u8>> = std::sync::LazyLock::new(|| {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/nitro-attestation-prerelease.nonce"
+        );
+        std::fs::read(path).unwrap()
+    });
+    &NONCE
+}
 const MEASUREMENTS: &[u8] = include_bytes!("fixtures/measurements-prerelease.json");
 /// A debug enclave (PCRs all zero), 2023-09-18T15:03:30Z.
 const DEBUG_DOCUMENT: &[u8] = include_bytes!("fixtures/nitro-attestation-debug.cbor");
@@ -107,7 +117,7 @@ fn the_pinned_root_is_aws_nitro_enclaves_root_g1() {
 
 #[test]
 fn a_real_document_verifies() {
-    let verified = verify(DOCUMENT, NONCE, &accepted(), &roots()).unwrap();
+    let verified = verify(DOCUMENT, fixture_nonce(), &accepted(), &roots()).unwrap();
     let measurement = &accepted()[0];
     assert_eq!(verified.release, "v1.0.0");
     assert_eq!(
@@ -125,7 +135,9 @@ fn a_real_document_verifies() {
     other.pcr0[0] ^= 1;
     let list = vec![other, measurement.clone()];
     assert_eq!(
-        verify(DOCUMENT, NONCE, &list, &roots()).unwrap().release,
+        verify(DOCUMENT, fixture_nonce(), &list, &roots())
+            .unwrap()
+            .release,
         "v1.0.0"
     );
 }
@@ -134,29 +146,29 @@ fn a_real_document_verifies() {
 fn a_tagged_document_verifies() {
     let mut tagged = vec![0xd2];
     tagged.extend_from_slice(DOCUMENT);
-    verify(&tagged, NONCE, &accepted(), &roots()).unwrap();
+    verify(&tagged, fixture_nonce(), &accepted(), &roots()).unwrap();
     // Any other tag is refused.
     tagged[0] = 0xd1;
     assert!(matches!(
-        verify(&tagged, NONCE, &accepted(), &roots()),
+        verify(&tagged, fixture_nonce(), &accepted(), &roots()),
         Err(Error::NotCoseSign1(_))
     ));
 }
 
 #[test]
 fn a_wrong_nonce_is_refused() {
-    let mut nonce = NONCE.to_vec();
+    let mut nonce = fixture_nonce().to_vec();
     nonce[0] ^= 1;
     assert!(matches!(
         verify(DOCUMENT, &nonce, &accepted(), &roots()),
         Err(Error::NonceMismatch)
     ));
     assert!(matches!(
-        verify(DOCUMENT, &NONCE[..31], &accepted(), &roots()),
+        verify(DOCUMENT, &fixture_nonce()[..31], &accepted(), &roots()),
         Err(Error::NonceMismatch)
     ));
     assert!(matches!(
-        verify(DOCUMENT, b"", &accepted(), &roots()),
+        verify(DOCUMENT, &fixture_nonce()[..0], &accepted(), &roots()),
         Err(Error::NonceEmpty)
     ));
 }
@@ -168,7 +180,7 @@ fn a_flipped_signature_byte_is_refused() {
         let mut document = DOCUMENT.to_vec();
         document[at] ^= 0x01;
         assert!(matches!(
-            verify(&document, NONCE, &accepted(), &roots()),
+            verify(&document, fixture_nonce(), &accepted(), &roots()),
             Err(Error::SignatureInvalid)
         ));
     }
@@ -187,19 +199,19 @@ fn a_flipped_payload_byte_is_refused() {
         let mut document = DOCUMENT.to_vec();
         document[at + offset] ^= 0x80;
         assert!(matches!(
-            verify(&document, NONCE, &accepted(), &roots()),
+            verify(&document, fixture_nonce(), &accepted(), &roots()),
             Err(Error::SignatureInvalid)
         ));
     }
     // The nonce inside the payload too: the signature fails before the nonce is compared.
     let at = DOCUMENT
-        .windows(NONCE.len())
-        .position(|window| window == NONCE)
+        .windows(fixture_nonce().len())
+        .position(|window| window == fixture_nonce())
         .unwrap();
     let mut document = DOCUMENT.to_vec();
     document[at] ^= 1;
     assert!(matches!(
-        verify(&document, NONCE, &accepted(), &roots()),
+        verify(&document, fixture_nonce(), &accepted(), &roots()),
         Err(Error::SignatureInvalid)
     ));
 }
@@ -214,12 +226,12 @@ fn pcrs_not_in_the_list_are_refused() {
             _ => list[0].pcr2[20] ^= 1,
         }
         assert!(matches!(
-            verify(DOCUMENT, NONCE, &list, &roots()),
+            verify(DOCUMENT, fixture_nonce(), &list, &roots()),
             Err(Error::UnknownMeasurement)
         ));
     }
     assert!(matches!(
-        verify(DOCUMENT, NONCE, &[], &roots()),
+        verify(DOCUMENT, fixture_nonce(), &[], &roots()),
         Err(Error::UnknownMeasurement)
     ));
 }
@@ -254,11 +266,11 @@ fn a_wrong_root_is_refused() {
     // ground for trust, only the pinned roots are.
     let unrelated = vec![CertificateDer::from_slice(UNRELATED_ROOT)];
     assert!(matches!(
-        verify(DOCUMENT, NONCE, &accepted(), &unrelated),
+        verify(DOCUMENT, fixture_nonce(), &accepted(), &unrelated),
         Err(Error::ChainUntrusted(_))
     ));
     assert!(matches!(
-        verify(DOCUMENT, NONCE, &accepted(), &[]),
+        verify(DOCUMENT, fixture_nonce(), &accepted(), &[]),
         Err(Error::RootInvalid(_))
     ));
 }
@@ -272,7 +284,7 @@ fn a_time_outside_the_validity_of_the_certificates_is_refused() {
         });
         assert!(
             matches!(
-                verify(&document, NONCE, &accepted(), &roots()),
+                verify(&document, fixture_nonce(), &accepted(), &roots()),
                 Err(Error::CertificateNotValidAt { timestamp_ms, .. }) if timestamp_ms == time
             ),
             "{time}"
@@ -283,7 +295,7 @@ fn a_time_outside_the_validity_of_the_certificates_is_refused() {
         set(entries, "timestamp", Value::Integer((timestamp + 1).into()));
     });
     assert!(matches!(
-        verify(&document, NONCE, &accepted(), &roots()),
+        verify(&document, fixture_nonce(), &accepted(), &roots()),
         Err(Error::SignatureInvalid)
     ));
 }
@@ -293,7 +305,7 @@ fn malformed_documents_are_refused() {
     assert!(matches!(
         verify(
             &DOCUMENT[..DOCUMENT.len() - 1],
-            NONCE,
+            fixture_nonce(),
             &accepted(),
             &roots()
         ),
@@ -302,45 +314,55 @@ fn malformed_documents_are_refused() {
     let mut trailing = DOCUMENT.to_vec();
     trailing.push(0);
     assert!(matches!(
-        verify(&trailing, NONCE, &accepted(), &roots()),
+        verify(&trailing, fixture_nonce(), &accepted(), &roots()),
         Err(Error::NotCbor)
     ));
     assert!(matches!(
-        verify(&vec![0u8; 20_000], NONCE, &accepted(), &roots()),
+        verify(&vec![0u8; 20_000], fixture_nonce(), &accepted(), &roots()),
         Err(Error::DocumentTooLarge)
     ));
     let mut three = items(DOCUMENT);
     three.pop();
     assert!(matches!(
-        verify(&encode(&Value::Array(three)), NONCE, &accepted(), &roots()),
+        verify(
+            &encode(&Value::Array(three)),
+            fixture_nonce(),
+            &accepted(),
+            &roots()
+        ),
         Err(Error::NotCoseSign1(_))
     ));
     // ES256 instead of ES384.
     let mut es256 = items(DOCUMENT);
     es256[0] = Value::Bytes(vec![0xa1, 0x01, 0x26]);
     assert!(matches!(
-        verify(&encode(&Value::Array(es256)), NONCE, &accepted(), &roots()),
+        verify(
+            &encode(&Value::Array(es256)),
+            fixture_nonce(),
+            &accepted(),
+            &roots()
+        ),
         Err(Error::UnsupportedAlgorithm)
     ));
     let sha256 = with_payload(DOCUMENT, |entries| {
         set(entries, "digest", Value::Text("SHA256".to_string()));
     });
     assert!(matches!(
-        verify(&sha256, NONCE, &accepted(), &roots()),
+        verify(&sha256, fixture_nonce(), &accepted(), &roots()),
         Err(Error::UnsupportedDigest(_))
     ));
     let empty = with_payload(DOCUMENT, |entries| {
         set(entries, "cabundle", Value::Array(Vec::new()));
     });
     assert!(matches!(
-        verify(&empty, NONCE, &accepted(), &roots()),
+        verify(&empty, fixture_nonce(), &accepted(), &roots()),
         Err(Error::EmptyCaBundle)
     ));
     let no_pcrs = with_payload(DOCUMENT, |entries| {
         entries.retain(|(key, _)| key.as_text() != Some("pcrs"));
     });
     assert!(matches!(
-        verify(&no_pcrs, NONCE, &accepted(), &roots()),
+        verify(&no_pcrs, fixture_nonce(), &accepted(), &roots()),
         Err(Error::PayloadInvalid(_))
     ));
     let short_pcr = with_payload(DOCUMENT, |entries| {
@@ -351,14 +373,14 @@ fn malformed_documents_are_refused() {
         );
     });
     assert!(matches!(
-        verify(&short_pcr, NONCE, &accepted(), &roots()),
+        verify(&short_pcr, fixture_nonce(), &accepted(), &roots()),
         Err(Error::PayloadInvalid(_))
     ));
     let bad_leaf = with_payload(DOCUMENT, |entries| {
         set(entries, "certificate", Value::Bytes(vec![0x30, 0x00]));
     });
     assert!(matches!(
-        verify(&bad_leaf, NONCE, &accepted(), &roots()),
+        verify(&bad_leaf, fixture_nonce(), &accepted(), &roots()),
         Err(Error::CertificateInvalid(_))
     ));
 }
@@ -369,7 +391,7 @@ fn identity() -> engine::grant::NodeIdentity {
 
 #[test]
 fn the_binding_must_be_the_node_identity() {
-    let verified = verify(DOCUMENT, NONCE, &accepted(), &roots()).unwrap();
+    let verified = verify(DOCUMENT, fixture_nonce(), &accepted(), &roots()).unwrap();
     // The fixture binds a node of another program, not this identity.
     assert!(matches!(
         bind(&identity(), &verified),
