@@ -180,7 +180,7 @@
       "required": ["do", "connection", "destinations"],
       "properties": {
         "do": {"const": "open"},
-        "connection": {"enum": ["https", "tls", "websocket"]},
+        "connection": {"enum": ["https", "tls", "websocket", "udp"]},
         "destinations": {"type": "array", "minItems": 1, "maxItems": 32, "items": {"$ref": "#/$defs/Destination"}},
         "identity": {
           "type": "object",

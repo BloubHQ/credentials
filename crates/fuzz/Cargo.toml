@@ -18,6 +18,7 @@ continuity = { path = "../continuity" }
 client = { path = "../client" }
 sandbox = { path = "../sandbox" }
 transport = { path = "../transport" }
+relay = { path = "../relay" }
 libfuzzer-sys = "0.4"
 serde_json = "1"
 
@@ -164,6 +165,13 @@ bench = false
 [[bin]]
 name = "stream_scrubber"
 path = "fuzz_targets/stream_scrubber.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "relay_datagrams"
+path = "fuzz_targets/relay_datagrams.rs"
 test = false
 doc = false
 bench = false

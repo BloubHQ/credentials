@@ -403,7 +403,7 @@ impl<S: LogSink, C: Clock> Node<S, C> {
         match open.connection {
             Connection::Websocket => self.socket(run, open, request, transport, &mut live, updated),
             Connection::Https => self.streamed(run, open, request, transport, &mut live, updated),
-            Connection::Tls => Err(operation.unknown()),
+            Connection::Tls | Connection::Udp => Err(operation.unknown()),
         }
     }
 

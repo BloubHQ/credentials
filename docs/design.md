@@ -311,8 +311,36 @@ The enclave reaches the network only through TCP connections the host relays (vs
 | SIP, RTP (calls) | SIP digest authentication; media relayed |
 | RADIUS, DNS over UDP | request authenticators and TSIG signatures computed by the node |
 
-**Implementation.** a `datagram` channel next to the egress relay in `relay` and `host`
-(allow-listed like TCP), and the protocol modules above in `tunnel`.
+**Implementation (part 9).** A `udp` connection kind (`docs/policy.md`, UDP) for request and
+response protocols that protect their own messages with a MAC: each `send` is one datagram,
+each `receive` one datagram, the destination fixed by the policy, the reads searched like every
+stream read, one log entry per operation with the hash of the caller's sends. Since nothing
+encrypts a datagram, a `send` template on `udp` may not be tainted: secrets reach a datagram
+only through one-way functions (RADIUS Message-Authenticator, TSIG, STUN MESSAGE-INTEGRITY,
+EAP-MD5 over a captured challenge). Protocols that put a secret in reversible form into a
+datagram (RADIUS PAP, User-Password hidden by MD5 of the shared secret and a node-chosen
+authenticator; CHAP with a node-chosen challenge) are refused at signing: the host of an
+enclave reads every datagram. No protocol module: the families are generic.
+
+The enclave egress for datagrams: the node opens a vsock link to the same port 5001 and sends
+`DATAGRAM host:port\n` instead of `CONNECT host:port\n`; the host checks
+`udp/host:port` against its `--allow` list (a TCP entry does not allow datagrams; an empty
+list allows everything, as for TCP), opens a UDP socket connected to the first address of the
+name (the kernel drops datagrams from any other address), answers `OK`, and relays frames
+(two-byte big-endian length, 1 to 65,507 bytes) both ways until the link closes or 130 s
+pass with no datagram (`relay::datagram`, `host`). On the node, `TlsTransport::datagrams`
+takes a `RelayDatagramConnector` in the enclave and a plain UDP socket elsewhere
+(`transport::udp`): a read waits at most 10 s, sending the last datagram again after 1, 2 and
+4 s. The Linux paths of `host` and `enclave` were not compiled on the machine that wrote them
+(no Linux target installed); the same functions run in `crates/relay/tests/datagram.rs` over a
+local TCP link.
+
+DTLS is not offered. The maintained synchronous candidate, `dimpl` 0.8/0.9 (Sans-IO, DTLS 1.2
+and 1.3, `forbid(unsafe_code)`), depends with its `rust-crypto` feature on the previous
+RustCrypto generation (`p256` 0.13, `aes-gcm` 0.10, `sha2` 0.10, `hmac` 0.12) next to the 0.14 /
+0.11 generation the engine uses, and leaves certificate validation to the caller; its size in
+`credentials.exe` was not measured. The HTTP/3, WireGuard, IPsec and SIP rows above stay
+protocol modules of later parts.
 
 ## 8. Transport and engine gaps
 
@@ -513,7 +541,7 @@ As built (part 10):
 | 6 | Connection kinds in layer 1: HTTP/2, WebSocket, streamed responses (first half done: `docs/policy.md`, HTTP versions and gRPC, WebSocket; own synchronous HTTP/2 client and HPACK, one thread per open connection, the Nitro host relay unchanged), then SSH, databases, FTP, mail, queues; tunnels as an IR relay step (next) | 2 |
 | 7 | Trusted code sandbox (layer 3): WebAssembly runtime, JavaScript module, origin-pinned site code (done: `run` step, `crates/sandbox`, wasmi 1.1.0 chosen by measurement; JavaScript measured with boa in the sandbox, its shipping plan in `docs/sandbox.md`) | 2 |
 | 8 | Browser fills over CDP | 4, 5 |
-| 9 | Remaining primitive families (Appendices A, B), UDP relay and its protocols | 1 |
+| 9 | Remaining primitive families (Appendices A, B), UDP relay and its protocols (done: HPKE, TurboSHAKE, KangarooTwelve, ML-DSA, SM2, brainpool ECDSA, `tls_exporter` in TLS sends, the `udp` connection and the datagram relay; `docs/policy.md` and section 7b; the rows still open and why are listed under Appendix A, Part 9) | 1 |
 | 10 | Node hand-over; key backup and device transfer in `client` (done: `crates/continuity`, `Node::hand_over`/`take_over`, `credentials hand-over`, `credentials verify --next`, `client` continuity, backup and transfer; real Nitro hardware and the real Sigstore root are not exercised by the tests, and the compiled Sigstore trust root is empty until it is committed, so nodes refuse every statement until then) | 3 |
 | 11 | Section 8a and 8b schemes as IR policies and reviewed modules | 6, 7 |
 
@@ -546,9 +574,9 @@ registry marks deprecated, obsolete or prohibited (37) are left out.
 
 | Of 617 entries | Count |
 | --- | --- |
-| Work today | 76 |
+| Work today | 94 |
 | Planned in sections 3-8c | 85 |
-| Missing, possible in principle (rows below) | 215 |
+| Missing, possible in principle (rows below) | 197 |
 | Not a vault's concern (server side, no secret) | 235 |
 | Impossible in principle (hardware attestation formats, device-bound extension) | 6 |
 
@@ -634,9 +662,40 @@ algorithms, HTTP Digest `SHA-512-256`, ML-DSA and SLH-DSA.
 
 Status: groups 1 and 2 are in, with SHA-3/SHAKE, Ed448, prehashed ECDSA, DSA, X448, AES-CCM,
 EAX, CMAC, CBC-MAC, CTS, SP 800-108 counter mode and Kerberos n-fold/DK, and the CBOR of
-group 3 (`docs/policy.md`). Not yet: `hpke_seal`, `turboshake*`/`kt*`, and TLS channel binding
-(`tls_exporter`, `tls_server_end_point`), which needs an HTTPS request rendered after the
-handshake inside the transport, since `send` renders it before connecting today.
+group 3 (`docs/policy.md`). Part 9 added HPKE, TurboSHAKE, KangarooTwelve, ML-DSA, SM2,
+brainpool ECDSA and `tls_exporter` (below).
+
+### Part 9
+
+The counts above moved by the entries these rows name, not by a fresh pass over the
+registries: JOSE `HPKE-0` to `HPKE-7` (8; every suite is a KEM, KDF and AEAD of
+`hpke_seal`), JOSE and COSE `ML-DSA-44`, `-65`, `-87` (6), COSE `ESB256` and `ESB384` (2), and
+SASL `SCRAM-SHA-1-PLUS` and `SCRAM-SHA-256-PLUS` over a TLS stream with the RFC 9266
+binding (2): 18 from missing to working. `HPKE-*-KE`, COSE HPKE and the COSE hash
+entries of TurboSHAKE and KangarooTwelve have their functions now but were not recounted
+entry by entry (unmeasured).
+
+Each row of Appendices A and B that names a standard family, and where it stands:
+
+| Row | Status |
+| --- | --- |
+| `hpke_seal` (RFC 9180) | Done: `hpke_seal`, `hpke_open`, `hpke_export`, `hpke_receiver_export`, `hpke_public`, `hpke_derive_key`; the five DHKEMs, three KDFs, three AEADs and export-only, the four modes; RFC 9180 vectors (128 suites, 384 encryptions, 384 exports) |
+| `turboshake128/256`, `kt128/256` | Done; RFC 9861 vectors (25 TurboSHAKE, 21 KangarooTwelve) |
+| TLS channel binding `tls_exporter` | Done in the `send` of a TLS stream (TLS 1.3 only: rustls does not report the extended master secret of TLS 1.2). Not in an HTTPS request, which is rendered before its connection exists: HTTP `Concealed` stays missing |
+| `tls_server_end_point` | Not done: RFC 5929 hashes the server certificate with the hash of its signature algorithm, which needs an X.509 parser in `transport` that it does not have |
+| tls-unique (RFC 5929) | Not offered: rustls exposes no Finished message, it is undefined for TLS 1.3, and RFC 9266 replaces it |
+| `mldsa_sign` (44, 65, 87) | Done as a template function (JOSE, COSE, key type `AKP` from `mldsa_public`); LAMPS key generation examples. TLS and SSH use need a signer inside `transport` and russh, not a template function |
+| `brainpool_sign` | P256r1 and P384r1 done through `ecdsa_sign_prehash` (`bp256`, `bp384`). P320r1 and P512r1 not: RustCrypto has no crate for them (the only `bp512` crate on crates.io, `bp512-nestler` 0.2.1, is a single-author implementation outside RustCrypto) |
+| `slhdsa_sign` | Not done: only a release candidate exists (`slh-dsa` 0.2.0-rc.5) |
+| `hss_lms_sign` | Not done: stateful; its counter must be re-sealed into the record on each use with rollback protection, which is a record change, not a template function (and `lms-signature` is 0.1.0-rc.2) |
+| `dsa_sign`; ECDSA with SHA-1 | Done before part 9 (`dsa_sign`; `ecdsa_sign_prehash` over a SHA-1 digest) |
+| National: SM2/SM3 | `sm2_sign` done (TLS `sm2sig_sm3` needs a signer in `transport`); GOST R 34.10-2012: no RustCrypto signature crate; BIGN: `bign256` 0.13.1 is of the previous RustCrypto generation (`elliptic-curve` 0.13) |
+| Identity-based (ECCSI, ISO IBS, Chinese IBS), WalnutDSA | Not done: no Rust crate found (`cargo search eccsi`: none) |
+| `hash_chain`, length-framed `expect`, retry on a server nonce | Not primitive families: changes to the step language (loops are refused until run; part 2) |
+| SSH key exchange, ciphers and MACs (Appendix B) | Transport of russh, not template functions (section 7) |
+| MSCHAPv2 (`des`) inside RADIUS | Not done: its response is DES under a key cut from the password hash, tainted by rule 4, and a datagram may not carry a tainted value, so the policy would be refused anyway |
+| Camellia CTS, CMAC and feedback-mode KDF | Not done: needed only by Kerberos etypes 25 and 26, whose AS exchange (section 7) does not exist yet |
+| PKINIT, SPAKE2 pre-authentication, SRP, EAP-pwd, EAP-EKE | Protocol modules with their own state machines (Appendix B), not families |
 
 ## Appendix B. Gaps found against further registries (2026-11)
 

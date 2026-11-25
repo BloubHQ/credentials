@@ -13,6 +13,7 @@ use aws_nitro_enclaves_nsm_api::driver::{nsm_exit, nsm_init, nsm_process_request
 use continuity::wire::{HANDOVER_PORT, Service};
 use engine::keys::NodeKey;
 use engine::node::{Node, SystemClock};
+use relay::datagram::RelayDatagramConnector;
 use relay::vsock::{self, Vsock};
 use relay::{
     EGRESS_PORT, HTTP_PORT, LOG_PORT, LogLink, PARENT_CID, RelayConnector, RelayError, RelaySink,
@@ -137,7 +138,11 @@ pub fn run() -> Result<(), NitroError> {
     let node = Node::new(key, RelaySink::new(Arc::clone(&link), None), SystemClock);
     let server = Server::new(
         node,
-        || TlsTransport::new().connector(RelayConnector::new(|| dial(EGRESS_PORT))),
+        || {
+            TlsTransport::new()
+                .connector(RelayConnector::new(|| dial(EGRESS_PORT)))
+                .datagrams(RelayDatagramConnector::new(|| dial(EGRESS_PORT)))
+        },
         Options::default(),
         EnclaveHooks::new(Arc::clone(&nsm), link),
     );

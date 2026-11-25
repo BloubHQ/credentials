@@ -115,6 +115,19 @@ pub trait Stream {
     fn close(&mut self) -> Result<()> {
         Ok(())
     }
+
+    /// `length` bytes of keying material exported from the connection's TLS 1.3 handshake
+    /// with `label` and `context` (RFC 8446 section 7.5). The default refuses: a connection
+    /// without TLS, or one that cannot prove the exporter binds it, has none.
+    fn tls_exporter(
+        &self,
+        label: &[u8],
+        context: &[u8],
+        length: usize,
+    ) -> Result<Zeroizing<Vec<u8>>> {
+        let _ = (label, context, length);
+        Err(Error::transport(TransportKind::Unsupported, true))
+    }
 }
 
 /// Sends requests and opens connections.
@@ -177,6 +190,14 @@ pub trait Transport {
         let _ = (destination, identity, wire, versions);
         Err(Error::transport(TransportKind::Unsupported, false))
     }
+
+    /// Opens an exchange of UDP datagrams with `destination` (a `udp` operation): each
+    /// [`Stream::write`] sends one datagram, each [`Stream::read_until`] with no delimiter
+    /// reads one, from that destination only. The default refuses.
+    fn open_datagrams(&mut self, destination: &Destination) -> Result<Box<dyn Stream + '_>> {
+        let _ = destination;
+        Err(Error::transport(TransportKind::Unsupported, false))
+    }
 }
 
 /// Hands the bytes to the transport. Consumes the confirmation: one entry, one request.
@@ -234,5 +255,17 @@ pub(crate) fn open_stream<'t, T: Transport>(
 ) -> Result<(u64, Box<dyn Stream + 't>)> {
     let seq = confirmed.seq();
     let stream = transport.open(destination, identity)?;
+    Ok((seq, stream))
+}
+
+/// Opens the datagram exchange of a `udp` operation. Consumes the confirmation: one entry,
+/// one exchange.
+pub(crate) fn open_datagrams<'t, T: Transport>(
+    confirmed: Confirmed,
+    transport: &'t mut T,
+    destination: &Destination,
+) -> Result<(u64, Box<dyn Stream + 't>)> {
+    let seq = confirmed.seq();
+    let stream = transport.open_datagrams(destination)?;
     Ok((seq, stream))
 }

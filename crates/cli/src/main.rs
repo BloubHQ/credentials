@@ -453,8 +453,9 @@ struct HostArgs {
     /// The TCP address clients connect to; each connection is forwarded to the enclave.
     #[arg(long, default_value = "127.0.0.1:8700")]
     listen: String,
-    /// A destination the egress relay may connect to, as host:port (repeat it). Without any,
-    /// the relay connects wherever the node asks (the node checks the signed policies).
+    /// A destination the egress relay may connect to, as host:port, or relay datagrams to, as
+    /// udp/host:port (repeat it). Without any, the relay connects wherever the node asks (the
+    /// node checks the signed policies).
     #[arg(long, value_name = "HOST:PORT", value_parser = host::parse_allow)]
     allow: Vec<String>,
     /// The vsock port of the node server in the enclave.

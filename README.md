@@ -173,8 +173,8 @@ reference is in [docs/policy.md](docs/policy.md).
 }
 ```
 
-An operation is a list of **steps** over one connection: `open` (HTTPS, a TLS stream, a WebSocket, or
-none), `send`, `receive` (with captures), `compute` (a template into a name later steps
+An operation is a list of **steps** over one connection: `open` (HTTPS, a TLS stream, a WebSocket, UDP
+datagrams, or none), `send`, `receive` (with captures), `compute` (a template into a name later steps
 read), `run` (the site's own code in a sandbox, below), and `return`, which says what goes
 back to the caller.
 
@@ -183,6 +183,7 @@ back to the caller.
 | `https` | 1 to 8 requests. Each `send` carries the caller's request within a **contract** (methods, path templates, headers, query parameters and their values) or a request the policy fixes, with injected values; a `receive` captures from its response into a field (a new record generation) or a temporary value. `return` lets back the status and only the headers and JSON members it lists (`"body": "all"` for everything). HTTP/2 by ALPN (or pinned with `protocol`, never downgraded), unary gRPC, and bodies handed on as they arrive (`"body": "stream"`: server-sent events, chunked), searched for secrets across chunks. |
 | `websocket` | A handshake request, messages the policy writes (first-message authentication), then the caller's signed frames, each checked against a closed JSON schema or pattern; the server's messages go back only if `return` says so, searched for secrets. Limits on idle time, duration and bytes; one log entry when it opens and one when it closes. |
 | `tls` | A send/receive script on one TLS connection (IMAP, SMTP, line protocols); then the caller's exchanges whose sends match the patterns `return` relays. |
+| `udp` | One datagram per `send` and per `receive` to the destination the policy fixes (RADIUS, DNS with TSIG, STUN), resent while unanswered; then the caller's datagrams that match the patterns `return` relays. No TLS, so a datagram may carry a secret only through a one-way function (an HMAC, a signature): anything else is refused at signing. |
 | none | `return` renders a template for the caller: signatures, HMACs, TOTP codes, JWTs. The caller's `$input` is checked first against the operation's `input` schema (raw bytes, JSON or RLP: fixed members, allowed values, numeric bounds, times the node sets). |
 
 Policies of the format before steps (`"kind": "http" | "stream" | "derive"`) convert with
@@ -580,6 +581,9 @@ explains each.
 - **Open connections** (a WebSocket, a streamed response) end with their limits (at most an
   hour) and hold a thread each. SSH and database wire protocols work only as far as a
   send/expect script can go; gRPC is unary only (no client, server or bidirectional streams).
+- **UDP datagrams are not encrypted.** What a `udp` operation sends and receives is
+  readable on the path and by the host of an enclave; the policy keeps secrets out of it
+  except through one-way functions. DTLS is not offered.
 - **Site code is trusted as the site.** A `run` module computes on the secret; it can fail
   or take time depending on it, and an unpinned module is whatever the origin serves.
 - **Browser logins and hardware keys** need a person or a device and cannot be delegated.

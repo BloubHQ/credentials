@@ -59,32 +59,50 @@ pub struct Config {
     pub log_port: u32,
     /// Where the logs go.
     pub log_dir: PathBuf,
-    /// The only `host:port` the relay connects to; empty: whatever the node asks.
+    /// The only `host:port` the relay connects to over TCP, and `udp/host:port` it relays
+    /// datagrams to; empty: whatever the node asks.
     pub allow: Vec<String>,
     /// Most client connections open at once.
     pub max_connections: usize,
 }
 
-/// Whether the relay may connect to `host:port`: any destination with an empty list, else
-/// only one listed (the host compared without case).
+/// Whether the relay may connect to `host:port` over TCP: any destination with an empty
+/// list, else only one listed (the host compared without case).
 pub fn allowed(allow: &[String], host: &str, port: u16) -> bool {
+    allow.is_empty() || allow.iter().any(|entry| names(entry, host, port))
+}
+
+/// Whether the relay may send datagrams to `host:port`: any destination with an empty list,
+/// else only one listed as `udp/host:port`. A TCP entry does not allow datagrams, nor a UDP
+/// entry a TCP connection.
+pub fn allowed_datagrams(allow: &[String], host: &str, port: u16) -> bool {
     allow.is_empty()
         || allow.iter().any(|entry| {
-            entry.rsplit_once(':').is_some_and(|(h, p)| {
-                h.eq_ignore_ascii_case(host) && p.parse::<u16>().ok() == Some(port)
-            })
+            entry
+                .strip_prefix(UDP_PREFIX)
+                .is_some_and(|entry| names(entry, host, port))
         })
 }
 
-/// Checks an `--allow` value: `host:port`.
+/// The prefix of an `--allow` entry for datagrams.
+const UDP_PREFIX: &str = "udp/";
+
+fn names(entry: &str, host: &str, port: u16) -> bool {
+    entry
+        .rsplit_once(':')
+        .is_some_and(|(h, p)| h.eq_ignore_ascii_case(host) && p.parse::<u16>().ok() == Some(port))
+}
+
+/// Checks an `--allow` value: `host:port`, or `udp/host:port` for datagrams.
 pub fn parse_allow(entry: &str) -> Result<String, String> {
-    match entry.rsplit_once(':') {
+    let target = entry.strip_prefix(UDP_PREFIX).unwrap_or(entry);
+    match target.rsplit_once(':') {
         Some((host, port))
             if relay::valid_host(host) && port.parse::<u16>().is_ok_and(|p| p > 0) =>
         {
             Ok(entry.to_string())
         }
-        _ => Err(format!("{entry:?} is not host:port")),
+        _ => Err(format!("{entry:?} is not host:port or udp/host:port")),
     }
 }
 
@@ -209,11 +227,12 @@ mod linux {
     use std::thread;
     use std::time::Duration;
 
+    use relay::datagram::{self, Egress};
     use relay::vsock::{self, Vsock};
-    use relay::{answer_tunnel, read_tunnel_request, serve_log, splice};
+    use relay::{answer_tunnel, serve_log, splice};
     use transport::Socket;
 
-    use super::{Config, Error, LogDir, allowed};
+    use super::{Config, Error, LogDir, allowed, allowed_datagrams};
 
     /// How long the relay waits to connect to a destination.
     const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -248,13 +267,17 @@ mod linux {
 
     fn egress(mut link: Vsock, allow: &[String]) {
         let _ = link.0.set_read_timeout(Some(CONNECT_TIMEOUT));
-        let (host, port) = match read_tunnel_request(&mut link) {
+        let (kind, host, port) = match datagram::read_egress_request(&mut link) {
             Ok(target) => target,
             Err(e) => {
                 eprintln!("egress: {e}");
                 return;
             }
         };
+        if kind == Egress::Datagram {
+            datagrams(link, allow, &host, port);
+            return;
+        }
         if !allowed(allow, &host, port) {
             eprintln!("egress: refused {host}:{port} (not in --allow)");
             let _ = answer_tunnel(&mut link, Err("destination not allowed by the host"));
@@ -277,6 +300,36 @@ mod linux {
         match (pair(link, clone), pair(tcp, tcp_clone)) {
             (Ok((a, a2)), Ok((b, b2))) => splice(a, a2, b, b2),
             _ => eprintln!("egress: cannot set up the relay of {host}:{port}"),
+        }
+    }
+
+    /// Relays the datagrams of a `DATAGRAM` link to `host:port`.
+    fn datagrams(mut link: Vsock, allow: &[String], host: &str, port: u16) {
+        if !allowed_datagrams(allow, host, port) {
+            eprintln!("egress: refused udp/{host}:{port} (not in --allow)");
+            let _ = answer_tunnel(&mut link, Err("destination not allowed by the host"));
+            return;
+        }
+        let udp = match datagram::connect_udp(host, port) {
+            Ok(udp) => udp,
+            Err(e) => {
+                eprintln!("egress: cannot open udp/{host}:{port}: {e}");
+                let _ = answer_tunnel(&mut link, Err("cannot connect"));
+                return;
+            }
+        };
+        if answer_tunnel(&mut link, Ok(())).is_err() {
+            return;
+        }
+        eprintln!("egress: udp/{host}:{port}");
+        let clone = link.try_clone();
+        match pair(link, clone) {
+            Ok((a, a2)) => {
+                if let Err(e) = datagram::serve_datagrams(a, a2, udp, datagram::IDLE) {
+                    eprintln!("egress: udp/{host}:{port}: {e}");
+                }
+            }
+            Err(_) => eprintln!("egress: cannot set up the relay of udp/{host}:{port}"),
         }
     }
 
@@ -389,6 +442,19 @@ mod tests {
         assert!(parse_allow("api.example.com").is_err());
         assert!(parse_allow("api.example.com:0").is_err());
         assert!(parse_allow("bad host:443").is_err());
+        // Datagrams need their own entries.
+        assert!(parse_allow("udp/radius.example.com:1812").is_ok());
+        let allow = vec![
+            "udp/radius.example.com:1812".to_string(),
+            "api.example.com:443".to_string(),
+        ];
+        assert!(allowed_datagrams(&allow, "RADIUS.example.com", 1812));
+        assert!(!allowed_datagrams(&allow, "radius.example.com", 1813));
+        assert!(!allowed_datagrams(&allow, "api.example.com", 443));
+        assert!(!allowed(&allow, "radius.example.com", 1812));
+        assert!(allowed_datagrams(&[], "anything", 53));
+        assert!(parse_allow("udp/radius.example.com").is_err());
+        assert!(parse_allow("tcp/radius.example.com:1812").is_err());
     }
 
     #[test]
