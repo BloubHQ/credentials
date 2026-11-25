@@ -32,6 +32,7 @@ signing, TOTP, IMAP logins, mutual TLS and Ethereum signatures are all policy da
 - [Records, generations and rollback](#records-generations-and-rollback)
 - [The log](#the-log)
 - [Running a node](#running-a-node)
+- [Running in a Nitro Enclave](#running-in-a-nitro-enclave)
 - [What it guarantees](#what-it-guarantees)
 - [Measurements](#measurements)
 - [What it does not do](#what-it-does-not-do)
@@ -267,8 +268,8 @@ credentials verify log.jsonl <node-public-key> --owner alice --user-key key.txt 
   time (table below).
 - **Attestation.** Run the node in a TEE (SGX, TDX, SEV-SNP, Nitro). Put
   `NodeIdentity::report_data()` (SHA-512 over the log key and the seal key) into the quote's
-  report data; owners check the quote and that value before they seal a grant. Quote
-  verification is platform-specific and not in this repository.
+  report data; owners check the quote and that value before they seal a grant. AWS Nitro
+  Enclaves are integrated: see [Running in a Nitro Enclave](#running-in-a-nitro-enclave).
 - **Keys and restarts.** Keep `NodeKey::to_bytes()` sealed to the enclave. After a restart,
   `Node::restore(key, sink, clock, entries)` continues the chain and brings back record
   floors, known devices and the last grant times; owners grant again, and nothing granted or
@@ -280,6 +281,89 @@ credentials verify log.jsonl <node-public-key> --owner alice --user-key key.txt 
   durable JSONL log.
 - **Concurrency.** Every method takes `&self`; share one node between threads. Transport I/O
   runs outside the node's lock.
+
+## Running in a Nitro Enclave
+
+The [`enclave`](crates/enclave) program runs a node inside an AWS Nitro Enclave, and
+`credentials host` runs next to it on the parent instance. The enclave has no network and no
+disk; vsock to the parent is its only link.
+
+```mermaid
+flowchart LR
+  client[Owner / caller] -- HTTP --> host
+  subgraph parent[Parent EC2 instance]
+    host[credentials host]
+    logs[(log-dir/NODE.jsonl)]
+  end
+  subgraph enclave[Nitro Enclave]
+    node[enclave: node + TLS]
+    nsm[NSM]
+  end
+  host -- "vsock 5000: HTTP" --> node
+  node -- "vsock 5001: CONNECT host:port, then TLS bytes" --> host
+  node -- "vsock 5002: log entries, synced before confirmed" --> host
+  host --> logs
+  host -- TCP --> dest[Destination]
+  node --- nsm
+```
+
+- **Boot.** The program refuses to start unless the kernel draws randomness from the NSM
+  (`nsm-hwrng`), then generates a fresh node key. There is no sealed storage on Nitro: **a
+  restarted enclave is a new node** with a new identity and a new log file, and owners grant
+  to it again (grants are sealed to one node's key and never survive a restart anyway).
+- **API.** The HTTP API of `credentials serve` (the same server code, from the
+  [`server`](crates/server) crate) on vsock port 5000, plus `GET /attestation?nonce=<base64url>`,
+  which answers `{"identity": <NodeIdentity>, "document": <base64url>}`. The document is a
+  COSE-signed NSM attestation whose `user_data` is `NodeIdentity::report_data()` and whose
+  `nonce` is the caller's (1 to 512 bytes).
+- **Before granting**, an owner checks the document: its certificate chain to the AWS Nitro
+  root, PCR0, PCR1 and PCR2 against `measurements.json` of a release (all-zero PCRs mean a
+  debug-mode enclave, whose memory the parent can read), the nonce it sent, and that
+  `user_data` equals `report_data()` of the identity it is about to grant to.
+- **Egress.** TLS stays inside the enclave (`TlsTransport` over a vsock `Connector`). For each
+  connection the node, after checking the destination against the signed policy, sends
+  `CONNECT host:port` to the host, which connects over TCP (only to `--allow` entries, when
+  given) and then carries ciphertext both ways. The host resolves DNS; the certificate check
+  of the destination is what binds the connection, as without an enclave.
+- **Log.** Entries go to the host, which appends each to `<log-dir>/<node log key>.jsonl` and
+  `sync_data`s it before it confirms; the node treats an entry as stored only after that
+  confirmation, halts otherwise, and reconciles with what the host reports. Checkpoints go to
+  `<node log key>.jsonl.head.json`. Check the log with `credentials verify` as usual.
+- **Clock.** The node uses the system clock of the enclave, which comes from the host
+  hypervisor (see the [threat model](docs/threat-model.md)).
+
+### Build the enclave image file
+
+```sh
+build/reproduce.sh --release dev --out out   # needs git and Docker with buildx
+```
+
+`build/build.sh` builds the commit `HEAD` (not the work tree): `build/Dockerfile.enclave`
+compiles `enclave` statically for `x86_64-unknown-linux-musl` in a Rust 1.97.1 image pinned by
+digest, with `--locked`, `SOURCE_DATE_EPOCH` set to the commit time and paths remapped; then
+`nitro-cli build-enclave`, from an Amazon Linux 2023 image pinned by digest with
+`aws-nitro-enclaves-cli` pinned by version, makes `enclave.eif`. `measurements.json` holds the
+release, the commit, PCR0, PCR1, PCR2 and the SHA-256 of every input (images, files of the
+commit, the kernel and init that nitro-cli adds, the program). `build/reproduce.sh` builds
+twice, the second time without any cache, and fails unless the measurements are the same; CI
+runs it on every change to the enclave or its build, and each release attaches `enclave.eif`
+and `measurements.json` (in `SHA256SUMS` and the build provenance attestation) and prints the
+measurements in its notes. The EIF file itself differs between builds (its metadata holds the
+build time); its PCRs do not.
+
+### Run it
+
+On a Nitro-enabled instance with `aws-nitro-enclaves-cli` and the allocator configured:
+
+```sh
+nitro-cli run-enclave --eif-path enclave.eif --cpu-count 2 --memory 1024 --enclave-cid 16
+credentials host --enclave-cid 16 --log-dir /var/lib/credentials \
+  --listen 127.0.0.1:8700 --allow api.github.com:443
+curl -s "http://127.0.0.1:8700/attestation?nonce=$(head -c 32 /dev/urandom | basenc --base64url | tr -d '=')"
+```
+
+Start `credentials host` first or right after: the node connects to its log writer at boot and
+stops if it cannot. `credentials host` is described in [crates/cli](crates/cli#the-host-nitro-enclaves).
 
 ## What it guarantees
 
@@ -334,9 +418,10 @@ stays.
 These are limits of the design, not missing code. The [threat model](docs/threat-model.md)
 explains each.
 
-- **No TEE in this repository.** The node is an ordinary process here; attestation is a
-  platform integration (see [Running a node](#running-a-node)). Without a TEE, whoever runs the
-  node can read its memory.
+- **One TEE only.** AWS Nitro Enclaves are integrated ([Running in a Nitro
+  Enclave](#running-in-a-nitro-enclave)); elsewhere the node is an ordinary process and
+  whoever runs it can read its memory. A Nitro node has no sealed storage: a restart is a new
+  node, and owners grant again.
 - **Reflection search finds known encodings only**: raw, base64 (both alphabets), percent,
   JSON and hex, and escaped JSON strings. A server that splits, compresses in its own way or
   encrypts a secret it echoes is not caught. Secret fields of 4 to 7 bytes are searched raw
@@ -357,9 +442,11 @@ explains each.
 | Crate | |
 | --- | --- |
 | [`engine`](crates/engine) | Secrets, policies, templates, records, grants, callers, the log, responses, the node |
-| [`transport`](crates/transport) | TLS transport (rustls), and an end-to-end example |
+| [`transport`](crates/transport) | TLS transport (rustls) over TCP or any `Connector`, and an end-to-end example |
+| [`server`](crates/server) | The HTTP server of a node, and the vsock relay protocol between an enclave and its host |
+| [`enclave`](crates/enclave) | The node program inside an AWS Nitro Enclave (NSM attestation) |
 | [`verify`](crates/verify) | Verifier of node logs, run as `credentials verify` |
-| [`cli`](crates/cli) | The `credentials` tool: keys, policies, records, grants, calls, and a node server |
+| [`cli`](crates/cli) | The `credentials` tool: keys, policies, records, grants, calls, a node server, and the host of an enclave |
 
 ## Development
 
@@ -369,7 +456,7 @@ cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace --locked
 ```
 
-Minimum Rust: 1.87. CI also runs `cargo audit`, `cargo deny`, tests on the MSRV, a
+Minimum Rust: 1.87 (the `enclave` crate: 1.92, for `aws-nitro-enclaves-nsm-api`). CI also runs `cargo audit`, `cargo deny`, tests on the MSRV, a
 reproducible-build check and 60 seconds of fuzzing per target. See [CONTRIBUTING.md](.github/CONTRIBUTING.md).
 
 ## Security

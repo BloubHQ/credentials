@@ -76,7 +76,8 @@ pub struct NodeIdentity {
 
 impl NodeIdentity {
     /// The 64 bytes a hardware attestation of the node (the report data of an SGX, TDX or
-    /// SEV-SNP quote) must carry: SHA-512 over both keys. An owner checks the quote, then
+    /// SEV-SNP quote, the `user_data` of a Nitro attestation document) must carry: SHA-512
+    /// over both keys. An owner checks the quote, then
     /// that its report data equals this, before it seals a grant to `seal_key`.
     pub fn report_data(&self) -> [u8; 64] {
         let mut hash = Sha512::new();

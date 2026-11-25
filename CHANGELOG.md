@@ -7,6 +7,27 @@ before 1.0, minor versions may break formats and APIs.
 
 ### Added
 
+- AWS Nitro Enclaves. The `enclave` crate and program: a fresh node key at every boot (after
+  checking that the kernel draws randomness from the NSM), the HTTP API of `credentials serve`
+  on vsock, and `GET /attestation?nonce=` with an NSM attestation document whose `user_data`
+  is `NodeIdentity::report_data()`. Egress and the log go through the parent instance:
+  `credentials host` forwards HTTP to the enclave, relays `CONNECT host:port` tunnels (TLS
+  stays in the enclave; optional `--allow` list) and writes one synced JSONL log per node key,
+  confirming each entry only after `sync_data`.
+- Reproducible enclave image: `build/build.sh` (static musl build in a Rust image pinned by
+  digest, `SOURCE_DATE_EPOCH`, path remapping, `--locked`; `nitro-cli` from a pinned Amazon
+  Linux image) writes `enclave.eif` and `measurements.json` (release, commit, PCR0/1/2, input
+  digests); `build/reproduce.sh` builds twice and fails if the measurements differ. CI runs it
+  on changes to the enclave and its build; releases attach `enclave.eif` and
+  `measurements.json`, include them in `SHA256SUMS` and the provenance attestation, and print
+  the measurements in the notes.
+- `server` crate: the HTTP server of a node, shared by `credentials serve` and the enclave,
+  over any connection (`Connection`), log sink (`Sink`) and transport, with `Hooks` for
+  checkpoints and extra endpoints; `server::relay` holds the vsock protocol between an enclave
+  and its host.
+- `transport`: `TlsTransport` runs over any byte stream a `Connector` opens (`TcpConnector` by
+  default; `TlsTransport::connector`).
+
 - `transport` crate: a TLS transport on rustls (ring provider, Mozilla roots, client
   certificates, connect/read/total deadlines, size limits, erasing buffers), tests against
   local TLS servers with fixed test certificates, and the `github_user` example.

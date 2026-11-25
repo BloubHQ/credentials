@@ -14,8 +14,8 @@
 //! writer of the host, which confirms each only after it is synced (see
 //! [`server::relay`]). `credentials host` is that host program.
 //!
-//! The parts that need Nitro hardware ([`nitro`]) are compiled on Linux only; the attestation
-//! endpoint ([`attestation`]) is portable and tested with a stand-in for the NSM.
+//! The parts that need Nitro hardware (the `nitro` module) are compiled on Linux only; the
+//! attestation endpoint ([`attestation`]) is portable and tested with a stand-in for the NSM.
 
 pub mod attestation;
 

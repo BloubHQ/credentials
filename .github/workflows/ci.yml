@@ -55,7 +55,9 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           key: msrv-1.87
-      - run: cargo +1.87 test --workspace --locked
+      # The enclave crate needs Rust 1.92 (aws-nitro-enclaves-nsm-api); its image is built with
+      # rust-toolchain.toml.
+      - run: cargo +1.87 test --workspace --exclude enclave --locked
 
   fuzz:
     runs-on: ubuntu-latest
