@@ -1,0 +1,54 @@
+name: enclave
+
+# Builds the enclave image file twice (the second time without any cache) and fails unless
+# PCR0, PCR1 and PCR2 are the same: a change to the enclave or its build must keep it
+# reproducible.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "build/**"
+      - "crates/enclave/**"
+      - "crates/engine/**"
+      - "crates/server/**"
+      - "crates/transport/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - ".github/workflows/enclave.yml"
+  pull_request:
+    paths:
+      - "build/**"
+      - "crates/enclave/**"
+      - "crates/engine/**"
+      - "crates/server/**"
+      - "crates/transport/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - ".github/workflows/enclave.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: enclave-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  reproducible:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Build the enclave image file twice and compare PCR0, PCR1 and PCR2
+        run: build/reproduce.sh --release dev --out out
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: enclave-dev
+          path: |
+            out/enclave.eif
+            out/measurements.json
+          if-no-files-found: error

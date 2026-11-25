@@ -107,21 +107,23 @@ command -v git >/dev/null 2>&1 || fail "git is not installed"
 command -v docker >/dev/null 2>&1 || fail "docker is not installed"
 docker buildx version >/dev/null 2>&1 || fail "docker buildx is not available"
 
-SOURCE=$(cd "$SOURCE" && pwd)
 mkdir -p "$OUT"
 OUT=$(cd "$OUT" && pwd)
+# git runs in the source tree (Git for Windows does not take the paths of Git Bash once
+# MSYS_NO_PATHCONV is set).
+cd "$SOURCE"
 
 # ---- 1. The commit.
 
 # The build takes the files of the commit. A work tree that differs from it would give
 # measurements of something the tree does not show.
-git -C "$SOURCE" diff --quiet HEAD -- ||
+git diff --quiet HEAD -- ||
     fail "the work tree has uncommitted changes: commit them first (the build takes HEAD)"
-GIT_COMMIT=$(git -C "$SOURCE" rev-parse --verify HEAD)
+GIT_COMMIT=$(git rev-parse --verify HEAD)
 SHORT_COMMIT=$(printf '%s' "$GIT_COMMIT" | cut -c 1-12)
-SOURCE_DATE_EPOCH=$(git -C "$SOURCE" log -1 --format=%ct HEAD)
+SOURCE_DATE_EPOCH=$(git log -1 --format=%ct HEAD)
 committed() {
-    git -C "$SOURCE" cat-file blob "$GIT_COMMIT:$1"
+    git cat-file blob "$GIT_COMMIT:$1"
 }
 say "release $RELEASE, commit $GIT_COMMIT, commit time $SOURCE_DATE_EPOCH"
 
@@ -160,7 +162,7 @@ CACHE_OPTIONS=(--no-cache-filter image)
 [ -z "$NO_CACHE" ] || CACHE_OPTIONS=(--no-cache)
 
 say "building the enclave image $NODE_IMAGE"
-git -C "$SOURCE" archive --format=tar "$GIT_COMMIT" | docker buildx build \
+git archive --format=tar "$GIT_COMMIT" | docker buildx build \
     --builder "$BUILDER" \
     --platform "$PLATFORM" \
     --provenance=false \
