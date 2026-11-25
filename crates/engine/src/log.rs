@@ -1,25 +1,33 @@
 //! The write-ahead log.
 //!
-//! Every act of a node (a grant, a revoke, a use of a value) is an entry that the node signs
-//! and chains to the entry before it. The node performs the act only after its [`LogSink`]
-//! confirmed the entry: the act needs a [`Confirmed`], and only [`Log::commit`] makes one,
-//! after the sink returned `Ok`.
+//! Every act of a node (a grant, a use of a value, an update of a record) is an entry that the
+//! node signs and chains to the entry before it. The node performs the act only after its
+//! [`LogSink`] confirmed the entry: the act needs a [`Confirmed`], and only [`Log::commit`]
+//! makes one, after the sink returned `Ok`.
+//!
+//! Each entry also chains to the previous entry of the same owner (`owner_prev`), so an owner
+//! can verify its own entries without the entries of other owners ([`verify_owner_chain`]).
+//! A [`SignedHead`] fixes the head of the chain at a point in time: given to owners or
+//! published, it makes a cut tail visible.
 //!
 //! ```compile_fail
 //! // A confirmation cannot be made outside this module.
 //! let _ = engine::log::Confirmed { seq: 0 };
 //! ```
 
+use std::collections::HashMap;
+
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::encoding::{b64_array, canonical};
-use crate::keys::{NodeKey, NodePublicKey};
+use crate::keys::{DevicePublicKey, NodeKey, NodePublicKey};
 use crate::policy::Method;
 use crate::{Error, Result};
 
-const ENTRY_DOMAIN: &[u8] = b"entry/v1\0";
-const HASH_DOMAIN: &[u8] = b"entry-hash/v1\0";
+const ENTRY_DOMAIN: &[u8] = b"entry/v2\0";
+const HASH_DOMAIN: &[u8] = b"entry-hash/v2\0";
+const HEAD_DOMAIN: &[u8] = b"head/v1\0";
 
 /// What an entry records.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -29,14 +37,28 @@ pub enum Event {
     Grant {
         /// End of the grant, Unix milliseconds.
         expires_ms: u64,
+        /// The device the grant came from.
+        device: DevicePublicKey,
+    },
+    /// A device of the grant endorsed another device.
+    Device {
+        /// The added device.
+        device: DevicePublicKey,
     },
     /// The node erased the user key of the owner.
     Revoke,
+    /// The owner pinned the lowest generation of a record.
+    Pin {
+        /// The lowest generation accepted.
+        generation: u64,
+    },
     /// The node sent one request that carries the value of a record (one step of an HTTP
     /// operation).
     Use {
         /// The operation.
         operation: String,
+        /// The generation of the record.
+        generation: u64,
         /// Method.
         method: Method,
         /// Destination host.
@@ -48,11 +70,15 @@ pub enum Event {
         /// SHA-256 of the request body before injections.
         #[serde(with = "b64_array")]
         body_sha256: [u8; 32],
+        /// Length of the request body before injections.
+        body_len: u64,
     },
     /// The node opened one connection for a stream operation.
     Stream {
         /// The operation.
         operation: String,
+        /// The generation of the record.
+        generation: u64,
         /// Destination host.
         host: String,
         /// Destination port.
@@ -60,21 +86,38 @@ pub enum Event {
         /// SHA-256 over the sends of the caller, each prefixed by its length (u32, big-endian).
         #[serde(with = "b64_array")]
         sends_sha256: [u8; 32],
+        /// Number of exchanges of the caller.
+        exchanges: u32,
     },
     /// The node rendered a derivation and handed the output back.
     Derive {
         /// The operation.
         operation: String,
+        /// The generation of the record.
+        generation: u64,
         /// SHA-256 of the input.
         #[serde(with = "b64_array")]
         input_sha256: [u8; 32],
+        /// Length of the input.
+        input_len: u64,
     },
     /// The node sealed the record again with values an operation captured.
     Update {
         /// The operation.
         operation: String,
+        /// The new generation.
+        generation: u64,
         /// The fields that changed.
         fields: Vec<String>,
+    },
+    /// How the act of an earlier entry ended.
+    Done {
+        /// The sequence number of the act.
+        of: u64,
+        /// The HTTP status, when there was a response.
+        status: Option<u16>,
+        /// True when the result went back to the caller.
+        ok: bool,
     },
 }
 
@@ -87,12 +130,17 @@ pub struct Entry {
     /// Hash of the entry before; all zeros for the first.
     #[serde(with = "b64_array")]
     pub prev: [u8; 32],
-    /// Time of the entry, Unix milliseconds.
+    /// Hash of the previous entry of the same owner; all zeros for its first.
+    #[serde(with = "b64_array")]
+    pub owner_prev: [u8; 32],
+    /// Time of the entry, Unix milliseconds; never less than the time before it.
     pub time_ms: u64,
     /// The owner.
     pub owner: String,
-    /// The record, or empty for grant and revoke.
+    /// The record, or empty.
     pub record_id: String,
+    /// The caller, or empty.
+    pub caller: String,
     /// The act.
     pub event: Event,
 }
@@ -122,6 +170,48 @@ impl SignedEntry {
     }
 }
 
+/// The head of a chain at a point in time, signed by its node.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SignedHead {
+    /// Number of entries in the chain.
+    pub len: u64,
+    /// Hash of the last entry; all zeros for an empty chain.
+    #[serde(with = "b64_array")]
+    pub head: [u8; 32],
+    /// Time of the checkpoint, Unix milliseconds.
+    pub time_ms: u64,
+    /// Ed25519 signature of the node.
+    #[serde(with = "b64_array")]
+    pub signature: [u8; 64],
+}
+
+#[derive(Serialize)]
+struct HeadBody {
+    len: u64,
+    #[serde(with = "b64_array")]
+    head: [u8; 32],
+    time_ms: u64,
+}
+
+impl SignedHead {
+    fn message(&self) -> Result<Vec<u8>> {
+        canonical(
+            HEAD_DOMAIN,
+            &HeadBody {
+                len: self.len,
+                head: self.head,
+                time_ms: self.time_ms,
+            },
+        )
+    }
+
+    /// Verifies the signature of the node.
+    pub fn verify(&self, node: &NodePublicKey) -> Result<()> {
+        node.verify(&self.message()?, &self.signature)
+    }
+}
+
 /// Durable storage of entries. `append` returns `Ok` only once the entry is stored for good.
 pub trait LogSink {
     /// Stores one entry.
@@ -147,7 +237,9 @@ pub struct Log {
     key: NodeKey,
     next_seq: u64,
     head: [u8; 32],
-    halted: bool,
+    last_time: u64,
+    owner_heads: HashMap<String, [u8; 32]>,
+    pending: Option<SignedEntry>,
 }
 
 impl Log {
@@ -157,8 +249,25 @@ impl Log {
             key,
             next_seq: 0,
             head: [0; 32],
-            halted: false,
+            last_time: 0,
+            owner_heads: HashMap::new(),
+            pending: None,
         }
+    }
+
+    /// Continues the chain of `entries` (all of them, from seq 0), which `key` signed. Use it
+    /// after a restart, with the entries the sink holds.
+    pub fn resume(key: NodeKey, entries: &[SignedEntry]) -> Result<Self> {
+        let head = verify_chain(entries, &key.public())?;
+        let mut log = Self::new(key);
+        for signed in entries {
+            log.owner_heads
+                .insert(signed.entry.owner.clone(), signed.hash()?);
+            log.last_time = signed.entry.time_ms;
+        }
+        log.head = head;
+        log.next_seq = u64::try_from(entries.len()).map_err(|_| Error::LogMismatch)?;
+        Ok(log)
     }
 
     /// The public key that verifies the entries.
@@ -166,57 +275,199 @@ impl Log {
         self.key.public()
     }
 
+    /// True after an unconfirmed entry, until [`Log::reconcile`].
+    pub fn is_halted(&self) -> bool {
+        self.pending.is_some()
+    }
+
+    /// The head of the chain now, signed.
+    pub fn checkpoint(&self, time_ms: u64) -> Result<SignedHead> {
+        let mut head = SignedHead {
+            len: self.next_seq,
+            head: self.head,
+            time_ms,
+            signature: [0; 64],
+        };
+        head.signature = self.key.sign(&head.message()?);
+        Ok(head)
+    }
+
+    /// Ends a halt. `stored` is the last entry the sink holds now (read back from it). If it
+    /// is the unconfirmed entry, the chain goes on after it; if it is the entry before, the
+    /// unconfirmed entry is dropped. Anything else is [`Error::LogMismatch`].
+    pub fn reconcile(&mut self, stored: Option<&SignedEntry>) -> Result<()> {
+        let Some(pending) = self.pending.take() else {
+            return Ok(());
+        };
+        if stored == Some(&pending) {
+            self.advance(&pending)?;
+            return Ok(());
+        }
+        let at_head = match stored {
+            None => self.next_seq == 0,
+            Some(entry) => entry.hash()? == self.head,
+        };
+        if at_head {
+            Ok(())
+        } else {
+            self.pending = Some(pending);
+            Err(Error::LogMismatch)
+        }
+    }
+
+    fn advance(&mut self, signed: &SignedEntry) -> Result<()> {
+        let hash = signed.hash()?;
+        self.head = hash;
+        self.last_time = signed.entry.time_ms;
+        self.owner_heads.insert(signed.entry.owner.clone(), hash);
+        self.next_seq = self.next_seq.checked_add(1).ok_or(Error::LogHalted)?;
+        Ok(())
+    }
+
     /// Writes an entry and returns the confirmation of the act.
     ///
     /// When the sink fails, the entry may or may not be stored. The log halts: it refuses every
-    /// later entry, so no act happens on a chain whose state is unknown.
+    /// later entry until [`Log::reconcile`], so no act happens on a chain whose state is
+    /// unknown.
     pub fn commit<S: LogSink>(
         &mut self,
         sink: &mut S,
         time_ms: u64,
-        owner: &str,
-        record_id: &str,
+        who: (&str, &str, &str),
         event: Event,
     ) -> Result<(SignedEntry, Confirmed)> {
-        if self.halted {
+        if self.pending.is_some() {
             return Err(Error::LogHalted);
         }
+        let (owner, record_id, caller) = who;
         let entry = Entry {
             seq: self.next_seq,
             prev: self.head,
-            time_ms,
+            owner_prev: self.owner_heads.get(owner).copied().unwrap_or([0; 32]),
+            time_ms: time_ms.max(self.last_time),
             owner: owner.to_string(),
             record_id: record_id.to_string(),
+            caller: caller.to_string(),
             event,
         };
         let signature = self.key.sign(&canonical(ENTRY_DOMAIN, &entry)?);
         let signed = SignedEntry { entry, signature };
-        let hash = signed.hash()?;
         if sink.append(&signed).is_err() {
-            self.halted = true;
+            self.pending = Some(signed);
             return Err(Error::LogUnconfirmed);
         }
         let seq = self.next_seq;
-        self.head = hash;
-        self.next_seq = seq.checked_add(1).ok_or(Error::LogHalted)?;
+        self.advance(&signed)?;
         Ok((signed, Confirmed { seq }))
     }
 }
 
 /// Verifies a whole chain from its first entry and returns the hash of its head.
 pub fn verify_chain(entries: &[SignedEntry], node: &NodePublicKey) -> Result<[u8; 32]> {
-    let mut prev = [0u8; 32];
-    let mut last_time = 0u64;
-    for (seq, signed) in (0u64..).zip(entries) {
+    let mut verifier = ChainVerifier::new(*node);
+    for signed in entries {
+        verifier.push(signed)?;
+    }
+    Ok(verifier.head())
+}
+
+/// Verifies a chain entry by entry, without holding it in memory.
+pub struct ChainVerifier {
+    node: NodePublicKey,
+    next_seq: u64,
+    prev: [u8; 32],
+    last_time: u64,
+    owner_heads: HashMap<String, [u8; 32]>,
+}
+
+impl ChainVerifier {
+    /// A verifier at the start of a chain.
+    pub fn new(node: NodePublicKey) -> Self {
+        Self {
+            node,
+            next_seq: 0,
+            prev: [0; 32],
+            last_time: 0,
+            owner_heads: HashMap::new(),
+        }
+    }
+
+    /// Checks the next entry.
+    pub fn push(&mut self, signed: &SignedEntry) -> Result<()> {
+        let seq = self.next_seq;
         let entry = &signed.entry;
-        if entry.seq != seq || entry.prev != prev || entry.time_ms < last_time {
+        let owner_prev = self
+            .owner_heads
+            .get(&entry.owner)
+            .copied()
+            .unwrap_or([0; 32]);
+        if entry.seq != seq
+            || entry.prev != self.prev
+            || entry.owner_prev != owner_prev
+            || entry.time_ms < self.last_time
+        {
+            return Err(Error::ChainBroken { seq });
+        }
+        signed
+            .verify(&self.node)
+            .map_err(|_| Error::EntrySignature { seq })?;
+        self.prev = signed.hash()?;
+        self.owner_heads.insert(entry.owner.clone(), self.prev);
+        self.last_time = entry.time_ms;
+        self.next_seq = seq.checked_add(1).ok_or(Error::ChainBroken { seq })?;
+        Ok(())
+    }
+
+    /// Number of entries checked.
+    pub fn len(&self) -> u64 {
+        self.next_seq
+    }
+
+    /// True before the first entry.
+    pub fn is_empty(&self) -> bool {
+        self.next_seq == 0
+    }
+
+    /// Hash of the last entry checked.
+    pub fn head(&self) -> [u8; 32] {
+        self.prev
+    }
+
+    /// Checks that the chain so far ends at a signed head of the same node.
+    pub fn matches(&self, head: &SignedHead) -> Result<()> {
+        head.verify(&self.node)?;
+        if head.len == self.next_seq && head.head == self.prev {
+            Ok(())
+        } else {
+            Err(Error::ChainBroken {
+                seq: self.next_seq.min(head.len),
+            })
+        }
+    }
+}
+
+/// Verifies the entries of one owner (in order, without the entries of others) and returns
+/// the hash of its last entry. Every entry must name `owner`, chain to the one before it
+/// through `owner_prev`, and carry the signature of the node.
+pub fn verify_owner_chain(
+    entries: &[SignedEntry],
+    owner: &str,
+    node: &NodePublicKey,
+) -> Result<[u8; 32]> {
+    let mut prev = [0u8; 32];
+    let mut last: Option<(u64, u64)> = None;
+    for signed in entries {
+        let entry = &signed.entry;
+        let seq = entry.seq;
+        let ordered = last.is_none_or(|(s, t)| seq > s && entry.time_ms >= t);
+        if entry.owner != owner || entry.owner_prev != prev || !ordered {
             return Err(Error::ChainBroken { seq });
         }
         signed
             .verify(node)
             .map_err(|_| Error::EntrySignature { seq })?;
         prev = signed.hash()?;
-        last_time = entry.time_ms;
+        last = Some((seq, entry.time_ms));
     }
     Ok(prev)
 }
@@ -226,6 +477,7 @@ pub fn verify_chain(entries: &[SignedEntry], node: &NodePublicKey) -> Result<[u8
 pub struct MemorySink {
     entries: Vec<SignedEntry>,
     failing: bool,
+    store_then_fail: bool,
 }
 
 impl MemorySink {
@@ -243,6 +495,11 @@ impl MemorySink {
     pub fn set_failing(&mut self, failing: bool) {
         self.failing = failing;
     }
+
+    /// Makes the next appends store the entry and then report failure (a lost acknowledgement).
+    pub fn set_store_then_fail(&mut self, on: bool) {
+        self.store_then_fail = on;
+    }
 }
 
 impl LogSink for MemorySink {
@@ -251,6 +508,9 @@ impl LogSink for MemorySink {
             return Err(Error::LogUnconfirmed);
         }
         self.entries.push(entry.clone());
+        if self.store_then_fail {
+            return Err(Error::LogUnconfirmed);
+        }
         Ok(())
     }
 }

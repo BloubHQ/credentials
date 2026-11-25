@@ -8,7 +8,9 @@ use crate::{Error, Result};
 /// The code of `seed` at `unix_seconds`, with `digits` digits and a step of `period` seconds.
 pub(crate) fn code(seed: &[u8], unix_seconds: u64, digits: u32, period: u64) -> Result<u32> {
     if !(6..=9).contains(&digits) || period == 0 || seed.is_empty() {
-        return Err(Error::TemplateInvalid);
+        return Err(Error::TemplateInvalid {
+            rule: "totp digits or period out of range",
+        });
     }
     let counter = unix_seconds / period;
     let mut mac = Hmac::<Sha1>::new_from_slice(seed).map_err(|_| Error::KeyInvalid)?;

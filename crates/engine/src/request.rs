@@ -12,10 +12,12 @@ use zeroize::Zeroizing;
 
 use crate::fields::Fields;
 use crate::policy::{
-    Destination, Method, Operation, RESERVED_HEADERS, Step, StepRequest, Target, is_token,
+    Destination, Method, Operation, Policy, RESERVED_HEADERS, Step, StepRequest, Target,
+    check_path, is_token, under,
 };
+use crate::primitives::{hex, pct};
 use crate::secret::Secret;
-use crate::template::{Context, Template, Temps, Var, hex, pct};
+use crate::template::{Budget, Context, Template, Temps, Var};
 use crate::{Error, Result};
 
 /// Longest path and query, in bytes.
@@ -25,28 +27,50 @@ pub const MAX_HEADERS: usize = 64;
 /// Longest caller header value, in bytes.
 pub const MAX_HEADER_VALUE: usize = 4096;
 /// Longest caller body, in bytes.
-pub const MAX_BODY: usize = 1024 * 1024;
+pub const MAX_BODY: usize = 8 * 1024 * 1024;
+
+fn invalid(rule: &'static str) -> Error {
+    Error::RequestInvalid { rule }
+}
 
 /// A request the caller asks a node to send with the values of a record.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Request {
     /// Method.
     pub method: Method,
-    /// Destination.
+    /// Destination (a concrete host).
     pub destination: Destination,
     /// Path and query, starting with `/`; it holds `{name}` once for each path parameter.
     pub path: String,
-    /// Further headers.
+    /// Further headers; each must be one the operation lists.
     pub headers: Vec<(String, String)>,
     /// Body; `$body` to the templates.
     pub body: Vec<u8>,
 }
 
 impl Request {
-    /// Checks the request against an HTTP operation: destination, method, form, the path
-    /// parameters its steps fill, and no header the engine or an injection sets.
+    /// A request without headers or body.
+    pub fn new(method: Method, destination: Destination, path: &str) -> Self {
+        Self {
+            method,
+            destination,
+            path: path.into(),
+            headers: Vec::new(),
+            body: Vec::new(),
+        }
+    }
+
+    /// Checks the request against an HTTP operation: destination, method, path, the path
+    /// parameters its steps fill, and the headers.
     pub fn validate(&self, operation: &Operation) -> Result<()> {
-        let Operation::Http { methods, steps, .. } = operation else {
+        let Operation::Http {
+            methods,
+            paths,
+            caller_headers,
+            steps,
+            ..
+        } = operation
+        else {
             return Err(Error::OperationUnknown);
         };
         if !operation.allows_destination(&self.destination) {
@@ -55,10 +79,15 @@ impl Request {
         if !methods.contains(&self.method) {
             return Err(Error::MethodDenied);
         }
+        if !check_path(&self.path) {
+            return Err(invalid(
+                "path must start with / and hold no fragment, dot segment or encoded separator",
+            ));
+        }
+        if !paths.iter().any(|p| under(&self.path, p)) {
+            return Err(Error::PathDenied);
+        }
         let caller_steps = || steps.iter().filter(|s| s.request == StepRequest::Caller);
-        let path_ok = self.path.starts_with('/')
-            && self.path.len() <= MAX_PATH
-            && self.path.bytes().all(|b| b.is_ascii_graphic() && b != b'#');
         let params_ok = caller_steps()
             .flat_map(|s| &s.inject)
             .all(|i| match &i.target {
@@ -67,30 +96,32 @@ impl Request {
                 }
                 _ => true,
             });
-        if !path_ok || !params_ok || self.body.len() > MAX_BODY || self.headers.len() > MAX_HEADERS
-        {
-            return Err(Error::RequestInvalid);
+        if !params_ok {
+            return Err(invalid("path must hold each path parameter once"));
         }
-        let injected: Vec<String> = caller_steps()
-            .flat_map(|s| &s.inject)
-            .filter_map(|i| match &i.target {
-                Target::Header { name } => Some(name.to_ascii_lowercase()),
-                _ => None,
-            })
-            .collect();
+        if self.body.len() > MAX_BODY {
+            return Err(invalid("body too large"));
+        }
+        if self.headers.len() > MAX_HEADERS {
+            return Err(invalid("too many headers"));
+        }
+        let mut seen: Vec<String> = Vec::with_capacity(self.headers.len());
         for (name, value) in &self.headers {
             let lower = name.to_ascii_lowercase();
             let value_ok = value.len() <= MAX_HEADER_VALUE
                 && value
                     .bytes()
                     .all(|b| b == b'\t' || (0x20..=0x7e).contains(&b));
-            if !is_token(name)
-                || RESERVED_HEADERS.contains(&lower.as_str())
-                || injected.contains(&lower)
-                || !value_ok
-            {
-                return Err(Error::RequestInvalid);
+            if !is_token(name) || !value_ok || RESERVED_HEADERS.contains(&lower.as_str()) {
+                return Err(invalid("header name or value malformed or reserved"));
             }
+            if !caller_headers.iter().any(|h| h.eq_ignore_ascii_case(name)) {
+                return Err(invalid("header not allowed by the operation"));
+            }
+            if seen.contains(&lower) {
+                return Err(invalid("header repeated"));
+            }
+            seen.push(lower);
         }
         Ok(())
     }
@@ -114,7 +145,7 @@ impl<'a> Outbound<'a> {
     ) -> Result<Self> {
         Ok(match &step.request {
             StepRequest::Caller => {
-                let request = caller.ok_or(Error::RequestInvalid)?;
+                let request = caller.ok_or(invalid("the operation needs a request"))?;
                 Self {
                     method: request.method,
                     destination: &request.destination,
@@ -129,10 +160,11 @@ impl<'a> Outbound<'a> {
                 destination,
             } => Self {
                 method: *method,
-                destination: destination
-                    .as_ref()
-                    .or(destinations.first())
-                    .ok_or(Error::PolicyInvalid)?,
+                destination: match (destination, destinations) {
+                    (Some(d), _) => d,
+                    (None, [only]) => only,
+                    _ => return Err(Error::policy("step", "fixed request without destination")),
+                },
                 path,
                 headers: &[],
                 body: &[],
@@ -168,22 +200,26 @@ pub(crate) struct Built {
     pub tainted: Vec<Zeroizing<Vec<u8>>>,
 }
 
-/// Renders the injections of `step` and builds the HTTP/1.1 bytes. `secret` says which names
-/// are secret.
-pub(crate) fn build(
-    step: &Step,
-    request: &Outbound<'_>,
-    fields: &Fields,
-    temps: &Temps,
-    unix_ms: u64,
-    secret: &dyn Fn(&str) -> bool,
-) -> Result<Built> {
+/// What a build reads besides the step and its request.
+pub(crate) struct Inputs<'a> {
+    pub policy: &'a Policy,
+    pub operation: &'a Operation,
+    pub fields: &'a Fields,
+    pub temps: &'a Temps,
+    pub unix_ms: u64,
+    pub budget: &'a Budget,
+}
+
+/// Renders the injections of `step` and builds the HTTP/1.1 bytes.
+pub(crate) fn build(step: &Step, request: &Outbound<'_>, inputs: &Inputs<'_>) -> Result<Built> {
     let ctx = Context {
-        fields,
-        temps,
-        vars: request.vars(unix_ms),
-        unix: unix_ms / 1000,
+        fields: inputs.fields,
+        temps: inputs.temps,
+        vars: request.vars(inputs.unix_ms),
+        unix: inputs.unix_ms / 1000,
+        budget: inputs.budget,
     };
+    let kind = |name: &str| inputs.policy.name_kind(inputs.operation, name);
 
     let mut headers: Vec<(&str, Zeroizing<Vec<u8>>)> = Vec::new();
     let mut query: Vec<(&str, Zeroizing<Vec<u8>>)> = Vec::new();
@@ -194,7 +230,7 @@ pub(crate) fn build(
     for injection in &step.inject {
         let template = Template::parse(&injection.template)?;
         let value = template.render(&ctx)?;
-        if template.tainted(secret) && !matches!(injection.target, Target::Body) {
+        if template.tainted(&kind) && !matches!(injection.target, Target::Body) {
             tainted.push(value.clone());
         }
         match &injection.target {
@@ -215,10 +251,10 @@ pub(crate) fn build(
 
     let mut path = Zeroizing::new(request.path.as_bytes().to_vec());
     for (placeholder, value) in &params {
-        let text = core::str::from_utf8(&path).map_err(|_| Error::RequestInvalid)?;
+        let text = core::str::from_utf8(&path).map_err(|_| invalid("path not UTF-8"))?;
         let (before, after) = text
             .split_once(placeholder.as_str())
-            .ok_or(Error::RequestInvalid)?;
+            .ok_or(invalid("path parameter missing"))?;
         let mut next = Zeroizing::new(Vec::with_capacity(before.len() + value.len() + after.len()));
         next.extend_from_slice(before.as_bytes());
         next.extend_from_slice(value);
@@ -227,13 +263,18 @@ pub(crate) fn build(
     }
 
     let body_bytes: &[u8] = body.as_deref().map_or(request.body, |b| b.as_slice());
+    if body_bytes.len() > MAX_BODY {
+        return Err(Error::Budget { what: "body" });
+    }
     let port = if request.destination.port == 443 {
         String::new()
     } else {
         format!(":{}", request.destination.port)
     };
     let length_line = format!("Content-Length: {}\r\n", body_bytes.len());
-    let capacity = 64
+    const FIXED: &[u8] = b"Accept-Encoding: identity\r\nConnection: close\r\n\r\n";
+    let capacity = 32
+        + request.method.as_str().len()
         + path.len()
         + query
             .iter()
@@ -251,6 +292,7 @@ pub(crate) fn build(
             .map(|(n, v)| n.len() + v.len() + 4)
             .sum::<usize>()
         + length_line.len()
+        + FIXED.len()
         + body_bytes.len();
 
     let mut wire = Secret::new(Vec::with_capacity(capacity));
@@ -283,7 +325,7 @@ pub(crate) fn build(
         out.extend_from_slice(b"\r\n");
     }
     out.extend_from_slice(length_line.as_bytes());
-    out.extend_from_slice(b"Connection: close\r\n\r\n");
+    out.extend_from_slice(FIXED);
     out.extend_from_slice(body_bytes);
     Ok(Built { wire, tainted })
 }

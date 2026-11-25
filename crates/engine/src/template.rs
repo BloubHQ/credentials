@@ -12,33 +12,46 @@
 //! variable (`$method`, `$host`, `$path`, `$pathname`, `$query`, `$body`, `$unix`, `$unix_ms`,
 //! `$boundary`, `$nonce`, `$input`), a string literal, a call of a function of [`Func`], or
 //! several of them joined by `+`. There is no branch and no loop: a policy reads as what it
-//! does.
+//! does. Text outside `{{ }}` is copied as it is, `}}` included.
 //!
-//! Every value carries a taint: it is tainted when it holds a secret in a form that can be
-//! turned back. Encodings keep the taint; one-way functions (hashes, MACs, signatures, TOTP)
-//! drop it; an encryption drops it only when its key is itself secret. A request may carry
-//! tainted values to the destinations of its operation; a value handed back to the caller must
-//! be untainted, which [`Template::tainted`] decides before a policy is signed.
+//! # Analysis
+//!
+//! Before a policy is signed, [`Template::analyze`] follows every value:
+//!
+//! - **tainted**: it holds a secret in a form that can be turned back. Encodings keep the
+//!   taint; one-way functions (hashes, MACs, signatures, TOTP, `len`) drop it. An encryption
+//!   drops it only under a key that is a secret field (or a hash of one), with a nonce that is
+//!   not secret, and, when the caller chooses part of the message, with `$nonce` in the nonce.
+//! - **controlled**: the caller or a server chooses part of it (`$input`, `$body`, `$query`,
+//!   `$path`, `$pathname`, `$method`, captured values).
+//!
+//! A value both tainted and controlled must not reach a function whose output or failure
+//! tells how the two relate: `replace` and `xor` with a secret on one side and a chosen value
+//! on the other, a decoder, `json_set`, `time`, number arguments, or a key argument. Such a
+//! template is refused: it would be an oracle that gives the secret back piece by piece.
+//! A value handed back to the caller must be untainted.
 
+use std::cell::Cell;
 use std::collections::HashMap;
 
-use base64::Engine;
-use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD};
-use ed25519_dalek::Signer as _;
-use hmac::{Hmac, Mac};
-use sha1::Sha1;
-use sha2::{Digest, Sha256, Sha512};
 use zeroize::Zeroizing;
 
 use crate::fields::Fields;
-use crate::{Error, Result, totp};
+use crate::primitives;
+use crate::{Error, Result};
+
+pub use crate::primitives::MAX_PBKDF2_ROUNDS;
 
 /// Longest template, in bytes.
 pub const MAX_TEMPLATE: usize = 8192;
 const MAX_DEPTH: usize = 24;
 const MAX_NODES: usize = 512;
-/// Most PBKDF2 iterations a template may ask for.
-pub const MAX_PBKDF2_ROUNDS: u64 = 1_000_000;
+/// Most bytes all renderings of one operation may produce.
+pub const MAX_RENDER_BYTES: usize = 128 * 1024 * 1024;
+/// Most PBKDF2 rounds of one operation.
+pub const MAX_RENDER_ROUNDS: u64 = 1_000_000;
+/// Most signatures of one operation.
+pub const MAX_RENDER_SIGNATURES: u32 = 32;
 
 /// A variable a template can read.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -99,6 +112,14 @@ impl Var {
     pub fn in_derive(self) -> bool {
         matches!(self, Var::Input | Var::Unix | Var::UnixMs | Var::Nonce)
     }
+
+    /// True when the caller chooses the value.
+    fn controlled(self) -> bool {
+        matches!(
+            self,
+            Var::Method | Var::Path | Var::PathName | Var::Query | Var::Body | Var::Input
+        )
+    }
 }
 
 macro_rules! funcs {
@@ -126,8 +147,8 @@ funcs! {
     B64Raw = "b64raw"(1, 1): "Standard base64 without padding.",
     B64Url = "b64url"(1, 1): "URL-safe base64 with padding.",
     B64UrlRaw = "b64urlraw"(1, 1): "URL-safe base64 without padding.",
-    B64Decode = "b64decode"(1, 1): "Base64 decoding (any alphabet, padding optional).",
-    B32Decode = "b32decode"(1, 1): "Base32 decoding (RFC 4648; case, spaces and padding ignored).",
+    B64Decode = "b64decode"(1, 1): "Base64 decoding (either alphabet; padding, whitespace and trailing bits accepted).",
+    B32Decode = "b32decode"(1, 1): "Base32 decoding (RFC 4648; case, whitespace, `-` and padding ignored).",
     Hex = "hex"(1, 1): "Lowercase hex.",
     HexDecode = "hexdecode"(1, 1): "Hex decoding.",
     Pct = "pct"(1, 1): "Percent encoding of everything but unreserved characters.",
@@ -172,33 +193,91 @@ impl Func {
         Func::ALL.iter().find(|(n, _)| *n == name).map(|(_, f)| *f)
     }
 
-    /// The taint of the output, from the taints of the arguments.
-    pub fn taint(self, args: &[bool]) -> bool {
-        let at = |i: usize| args.get(i).copied().unwrap_or(false);
-        match self {
+    fn one_way(self) -> bool {
+        matches!(
+            self,
             Func::Len
-            | Func::Md5
-            | Func::Sha1
-            | Func::Sha256
-            | Func::Sha512
-            | Func::Keccak256
-            | Func::HmacSha1
-            | Func::HmacSha256
-            | Func::HmacSha512
-            | Func::Pbkdf2Sha256
-            | Func::Totp
-            | Func::Ed25519Sign
-            | Func::P256Sign
-            | Func::P256SignDer
-            | Func::P384Sign
-            | Func::K256Sign
-            | Func::K256SignRecoverable
-            | Func::RsaSignPkcs1Sha256
-            | Func::RsaSignPssSha256 => false,
-            // Whoever knows the key reads the message back.
-            Func::AesGcmEncrypt | Func::AesCbcEncrypt => at(2) && !at(0),
-            _ => args.iter().any(|t| *t),
+                | Func::Md5
+                | Func::Sha1
+                | Func::Sha256
+                | Func::Sha512
+                | Func::Keccak256
+                | Func::HmacSha1
+                | Func::HmacSha256
+                | Func::HmacSha512
+                | Func::Pbkdf2Sha256
+                | Func::Totp
+                | Func::Ed25519Sign
+                | Func::P256Sign
+                | Func::P256SignDer
+                | Func::P384Sign
+                | Func::K256Sign
+                | Func::K256SignRecoverable
+                | Func::RsaSignPkcs1Sha256
+                | Func::RsaSignPssSha256
+        )
+    }
+
+    fn signs(self) -> bool {
+        matches!(
+            self,
+            Func::Ed25519Sign
+                | Func::P256Sign
+                | Func::P256SignDer
+                | Func::P384Sign
+                | Func::K256Sign
+                | Func::K256SignRecoverable
+                | Func::RsaSignPkcs1Sha256
+                | Func::RsaSignPssSha256
+        )
+    }
+
+    /// The arguments whose value, when it mixes a secret with a chosen value, makes the
+    /// function an oracle (by failing or not, or by how it compares them).
+    fn sensitive_args(self) -> core::ops::Range<usize> {
+        match self {
+            Func::B64Decode
+            | Func::B32Decode
+            | Func::HexDecode
+            | Func::PctDecode
+            | Func::Pem
+            | Func::CanonicalQuery
+            | Func::Be16
+            | Func::Be32 => 0..1,
+            Func::Time => 0..2,
+            Func::Totp => 1..3,
+            Func::Pbkdf2Sha256 => 2..4,
+            Func::AesGcmEncrypt | Func::AesCbcEncrypt => 0..2,
+            f if f.signs() => 0..1,
+            _ => 0..0,
         }
+    }
+}
+
+/// What a name is, for the analysis.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NameKind {
+    /// A secret field.
+    SecretField,
+    /// A public field.
+    PublicField,
+    /// A captured value marked secret.
+    SecretTemp,
+    /// A captured value not marked secret.
+    PublicTemp,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct Info {
+    tainted: bool,
+    controlled: bool,
+    secret_key: bool,
+    has_nonce: bool,
+}
+
+impl Info {
+    fn mixed(self) -> bool {
+        self.tainted && self.controlled
     }
 }
 
@@ -234,10 +313,14 @@ enum Tok {
     Plus,
 }
 
-fn lex(src: &str) -> Result<Vec<Tok>> {
+fn is_name_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '_' || c == '-'
+}
+
+fn lex(src: &str) -> core::result::Result<Vec<Tok>, usize> {
     let mut toks = Vec::new();
-    let mut chars = src.chars().peekable();
-    while let Some(c) = chars.next() {
+    let mut chars = src.char_indices().peekable();
+    while let Some((at, c)) = chars.next() {
         match c {
             c if c.is_whitespace() => {}
             '(' => toks.push(Tok::LParen),
@@ -247,29 +330,30 @@ fn lex(src: &str) -> Result<Vec<Tok>> {
             '"' => {
                 let mut s = String::new();
                 loop {
-                    match chars.next().ok_or(Error::TemplateInvalid)? {
+                    let (_, c) = chars.next().ok_or(at)?;
+                    match c {
                         '"' => break,
-                        '\\' => s.push(match chars.next().ok_or(Error::TemplateInvalid)? {
+                        '\\' => s.push(match chars.next().ok_or(at)?.1 {
                             'n' => '\n',
                             'r' => '\r',
                             't' => '\t',
                             '0' => '\0',
                             '"' => '"',
                             '\\' => '\\',
-                            _ => return Err(Error::TemplateInvalid),
+                            _ => return Err(at),
                         }),
                         other => s.push(other),
                     }
                 }
                 toks.push(Tok::Str(s.into_bytes()));
             }
-            '$' | 'a'..='z' | 'A'..='Z' | '_' => {
+            c if c == '$' || is_name_char(c) => {
                 let mut name = String::new();
                 if c != '$' {
                     name.push(c);
                 }
-                while let Some(&n) = chars.peek() {
-                    if n.is_ascii_alphanumeric() || n == '_' {
+                while let Some(&(_, n)) = chars.peek() {
+                    if is_name_char(n) {
                         name.push(n);
                         chars.next();
                     } else {
@@ -282,7 +366,7 @@ fn lex(src: &str) -> Result<Vec<Tok>> {
                     Tok::Ident(name)
                 });
             }
-            _ => return Err(Error::TemplateInvalid),
+            _ => return Err(at),
         }
     }
     Ok(toks)
@@ -299,41 +383,35 @@ impl Parser {
         self.toks.get(self.pos)
     }
 
-    fn next(&mut self) -> Result<Tok> {
-        let tok = self
-            .toks
-            .get(self.pos)
-            .cloned()
-            .ok_or(Error::TemplateInvalid)?;
+    fn next(&mut self) -> Option<Tok> {
+        let tok = self.toks.get(self.pos).cloned()?;
         self.pos += 1;
-        Ok(tok)
+        Some(tok)
     }
 
-    fn expr(&mut self, depth: usize) -> Result<Expr> {
+    fn expr(&mut self, depth: usize) -> Option<Expr> {
         let mut parts = vec![self.term(depth)?];
         while self.peek() == Some(&Tok::Plus) {
             self.pos += 1;
             parts.push(self.term(depth)?);
         }
-        Ok(if parts.len() == 1 {
+        Some(if parts.len() == 1 {
             parts.remove(0)
         } else {
             Expr::Concat(parts)
         })
     }
 
-    fn term(&mut self, depth: usize) -> Result<Expr> {
+    fn term(&mut self, depth: usize) -> Option<Expr> {
         self.nodes += 1;
         if depth > MAX_DEPTH || self.nodes > MAX_NODES {
-            return Err(Error::TemplateInvalid);
+            return None;
         }
         match self.next()? {
-            Tok::Str(s) => Ok(Expr::Lit(s)),
-            Tok::Var(name) => Var::parse(&name)
-                .map(Expr::Var)
-                .ok_or(Error::TemplateInvalid),
+            Tok::Str(s) => Some(Expr::Lit(s)),
+            Tok::Var(name) => Var::parse(&name).map(Expr::Var),
             Tok::Ident(name) if self.peek() == Some(&Tok::LParen) => {
-                let func = Func::parse(&name).ok_or(Error::TemplateInvalid)?;
+                let func = Func::parse(&name)?;
                 self.pos += 1;
                 let mut args = Vec::new();
                 if self.peek() != Some(&Tok::RParen) {
@@ -344,16 +422,15 @@ impl Parser {
                     }
                 }
                 if self.next()? != Tok::RParen {
-                    return Err(Error::TemplateInvalid);
+                    return None;
                 }
                 let (min, max) = func.arity();
-                if args.len() < min || args.len() > max {
-                    return Err(Error::TemplateInvalid);
-                }
-                Ok(Expr::Call(func, args))
+                (min..=max)
+                    .contains(&args.len())
+                    .then_some(Expr::Call(func, args))
             }
-            Tok::Ident(name) if crate::policy::is_token(&name) => Ok(Expr::Name(name)),
-            _ => Err(Error::TemplateInvalid),
+            Tok::Ident(name) if crate::policy::is_token(&name) => Some(Expr::Name(name)),
+            _ => None,
         }
     }
 }
@@ -365,50 +442,142 @@ fn walk<'e>(expr: &'e Expr, visit: &mut dyn FnMut(&'e Expr)) {
     }
 }
 
-fn expr_tainted(expr: &Expr, secret: &dyn Fn(&str) -> bool) -> bool {
-    match expr {
-        Expr::Lit(_) | Expr::Var(_) => false,
-        Expr::Name(name) => secret(name),
-        Expr::Call(func, args) => {
-            let taints: Vec<bool> = args.iter().map(|a| expr_tainted(a, secret)).collect();
-            func.taint(&taints)
+type Rule = &'static str;
+
+fn analyze(expr: &Expr, kind: &dyn Fn(&str) -> NameKind) -> core::result::Result<Info, Rule> {
+    Ok(match expr {
+        Expr::Lit(_) => Info::default(),
+        Expr::Name(name) => match kind(name) {
+            NameKind::SecretField => Info {
+                tainted: true,
+                secret_key: true,
+                ..Info::default()
+            },
+            NameKind::PublicField => Info::default(),
+            NameKind::SecretTemp => Info {
+                tainted: true,
+                controlled: true,
+                ..Info::default()
+            },
+            NameKind::PublicTemp => Info {
+                controlled: true,
+                ..Info::default()
+            },
+        },
+        Expr::Var(v) => Info {
+            controlled: v.controlled(),
+            has_nonce: *v == Var::Nonce,
+            ..Info::default()
+        },
+        Expr::Concat(parts) => {
+            let infos = parts
+                .iter()
+                .map(|p| analyze(p, kind))
+                .collect::<core::result::Result<Vec<_>, _>>()?;
+            Info {
+                tainted: infos.iter().any(|i| i.tainted),
+                controlled: infos.iter().any(|i| i.controlled),
+                secret_key: false,
+                has_nonce: infos.iter().any(|i| i.has_nonce),
+            }
         }
-        Expr::Concat(parts) => parts.iter().any(|p| expr_tainted(p, secret)),
+        Expr::Call(func, args) => {
+            let infos = args
+                .iter()
+                .map(|a| analyze(a, kind))
+                .collect::<core::result::Result<Vec<_>, _>>()?;
+            call_info(*func, &infos)?
+        }
+    })
+}
+
+fn call_info(func: Func, args: &[Info]) -> core::result::Result<Info, Rule> {
+    let at = |i: usize| args.get(i).copied().unwrap_or_default();
+    let any_tainted = args.iter().any(|i| i.tainted);
+    let any_controlled = args.iter().any(|i| i.controlled);
+    if matches!(func, Func::Replace | Func::Xor) && any_tainted && any_controlled {
+        return Err("a secret and a chosen value meet in replace, xor or json_set");
     }
+    // `json_set` compares its object and its key (a member present makes it fail); the value
+    // is only escaped and appended.
+    if func == Func::JsonSet && (at(0).tainted || at(1).tainted) && any_controlled {
+        return Err("a secret and a chosen value meet in replace, xor or json_set");
+    }
+    if func.sensitive_args().any(|i| at(i).mixed()) {
+        return Err("a secret mixed with a chosen value reaches a decoder, number or key");
+    }
+    let tainted = if func.one_way() {
+        false
+    } else if matches!(func, Func::AesGcmEncrypt | Func::AesCbcEncrypt) {
+        let (key, nonce, message, aad) = (at(0), at(1), at(2), at(3));
+        if key.secret_key {
+            // Under a secret key only a secret in the nonce or the associated data, or a
+            // secret next to chosen bytes under a fixed nonce (the keystream repeats), can be
+            // read back.
+            nonce.tainted || aad.tainted || (message.mixed() && !nonce.has_nonce)
+        } else {
+            any_tainted
+        }
+    } else {
+        any_tainted
+    };
+    let secret_key = match func {
+        Func::B64Decode | Func::B32Decode | Func::HexDecode | Func::Pem | Func::Trim => {
+            at(0).secret_key
+        }
+        Func::Sha256
+        | Func::Sha512
+        | Func::Keccak256
+        | Func::HmacSha1
+        | Func::HmacSha256
+        | Func::HmacSha512
+        | Func::Pbkdf2Sha256 => at(0).secret_key,
+        _ => false,
+    };
+    Ok(Info {
+        tainted,
+        controlled: any_controlled,
+        secret_key,
+        has_nonce: args.iter().any(|i| i.has_nonce),
+    })
 }
 
 impl Template {
-    /// Parses a template. `}}` cannot appear inside a string literal of an expression.
+    /// Parses a template.
     pub fn parse(text: &str) -> Result<Self> {
         if text.len() > MAX_TEMPLATE {
-            return Err(Error::TemplateInvalid);
+            return Err(Error::TemplateSyntax {
+                offset: MAX_TEMPLATE,
+            });
         }
         let mut segments = Vec::new();
         let mut rest = text;
         let mut nodes = 0;
         while let Some(open) = rest.find("{{") {
+            let offset = text.len() - rest.len() + open;
+            let syntax = |at: usize| Error::TemplateSyntax {
+                offset: offset + at,
+            };
             let (before, after) = rest.split_at(open);
             if !before.is_empty() {
                 segments.push(Segment::Text(before.as_bytes().to_vec()));
             }
-            let after = after.get(2..).ok_or(Error::TemplateInvalid)?;
-            let close = after.find("}}").ok_or(Error::TemplateInvalid)?;
+            let after = after.get(2..).ok_or(syntax(0))?;
+            let close = after.find("}}").ok_or(syntax(0))?;
             let (inner, tail) = after.split_at(close);
+            let toks = lex(inner).map_err(|at| syntax(at + 2))?;
             let mut parser = Parser {
-                toks: lex(inner)?,
+                toks,
                 pos: 0,
                 nodes,
             };
-            let expr = parser.expr(0)?;
+            let expr = parser.expr(0).ok_or(syntax(2))?;
             if parser.pos != parser.toks.len() {
-                return Err(Error::TemplateInvalid);
+                return Err(syntax(2));
             }
             nodes = parser.nodes;
             segments.push(Segment::Expr(expr));
-            rest = tail.get(2..).ok_or(Error::TemplateInvalid)?;
-        }
-        if rest.contains("}}") {
-            return Err(Error::TemplateInvalid);
+            rest = tail.get(2..).ok_or(syntax(0))?;
         }
         if !rest.is_empty() {
             segments.push(Segment::Text(rest.as_bytes().to_vec()));
@@ -449,27 +618,101 @@ impl Template {
         out
     }
 
-    /// True when the output can give a secret back. `secret` says which names are secret.
-    pub fn tainted(&self, secret: &dyn Fn(&str) -> bool) -> bool {
-        self.exprs().any(|e| expr_tainted(e, secret))
+    /// Checks the rules of the analysis and returns true when the output can give a secret
+    /// back. `kind` says what each name is.
+    pub fn analyze(&self, kind: &dyn Fn(&str) -> NameKind) -> core::result::Result<bool, Rule> {
+        let mut tainted = false;
+        for expr in self.exprs() {
+            tainted |= analyze(expr, kind)?.tainted;
+        }
+        Ok(tainted)
+    }
+
+    /// True when the output can give a secret back (a template that breaks a rule counts as
+    /// tainted).
+    pub fn tainted(&self, kind: &dyn Fn(&str) -> NameKind) -> bool {
+        self.analyze(kind).unwrap_or(true)
     }
 
     pub(crate) fn render(&self, ctx: &Context<'_>) -> Result<Bytes> {
         let mut parts = Vec::with_capacity(self.segments.len());
         for segment in &self.segments {
             parts.push(match segment {
-                Segment::Text(t) => Zeroizing::new(t.clone()),
+                Segment::Text(t) => {
+                    ctx.budget.bytes(t.len())?;
+                    Zeroizing::new(t.clone())
+                }
                 Segment::Expr(e) => eval(e, ctx)?,
             });
         }
-        let mut out = Zeroizing::new(Vec::with_capacity(parts.iter().map(|p| p.len()).sum()));
-        parts.iter().for_each(|p| out.extend_from_slice(p));
-        Ok(out)
+        concat(&parts, ctx.budget)
     }
+}
+
+fn concat(parts: &[Bytes], budget: &Budget) -> Result<Bytes> {
+    let len = parts.iter().map(|p| p.len()).sum();
+    budget.bytes(len)?;
+    let mut out = Zeroizing::new(Vec::with_capacity(len));
+    parts.iter().for_each(|p| out.extend_from_slice(p));
+    Ok(out)
 }
 
 /// Values captured by earlier steps of an operation.
 pub(crate) type Temps = HashMap<String, Zeroizing<Vec<u8>>>;
+
+/// The limits of one operation: bytes produced, PBKDF2 rounds and signatures.
+pub(crate) struct Budget {
+    bytes: Cell<usize>,
+    rounds: Cell<u64>,
+    signatures: Cell<u32>,
+}
+
+impl Default for Budget {
+    fn default() -> Self {
+        Self {
+            bytes: Cell::new(MAX_RENDER_BYTES),
+            rounds: Cell::new(MAX_RENDER_ROUNDS),
+            signatures: Cell::new(MAX_RENDER_SIGNATURES),
+        }
+    }
+}
+
+impl Budget {
+    /// Fails when fewer than `n` bytes are left; does not spend them.
+    fn room(&self, n: usize) -> Result<()> {
+        if n > self.bytes.get() {
+            return Err(Error::Budget { what: "bytes" });
+        }
+        Ok(())
+    }
+
+    /// Spends `n` bytes.
+    pub(crate) fn bytes(&self, n: usize) -> Result<()> {
+        self.room(n)?;
+        self.bytes.set(self.bytes.get() - n);
+        Ok(())
+    }
+
+    /// Spends `n` PBKDF2 rounds.
+    pub(crate) fn rounds(&self, n: u64) -> Result<()> {
+        let left = self.rounds.get().checked_sub(n).ok_or(Error::Budget {
+            what: "pbkdf2 rounds",
+        })?;
+        self.rounds.set(left);
+        Ok(())
+    }
+
+    /// Spends one signature.
+    pub(crate) fn signature(&self) -> Result<()> {
+        let left = self
+            .signatures
+            .get()
+            .checked_sub(1)
+            .ok_or(Error::Budget { what: "signatures" })?;
+        self.signatures.set(left);
+        Ok(())
+    }
+}
 
 /// What a rendering reads.
 pub(crate) struct Context<'a> {
@@ -477,544 +720,50 @@ pub(crate) struct Context<'a> {
     pub temps: &'a Temps,
     pub vars: HashMap<Var, Vec<u8>>,
     pub unix: u64,
+    pub budget: &'a Budget,
 }
 
 pub(crate) type Bytes = Zeroizing<Vec<u8>>;
 
 fn eval(expr: &Expr, ctx: &Context<'_>) -> Result<Bytes> {
     Ok(match expr {
-        Expr::Lit(b) => Zeroizing::new(b.clone()),
+        Expr::Lit(b) => {
+            ctx.budget.bytes(b.len())?;
+            Zeroizing::new(b.clone())
+        }
         Expr::Name(name) => {
             let value = ctx
                 .fields
                 .get(name)
                 .or_else(|| ctx.temps.get(name).map(|v| v.as_slice()))
                 .ok_or(Error::FieldMissing)?;
+            ctx.budget.bytes(value.len())?;
             Zeroizing::new(value.to_vec())
         }
-        Expr::Var(v) => Zeroizing::new(ctx.vars.get(v).ok_or(Error::TemplateInvalid)?.clone()),
+        Expr::Var(v) => {
+            let value = ctx.vars.get(v).ok_or(Error::TemplateInvalid {
+                rule: "variable not available here",
+            })?;
+            ctx.budget.bytes(value.len())?;
+            Zeroizing::new(value.clone())
+        }
         Expr::Concat(parts) => {
             let values = parts
                 .iter()
                 .map(|p| eval(p, ctx))
                 .collect::<Result<Vec<_>>>()?;
-            let mut out = Zeroizing::new(Vec::with_capacity(values.iter().map(|v| v.len()).sum()));
-            values.iter().for_each(|v| out.extend_from_slice(v));
-            out
+            concat(&values, ctx.budget)?
         }
         Expr::Call(func, args) => {
             let args = args
                 .iter()
                 .map(|a| eval(a, ctx))
                 .collect::<Result<Vec<_>>>()?;
-            call(*func, &args, ctx.unix)?
-        }
-    })
-}
-
-// ---- primitives ----
-
-const HEX: &[u8; 16] = b"0123456789abcdef";
-const HEX_UPPER: &[u8; 16] = b"0123456789ABCDEF";
-
-pub(crate) fn is_unreserved(b: u8) -> bool {
-    b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~')
-}
-
-fn b64<E: Engine>(engine: &E, input: &[u8]) -> Result<Bytes> {
-    let len = base64::encoded_len(input.len(), true).ok_or(Error::Encoding)?;
-    let mut out = Zeroizing::new(vec![0u8; len]);
-    let written = engine
-        .encode_slice(input, out.as_mut_slice())
-        .map_err(|_| Error::Encoding)?;
-    out.truncate(written);
-    Ok(out)
-}
-
-pub(crate) fn pct(input: &[u8]) -> Bytes {
-    let mut out = Zeroizing::new(Vec::with_capacity(input.len() * 3));
-    for &b in input {
-        if is_unreserved(b) {
-            out.push(b);
-        } else {
-            out.push(b'%');
-            out.extend(HEX_UPPER.get(usize::from(b >> 4)));
-            out.extend(HEX_UPPER.get(usize::from(b & 0x0f)));
-        }
-    }
-    out
-}
-
-fn hex_digit(c: u8) -> Result<u8> {
-    match c {
-        b'0'..=b'9' => Ok(c - b'0'),
-        b'a'..=b'f' => Ok(c - b'a' + 10),
-        b'A'..=b'F' => Ok(c - b'A' + 10),
-        _ => Err(Error::Encoding),
-    }
-}
-
-fn pct_decode(input: &[u8]) -> Result<Bytes> {
-    let mut out = Zeroizing::new(Vec::with_capacity(input.len()));
-    let mut iter = input.iter();
-    while let Some(&b) = iter.next() {
-        if b == b'%' {
-            let hi = hex_digit(*iter.next().ok_or(Error::Encoding)?)?;
-            let lo = hex_digit(*iter.next().ok_or(Error::Encoding)?)?;
-            out.push(hi * 16 + lo);
-        } else {
-            out.push(b);
-        }
-    }
-    Ok(out)
-}
-
-pub(crate) fn json_escape(input: &[u8]) -> Bytes {
-    let mut out = Zeroizing::new(Vec::with_capacity(input.len() + 16));
-    for &b in input {
-        match b {
-            b'"' => out.extend_from_slice(b"\\\""),
-            b'\\' => out.extend_from_slice(b"\\\\"),
-            b'\n' => out.extend_from_slice(b"\\n"),
-            b'\r' => out.extend_from_slice(b"\\r"),
-            b'\t' => out.extend_from_slice(b"\\t"),
-            0..=0x1f => {
-                out.extend_from_slice(b"\\u00");
-                out.extend(HEX.get(usize::from(b >> 4)));
-                out.extend(HEX.get(usize::from(b & 0x0f)));
-            }
-            _ => out.push(b),
-        }
-    }
-    out
-}
-
-pub(crate) fn hex(input: &[u8]) -> Bytes {
-    let mut out = Zeroizing::new(Vec::with_capacity(input.len() * 2));
-    for &b in input {
-        out.extend(HEX.get(usize::from(b >> 4)));
-        out.extend(HEX.get(usize::from(b & 0x0f)));
-    }
-    out
-}
-
-fn hex_decode(input: &[u8]) -> Result<Bytes> {
-    let mut out = Zeroizing::new(Vec::with_capacity(input.len() / 2));
-    for pair in input.chunks(2) {
-        let [hi, lo] = pair else {
-            return Err(Error::Encoding);
-        };
-        out.push(hex_digit(*hi)? * 16 + hex_digit(*lo)?);
-    }
-    Ok(out)
-}
-
-fn b32_decode(input: &[u8]) -> Result<Bytes> {
-    let mut out = Zeroizing::new(Vec::with_capacity(input.len() * 5 / 8));
-    let (mut buffer, mut bits) = (0u64, 0u32);
-    for &c in input {
-        let v = match c.to_ascii_uppercase() {
-            c @ b'A'..=b'Z' => c - b'A',
-            c @ b'2'..=b'7' => c - b'2' + 26,
-            b'=' | b' ' | b'-' => continue,
-            _ => return Err(Error::Encoding),
-        };
-        buffer = ((buffer << 5) | u64::from(v)) & 0xffff;
-        bits += 5;
-        if bits >= 8 {
-            bits -= 8;
-            out.push(u8::try_from((buffer >> bits) & 0xff).map_err(|_| Error::Encoding)?);
-        }
-    }
-    Ok(out)
-}
-
-fn b64_decode(input: &[u8]) -> Result<Bytes> {
-    let text: Bytes = Zeroizing::new(
-        input
-            .iter()
-            .copied()
-            .filter(|b| !b.is_ascii_whitespace())
-            .collect(),
-    );
-    let url = text.iter().any(|b| *b == b'-' || *b == b'_');
-    let padded = text.ends_with(b"=");
-    let result = match (url, padded) {
-        (false, true) => STANDARD.decode(text.as_slice()),
-        (false, false) => STANDARD_NO_PAD.decode(text.as_slice()),
-        (true, true) => URL_SAFE.decode(text.as_slice()),
-        (true, false) => URL_SAFE_NO_PAD.decode(text.as_slice()),
-    };
-    result.map(Zeroizing::new).map_err(|_| Error::Encoding)
-}
-
-/// The base64 body between the first `-----BEGIN ` line and its `-----END ` line, whatever
-/// the label.
-fn pem_body(input: &[u8]) -> Result<Bytes> {
-    let text = core::str::from_utf8(input).map_err(|_| Error::Encoding)?;
-    let mut lines = text.lines().map(str::trim);
-    lines
-        .by_ref()
-        .find(|l| l.starts_with("-----BEGIN ") && l.ends_with("-----"))
-        .ok_or(Error::Encoding)?;
-    let mut body = Zeroizing::new(Vec::with_capacity(input.len()));
-    for line in lines {
-        if line.starts_with("-----END ") {
-            return b64_decode(&body);
-        }
-        if !line.contains(':') {
-            body.extend_from_slice(line.as_bytes());
-        }
-    }
-    Err(Error::Encoding)
-}
-
-fn replace(text: &[u8], from: &[u8], to: &[u8]) -> Result<Bytes> {
-    if from.is_empty() {
-        return Err(Error::TemplateInvalid);
-    }
-    let mut out = Zeroizing::new(Vec::with_capacity(text.len()));
-    let mut rest = text;
-    while !rest.is_empty() {
-        if rest.starts_with(from) {
-            out.extend_from_slice(to);
-            rest = rest.get(from.len()..).unwrap_or_default();
-        } else {
-            out.extend(rest.first());
-            rest = rest.get(1..).unwrap_or_default();
-        }
-    }
-    Ok(out)
-}
-
-/// The JSON object `object` with the string member `key: value` added at its end. The object
-/// must not have that member; an empty object text is `{}`.
-pub(crate) fn json_set(object: &[u8], key: &[u8], value: &[u8]) -> Result<Bytes> {
-    let parsed: serde_json::Map<String, serde_json::Value> = if object.trim_ascii().is_empty() {
-        serde_json::Map::new()
-    } else {
-        serde_json::from_slice(object).map_err(|_| Error::RequestInvalid)?
-    };
-    let key_text = core::str::from_utf8(key).map_err(|_| Error::Encoding)?;
-    if parsed.contains_key(key_text) {
-        return Err(Error::RequestInvalid);
-    }
-    let trimmed = object.trim_ascii();
-    let open: &[u8] = if trimmed.is_empty() {
-        b"{"
-    } else {
-        trimmed.strip_suffix(b"}").ok_or(Error::RequestInvalid)?
-    };
-    let escaped_key = json_escape(key);
-    let escaped = json_escape(value);
-    let mut out = Zeroizing::new(Vec::with_capacity(
-        open.len() + escaped_key.len() + escaped.len() + 8,
-    ));
-    out.extend_from_slice(open);
-    if !parsed.is_empty() {
-        out.push(b',');
-    }
-    out.push(b'"');
-    out.extend_from_slice(&escaped_key);
-    out.extend_from_slice(b"\":\"");
-    out.extend_from_slice(&escaped);
-    out.extend_from_slice(b"\"}");
-    Ok(out)
-}
-
-fn canonical_query(query: &[u8]) -> Result<Bytes> {
-    let mut pairs: Vec<(Bytes, Bytes)> = Vec::new();
-    for part in query.split(|b| *b == b'&').filter(|p| !p.is_empty()) {
-        let mut halves = part.splitn(2, |b| *b == b'=');
-        let name = halves.next().unwrap_or_default();
-        let value = halves.next().unwrap_or_default();
-        pairs.push((pct(&pct_decode(name)?), pct(&pct_decode(value)?)));
-    }
-    pairs.sort_by(|a, b| (a.0.as_slice(), a.1.as_slice()).cmp(&(b.0.as_slice(), b.1.as_slice())));
-    let mut out = Zeroizing::new(Vec::with_capacity(query.len() * 3));
-    for (i, (name, value)) in pairs.iter().enumerate() {
-        if i > 0 {
-            out.push(b'&');
-        }
-        out.extend_from_slice(name);
-        out.push(b'=');
-        out.extend_from_slice(value);
-    }
-    Ok(out)
-}
-
-/// Year, month and day of a count of days since 1970-01-01 (proleptic Gregorian).
-fn civil(days: i64) -> (i64, i64, i64) {
-    let z = days + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z.rem_euclid(146_097);
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let day = doy - (153 * mp + 2) / 5 + 1;
-    let month = if mp < 10 { mp + 3 } else { mp - 9 };
-    let year = yoe + era * 400 + i64::from(month <= 2);
-    (year, month, day)
-}
-
-fn time_format(unix: &[u8], format: &[u8]) -> Result<Bytes> {
-    const DAYS: [&str; 7] = ["Thu", "Fri", "Sat", "Sun", "Mon", "Tue", "Wed"];
-    const MONTHS: [&str; 12] = [
-        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
-    ];
-    let seconds: i64 = core::str::from_utf8(unix)
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .ok_or(Error::TemplateInvalid)?;
-    let days = seconds.div_euclid(86_400);
-    let of_day = seconds.rem_euclid(86_400);
-    let (year, month, day) = civil(days);
-    let weekday = usize::try_from(days.rem_euclid(7)).map_err(|_| Error::Encoding)?;
-    let month_index = usize::try_from(month - 1).map_err(|_| Error::Encoding)?;
-    let mut out = String::new();
-    let mut chars = core::str::from_utf8(format)
-        .map_err(|_| Error::TemplateInvalid)?
-        .chars();
-    while let Some(c) = chars.next() {
-        if c != '%' {
-            out.push(c);
-            continue;
-        }
-        match chars.next().ok_or(Error::TemplateInvalid)? {
-            'Y' => out.push_str(&format!("{year:04}")),
-            'm' => out.push_str(&format!("{month:02}")),
-            'd' => out.push_str(&format!("{day:02}")),
-            'H' => out.push_str(&format!("{:02}", of_day / 3600)),
-            'M' => out.push_str(&format!("{:02}", of_day / 60 % 60)),
-            'S' => out.push_str(&format!("{:02}", of_day % 60)),
-            'a' => out.push_str(DAYS.get(weekday).ok_or(Error::Encoding)?),
-            'b' => out.push_str(MONTHS.get(month_index).ok_or(Error::Encoding)?),
-            's' => out.push_str(&seconds.to_string()),
-            '%' => out.push('%'),
-            _ => return Err(Error::TemplateInvalid),
-        }
-    }
-    Ok(Zeroizing::new(out.into_bytes()))
-}
-
-fn arg(args: &[Bytes], i: usize) -> Result<&[u8]> {
-    args.get(i)
-        .map(|a| a.as_slice())
-        .ok_or(Error::TemplateInvalid)
-}
-
-fn number(args: &[Bytes], i: usize, default: u64) -> Result<u64> {
-    match args.get(i) {
-        None => Ok(default),
-        Some(a) => core::str::from_utf8(a)
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .ok_or(Error::TemplateInvalid),
-    }
-}
-
-fn mac<M: Mac + hmac::digest::KeyInit>(key: &[u8], message: &[u8]) -> Result<Bytes> {
-    let mut mac = <M as Mac>::new_from_slice(key).map_err(|_| Error::KeyInvalid)?;
-    mac.update(message);
-    Ok(Zeroizing::new(mac.finalize().into_bytes().to_vec()))
-}
-
-fn ed25519_key(bytes: &[u8]) -> Result<ed25519_dalek::SigningKey> {
-    if let Ok(seed) = <[u8; 32]>::try_from(bytes) {
-        return Ok(ed25519_dalek::SigningKey::from_bytes(&seed));
-    }
-    use ed25519_dalek::pkcs8::DecodePrivateKey;
-    ed25519_dalek::SigningKey::from_pkcs8_der(bytes).map_err(|_| Error::KeyInvalid)
-}
-
-fn p256_key(bytes: &[u8]) -> Result<p256::ecdsa::SigningKey> {
-    if bytes.len() == 32 {
-        return p256::ecdsa::SigningKey::from_slice(bytes).map_err(|_| Error::KeyInvalid);
-    }
-    use p256::pkcs8::DecodePrivateKey;
-    p256::ecdsa::SigningKey::from_pkcs8_der(bytes).map_err(|_| Error::KeyInvalid)
-}
-
-fn k256_key(bytes: &[u8]) -> Result<k256::ecdsa::SigningKey> {
-    if bytes.len() == 32 {
-        return k256::ecdsa::SigningKey::from_slice(bytes).map_err(|_| Error::KeyInvalid);
-    }
-    use k256::pkcs8::DecodePrivateKey;
-    k256::ecdsa::SigningKey::from_pkcs8_der(bytes).map_err(|_| Error::KeyInvalid)
-}
-
-fn rsa_sign(key: &[u8], message: &[u8], pss: bool) -> Result<Bytes> {
-    use ring::signature::{RSA_PKCS1_SHA256, RSA_PSS_SHA256, RsaKeyPair};
-    let pair = RsaKeyPair::from_pkcs8(key)
-        .or_else(|_| RsaKeyPair::from_der(key))
-        .map_err(|_| Error::KeyInvalid)?;
-    let mut out = Zeroizing::new(vec![0u8; pair.public().modulus_len()]);
-    let rng = ring::rand::SystemRandom::new();
-    let padding: &'static dyn ring::signature::RsaEncoding = if pss {
-        &RSA_PSS_SHA256
-    } else {
-        &RSA_PKCS1_SHA256
-    };
-    pair.sign(padding, &rng, message, &mut out)
-        .map_err(|_| Error::KeyInvalid)?;
-    Ok(out)
-}
-
-fn p384_sign(key: &[u8], message: &[u8]) -> Result<Bytes> {
-    use ring::signature::{ECDSA_P384_SHA384_FIXED_SIGNING, EcdsaKeyPair};
-    let rng = ring::rand::SystemRandom::new();
-    let pair = EcdsaKeyPair::from_pkcs8(&ECDSA_P384_SHA384_FIXED_SIGNING, key, &rng)
-        .map_err(|_| Error::KeyInvalid)?;
-    let signature = pair.sign(&rng, message).map_err(|_| Error::KeyInvalid)?;
-    Ok(Zeroizing::new(signature.as_ref().to_vec()))
-}
-
-fn aes_gcm(key: &[u8], nonce: &[u8], message: &[u8], aad: &[u8]) -> Result<Bytes> {
-    use aes_gcm::aead::{Aead, KeyInit, Payload};
-    use aes_gcm::{Aes128Gcm, Aes256Gcm, Nonce};
-    if nonce.len() != 12 {
-        return Err(Error::KeyInvalid);
-    }
-    let nonce = Nonce::from_slice(nonce);
-    let payload = Payload { msg: message, aad };
-    let out = match key.len() {
-        16 => Aes128Gcm::new_from_slice(key)
-            .map_err(|_| Error::KeyInvalid)?
-            .encrypt(nonce, payload),
-        32 => Aes256Gcm::new_from_slice(key)
-            .map_err(|_| Error::KeyInvalid)?
-            .encrypt(nonce, payload),
-        _ => return Err(Error::KeyInvalid),
-    };
-    out.map(Zeroizing::new).map_err(|_| Error::Encoding)
-}
-
-fn aes_cbc(key: &[u8], iv: &[u8], message: &[u8]) -> Result<Bytes> {
-    use cbc::cipher::{BlockEncryptMut, KeyIvInit, block_padding::Pkcs7};
-    let out = match key.len() {
-        16 => cbc::Encryptor::<aes::Aes128>::new_from_slices(key, iv)
-            .map_err(|_| Error::KeyInvalid)?
-            .encrypt_padded_vec_mut::<Pkcs7>(message),
-        24 => cbc::Encryptor::<aes::Aes192>::new_from_slices(key, iv)
-            .map_err(|_| Error::KeyInvalid)?
-            .encrypt_padded_vec_mut::<Pkcs7>(message),
-        32 => cbc::Encryptor::<aes::Aes256>::new_from_slices(key, iv)
-            .map_err(|_| Error::KeyInvalid)?
-            .encrypt_padded_vec_mut::<Pkcs7>(message),
-        _ => return Err(Error::KeyInvalid),
-    };
-    Ok(Zeroizing::new(out))
-}
-
-fn big_endian(text: &[u8], bytes: usize) -> Result<Bytes> {
-    let value: u64 = core::str::from_utf8(text)
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .ok_or(Error::TemplateInvalid)?;
-    let all = value.to_be_bytes();
-    let (high, low) = all.split_at(8 - bytes);
-    if high.iter().any(|b| *b != 0) {
-        return Err(Error::TemplateInvalid);
-    }
-    Ok(Zeroizing::new(low.to_vec()))
-}
-
-fn call(func: Func, args: &[Bytes], unix: u64) -> Result<Bytes> {
-    let a = arg(args, 0)?;
-    Ok(match func {
-        Func::B64 => b64(&STANDARD, a)?,
-        Func::B64Raw => b64(&STANDARD_NO_PAD, a)?,
-        Func::B64Url => b64(&URL_SAFE, a)?,
-        Func::B64UrlRaw => b64(&URL_SAFE_NO_PAD, a)?,
-        Func::B64Decode => b64_decode(a)?,
-        Func::B32Decode => b32_decode(a)?,
-        Func::Hex => hex(a),
-        Func::HexDecode => hex_decode(a)?,
-        Func::Pct => pct(a),
-        Func::PctDecode => pct_decode(a)?,
-        Func::Json => json_escape(a),
-        Func::Upper => Zeroizing::new(a.to_ascii_uppercase()),
-        Func::Lower => Zeroizing::new(a.to_ascii_lowercase()),
-        Func::Trim => Zeroizing::new(a.trim_ascii().to_vec()),
-        Func::Replace => replace(a, arg(args, 1)?, arg(args, 2)?)?,
-        Func::Pem => pem_body(a)?,
-        Func::JsonSet => json_set(a, arg(args, 1)?, arg(args, 2)?)?,
-        Func::CanonicalQuery => canonical_query(a)?,
-        Func::Time => time_format(a, arg(args, 1)?)?,
-        Func::Len => Zeroizing::new(a.len().to_string().into_bytes()),
-        Func::Be16 => big_endian(a, 2)?,
-        Func::Be32 => big_endian(a, 4)?,
-        Func::Xor => {
-            let b = arg(args, 1)?;
-            if a.len() != b.len() {
-                return Err(Error::Encoding);
-            }
-            Zeroizing::new(a.iter().zip(b).map(|(x, y)| x ^ y).collect())
-        }
-        Func::Md5 => Zeroizing::new(md5::Md5::digest(a).to_vec()),
-        Func::Sha1 => Zeroizing::new(Sha1::digest(a).to_vec()),
-        Func::Sha256 => Zeroizing::new(Sha256::digest(a).to_vec()),
-        Func::Sha512 => Zeroizing::new(Sha512::digest(a).to_vec()),
-        Func::Keccak256 => Zeroizing::new(sha3::Keccak256::digest(a).to_vec()),
-        Func::HmacSha1 => mac::<Hmac<Sha1>>(a, arg(args, 1)?)?,
-        Func::HmacSha256 => mac::<Hmac<Sha256>>(a, arg(args, 1)?)?,
-        Func::HmacSha512 => mac::<Hmac<Sha512>>(a, arg(args, 1)?)?,
-        Func::Pbkdf2Sha256 => {
-            let rounds = number(args, 2, 0)?;
-            let length =
-                usize::try_from(number(args, 3, 32)?).map_err(|_| Error::TemplateInvalid)?;
-            if rounds == 0 || rounds > MAX_PBKDF2_ROUNDS || !(1..=64).contains(&length) {
-                return Err(Error::TemplateInvalid);
-            }
-            let mut out = Zeroizing::new(vec![0u8; length]);
-            let rounds = u32::try_from(rounds).map_err(|_| Error::TemplateInvalid)?;
-            pbkdf2::pbkdf2_hmac::<Sha256>(a, arg(args, 1)?, rounds, &mut out);
+            ctx.budget.room(primitives::output_bound(*func, &args))?;
+            let out = primitives::call(*func, &args, ctx.unix, ctx.budget)?;
+            ctx.budget.bytes(out.len())?;
             out
         }
-        Func::Totp => {
-            let digits = u32::try_from(number(args, 1, 6)?).map_err(|_| Error::TemplateInvalid)?;
-            let period = number(args, 2, 30)?;
-            let code = totp::code(a, unix, digits, period)?;
-            let width = usize::try_from(digits).map_err(|_| Error::TemplateInvalid)?;
-            Zeroizing::new(format!("{code:0width$}").into_bytes())
-        }
-        Func::Ed25519Sign => {
-            Zeroizing::new(ed25519_key(a)?.sign(arg(args, 1)?).to_bytes().to_vec())
-        }
-        Func::P256Sign | Func::P256SignDer => {
-            use p256::ecdsa::signature::Signer as _;
-            let signature: p256::ecdsa::Signature = p256_key(a)?.sign(arg(args, 1)?);
-            Zeroizing::new(if func == Func::P256Sign {
-                signature.to_bytes().to_vec()
-            } else {
-                signature.to_der().as_bytes().to_vec()
-            })
-        }
-        Func::P384Sign => p384_sign(a, arg(args, 1)?)?,
-        Func::K256Sign => {
-            use k256::ecdsa::signature::Signer as _;
-            let signature: k256::ecdsa::Signature = k256_key(a)?.sign(arg(args, 1)?);
-            Zeroizing::new(signature.to_bytes().to_vec())
-        }
-        Func::K256SignRecoverable => {
-            let digest = arg(args, 1)?;
-            if digest.len() != 32 {
-                return Err(Error::TemplateInvalid);
-            }
-            let (signature, id) = k256_key(a)?
-                .sign_prehash_recoverable(digest)
-                .map_err(|_| Error::KeyInvalid)?;
-            let mut out = Zeroizing::new(signature.to_bytes().to_vec());
-            out.push(27 + id.to_byte());
-            out
-        }
-        Func::RsaSignPkcs1Sha256 => rsa_sign(a, arg(args, 1)?, false)?,
-        Func::RsaSignPssSha256 => rsa_sign(a, arg(args, 1)?, true)?,
-        Func::AesGcmEncrypt => {
-            let aad = args.get(3).map_or(&[][..], |v| v.as_slice());
-            aes_gcm(a, arg(args, 1)?, arg(args, 2)?, aad)?
-        }
-        Func::AesCbcEncrypt => aes_cbc(a, arg(args, 1)?, arg(args, 2)?)?,
     })
 }
 
@@ -1025,11 +774,13 @@ mod tests {
 
     fn render(text: &str, fields: &Fields) -> Vec<u8> {
         let temps = Temps::new();
+        let budget = Budget::default();
         let ctx = Context {
             fields,
             temps: &temps,
-            vars: HashMap::new(),
+            vars: HashMap::from([(Var::Input, b"in".to_vec())]),
             unix: 59,
+            budget: &budget,
         };
         Template::parse(text)
             .unwrap()
@@ -1046,7 +797,8 @@ mod tests {
         fields
             .insert("seed", b"GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ".to_vec())
             .unwrap();
-        let cases: [(&str, &[u8]); 13] = [
+        fields.insert("api-key", b"k-1".to_vec()).unwrap();
+        let cases: [(&str, &[u8]); 18] = [
             (
                 r#"Basic {{ b64(user + ":" + password) }}"#,
                 b"Basic Ym90OnBAc3Mgd29yZA==",
@@ -1057,11 +809,13 @@ mod tests {
                 "{{json_set(\"{\\\"a\\\":1}\", \"k\", password)}}",
                 br#"{"a":1,"k":"p@ss word"}"#,
             ),
+            (r#"{{ json_set("{}", "k", user) }}"#, br#"{"k":"bot"}"#),
             (
                 r#"{{ time("784111777", "%a, %d %b %Y %H:%M:%S GMT") }}"#,
                 b"Sun, 06 Nov 1994 08:49:37 GMT",
             ),
             (r#"{{ time("951782400", "%Y-%m-%d") }}"#, b"2000-02-29"),
+            (r#"{{ time("-86400", "%Y-%m-%d") }}"#, b"1969-12-31"),
             (
                 r#"{{ canonical_query("b=2&a=x%2Fy&a=1&c") }}"#,
                 b"a=1&a=x%2Fy&b=2&c=",
@@ -1082,6 +836,10 @@ mod tests {
                 b"c5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470",
             ),
             (r#"{{ hex(md5("")) }}"#, b"d41d8cd98f00b204e9800998ecf8427e"),
+            // Text after the last expression may hold `}}`: a nested JSON body.
+            (r#"{"o":{"u":"{{user}}"}}"#, br#"{"o":{"u":"bot"}}"#),
+            ("{{ api-key }}", b"k-1"),
+            (r#"{{ b64decode("YWJj=") + b64decode("YWJk") }}"#, b"abcabd"),
         ];
         for (template, expected) in cases {
             assert_eq!(render(template, &fields), expected, "{template}");
@@ -1096,17 +854,65 @@ mod tests {
             "{{ b64() }}",
             "{{ unknown(x) }}",
             "{{ $nope }}",
-            "a }} b",
             "{{ \"x }}",
         ] {
-            assert!(Template::parse(text).is_err(), "{text}");
+            assert!(
+                matches!(Template::parse(text), Err(Error::TemplateSyntax { .. })),
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn budget_stops_runaway_templates() {
+        let mut fields = Fields::new();
+        fields.insert("k", vec![b'a'; 1024]).unwrap();
+        let temps = Temps::new();
+        let budget = Budget {
+            bytes: Cell::new(1 << 20),
+            ..Budget::default()
+        };
+        let ctx = Context {
+            fields: &fields,
+            temps: &temps,
+            vars: HashMap::new(),
+            unix: 0,
+            budget: &budget,
+        };
+        let nested = format!("{{{{ {}k{} }}}}", "hex(".repeat(20), ")".repeat(20));
+        assert_eq!(
+            Template::parse(&nested).unwrap().render(&ctx).map(|_| ()),
+            Err(Error::Budget { what: "bytes" })
+        );
+        let budget = Budget {
+            rounds: Cell::new(10),
+            ..Budget::default()
+        };
+        let ctx = Context {
+            budget: &budget,
+            ..ctx
+        };
+        let rounds = r#"{{ pbkdf2_sha256(k, "s", "6") + pbkdf2_sha256(k, "s", "5") }}"#;
+        assert_eq!(
+            Template::parse(rounds).unwrap().render(&ctx).map(|_| ()),
+            Err(Error::Budget {
+                what: "pbkdf2 rounds"
+            })
+        );
+    }
+
+    fn kind(name: &str) -> NameKind {
+        match name {
+            "key" | "msg" => NameKind::SecretField,
+            "session" => NameKind::SecretTemp,
+            "nonce_t" => NameKind::PublicTemp,
+            _ => NameKind::PublicField,
         }
     }
 
     #[test]
     fn taint_follows_reversible_functions_only() {
-        let secret = |n: &str| n == "key" || n == "msg";
-        let tainted = |t: &str| Template::parse(t).unwrap().tainted(&secret);
+        let tainted = |t: &str| Template::parse(t).unwrap().analyze(&kind).unwrap();
         assert!(tainted("{{key}}"));
         assert!(tainted("{{ b64(hexdecode(hex(key))) }}"));
         assert!(tainted("x{{ \"a\" + key }}"));
@@ -1114,12 +920,51 @@ mod tests {
         assert!(tainted(
             r#"{{ aes_gcm_encrypt("0123456789abcdef", "000000000000", msg) }}"#
         ));
+        // A key that is not a secret field in substance.
+        assert!(tainted(
+            r#"{{ aes_gcm_encrypt(xor(key, key), "000000000000", key) }}"#
+        ));
+        assert!(tainted(
+            r#"{{ aes_cbc_encrypt("0123456789abcdef", key, "x") }}"#
+        ));
+        assert!(tainted(
+            r#"{{ aes_gcm_encrypt(key, "000000000000", "x", msg) }}"#
+        ));
         assert!(!tainted(
             r#"{{ aes_gcm_encrypt(key, "000000000000", msg) }}"#
+        ));
+        assert!(!tainted(
+            r#"{{ aes_gcm_encrypt(sha256(key), hexdecode(replace($nonce, "00000000", "")), msg + $input) }}"#
         ));
         assert!(!tainted("{{ hex(hmac_sha256(key, $input)) }}"));
         assert!(!tainted("{{ b64(rsa_sign_pkcs1_sha256(key, $input)) }}"));
         assert!(!tainted("{{ len(key) }}"));
         assert!(!tainted("{{ user }}"));
+    }
+
+    #[test]
+    fn oracles_are_refused() {
+        let refused = |t: &str| Template::parse(t).unwrap().analyze(&kind).is_err();
+        for template in [
+            r#"{{ len(replace(key, $input, "")) }}"#,
+            r#"{{ sha256(xor(key, $input)) }}"#,
+            r#"{{ sha256(b64decode(key + $input)) }}"#,
+            r#"{{ json_set(key, $input, "x") }}"#,
+            r#"{{ hmac_sha256(sha256(b64decode(session + "x")), "m") }}"#,
+            r#"{{ ed25519_sign(key + $input, "m") }}"#,
+            r#"{{ aes_gcm_encrypt(key, "000000000000", msg + $input) }}"#,
+            r#"{{ totp(key, key + $input) }}"#,
+        ] {
+            let result = Template::parse(template).unwrap().analyze(&kind);
+            if template.contains("aes_gcm_encrypt") {
+                // Not refused, but tainted: a fixed nonce with a chosen message.
+                assert_eq!(result, Ok(true), "{template}");
+            } else {
+                assert!(refused(template), "{template}");
+            }
+        }
+        assert!(!refused(r#"{{ sha256(key + $input) }}"#));
+        assert!(!refused(r#"{{ replace($body, "a", "b") }}"#));
+        assert!(!refused(r#"{{ pbkdf2_sha256(key, $input, "1000") }}"#));
     }
 }

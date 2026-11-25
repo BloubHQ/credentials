@@ -1,12 +1,13 @@
-//! Policies: which fields a record holds and what may be done with them, as data.
+//! Policies: which fields a record holds, who may use them, and how, as data.
 //!
 //! The engine knows no kind of credential and no protocol flow. A policy names the fields of
-//! its record and a list of named [`Operation`]s:
+//! its record, the callers that may use it, and a list of named [`Operation`]s:
 //!
 //! - [`Operation::Http`]: one or more HTTP [`Step`]s. A step sends either the request of the
-//!   caller or a request the policy fixes, puts rendered templates into it, and may capture
-//!   values from its response, either into a field of the record (a refreshed token, which
-//!   the node seals into a new record) or into a value later steps read (a session cookie, a
+//!   caller (within the destinations, methods, paths and headers of the operation) or a
+//!   request the policy fixes, puts rendered templates into it, and may capture values from
+//!   its response, either into a secret field of the record (a refreshed token, which the
+//!   node seals into a new record) or into a value later steps read (a session cookie, a
 //!   challenge nonce). The response of the last step goes back to the caller.
 //! - [`Operation::Stream`]: a script of sends and expects over one TLS connection, for
 //!   protocols that are not HTTP (IMAP, SMTP, line protocols), followed by the exchanges of
@@ -14,7 +15,8 @@
 //! - [`Operation::Derive`]: a template whose output goes back to the caller; it must not be
 //!   tainted.
 //!
-//! Http and Stream operations may present a client certificate ([`Identity`]).
+//! Every call names a [`Caller`] of the policy and carries its signature; a caller may use only
+//! the operations it lists, at most at its [`Limit`].
 //!
 //! The device of the owner signs the policy, and the policy is bound to the ciphertext of its
 //! record, so the operator can neither widen it nor move it to another record.
@@ -22,16 +24,20 @@
 use serde::{Deserialize, Serialize};
 
 use crate::encoding::{b64_array, canonical};
-use crate::keys::{DeviceKey, DevicePublicKey};
-use crate::template::{Template, Var};
+use crate::keys::{CallerPublicKey, DeviceKey, DevicePublicKey};
+use crate::template::{NameKind, Template, Var};
 use crate::{Error, Result};
 
-const POLICY_DOMAIN: &[u8] = b"policy/v2\0";
+const POLICY_DOMAIN: &[u8] = b"policy/v3\0";
 
 /// Most operations of a policy.
 pub const MAX_OPERATIONS: usize = 16;
+/// Most callers of a policy.
+pub const MAX_CALLERS: usize = 32;
 /// Most destinations of an operation.
 pub const MAX_DESTINATIONS: usize = 32;
+/// Most path prefixes of an operation.
+pub const MAX_PATHS: usize = 32;
 /// Most steps of an HTTP operation.
 pub const MAX_STEPS: usize = 8;
 /// Most injections of a step.
@@ -40,16 +46,29 @@ pub const MAX_INJECTIONS: usize = 16;
 pub const MAX_CAPTURES: usize = 16;
 /// Most entries of a stream script.
 pub const MAX_SCRIPT: usize = 32;
+/// Most delimiters of one expect.
+pub const MAX_DELIMITERS: usize = 8;
 /// Longest delimiter of an expect, in bytes.
 pub const MAX_DELIMITER: usize = 256;
 
-/// Headers the engine sets itself; neither an injection nor a caller may name them.
-pub(crate) const RESERVED_HEADERS: [&str; 5] = [
+/// Headers the engine sets itself, or that change how a server reads or answers a request;
+/// neither an injection nor a caller may name them.
+pub(crate) const RESERVED_HEADERS: [&str; 15] = [
     "host",
     "content-length",
     "transfer-encoding",
     "connection",
     "upgrade",
+    "te",
+    "trailer",
+    "expect",
+    "accept-encoding",
+    "range",
+    "if-range",
+    "keep-alive",
+    "x-http-method-override",
+    "x-http-method",
+    "x-method-override",
 ];
 
 fn is_false(b: &bool) -> bool {
@@ -68,6 +87,57 @@ pub struct FieldSpec {
     /// True when the record may lack the field (one an operation fills in later).
     #[serde(default, skip_serializing_if = "is_false")]
     pub optional: bool,
+}
+
+impl FieldSpec {
+    /// A secret field.
+    pub fn secret(name: &str) -> Self {
+        Self {
+            name: name.into(),
+            secret: true,
+            optional: false,
+        }
+    }
+
+    /// A public field.
+    pub fn public(name: &str) -> Self {
+        Self {
+            name: name.into(),
+            secret: false,
+            optional: false,
+        }
+    }
+
+    /// The same field, optional.
+    pub fn optional(mut self) -> Self {
+        self.optional = true;
+        self
+    }
+}
+
+/// How often a caller may use a record.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Limit {
+    /// Most calls in one window.
+    pub count: u32,
+    /// The window, in milliseconds.
+    pub window_ms: u64,
+}
+
+/// An application or agent that may use the record.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Caller {
+    /// Its name in the log.
+    pub name: String,
+    /// The key that signs its calls.
+    pub key: CallerPublicKey,
+    /// The operations it may use.
+    pub operations: Vec<String>,
+    /// How often it may call, over all its operations on this record.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<Limit>,
 }
 
 /// Where an injection puts its rendered template.
@@ -103,36 +173,67 @@ pub struct Injection {
     pub template: String,
 }
 
-/// HTTP method.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "UPPERCASE")]
-pub enum Method {
-    /// GET
-    Get,
-    /// POST
-    Post,
-    /// PUT
-    Put,
-    /// PATCH
-    Patch,
-    /// DELETE
-    Delete,
-}
+impl Injection {
+    /// A header injection.
+    pub fn header(name: &str, template: &str) -> Self {
+        Self {
+            target: Target::Header { name: name.into() },
+            template: template.into(),
+        }
+    }
 
-impl Method {
-    /// The token of the method.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Method::Get => "GET",
-            Method::Post => "POST",
-            Method::Put => "PUT",
-            Method::Patch => "PATCH",
-            Method::Delete => "DELETE",
+    /// A query injection.
+    pub fn query(name: &str, template: &str) -> Self {
+        Self {
+            target: Target::Query { name: name.into() },
+            template: template.into(),
+        }
+    }
+
+    /// A body injection.
+    pub fn body(template: &str) -> Self {
+        Self {
+            target: Target::Body,
+            template: template.into(),
         }
     }
 }
 
-/// A TLS destination: an exact host name and a port. No wildcard.
+macro_rules! methods {
+    ($( $variant:ident = $name:literal ),* $(,)?) => {
+        /// HTTP method.
+        #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+        pub enum Method {
+            $( #[doc = $name] #[serde(rename = $name)] $variant, )*
+        }
+
+        impl Method {
+            /// The token of the method.
+            pub fn as_str(self) -> &'static str {
+                match self { $( Method::$variant => $name, )* }
+            }
+        }
+    };
+}
+
+methods! {
+    Get = "GET",
+    Head = "HEAD",
+    Post = "POST",
+    Put = "PUT",
+    Patch = "PATCH",
+    Delete = "DELETE",
+    Options = "OPTIONS",
+    Propfind = "PROPFIND",
+    Report = "REPORT",
+    Mkcol = "MKCOL",
+    Copy = "COPY",
+    Move = "MOVE",
+}
+
+/// A TLS destination: a host name and a port. In a policy the host may start with `*.`,
+/// which stands for exactly one label (`*.example.com` matches `a.example.com`, not
+/// `example.com` nor `a.b.example.com`).
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Destination {
@@ -142,31 +243,64 @@ pub struct Destination {
     pub port: u16,
 }
 
+fn is_label(label: &[u8]) -> bool {
+    !label.is_empty()
+        && label.len() <= 63
+        && label
+            .iter()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || *b == b'-')
+        && label.first() != Some(&b'-')
+        && label.last() != Some(&b'-')
+}
+
 impl Destination {
     /// A destination on port 443.
     pub fn https(host: &str) -> Self {
         Self::new(host, 443)
     }
 
-    /// A destination on `port`.
+    /// A destination on `port`. The host is lowercased.
     pub fn new(host: &str, port: u16) -> Self {
         Self {
-            host: host.to_string(),
+            host: host.to_ascii_lowercase(),
             port,
         }
     }
 
-    fn validate(&self) -> Result<()> {
-        let host = self.host.as_bytes();
-        let valid_chars = host
-            .iter()
-            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || *b == b'.' || *b == b'-');
-        let edges_ok = !matches!(host.first(), Some(b'.' | b'-') | None)
-            && !matches!(host.last(), Some(b'.' | b'-') | None);
-        if host.len() > 253 || !valid_chars || !edges_ok || self.port == 0 {
-            return Err(Error::PolicyInvalid);
+    /// True when the host is a pattern.
+    pub fn is_wildcard(&self) -> bool {
+        self.host.starts_with("*.")
+    }
+
+    /// True for a host name of labels (no pattern) and a port that is not 0.
+    pub fn is_concrete(&self) -> bool {
+        self.port != 0
+            && self.host.len() <= 253
+            && self.host.split('.').all(|l| is_label(l.as_bytes()))
+    }
+
+    fn is_valid_pattern(&self) -> bool {
+        match self.host.strip_prefix("*.") {
+            Some(rest) => {
+                rest.split('.').count() >= 2 && Destination::new(rest, self.port).is_concrete()
+            }
+            None => self.is_concrete(),
         }
-        Ok(())
+    }
+
+    /// True when the concrete destination `other` is one this destination names.
+    pub fn matches(&self, other: &Destination) -> bool {
+        if !other.is_concrete() || self.port != other.port {
+            return false;
+        }
+        match self.host.strip_prefix("*.") {
+            Some(suffix) => other
+                .host
+                .strip_suffix(suffix)
+                .and_then(|h| h.strip_suffix('.'))
+                .is_some_and(|label| !label.is_empty() && !label.contains('.')),
+            None => self.host == other.host,
+        }
     }
 }
 
@@ -193,7 +327,8 @@ pub enum StepRequest {
         method: Method,
         /// Path and query, starting with `/`.
         path: String,
-        /// Destination; the first destination of the operation when absent.
+        /// Destination (concrete). It may be left out only when the operation has exactly one
+        /// destination and that one is concrete.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         destination: Option<Destination>,
     },
@@ -211,18 +346,23 @@ pub enum Source {
         name: String,
     },
     /// A `param=value` or `param="value"` inside a header value (as in `WWW-Authenticate`).
+    /// With `scheme`, only a challenge of that scheme is read.
     HeaderParam {
         /// Header name.
         name: String,
         /// Parameter name.
         param: String,
+        /// Authentication scheme, such as `Digest`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        scheme: Option<String>,
     },
     /// The value of the cookie with this name in a `Set-Cookie` header.
     Cookie {
         /// Cookie name.
         name: String,
     },
-    /// A JSON value of the body, by JSON pointer (RFC 6901). Strings are taken unquoted.
+    /// A JSON value of the body, by JSON pointer (RFC 6901). Strings are taken unquoted,
+    /// numbers as written.
     Json {
         /// JSON pointer, such as `/access_token`.
         pointer: String,
@@ -239,23 +379,36 @@ pub enum Source {
 }
 
 impl Source {
-    fn validate(&self, stream: bool) -> Result<()> {
-        let ok = match self {
-            Source::Status | Source::All => !stream || matches!(self, Source::All),
-            Source::Header { name } | Source::Cookie { name } => !stream && is_token(name),
-            Source::HeaderParam { name, param } => !stream && is_token(name) && is_token(param),
-            Source::Json { pointer } => !stream && (pointer.is_empty() || pointer.starts_with('/')),
-            Source::Between { start, end } => {
-                !start.is_empty()
-                    && !end.is_empty()
-                    && start.len() <= MAX_DELIMITER
-                    && end.len() <= MAX_DELIMITER
+    fn rule(&self, stream: bool) -> Option<&'static str> {
+        let http_only = "source not available on a stream";
+        match self {
+            Source::All => None,
+            Source::Status if stream => Some(http_only),
+            Source::Status => None,
+            Source::Header { .. }
+            | Source::Cookie { .. }
+            | Source::HeaderParam { .. }
+            | Source::Json { .. }
+                if stream =>
+            {
+                Some(http_only)
             }
-        };
-        if ok {
-            Ok(())
-        } else {
-            Err(Error::PolicyInvalid)
+            Source::Header { name } | Source::Cookie { name } => {
+                (!is_token(name)).then_some("name is not a token")
+            }
+            Source::HeaderParam {
+                name,
+                param,
+                scheme,
+            } => (!is_token(name) || !is_token(param) || !scheme.as_deref().is_none_or(is_token))
+                .then_some("name is not a token"),
+            Source::Json { pointer } => (!(pointer.is_empty() || pointer.starts_with('/')))
+                .then_some("JSON pointer must be empty or start with /"),
+            Source::Between { start, end } => (start.is_empty()
+                || end.is_empty()
+                || start.len() > MAX_DELIMITER
+                || end.len() > MAX_DELIMITER)
+                .then_some("between needs delimiters of 1 to 256 bytes"),
         }
     }
 }
@@ -264,7 +417,8 @@ impl Source {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Store {
-    /// A field of the record. The node seals the record again and hands the new one back.
+    /// A secret field of the record. The node seals the record again and hands the new one
+    /// back. Only a request the policy fixes may capture into a field.
     Field {
         /// Field name.
         name: String,
@@ -315,10 +469,10 @@ pub enum Exchange {
         /// What is written.
         template: String,
     },
-    /// Reads up to and including `until`.
+    /// Reads up to and including the first of the delimiters `until`.
     Expect {
-        /// The delimiter that ends the read.
-        until: String,
+        /// The delimiters that end the read.
+        until: Vec<String>,
         /// What is taken from the bytes read (only `between` and `all`).
         #[serde(default)]
         capture: Vec<Capture>,
@@ -336,7 +490,15 @@ pub enum Operation {
         /// Destinations its requests may go to.
         destinations: Vec<Destination>,
         /// Methods a request of the caller may use.
+        #[serde(default)]
         methods: Vec<Method>,
+        /// Path prefixes a request of the caller may use (`/v1/` allows `/v1/x`; `/v1`
+        /// allows `/v1`, `/v1/x` and `/v1?q`, not `/v10`).
+        #[serde(default)]
+        paths: Vec<String>,
+        /// Headers a request of the caller may carry (case does not matter).
+        #[serde(default)]
+        caller_headers: Vec<String>,
         /// Client certificate.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         identity: Option<Identity>,
@@ -396,14 +558,20 @@ impl Operation {
             .collect()
     }
 
-    /// True when the destination is one of the operation.
+    /// True when the concrete destination is one the operation names.
     pub fn allows_destination(&self, destination: &Destination) -> bool {
         match self {
             Operation::Http { destinations, .. } | Operation::Stream { destinations, .. } => {
-                destinations.contains(destination)
+                destinations.iter().any(|d| d.matches(destination))
             }
             Operation::Derive { .. } => false,
         }
+    }
+
+    /// True when a step sends the request of the caller.
+    pub fn takes_request(&self) -> bool {
+        matches!(self, Operation::Http { steps, .. }
+            if steps.iter().any(|s| s.request == StepRequest::Caller))
     }
 }
 
@@ -413,6 +581,8 @@ impl Operation {
 pub struct Policy {
     /// The fields of the record.
     pub fields: Vec<FieldSpec>,
+    /// Who may use them.
+    pub callers: Vec<Caller>,
     /// What may be done with them.
     pub operations: Vec<Operation>,
 }
@@ -431,17 +601,51 @@ fn unique<'a>(names: impl Iterator<Item = &'a str>) -> bool {
     names.windows(2).all(|w| w.first() != w.get(1))
 }
 
-fn check_path(path: &str) -> bool {
+/// A path the engine sends: starts with `/`, visible ASCII, no fragment, no `.` or `..`
+/// segment and no encoded `/`, `\` or `.`, so a server cannot read it as another path.
+pub(crate) fn check_path(path: &str) -> bool {
+    let pathname = path.split_once('?').map_or(path, |(p, _)| p);
+    let lower = pathname.to_ascii_lowercase();
     path.starts_with('/')
         && path.len() <= crate::request::MAX_PATH
         && path.bytes().all(|b| b.is_ascii_graphic() && b != b'#')
+        && !pathname.contains('\\')
+        && !["%2f", "%5c", "%2e"].iter().any(|e| lower.contains(e))
+        && !pathname.split('/').any(|s| s == "." || s == "..")
 }
 
-fn check_destinations(destinations: &[Destination]) -> Result<()> {
-    if destinations.is_empty() || destinations.len() > MAX_DESTINATIONS {
-        return Err(Error::PolicyInvalid);
+/// True when `path` is under `prefix` on a segment boundary.
+pub(crate) fn under(path: &str, prefix: &str) -> bool {
+    let Some(rest) = path.strip_prefix(prefix) else {
+        return false;
+    };
+    prefix.ends_with('/') || rest.is_empty() || rest.starts_with('/') || rest.starts_with('?')
+}
+
+type Checked = core::result::Result<(), Error>;
+
+fn fail(at: impl Into<String>, rule: &'static str) -> Checked {
+    Err(Error::policy(at, rule))
+}
+
+fn ensure(ok: bool, at: impl FnOnce() -> String, rule: &'static str) -> Checked {
+    if ok { Ok(()) } else { fail(at(), rule) }
+}
+
+fn check_destinations(at: &str, destinations: &[Destination]) -> Checked {
+    ensure(
+        !destinations.is_empty() && destinations.len() <= MAX_DESTINATIONS,
+        || format!("{at}.destinations"),
+        "1 to 32 destinations",
+    )?;
+    for (i, d) in destinations.iter().enumerate() {
+        ensure(
+            d.is_valid_pattern(),
+            || format!("{at}.destinations[{i}]"),
+            "lowercase host name (or *. and at least two labels) and a port",
+        )?;
     }
-    destinations.iter().try_for_each(Destination::validate)
+    Ok(())
 }
 
 impl Policy {
@@ -453,13 +657,28 @@ impl Policy {
             .is_none_or(|f| f.secret)
     }
 
-    /// True when the name, a field or a temporary value of `operation`, is secret. An unknown
-    /// name counts as secret.
-    pub fn is_secret_in(&self, operation: &Operation, name: &str) -> bool {
-        match operation.temps().into_iter().find(|(n, _)| *n == name) {
-            Some((_, secret)) => secret,
-            None => self.is_secret(name),
+    /// What a name read in `operation` is. An unknown name counts as a secret field.
+    pub fn name_kind(&self, operation: &Operation, name: &str) -> NameKind {
+        if let Some((_, secret)) = operation.temps().into_iter().find(|(n, _)| *n == name) {
+            return if secret {
+                NameKind::SecretTemp
+            } else {
+                NameKind::PublicTemp
+            };
         }
+        if self.is_secret(name) {
+            NameKind::SecretField
+        } else {
+            NameKind::PublicField
+        }
+    }
+
+    /// True when the name, a field or a temporary value of `operation`, is secret.
+    pub fn is_secret_in(&self, operation: &Operation, name: &str) -> bool {
+        matches!(
+            self.name_kind(operation, name),
+            NameKind::SecretField | NameKind::SecretTemp
+        )
     }
 
     fn is_field(&self, name: &str) -> bool {
@@ -474,92 +693,167 @@ impl Policy {
             .ok_or(Error::OperationUnknown)
     }
 
+    /// The caller with this name.
+    pub fn caller(&self, name: &str) -> Result<&Caller> {
+        self.callers
+            .iter()
+            .find(|c| c.name == name)
+            .ok_or(Error::CallerDenied)
+    }
+
+    /// Parses a template, checks its names and variables, and applies the analysis. Returns
+    /// whether its output is tainted.
     fn check_template(
         &self,
+        at: &str,
+        operation: &Operation,
         text: &str,
         temps: &[&str],
         var_ok: fn(Var) -> bool,
-    ) -> Result<Template> {
-        let template = Template::parse(text)?;
+    ) -> Result<bool> {
+        let template = Template::parse(text).map_err(|_| Error::policy(at, "template syntax"))?;
         let known = |name: &str| self.is_field(name) || temps.contains(&name);
-        if !template.names().into_iter().all(known) || !template.vars().into_iter().all(var_ok) {
-            return Err(Error::PolicyInvalid);
+        if !template.names().into_iter().all(known) {
+            return Err(Error::policy(at, "template reads an unknown or later name"));
         }
-        Ok(template)
+        if !template.vars().into_iter().all(var_ok) {
+            return Err(Error::policy(
+                at,
+                "template reads a variable not available here",
+            ));
+        }
+        template
+            .analyze(&|name| self.name_kind(operation, name))
+            .map_err(|rule| Error::policy(at, rule))
     }
 
     fn check_captures<'a>(
         &self,
+        at: &str,
         captures: &'a [Capture],
         stream: bool,
+        fixed: bool,
         temps: &mut Vec<&'a str>,
-    ) -> Result<()> {
-        if captures.len() > MAX_CAPTURES {
-            return Err(Error::PolicyInvalid);
-        }
-        for capture in captures {
-            capture.source.validate(stream)?;
+    ) -> Checked {
+        ensure(
+            captures.len() <= MAX_CAPTURES,
+            || format!("{at}.capture"),
+            "at most 16 captures",
+        )?;
+        for (i, capture) in captures.iter().enumerate() {
+            let at = format!("{at}.capture[{i}]");
+            if let Some(rule) = capture.source.rule(stream) {
+                return fail(at, rule);
+            }
             match &capture.into {
-                Store::Field { name } if self.is_field(name) => {}
-                Store::Temp { name, .. }
-                    if is_token(name)
-                        && !self.is_field(name)
-                        && !temps.contains(&name.as_str()) =>
-                {
+                Store::Field { name } => {
+                    ensure(
+                        self.is_field(name),
+                        || at.clone(),
+                        "capture into an unknown field",
+                    )?;
+                    ensure(
+                        self.is_secret(name),
+                        || at.clone(),
+                        "capture into a public field (a derivation could hand it back)",
+                    )?;
+                    ensure(
+                        fixed,
+                        || at.clone(),
+                        "capture into a field from a request of the caller",
+                    )?;
+                }
+                Store::Temp { name, .. } => {
+                    ensure(
+                        is_token(name) && !self.is_field(name) && !temps.contains(&name.as_str()),
+                        || at.clone(),
+                        "temporary name must be a new token",
+                    )?;
                     temps.push(name);
                 }
-                _ => return Err(Error::PolicyInvalid),
             }
         }
         Ok(())
     }
 
-    fn check_identity(&self, identity: Option<&Identity>) -> Result<()> {
+    fn check_identity(
+        &self,
+        at: &str,
+        operation: &Operation,
+        identity: Option<&Identity>,
+    ) -> Checked {
         if let Some(identity) = identity {
-            self.check_template(&identity.cert, &[], Var::in_stream)?;
-            self.check_template(&identity.key, &[], Var::in_stream)?;
+            self.check_template(
+                &format!("{at}.identity.cert"),
+                operation,
+                &identity.cert,
+                &[],
+                Var::in_stream,
+            )?;
+            self.check_template(
+                &format!("{at}.identity.key"),
+                operation,
+                &identity.key,
+                &[],
+                Var::in_stream,
+            )?;
         }
         Ok(())
     }
 
     fn check_step<'a>(
         &self,
+        at: &str,
+        operation: &Operation,
         step: &'a Step,
         destinations: &[Destination],
         temps: &mut Vec<&'a str>,
-    ) -> Result<()> {
-        if step.inject.len() > MAX_INJECTIONS {
-            return Err(Error::PolicyInvalid);
-        }
+    ) -> Checked {
+        ensure(
+            step.inject.len() <= MAX_INJECTIONS,
+            || format!("{at}.inject"),
+            "at most 16 injections",
+        )?;
         if let StepRequest::Fixed {
             path, destination, ..
         } = &step.request
         {
-            let destination_ok = destination
-                .as_ref()
-                .is_none_or(|d| destinations.contains(d));
-            if !check_path(path) || !destination_ok {
-                return Err(Error::PolicyInvalid);
+            ensure(
+                check_path(path),
+                || format!("{at}.request.path"),
+                "path must start with / and hold no dot segment or encoded separator",
+            )?;
+            match destination {
+                Some(d) => ensure(
+                    d.is_concrete() && destinations.iter().any(|p| p.matches(d)),
+                    || format!("{at}.request.destination"),
+                    "fixed destination must be concrete and one of the operation",
+                )?,
+                None => ensure(
+                    destinations.len() == 1 && destinations.iter().all(Destination::is_concrete),
+                    || format!("{at}.request.destination"),
+                    "fixed request needs a destination unless the operation has one concrete destination",
+                )?,
             }
         }
         let mut headers: Vec<String> = Vec::new();
         let mut bodies = 0;
-        for injection in &step.inject {
+        for (i, injection) in step.inject.iter().enumerate() {
+            let at = format!("{at}.inject[{i}]");
             match &injection.target {
                 Target::Header { name } => {
                     let lower = name.to_ascii_lowercase();
-                    if !is_token(name)
-                        || RESERVED_HEADERS.contains(&lower.as_str())
-                        || headers.contains(&lower)
-                    {
-                        return Err(Error::PolicyInvalid);
-                    }
+                    ensure(
+                        is_token(name)
+                            && !RESERVED_HEADERS.contains(&lower.as_str())
+                            && !headers.contains(&lower),
+                        || at.clone(),
+                        "header must be a token, not reserved, and set once",
+                    )?;
                     headers.push(lower);
                 }
                 Target::Query { name } => {
-                    if !is_token(name) {
-                        return Err(Error::PolicyInvalid);
-                    }
+                    ensure(is_token(name), || at.clone(), "query name is not a token")?;
                 }
                 Target::PathParam { name } => {
                     let placeholder_ok = match &step.request {
@@ -568,41 +862,90 @@ impl Policy {
                         }
                         StepRequest::Caller => true,
                     };
-                    if !is_token(name) || !placeholder_ok {
-                        return Err(Error::PolicyInvalid);
-                    }
+                    ensure(
+                        is_token(name) && placeholder_ok,
+                        || at.clone(),
+                        "path parameter must be a token found once in the path",
+                    )?;
                 }
                 Target::Body => bodies += 1,
             }
-            self.check_template(&injection.template, temps, Var::in_request)?;
+            self.check_template(&at, operation, &injection.template, temps, Var::in_request)?;
         }
-        if bodies > 1 {
-            return Err(Error::PolicyInvalid);
-        }
-        self.check_captures(&step.capture, false, temps)
+        ensure(bodies <= 1, || format!("{at}.inject"), "at most one body")?;
+        let fixed = matches!(step.request, StepRequest::Fixed { .. });
+        self.check_captures(at, &step.capture, false, fixed, temps)
     }
 
-    fn check_operation(&self, operation: &Operation) -> Result<()> {
-        if !is_token(operation.name()) {
-            return Err(Error::PolicyInvalid);
-        }
+    fn check_operation(&self, at: &str, operation: &Operation) -> Checked {
+        ensure(
+            is_token(operation.name()),
+            || format!("{at}.name"),
+            "name is not a token",
+        )?;
         let mut temps: Vec<&str> = Vec::new();
         match operation {
             Operation::Http {
                 destinations,
                 methods,
+                paths,
+                caller_headers,
                 identity,
                 steps,
                 ..
             } => {
-                check_destinations(destinations)?;
-                let has_caller = steps.iter().any(|s| s.request == StepRequest::Caller);
-                if steps.is_empty() || steps.len() > MAX_STEPS || has_caller == methods.is_empty() {
-                    return Err(Error::PolicyInvalid);
+                check_destinations(at, destinations)?;
+                ensure(
+                    !steps.is_empty() && steps.len() <= MAX_STEPS,
+                    || format!("{at}.steps"),
+                    "1 to 8 steps",
+                )?;
+                let has_caller = operation.takes_request();
+                ensure(
+                    has_caller != methods.is_empty(),
+                    || format!("{at}.methods"),
+                    "methods are needed exactly when a step sends the request of the caller",
+                )?;
+                ensure(
+                    has_caller != paths.is_empty() && paths.len() <= MAX_PATHS,
+                    || format!("{at}.paths"),
+                    "paths are needed exactly when a step sends the request of the caller",
+                )?;
+                for (i, path) in paths.iter().enumerate() {
+                    ensure(
+                        check_path(path) && !path.contains('?'),
+                        || format!("{at}.paths[{i}]"),
+                        "path prefix must start with / and hold no query or dot segment",
+                    )?;
                 }
-                self.check_identity(identity.as_ref())?;
-                for step in steps {
-                    self.check_step(step, destinations, &mut temps)?;
+                for (i, name) in caller_headers.iter().enumerate() {
+                    ensure(
+                        has_caller,
+                        || format!("{at}.caller_headers"),
+                        "caller headers need a step that sends the request of the caller",
+                    )?;
+                    let lower = name.to_ascii_lowercase();
+                    ensure(
+                        is_token(name) && !RESERVED_HEADERS.contains(&lower.as_str()),
+                        || format!("{at}.caller_headers[{i}]"),
+                        "caller header must be a token and not reserved",
+                    )?;
+                }
+                self.check_identity(at, operation, identity.as_ref())?;
+                for (i, step) in steps.iter().enumerate() {
+                    let at = format!("{at}.steps[{i}]");
+                    self.check_step(&at, operation, step, destinations, &mut temps)?;
+                    let injected = step.inject.iter().any(|inj| match &inj.target {
+                        Target::Header { name } => {
+                            caller_headers.iter().any(|h| h.eq_ignore_ascii_case(name))
+                        }
+                        _ => false,
+                    });
+                    ensure(
+                        !(step.request == StepRequest::Caller && injected),
+                        || at.clone(),
+                        "a caller header is also injected",
+                    )?;
                 }
             }
             Operation::Stream {
@@ -611,30 +954,74 @@ impl Policy {
                 script,
                 ..
             } => {
-                check_destinations(destinations)?;
-                if script.is_empty() || script.len() > MAX_SCRIPT {
-                    return Err(Error::PolicyInvalid);
-                }
-                self.check_identity(identity.as_ref())?;
-                for exchange in script {
+                check_destinations(at, destinations)?;
+                ensure(
+                    !script.is_empty() && script.len() <= MAX_SCRIPT,
+                    || format!("{at}.script"),
+                    "1 to 32 script entries",
+                )?;
+                self.check_identity(at, operation, identity.as_ref())?;
+                for (i, exchange) in script.iter().enumerate() {
+                    let at = format!("{at}.script[{i}]");
                     match exchange {
                         Exchange::Send { template } => {
-                            self.check_template(template, &temps, Var::in_stream)?;
+                            self.check_template(&at, operation, template, &temps, Var::in_stream)?;
                         }
                         Exchange::Expect { until, capture } => {
-                            if until.is_empty() || until.len() > MAX_DELIMITER {
-                                return Err(Error::PolicyInvalid);
-                            }
-                            self.check_captures(capture, true, &mut temps)?;
+                            ensure(
+                                !until.is_empty()
+                                    && until.len() <= MAX_DELIMITERS
+                                    && until
+                                        .iter()
+                                        .all(|u| !u.is_empty() && u.len() <= MAX_DELIMITER),
+                                || format!("{at}.until"),
+                                "1 to 8 delimiters of 1 to 256 bytes",
+                            )?;
+                            self.check_captures(&at, capture, true, true, &mut temps)?;
                         }
                     }
                 }
             }
             Operation::Derive { template, .. } => {
-                let template = self.check_template(template, &[], Var::in_derive)?;
-                if template.tainted(&|name| self.is_secret(name)) {
-                    return Err(Error::PolicyInvalid);
-                }
+                let at = format!("{at}.template");
+                let tainted = self.check_template(&at, operation, template, &[], Var::in_derive)?;
+                ensure(!tainted, || at, "a derivation would hand a secret back")?;
+            }
+        }
+        Ok(())
+    }
+
+    fn check_callers(&self) -> Checked {
+        ensure(
+            !self.callers.is_empty() && self.callers.len() <= MAX_CALLERS,
+            || "callers".into(),
+            "1 to 32 callers",
+        )?;
+        ensure(
+            unique(self.callers.iter().map(|c| c.name.as_str())),
+            || "callers".into(),
+            "caller names must be unique",
+        )?;
+        for (i, caller) in self.callers.iter().enumerate() {
+            let at = format!("callers[{i}]");
+            ensure(
+                is_token(&caller.name),
+                || format!("{at}.name"),
+                "name is not a token",
+            )?;
+            ensure(
+                !caller.operations.is_empty()
+                    && caller.operations.iter().all(|o| self.operation(o).is_ok())
+                    && unique(caller.operations.iter().map(String::as_str)),
+                || format!("{at}.operations"),
+                "operations must be names of operations, each once",
+            )?;
+            if let Some(limit) = caller.limit {
+                ensure(
+                    limit.count > 0 && limit.count <= 1_000_000 && limit.window_ms > 0,
+                    || format!("{at}.limit"),
+                    "limit needs a count of 1 to 1000000 and a window",
+                )?;
             }
         }
         Ok(())
@@ -642,23 +1029,101 @@ impl Policy {
 
     /// Checks the rules of the policy, including every template and the taint of derivations.
     pub fn validate(&self) -> Result<()> {
-        if self.fields.is_empty()
-            || self.fields.len() > crate::fields::MAX_FIELDS
-            || !self.fields.iter().all(|f| is_token(&f.name))
-            || !unique(self.fields.iter().map(|f| f.name.as_str()))
-            || self.operations.is_empty()
-            || self.operations.len() > MAX_OPERATIONS
-            || !unique(self.operations.iter().map(Operation::name))
-        {
-            return Err(Error::PolicyInvalid);
+        ensure(
+            !self.fields.is_empty() && self.fields.len() <= crate::fields::MAX_FIELDS,
+            || "fields".into(),
+            "1 to 32 fields",
+        )?;
+        for (i, field) in self.fields.iter().enumerate() {
+            ensure(
+                is_token(&field.name),
+                || format!("fields[{i}].name"),
+                "name is not a token",
+            )?;
         }
-        self.operations
-            .iter()
-            .try_for_each(|o| self.check_operation(o))
+        ensure(
+            unique(self.fields.iter().map(|f| f.name.as_str())),
+            || "fields".into(),
+            "field names must be unique",
+        )?;
+        ensure(
+            !self.operations.is_empty() && self.operations.len() <= MAX_OPERATIONS,
+            || "operations".into(),
+            "1 to 16 operations",
+        )?;
+        ensure(
+            unique(self.operations.iter().map(Operation::name)),
+            || "operations".into(),
+            "operation names must be unique",
+        )?;
+        for (i, operation) in self.operations.iter().enumerate() {
+            self.check_operation(&format!("operations[{i}]"), operation)?;
+        }
+        self.check_callers()
+    }
+
+    /// What the policy allows, in plain lines, for the owner to read before signing.
+    pub fn summary(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        for field in &self.fields {
+            out.push(format!(
+                "field {}: {}{}",
+                field.name,
+                if field.secret { "secret" } else { "public" },
+                if field.optional { ", optional" } else { "" }
+            ));
+        }
+        for operation in &self.operations {
+            let names = |d: &[Destination]| {
+                d.iter()
+                    .map(|d| format!("{}:{}", d.host, d.port))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+            out.push(match operation {
+                Operation::Http {
+                    name,
+                    destinations,
+                    methods,
+                    paths,
+                    steps,
+                    ..
+                } => format!(
+                    "operation {name}: HTTP to {} ({} steps; caller methods [{}] under [{}])",
+                    names(destinations),
+                    steps.len(),
+                    methods
+                        .iter()
+                        .map(|m| m.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    paths.join(", ")
+                ),
+                Operation::Stream {
+                    name, destinations, ..
+                } => format!("operation {name}: stream to {}", names(destinations)),
+                Operation::Derive { name, template } => {
+                    format!("operation {name}: derive {template}")
+                }
+            });
+        }
+        for caller in &self.callers {
+            out.push(format!(
+                "caller {} ({}): {}{}",
+                caller.name,
+                caller.key.to_b64(),
+                caller.operations.join(", "),
+                caller
+                    .limit
+                    .map(|l| format!(", at most {} per {} ms", l.count, l.window_ms))
+                    .unwrap_or_default()
+            ));
+        }
+        out
     }
 }
 
-/// A policy with the signature of the device of its owner.
+/// A policy with the signature of a device of its owner.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SignedPolicy {
@@ -672,10 +1137,18 @@ pub struct SignedPolicy {
 impl SignedPolicy {
     /// Verifies the signature under the key of the device and the rules of the policy.
     pub fn verify(&self, device: &DevicePublicKey) -> Result<&Policy> {
+        self.verify_any(core::slice::from_ref(device))
+    }
+
+    /// Verifies the signature under one of `devices` and the rules of the policy.
+    pub fn verify_any(&self, devices: &[DevicePublicKey]) -> Result<&Policy> {
         let message = canonical(POLICY_DOMAIN, &self.policy)?;
-        device
-            .verify(&message, &self.signature)
-            .map_err(|_| Error::PolicySignature)?;
+        if !devices
+            .iter()
+            .any(|d| d.verify(&message, &self.signature).is_ok())
+        {
+            return Err(Error::PolicySignature);
+        }
         self.policy.validate()?;
         Ok(&self.policy)
     }
@@ -697,31 +1170,31 @@ impl DeviceKey {
 #[allow(clippy::unwrap_used, clippy::indexing_slicing, clippy::panic)]
 mod tests {
     use super::*;
+    use crate::keys::CallerKey;
 
-    fn secret(name: &str) -> FieldSpec {
-        FieldSpec {
-            name: name.into(),
-            secret: true,
-            optional: false,
+    fn caller(operations: &[&str]) -> Caller {
+        Caller {
+            name: "app".into(),
+            key: CallerKey::generate().public(),
+            operations: operations.iter().map(|o| o.to_string()).collect(),
+            limit: None,
         }
     }
 
     fn bearer() -> Policy {
         Policy {
-            fields: vec![secret("token")],
+            fields: vec![FieldSpec::secret("token")],
+            callers: vec![caller(&["call"])],
             operations: vec![Operation::Http {
                 name: "call".into(),
                 destinations: vec![Destination::https("api.example.com")],
                 methods: vec![Method::Get],
+                paths: vec!["/v1/".into()],
+                caller_headers: vec![],
                 identity: None,
                 steps: vec![Step {
                     request: StepRequest::Caller,
-                    inject: vec![Injection {
-                        target: Target::Header {
-                            name: "Authorization".into(),
-                        },
-                        template: "Bearer {{token}}".into(),
-                    }],
+                    inject: vec![Injection::header("Authorization", "Bearer {{token}}")],
                     capture: vec![],
                 }],
             }],
@@ -730,7 +1203,8 @@ mod tests {
 
     fn derive_only(template: &str) -> Policy {
         Policy {
-            fields: vec![secret("key")],
+            fields: vec![FieldSpec::secret("key")],
+            callers: vec![caller(&["sign"])],
             operations: vec![Operation::Derive {
                 name: "sign".into(),
                 template: template.into(),
@@ -742,6 +1216,13 @@ mod tests {
         match &mut p.operations[0] {
             Operation::Http { steps, .. } => &mut steps[0],
             _ => panic!("not http"),
+        }
+    }
+
+    fn rule_of(p: &Policy) -> &'static str {
+        match p.validate() {
+            Err(Error::PolicyInvalid { rule, .. }) => rule,
+            other => panic!("{other:?}"),
         }
     }
 
@@ -761,36 +1242,70 @@ mod tests {
             "{{ hexdecode(hex(key)) }}",
             "x{{ \"a\" + key }}",
             r#"{{ aes_gcm_encrypt("0123456789abcdef", "000000000000", key) }}"#,
+            r#"{{ len(replace(key, $input, "")) }}"#,
         ] {
-            assert_eq!(
-                derive_only(template).validate(),
-                Err(Error::PolicyInvalid),
+            assert!(
+                matches!(
+                    derive_only(template).validate(),
+                    Err(Error::PolicyInvalid { .. })
+                ),
                 "{template}"
             );
         }
     }
 
     #[test]
-    fn rejects_bad_shapes() {
+    fn errors_name_the_part() {
         let mut p = bearer();
-        if let Operation::Http { destinations, .. } = &mut p.operations[0] {
-            *destinations = vec![Destination::https("*.example.com")];
-        }
-        assert_eq!(p.validate(), Err(Error::PolicyInvalid));
+        step_of(&mut p).inject[0].template = "Bearer {{other}}".into();
+        assert_eq!(
+            p.validate(),
+            Err(Error::PolicyInvalid {
+                at: "operations[0].steps[0].inject[0]".into(),
+                rule: "template reads an unknown or later name"
+            })
+        );
+    }
 
+    #[test]
+    fn destinations() {
+        let pattern = Destination::https("*.example.com");
+        assert!(pattern.matches(&Destination::https("a.example.com")));
+        assert!(!pattern.matches(&Destination::https("example.com")));
+        assert!(!pattern.matches(&Destination::https("a.b.example.com")));
+        assert!(!pattern.matches(&Destination::https("aexample.com")));
+        assert!(!pattern.matches(&Destination::new("a.example.com", 8443)));
+        assert!(!pattern.matches(&Destination::https("*.example.com")));
+        assert_eq!(
+            Destination::https("API.Example.com").host,
+            "api.example.com"
+        );
+        assert!(!Destination::https("*.com").is_valid_pattern());
+    }
+
+    #[test]
+    fn rejects_bad_shapes() {
         let mut p = bearer();
         step_of(&mut p).inject[0].target = Target::Header {
             name: "Host".into(),
         };
-        assert_eq!(p.validate(), Err(Error::PolicyInvalid));
+        assert_eq!(
+            rule_of(&p),
+            "header must be a token, not reserved, and set once"
+        );
 
         let mut p = bearer();
-        step_of(&mut p).inject[0].template = "Bearer {{other}}".into();
-        assert_eq!(p.validate(), Err(Error::PolicyInvalid));
+        step_of(&mut p).inject[0].target = Target::Header {
+            name: "X-HTTP-Method-Override".into(),
+        };
+        assert_eq!(
+            rule_of(&p),
+            "header must be a token, not reserved, and set once"
+        );
 
         let mut p = bearer();
         step_of(&mut p).inject[0].template = "{{ $input }}".into();
-        assert_eq!(p.validate(), Err(Error::PolicyInvalid));
+        assert_eq!(rule_of(&p), "template reads a variable not available here");
 
         // A temporary value is readable only after the step that captures it.
         let mut p = bearer();
@@ -803,25 +1318,60 @@ mod tests {
             },
             optional: false,
         });
-        assert_eq!(p.validate(), Err(Error::PolicyInvalid));
+        assert_eq!(rule_of(&p), "template reads an unknown or later name");
 
-        // A capture into an undeclared field.
+        // A capture into a field from the request of the caller.
         let mut p = bearer();
         step_of(&mut p).capture.push(Capture {
             source: Source::Json {
                 pointer: "/t".into(),
             },
             into: Store::Field {
-                name: "nope".into(),
+                name: "token".into(),
             },
             optional: false,
         });
-        assert_eq!(p.validate(), Err(Error::PolicyInvalid));
+        assert_eq!(
+            rule_of(&p),
+            "capture into a field from a request of the caller"
+        );
+
+        // An operation without path prefixes.
+        let mut p = bearer();
+        if let Operation::Http { paths, .. } = &mut p.operations[0] {
+            paths.clear();
+        }
+        assert_eq!(
+            rule_of(&p),
+            "paths are needed exactly when a step sends the request of the caller"
+        );
 
         // Two operations with one name.
         let mut p = bearer();
         p.operations.push(p.operations[0].clone());
-        assert_eq!(p.validate(), Err(Error::PolicyInvalid));
+        assert_eq!(rule_of(&p), "operation names must be unique");
+
+        // A caller of an unknown operation.
+        let mut p = bearer();
+        p.callers[0].operations.push("nope".into());
+        assert_eq!(
+            rule_of(&p),
+            "operations must be names of operations, each once"
+        );
+    }
+
+    #[test]
+    fn paths() {
+        assert!(under("/v1/x", "/v1/"));
+        assert!(under("/v1", "/v1"));
+        assert!(under("/v1?q=1", "/v1"));
+        assert!(under("/v1/x", "/v1"));
+        assert!(!under("/v10", "/v1"));
+        assert!(!check_path("/v1/../admin"));
+        assert!(!check_path("/v1/%2e%2e/admin"));
+        assert!(!check_path("/v1%2Fadmin"));
+        assert!(!check_path("/v1\\admin"));
+        assert!(check_path("/v1/a.b?x=..%2F"));
     }
 
     #[test]

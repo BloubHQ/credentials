@@ -13,14 +13,16 @@ use std::cell::Cell;
 use std::collections::VecDeque;
 
 use engine::Error;
+use engine::caller::{Authorization, Payload};
 use engine::egress::{ClientIdentity, Stream, Transport};
+use engine::error::TransportKind;
 use engine::fields::Fields;
-use engine::keys::{DeviceKey, NodeKey, UserKey};
-use engine::log::{Event, MemorySink, verify_chain};
-use engine::node::{CallerExchange, Clock, Node, Response};
+use engine::keys::{CallerKey, DeviceKey, NodeKey, UserKey};
+use engine::log::{Event, MemorySink, SignedEntry, verify_chain};
+use engine::node::{CallerExchange, Clock, Node, Outcome, Response, StreamOutput};
 use engine::policy::{
-    Capture, Destination, Exchange, FieldSpec, Identity, Injection, Method, Operation, Policy,
-    Source, Step, StepRequest, Store, Target,
+    Caller, Capture, Destination, Exchange, FieldSpec, Identity, Injection, Method, Operation,
+    Policy, Source, Step, StepRequest, Store, Target,
 };
 use engine::record::Record;
 use engine::request::Request;
@@ -30,11 +32,31 @@ const NOW: u64 = 1_800_000_000_000;
 const DAY: u64 = 24 * 60 * 60 * 1000;
 const TOKEN: &[u8] = b"tok_live_9f8e7d6c5b4a";
 
-struct TestClock(Cell<u64>);
+thread_local! {
+    static TIME: Cell<u64> = const { Cell::new(0) };
+}
+
+/// The time of the test thread; callers sign with it too.
+struct TestClock;
+
+impl TestClock {
+    fn at(ms: u64) -> Self {
+        TIME.with(|t| t.set(ms));
+        TestClock
+    }
+
+    fn set(&self, ms: u64) {
+        TIME.with(|t| t.set(ms));
+    }
+}
+
+fn now() -> u64 {
+    TIME.with(Cell::get)
+}
 
 impl Clock for &TestClock {
     fn now_ms(&self) -> u64 {
-        self.0.get()
+        now()
     }
 }
 
@@ -54,16 +76,20 @@ impl Transport for FakeTransport {
         _: &Destination,
         identity: Option<&ClientIdentity>,
         wire: &[u8],
+        _: usize,
     ) -> engine::Result<Vec<u8>> {
         self.sent.push(wire.to_vec());
         if let Some(identity) = identity {
             self.identities
                 .push((identity.cert().to_vec(), identity.key().to_vec()));
         }
-        Ok(self
-            .replies
-            .pop_front()
-            .unwrap_or_else(|| self.reply.clone()))
+        Ok(self.replies.pop_front().unwrap_or_else(|| {
+            if self.reply.is_empty() {
+                b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n".to_vec()
+            } else {
+                self.reply.clone()
+            }
+        }))
     }
 
     fn open(
@@ -83,8 +109,11 @@ impl Stream for FakeStream<'_> {
         Ok(())
     }
 
-    fn read_until(&mut self, _: &[u8], _: usize) -> engine::Result<Vec<u8>> {
-        self.0.replies.pop_front().ok_or(Error::Transport)
+    fn read_until(&mut self, _: &[&[u8]], _: usize) -> engine::Result<Vec<u8>> {
+        self.0
+            .replies
+            .pop_front()
+            .ok_or(Error::transport(TransportKind::Closed, false))
     }
 }
 
@@ -163,6 +192,8 @@ fn http(name: &str, destination: Destination, steps: Vec<Step>) -> Operation {
         } else {
             vec![]
         },
+        paths: if has_caller { vec!["/".into()] } else { vec![] },
+        caller_headers: vec![],
         identity: None,
         steps,
     }
@@ -171,6 +202,7 @@ fn http(name: &str, destination: Destination, steps: Vec<Step>) -> Operation {
 fn request_policy(fields: Vec<FieldSpec>, inject: Vec<Injection>) -> Policy {
     Policy {
         fields,
+        callers: vec![],
         operations: vec![http("call", host(), vec![caller_step(inject)])],
     }
 }
@@ -178,6 +210,7 @@ fn request_policy(fields: Vec<FieldSpec>, inject: Vec<Injection>) -> Policy {
 fn derive_policy(fields: Vec<FieldSpec>, derive: &str) -> Policy {
     Policy {
         fields,
+        callers: vec![],
         operations: vec![Operation::Derive {
             name: "derive".into(),
             template: derive.into(),
@@ -199,13 +232,82 @@ fn destinations_of(policy: &mut Policy) -> &mut Vec<Destination> {
     }
 }
 
+type TestNode<'c> = Node<MemorySink, &'c TestClock>;
+
+/// The key of the caller every test policy lists as `app`.
+fn caller_key() -> CallerKey {
+    CallerKey::from_bytes(&mut [5u8; 32])
+}
+
+fn authorize(
+    node: &TestNode<'_>,
+    record: &Record,
+    operation: &str,
+    payload: &Payload<'_>,
+) -> Authorization {
+    caller_key()
+        .authorize("app", &node.public_key(), record, operation, payload, now())
+        .unwrap()
+}
+
+fn call_http(
+    node: &TestNode<'_>,
+    record: &Record,
+    operation: &str,
+    request: Option<&Request>,
+    transport: &mut FakeTransport,
+) -> Outcome<Response> {
+    let auth = authorize(node, record, operation, &Payload::Http(request));
+    node.http(record, operation, &auth, request, transport)
+}
+
+fn call_stream(
+    node: &TestNode<'_>,
+    record: &Record,
+    operation: &str,
+    destination: &Destination,
+    exchanges: &[CallerExchange],
+    transport: &mut FakeTransport,
+) -> Outcome<StreamOutput> {
+    let payload = Payload::Stream {
+        destination,
+        exchanges,
+    };
+    let auth = authorize(node, record, operation, &payload);
+    node.stream(record, operation, &auth, destination, exchanges, transport)
+}
+
+fn call_derive(
+    node: &TestNode<'_>,
+    record: &Record,
+    operation: &str,
+    input: &[u8],
+) -> engine::Result<Vec<u8>> {
+    let auth = authorize(node, record, operation, &Payload::Derive(input));
+    node.derive(record, operation, &auth, input)
+}
+
+fn log_of(node: &TestNode<'_>) -> Vec<SignedEntry> {
+    node.with_sink(|sink| sink.entries().to_vec())
+}
+
+/// The last logged event `keep` accepts.
+fn last_event(node: &TestNode<'_>, keep: fn(&Event) -> bool) -> Event {
+    log_of(node)
+        .into_iter()
+        .rev()
+        .map(|e| e.entry.event)
+        .find(keep)
+        .unwrap()
+}
+
 fn forward(
-    node: &mut Node<MemorySink, &TestClock>,
+    node: &TestNode<'_>,
     record: &Record,
     request: &Request,
     transport: &mut FakeTransport,
 ) -> engine::Result<Response> {
-    let outcome = node.http(record, "call", Some(request), transport);
+    let outcome = call_http(node, record, "call", Some(request), transport);
     assert!(outcome.record.is_none());
     outcome.result
 }
@@ -219,12 +321,30 @@ fn fields(values: &[(&str, &[u8])]) -> Fields {
 }
 
 struct Setup<'c> {
-    node: Node<MemorySink, &'c TestClock>,
+    node: TestNode<'c>,
     record: Record,
     device: DeviceKey,
 }
 
+/// Lists the caller `app` for every operation, when the policy lists no caller.
+fn with_caller(mut policy: Policy) -> Policy {
+    if policy.callers.is_empty() {
+        policy.callers.push(Caller {
+            name: "app".into(),
+            key: caller_key().public(),
+            operations: policy
+                .operations
+                .iter()
+                .map(|o| o.name().to_string())
+                .collect(),
+            limit: None,
+        });
+    }
+    policy
+}
+
 fn setup<'c>(clock: &'c TestClock, policy: Policy, values: &[(&str, &[u8])]) -> Setup<'c> {
+    let policy = with_caller(policy);
     let device = DeviceKey::generate();
     let user_key = [7u8; 32];
     let signed = device.sign_policy(policy).unwrap();
@@ -236,7 +356,7 @@ fn setup<'c>(clock: &'c TestClock, policy: Policy, values: &[(&str, &[u8])]) -> 
         &fields(values),
     )
     .unwrap();
-    let mut node = Node::new(NodeKey::generate(), MemorySink::new(), clock);
+    let node = Node::new(NodeKey::generate(), MemorySink::new(), clock);
     node.grant(
         OWNER,
         UserKey::from_bytes(&mut user_key.clone()),
@@ -276,7 +396,7 @@ fn send(s: &mut Setup<'_>, request: &Request) -> Vec<u8> {
         reply: b"HTTP/1.1 200 OK\r\n\r\n{}".to_vec(),
         ..Default::default()
     };
-    forward(&mut s.node, &s.record, request, &mut transport).unwrap();
+    forward(&s.node, &s.record, request, &mut transport).unwrap();
     transport.sent.pop().unwrap()
 }
 
@@ -301,7 +421,7 @@ fn assert_length(wire: &[u8]) {
 
 #[test]
 fn every_usage_is_policy_data() {
-    let clock = TestClock(Cell::new(NOW));
+    let clock = TestClock::at(NOW);
     let token = secret("token");
     let cases: Vec<(Policy, Vec<(&str, &[u8])>, Request, &str)> = vec![
         (
@@ -422,7 +542,7 @@ fn every_usage_is_policy_data() {
 
 #[test]
 fn json_body_stays_valid_json() {
-    let clock = TestClock(Cell::new(NOW));
+    let clock = TestClock::at(NOW);
     let policy = request_policy(
         vec![public("user"), secret("password")],
         vec![inject(
@@ -443,7 +563,7 @@ fn json_body_stays_valid_json() {
 
 #[test]
 fn binary_values_go_in_bodies_and_parts() {
-    let clock = TestClock(Cell::new(NOW));
+    let clock = TestClock::at(NOW);
     let image: Vec<u8> = (0..=255u8).cycle().take(70_000).collect();
 
     let policy = request_policy(
@@ -489,12 +609,12 @@ fn binary_values_go_in_bodies_and_parts() {
 
 #[test]
 fn requests_outside_the_policy_are_refused_before_the_log() {
-    let clock = TestClock(Cell::new(NOW));
+    let clock = TestClock::at(NOW);
     let policy = request_policy(
         vec![secret("token")],
         vec![header("X-Api-Key", "{{token}}")],
     );
-    let mut s = setup(&clock, policy, &[("token", TOKEN)]);
+    let s = setup(&clock, policy, &[("token", TOKEN)]);
     let mut transport = FakeTransport::default();
 
     let mut other_host = get("/");
@@ -511,27 +631,48 @@ fn requests_outside_the_policy_are_refused_before_the_log() {
     for (request, error) in [
         (other_host, Error::DestinationDenied),
         (delete, Error::MethodDenied),
-        (own_header, Error::RequestInvalid),
-        (host_header, Error::RequestInvalid),
-        (get("no-slash"), Error::RequestInvalid),
+        (
+            own_header,
+            Error::RequestInvalid {
+                rule: "header not allowed by the operation",
+            },
+        ),
+        (
+            host_header,
+            Error::RequestInvalid {
+                rule: "header name or value malformed or reserved",
+            },
+        ),
+        (
+            get("no-slash"),
+            Error::RequestInvalid {
+                rule: "path must start with / and hold no fragment, dot segment or encoded separator",
+            },
+        ),
+        (
+            get("/a/../b"),
+            Error::RequestInvalid {
+                rule: "path must start with / and hold no fragment, dot segment or encoded separator",
+            },
+        ),
     ] {
         assert_eq!(
-            forward(&mut s.node, &s.record, &request, &mut transport),
+            forward(&s.node, &s.record, &request, &mut transport),
             Err(error)
         );
     }
     assert!(transport.sent.is_empty());
-    assert_eq!(s.node.sink().entries().len(), 1, "only the grant entry");
+    assert_eq!(log_of(&s.node).len(), 1, "only the grant entry");
 }
 
 #[test]
 fn a_policy_cannot_be_widened_or_swapped() {
-    let clock = TestClock(Cell::new(NOW));
+    let clock = TestClock::at(NOW);
     let policy = request_policy(
         vec![secret("token")],
         vec![header("Authorization", "Bearer {{token}}")],
     );
-    let mut s = setup(&clock, policy.clone(), &[("token", TOKEN)]);
+    let s = setup(&clock, policy.clone(), &[("token", TOKEN)]);
     let mut transport = FakeTransport::default();
     let mut to_evil = get("/");
     to_evil.destination = Destination::https("evil.example.net");
@@ -539,7 +680,7 @@ fn a_policy_cannot_be_widened_or_swapped() {
     let mut widened = s.record.clone();
     destinations_of(&mut widened.policy.policy).push(Destination::https("evil.example.net"));
     assert_eq!(
-        forward(&mut s.node, &widened, &to_evil, &mut transport),
+        forward(&s.node, &widened, &to_evil, &mut transport),
         Err(Error::PolicySignature)
     );
 
@@ -548,23 +689,23 @@ fn a_policy_cannot_be_widened_or_swapped() {
         .inject
         .push(header("X-Echo", "{{token}}"));
     assert_eq!(
-        forward(&mut s.node, &leaky, &get("/"), &mut transport),
+        forward(&s.node, &leaky, &get("/"), &mut transport),
         Err(Error::PolicySignature)
     );
 
     let mut wide = policy;
     destinations_of(&mut wide).push(Destination::https("evil.example.net"));
     let mut swapped = s.record.clone();
-    swapped.policy = s.device.sign_policy(wide).unwrap();
+    swapped.policy = s.device.sign_policy(with_caller(wide)).unwrap();
     assert_eq!(
-        forward(&mut s.node, &swapped, &to_evil, &mut transport),
+        forward(&s.node, &swapped, &to_evil, &mut transport),
         Err(Error::RecordOpen)
     );
 
     let mut wrong_owner = s.record.clone();
     wrong_owner.owner = "user-2".into();
     assert_eq!(
-        forward(&mut s.node, &wrong_owner, &get("/"), &mut transport),
+        forward(&s.node, &wrong_owner, &get("/"), &mut transport),
         Err(Error::NoGrant)
     );
     assert!(transport.sent.is_empty());
@@ -572,21 +713,21 @@ fn a_policy_cannot_be_widened_or_swapped() {
 
 #[test]
 fn nothing_is_sent_without_a_confirmed_entry() {
-    let clock = TestClock(Cell::new(NOW));
+    let clock = TestClock::at(NOW);
     let policy = request_policy(
         vec![secret("token")],
         vec![header("X-Api-Key", "{{token}}")],
     );
-    let mut s = setup(&clock, policy, &[("token", TOKEN)]);
+    let s = setup(&clock, policy, &[("token", TOKEN)]);
     let mut transport = FakeTransport::default();
-    s.node.sink_mut().set_failing(true);
+    s.node.with_sink(|k| k.set_failing(true));
     assert_eq!(
-        forward(&mut s.node, &s.record, &get("/"), &mut transport),
+        forward(&s.node, &s.record, &get("/"), &mut transport),
         Err(Error::LogUnconfirmed)
     );
-    s.node.sink_mut().set_failing(false);
+    s.node.with_sink(|k| k.set_failing(false));
     assert_eq!(
-        forward(&mut s.node, &s.record, &get("/"), &mut transport),
+        forward(&s.node, &s.record, &get("/"), &mut transport),
         Err(Error::LogHalted)
     );
     assert!(transport.sent.is_empty());
@@ -594,29 +735,29 @@ fn nothing_is_sent_without_a_confirmed_entry() {
 
 #[test]
 fn grants_end_and_revokes_erase() {
-    let clock = TestClock(Cell::new(NOW));
+    let clock = TestClock::at(NOW);
     let policy = request_policy(
         vec![secret("token")],
         vec![header("X-Api-Key", "{{token}}")],
     );
-    let mut s = setup(&clock, policy.clone(), &[("token", TOKEN)]);
+    let s = setup(&clock, policy.clone(), &[("token", TOKEN)]);
     let mut transport = FakeTransport::default();
 
-    clock.0.set(NOW + DAY);
+    clock.set(NOW + DAY);
     assert_eq!(
-        forward(&mut s.node, &s.record, &get("/"), &mut transport),
+        forward(&s.node, &s.record, &get("/"), &mut transport),
         Err(Error::GrantExpired)
     );
     assert_eq!(
-        forward(&mut s.node, &s.record, &get("/"), &mut transport),
+        forward(&s.node, &s.record, &get("/"), &mut transport),
         Err(Error::NoGrant)
     );
 
-    clock.0.set(NOW);
-    let mut s = setup(&clock, policy, &[("token", TOKEN)]);
+    clock.set(NOW);
+    let s = setup(&clock, policy, &[("token", TOKEN)]);
     s.node.revoke(OWNER).unwrap();
     assert_eq!(
-        forward(&mut s.node, &s.record, &get("/"), &mut transport),
+        forward(&s.node, &s.record, &get("/"), &mut transport),
         Err(Error::NoGrant)
     );
     assert!(transport.sent.is_empty());
@@ -629,15 +770,15 @@ fn grants_end_and_revokes_erase() {
             NOW + 365 * DAY,
         )
         .unwrap();
-    match &s.node.sink().entries().last().unwrap().entry.event {
-        Event::Grant { expires_ms } => assert_eq!(*expires_ms, NOW + 30 * DAY),
+    match &log_of(&s.node).last().unwrap().entry.event {
+        Event::Grant { expires_ms, .. } => assert_eq!(*expires_ms, NOW + 30 * DAY),
         other => panic!("unexpected event {other:?}"),
     }
 }
 
 #[test]
 fn responses_that_echo_a_secret_are_dropped() {
-    let clock = TestClock(Cell::new(NOW));
+    let clock = TestClock::at(NOW);
     let policy = request_policy(
         vec![public("user"), secret("password")],
         vec![header(
@@ -653,21 +794,23 @@ fn responses_that_echo_a_secret_are_dropped() {
         (b"{\"user\":\"bot\"}", false),
     ];
     for (reply, dropped) in replies {
-        let mut s = setup(
+        let s = setup(
             &clock,
             policy.clone(),
             &[("user", b"bot"), ("password", TOKEN)],
         );
+        let mut wire = b"HTTP/1.1 200 OK\r\n\r\n".to_vec();
+        wire.extend_from_slice(reply);
         let mut transport = FakeTransport {
-            reply: reply.to_vec(),
+            reply: wire,
             ..Default::default()
         };
-        let result = forward(&mut s.node, &s.record, &get("/"), &mut transport);
+        let result = forward(&s.node, &s.record, &get("/"), &mut transport);
         if dropped {
             assert_eq!(result, Err(Error::Reflection), "{}", text(reply));
         } else {
             assert_eq!(
-                result.unwrap().bytes,
+                result.unwrap().body(),
                 reply,
                 "a public field is not a secret"
             );
@@ -677,31 +820,31 @@ fn responses_that_echo_a_secret_are_dropped() {
 
 #[test]
 fn derivations_hand_back_only_one_way_outputs() {
-    let clock = TestClock(Cell::new(1_111_111_109_000));
+    let clock = TestClock::at(1_111_111_109_000);
     let mut transport = FakeTransport::default();
 
-    let mut s = setup(
+    let s = setup(
         &clock,
         derive_policy(vec![secret("seed")], "{{ totp(b32decode(seed)) }}"),
         &[("seed", b"GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ")],
     );
-    assert_eq!(s.node.derive(&s.record, "derive", b"").unwrap(), b"081804");
     assert_eq!(
-        forward(&mut s.node, &s.record, &get("/"), &mut transport),
+        call_derive(&s.node, &s.record, "derive", b"").unwrap(),
+        b"081804"
+    );
+    assert_eq!(
+        forward(&s.node, &s.record, &get("/"), &mut transport),
         Err(Error::OperationUnknown)
     );
 
     use hmac::{Hmac, Mac};
     let key = b"exchange-secret-key-0123456789";
-    let mut s = setup(
+    let s = setup(
         &clock,
         derive_policy(vec![secret("key")], "{{ hex(hmac_sha256(key, $input)) }}"),
         &[("key", key)],
     );
-    let tag = s
-        .node
-        .derive(&s.record, "derive", b"GET\n/api/v3/order\nts=1")
-        .unwrap();
+    let tag = call_derive(&s.node, &s.record, "derive", b"GET\n/api/v3/order\nts=1").unwrap();
     let mut mac = Hmac::<sha2::Sha256>::new_from_slice(key).unwrap();
     mac.update(b"GET\n/api/v3/order\nts=1");
     let expected: String = mac
@@ -711,7 +854,7 @@ fn derivations_hand_back_only_one_way_outputs() {
         .map(|b| format!("{b:02x}"))
         .collect();
     assert_eq!(tag, expected.as_bytes());
-    match &s.node.sink().entries().last().unwrap().entry.event {
+    match &log_of(&s.node).last().unwrap().entry.event {
         Event::Derive { .. } => {}
         other => panic!("unexpected event {other:?}"),
     }
@@ -719,9 +862,8 @@ fn derivations_hand_back_only_one_way_outputs() {
     let device = DeviceKey::generate();
     for leaky in ["{{key}}", "{{ b64(key) }}", "{{ hexdecode(hex(key)) }}"] {
         let policy = derive_policy(vec![secret("key")], leaky);
-        assert_eq!(
-            device.sign_policy(policy),
-            Err(Error::PolicyInvalid),
+        assert!(
+            matches!(device.sign_policy(policy), Err(Error::PolicyInvalid { .. })),
             "{leaky}"
         );
     }
@@ -732,24 +874,24 @@ fn derivations_hand_back_only_one_way_outputs() {
 fn private_keys_in_pem_sign_without_leaving() {
     use ed25519_dalek::pkcs8::EncodePrivateKey as _;
 
-    let clock = TestClock(Cell::new(NOW));
+    let clock = TestClock::at(NOW);
     let message = b"contract v1";
 
     let ed = ed25519_dalek::SigningKey::from_bytes(&[42u8; 32]);
     let ed_pem = ed.to_pkcs8_pem(Default::default()).unwrap();
     let policy = derive_policy(vec![secret("key")], "{{ ed25519_sign(pem(key), $input) }}");
-    let mut s = setup(&clock, policy, &[("key", ed_pem.as_bytes())]);
-    let signature = s.node.derive(&s.record, "derive", message).unwrap();
+    let s = setup(&clock, policy, &[("key", ed_pem.as_bytes())]);
+    let signature = call_derive(&s.node, &s.record, "derive", message).unwrap();
     let signature = ed25519_dalek::Signature::from_slice(&signature).unwrap();
     ed.verifying_key()
         .verify_strict(message, &signature)
         .unwrap();
 
     let ec = p256::ecdsa::SigningKey::from_slice(&[9u8; 32]).unwrap();
-    let ec_pem = ec.to_pkcs8_pem(Default::default()).unwrap();
+    let ec_pem = p256::pkcs8::EncodePrivateKey::to_pkcs8_pem(&ec, Default::default()).unwrap();
     let policy = derive_policy(vec![secret("key")], "{{ p256_sign_der(pem(key), $input) }}");
-    let mut s = setup(&clock, policy, &[("key", ec_pem.as_bytes())]);
-    let der = s.node.derive(&s.record, "derive", message).unwrap();
+    let s = setup(&clock, policy, &[("key", ec_pem.as_bytes())]);
+    let der = call_derive(&s.node, &s.record, "derive", message).unwrap();
     let signature = p256::ecdsa::Signature::from_der(&der).unwrap();
     use p256::ecdsa::signature::Verifier as _;
     ec.verifying_key().verify(message, &signature).unwrap();
@@ -757,18 +899,18 @@ fn private_keys_in_pem_sign_without_leaving() {
 
 #[test]
 fn a_tampered_chain_is_found() {
-    let clock = TestClock(Cell::new(NOW));
+    let clock = TestClock::at(NOW);
     let policy = request_policy(
         vec![secret("token")],
         vec![header("X-Api-Key", "{{token}}")],
     );
-    let mut s = setup(&clock, policy, &[("token", TOKEN)]);
+    let s = setup(&clock, policy, &[("token", TOKEN)]);
     let mut transport = FakeTransport::default();
     for path in ["/a", "/b", "/c"] {
-        forward(&mut s.node, &s.record, &get(path), &mut transport).unwrap();
+        forward(&s.node, &s.record, &get(path), &mut transport).unwrap();
     }
     let key = s.node.public_key();
-    let entries = s.node.sink().entries().to_vec();
+    let entries = log_of(&s.node).to_vec();
     verify_chain(&entries, &key).unwrap();
     let logged = serde_json::to_string(&entries).unwrap();
     assert!(
@@ -776,13 +918,15 @@ fn a_tampered_chain_is_found() {
         "the log must not hold a secret"
     );
 
+    // Entries: grant, then a use and its done for each request.
     let mut edited = entries.clone();
-    if let Event::Use { path, .. } = &mut edited[2].entry.event {
-        *path = "/innocent".into();
+    match &mut edited[3].entry.event {
+        Event::Use { path, .. } => *path = "/innocent".into(),
+        other => panic!("unexpected event {other:?}"),
     }
     assert_eq!(
         verify_chain(&edited, &key),
-        Err(Error::EntrySignature { seq: 2 })
+        Err(Error::EntrySignature { seq: 3 })
     );
 
     let mut dropped = entries.clone();
@@ -795,7 +939,7 @@ fn a_tampered_chain_is_found() {
 
 #[test]
 fn records_round_trip_as_json_without_their_values() {
-    let clock = TestClock(Cell::new(NOW));
+    let clock = TestClock::at(NOW);
     let policy = request_policy(
         vec![secret("token")],
         vec![header("X-Api-Key", "{{token}}")],
@@ -819,7 +963,7 @@ fn reply(head: &str, body: &str) -> Vec<u8> {
 
 #[test]
 fn oauth_refresh_writes_the_new_tokens_into_a_new_record() {
-    let clock = TestClock(Cell::new(NOW));
+    let clock = TestClock::at(NOW);
     let auth = Destination::https("auth.example.com");
     let refresh = Step {
         request: StepRequest::Fixed {
@@ -863,6 +1007,7 @@ fn oauth_refresh_writes_the_new_tokens_into_a_new_record() {
             secret("refresh_token"),
             later("access_token"),
         ],
+        callers: vec![],
         operations: vec![
             http("refresh", auth, vec![refresh]),
             http(
@@ -888,7 +1033,7 @@ fn oauth_refresh_writes_the_new_tokens_into_a_new_record() {
 
     // No access token yet: the template fails before anything is logged or sent.
     assert_eq!(
-        forward(&mut s.node, &s.record, &get("/me"), &mut transport),
+        forward(&s.node, &s.record, &get("/me"), &mut transport),
         Err(Error::FieldMissing)
     );
     assert!(transport.sent.is_empty());
@@ -897,10 +1042,10 @@ fn oauth_refresh_writes_the_new_tokens_into_a_new_record() {
         "200 OK",
         r#"{"access_token":"at_new_abcdefghijkl","refresh_token":"rt_second_987654321","expires_in":3600}"#,
     ));
-    let outcome = s.node.http(&s.record, "refresh", None, &mut transport);
+    let outcome = call_http(&s.node, &s.record, "refresh", None, &mut transport);
     let response = outcome.result.unwrap();
     assert_eq!(
-        text(body_of(&response.bytes)),
+        text(response.body()),
         r#"{"access_token":"[redacted]","refresh_token":"[redacted]","expires_in":3600}"#
     );
     let wire = text(&transport.sent.pop().unwrap());
@@ -910,8 +1055,10 @@ fn oauth_refresh_writes_the_new_tokens_into_a_new_record() {
     ));
     let renewed = outcome.record.unwrap();
     assert_ne!(renewed.ct, s.record.ct);
-    match &s.node.sink().entries().last().unwrap().entry.event {
-        Event::Update { operation, fields } => {
+    match last_event(&s.node, |e| matches!(e, Event::Update { .. })) {
+        Event::Update {
+            operation, fields, ..
+        } => {
             assert_eq!(operation, "refresh");
             assert_eq!(fields, &["access_token", "refresh_token"]);
         }
@@ -920,7 +1067,7 @@ fn oauth_refresh_writes_the_new_tokens_into_a_new_record() {
 
     s.record = renewed;
     transport.reply = reply("200 OK", "{}");
-    forward(&mut s.node, &s.record, &get("/me"), &mut transport).unwrap();
+    forward(&s.node, &s.record, &get("/me"), &mut transport).unwrap();
     assert!(
         text(&transport.sent.pop().unwrap())
             .contains("Authorization: Bearer at_new_abcdefghijkl\r\n")
@@ -930,20 +1077,32 @@ fn oauth_refresh_writes_the_new_tokens_into_a_new_record() {
     transport
         .replies
         .push_back(reply("200 OK", r#"{"access_token":"at_third_abcdefghij"}"#));
-    let outcome = s.node.http(&s.record, "refresh", None, &mut transport);
+    let outcome = call_http(&s.node, &s.record, "refresh", None, &mut transport);
     outcome.result.unwrap();
-    assert!(outcome.record.is_some());
     assert!(text(&transport.sent.pop().unwrap()).contains("refresh_token=rt_second_987654321&"));
+
+    // The record it replaces is refused from now on: an operator cannot roll it back.
+    let newest = outcome.record.unwrap();
+    assert_eq!(newest.generation, s.record.generation + 1);
+    let outcome = call_http(&s.node, &s.record, "refresh", None, &mut transport);
+    assert_eq!(
+        outcome.result,
+        Err(Error::RecordStale {
+            have: s.record.generation,
+            need: newest.generation
+        })
+    );
+    s.record = newest;
 
     // A refresh that returns no token fails and changes nothing.
     transport
         .replies
         .push_back(reply("400 Bad Request", r#"{"error":"invalid_grant"}"#));
-    let outcome = s.node.http(&s.record, "refresh", None, &mut transport);
+    let outcome = call_http(&s.node, &s.record, "refresh", None, &mut transport);
     assert_eq!(outcome.result, Err(Error::CaptureMissing));
     assert!(outcome.record.is_none());
 
-    let logged = serde_json::to_string(s.node.sink().entries()).unwrap();
+    let logged = serde_json::to_string(&log_of(&s.node)).unwrap();
     for value in ["at_new", "rt_first", "rt_second", "cs_0123"] {
         assert!(!logged.contains(value), "{value}");
     }
@@ -951,7 +1110,7 @@ fn oauth_refresh_writes_the_new_tokens_into_a_new_record() {
 
 #[test]
 fn a_session_login_feeds_a_cookie_to_the_caller_request() {
-    let clock = TestClock(Cell::new(NOW));
+    let clock = TestClock::at(NOW);
     let login = Step {
         request: StepRequest::Fixed {
             method: Method::Post,
@@ -972,6 +1131,7 @@ fn a_session_login_feeds_a_cookie_to_the_caller_request() {
     };
     let policy = Policy {
         fields: vec![public("user"), secret("password")],
+        callers: vec![],
         operations: vec![http(
             "call",
             host(),
@@ -981,7 +1141,7 @@ fn a_session_login_feeds_a_cookie_to_the_caller_request() {
             ],
         )],
     };
-    let mut s = setup(&clock, policy, &[("user", b"kim"), ("password", TOKEN)]);
+    let s = setup(&clock, policy, &[("user", b"kim"), ("password", TOKEN)]);
     let mut transport = FakeTransport::default();
     transport.replies.push_back(
         b"HTTP/1.1 302 Found\r\nSet-Cookie: sid=sess_0123456789abcdef; HttpOnly\r\nContent-Length: 0\r\n\r\n"
@@ -991,19 +1151,16 @@ fn a_session_login_feeds_a_cookie_to_the_caller_request() {
         "200 OK",
         r#"{"orders":[],"echo":"sess_0123456789abcdef"}"#,
     ));
-    let response = forward(&mut s.node, &s.record, &get("/orders"), &mut transport).unwrap();
+    let response = forward(&s.node, &s.record, &get("/orders"), &mut transport).unwrap();
     assert_eq!(
-        text(body_of(&response.bytes)),
+        text(response.body()),
         r#"{"orders":[],"echo":"[redacted]"}"#
     );
     assert!(text(&transport.sent[0]).starts_with("POST /login HTTP/1.1\r\n"));
     let second = text(&transport.sent[1]);
     assert!(second.starts_with("GET /orders HTTP/1.1\r\n"));
     assert!(second.contains("Cookie: sid=sess_0123456789abcdef\r\n"));
-    let uses = s
-        .node
-        .sink()
-        .entries()
+    let uses = log_of(&s.node)
         .iter()
         .filter(|e| matches!(e.entry.event, Event::Use { .. }))
         .count();
@@ -1013,10 +1170,11 @@ fn a_session_login_feeds_a_cookie_to_the_caller_request() {
 #[test]
 fn digest_authentication_answers_the_challenge() {
     // RFC 2617, section 3.5.
-    let clock = TestClock(Cell::new(NOW));
+    let clock = TestClock::at(NOW);
     let param = |p: &str| Source::HeaderParam {
         name: "WWW-Authenticate".into(),
         param: p.into(),
+        scheme: None,
     };
     let challenge = Step {
         request: StepRequest::Caller,
@@ -1036,9 +1194,10 @@ fn digest_authentication_answers_the_challenge() {
     )]);
     let policy = Policy {
         fields: vec![public("username"), secret("password")],
+        callers: vec![],
         operations: vec![http("call", host(), vec![challenge, answer])],
     };
-    let mut s = setup(
+    let s = setup(
         &clock,
         policy,
         &[("username", b"Mufasa"), ("password", b"Circle Of Life")],
@@ -1046,13 +1205,7 @@ fn digest_authentication_answers_the_challenge() {
     let mut transport = FakeTransport::default();
     transport.replies.push_back(b"HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Digest realm=\"testrealm@host.com\", qop=\"auth,auth-int\", nonce=\"dcd98b7102dd2f0e8b11d0f600bfb0c093\", opaque=\"5ccc069c403ebaf9f0171e9517f40e41\"\r\nContent-Length: 0\r\n\r\n".to_vec());
     transport.reply = reply("200 OK", "ok");
-    forward(
-        &mut s.node,
-        &s.record,
-        &get("/dir/index.html"),
-        &mut transport,
-    )
-    .unwrap();
+    forward(&s.node, &s.record, &get("/dir/index.html"), &mut transport).unwrap();
     assert!(!text(&transport.sent[0]).contains("Authorization"));
     let wire = text(&transport.sent[1]);
     assert!(
@@ -1065,7 +1218,7 @@ fn digest_authentication_answers_the_challenge() {
 #[test]
 fn aws_signature_v4_is_a_template() {
     // The get-vanilla case of the AWS Signature Version 4 test suite.
-    let clock = TestClock(Cell::new(1_440_938_160_000));
+    let clock = TestClock::at(1_440_938_160_000);
     let date = r#"time($unix, "%Y%m%d")"#;
     let stamp = r#"time($unix, "%Y%m%dT%H%M%SZ")"#;
     let key = format!(
@@ -1083,6 +1236,7 @@ fn aws_signature_v4_is_a_template() {
     let destination = Destination::https("example.amazonaws.com");
     let policy = Policy {
         fields: vec![public("access_key"), secret("secret_key")],
+        callers: vec![],
         operations: vec![http(
             "call",
             destination.clone(),
@@ -1092,7 +1246,7 @@ fn aws_signature_v4_is_a_template() {
             ])],
         )],
     };
-    let mut s = setup(
+    let s = setup(
         &clock,
         policy,
         &[
@@ -1106,7 +1260,7 @@ fn aws_signature_v4_is_a_template() {
     };
     let mut request = get("/");
     request.destination = destination;
-    forward(&mut s.node, &s.record, &request, &mut transport).unwrap();
+    forward(&s.node, &s.record, &request, &mut transport).unwrap();
     let wire = text(&transport.sent[0]);
     assert!(wire.contains("X-Amz-Date: 20150830T123600Z\r\n"));
     assert!(
@@ -1135,18 +1289,19 @@ fn rsa_keys_sign_jwts() {
         .as_ref()
         .to_vec();
 
-    let clock = TestClock(Cell::new(NOW));
+    let clock = TestClock::at(NOW);
     let head = r#"b64urlraw("{\"alg\":\"RS256\",\"typ\":\"JWT\"}") + "." + b64urlraw($input)"#;
     let jwt =
         format!("{{{{ {head} + \".\" + b64urlraw(rsa_sign_pkcs1_sha256(pem(key), {head})) }}}}");
-    let mut s = setup(
+    let s = setup(
         &clock,
         derive_policy(vec![secret("key")], &jwt),
         &[("key", pem.as_bytes())],
     );
     let claims =
         br#"{"iss":"svc@example.iam","aud":"https://oauth2.example.com/token","exp":1800000600}"#;
-    let token = String::from_utf8(s.node.derive(&s.record, "derive", claims).unwrap()).unwrap();
+    let token =
+        String::from_utf8(call_derive(&s.node, &s.record, "derive", claims).unwrap()).unwrap();
     let (signed, signature) = token.rsplit_once('.').unwrap();
     assert_eq!(
         URL_SAFE_NO_PAD
@@ -1165,8 +1320,8 @@ fn rsa_keys_sign_jwts() {
         vec![secret("key")],
         "{{ rsa_sign_pss_sha256(pem(key), $input) }}",
     );
-    let mut s = setup(&clock, pss, &[("key", pem.as_bytes())]);
-    let signature = s.node.derive(&s.record, "derive", b"message").unwrap();
+    let s = setup(&clock, pss, &[("key", pem.as_bytes())]);
+    let signature = call_derive(&s.node, &s.record, "derive", b"message").unwrap();
     UnparsedPublicKey::new(&RSA_PSS_2048_8192_SHA256, &public)
         .verify(b"message", &signature)
         .unwrap();
@@ -1178,11 +1333,12 @@ fn secp256k1_keys_sign_and_recover() {
     use k256::ecdsa::{RecoveryId, Signature, SigningKey, VerifyingKey};
     use sha3::Digest as _;
 
-    let clock = TestClock(Cell::new(NOW));
+    let clock = TestClock::at(NOW);
     let secret_key = [0x11u8; 32];
     let key = SigningKey::from_slice(&secret_key).unwrap();
     let policy = Policy {
         fields: vec![secret("key")],
+        callers: vec![],
         operations: vec![
             Operation::Derive {
                 name: "derive".into(),
@@ -1194,13 +1350,13 @@ fn secp256k1_keys_sign_and_recover() {
             },
         ],
     };
-    let mut s = setup(&clock, policy, &[("key", &secret_key)]);
+    let s = setup(&clock, policy, &[("key", &secret_key)]);
 
-    let signature = s.node.derive(&s.record, "derive", b"order 42").unwrap();
+    let signature = call_derive(&s.node, &s.record, "derive", b"order 42").unwrap();
     let signature = Signature::from_slice(&signature).unwrap();
     key.verifying_key().verify(b"order 42", &signature).unwrap();
 
-    let out = s.node.derive(&s.record, "eth", b"transfer 1 eth").unwrap();
+    let out = call_derive(&s.node, &s.record, "eth", b"transfer 1 eth").unwrap();
     assert_eq!(out.len(), 65);
     let digest = sha3::Keccak256::digest(b"transfer 1 eth");
     let recovered = VerifyingKey::recover_from_prehash(
@@ -1217,14 +1373,14 @@ fn aes_encrypts_only_under_a_secret_key() {
     use aes_gcm::aead::{Aead, KeyInit, Payload};
     use aes_gcm::{Aes256Gcm, Nonce};
 
-    let clock = TestClock(Cell::new(NOW));
+    let clock = TestClock::at(NOW);
     let key = [0x42u8; 32];
     let policy = derive_policy(
         vec![secret("key")],
         r#"{{ aes_gcm_encrypt(key, hexdecode("000102030405060708090a0b"), $input, "v1") }}"#,
     );
-    let mut s = setup(&clock, policy, &[("key", &key)]);
-    let sealed = s.node.derive(&s.record, "derive", b"card 4111").unwrap();
+    let s = setup(&clock, policy, &[("key", &key)]);
+    let sealed = call_derive(&s.node, &s.record, "derive", b"card 4111").unwrap();
     let nonce: Vec<u8> = (0u8..12).collect();
     let plain = Aes256Gcm::new_from_slice(&key)
         .unwrap()
@@ -1243,29 +1399,30 @@ fn aes_encrypts_only_under_a_secret_key() {
         vec![secret("key")],
         r#"{{ aes_gcm_encrypt("0123456789abcdef", "000000000000", key) }}"#,
     );
-    assert_eq!(
+    assert!(matches!(
         DeviceKey::generate().sign_policy(leaky),
-        Err(Error::PolicyInvalid)
-    );
+        Err(Error::PolicyInvalid { .. })
+    ));
 }
 
 fn imap_policy() -> Policy {
     Policy {
         fields: vec![public("user"), secret("password")],
+        callers: vec![],
         operations: vec![Operation::Stream {
             name: "imap".into(),
             destinations: vec![Destination::new("imap.example.com", 993)],
             identity: None,
             script: vec![
                 Exchange::Expect {
-                    until: "\r\n".into(),
+                    until: vec!["\r\n".into()],
                     capture: vec![],
                 },
                 Exchange::Send {
                     template: "a1 LOGIN {{user}} {{password}}\r\n".into(),
                 },
                 Exchange::Expect {
-                    until: "\r\n".into(),
+                    until: vec!["\r\n".into()],
                     capture: vec![capture(
                         Source::Between {
                             start: "a1 ".into(),
@@ -1281,8 +1438,8 @@ fn imap_policy() -> Policy {
 
 #[test]
 fn a_stream_logs_in_then_carries_the_caller() {
-    let clock = TestClock(Cell::new(NOW));
-    let mut s = setup(
+    let clock = TestClock::at(NOW);
+    let s = setup(
         &clock,
         imap_policy(),
         &[("user", b"bot"), ("password", b"p4ssw0rd-imap")],
@@ -1296,15 +1453,23 @@ fn a_stream_logs_in_then_carries_the_caller() {
     ]);
     let exchanges = [CallerExchange {
         send: b"a2 SELECT INBOX\r\n".to_vec(),
-        until: b"a2 OK".to_vec(),
+        until: vec![b"a2 OK".to_vec()],
     }];
-    let outcome = s
-        .node
-        .stream(&s.record, "imap", &imap, &exchanges, &mut transport);
+    let outcome = call_stream(
+        &s.node,
+        &s.record,
+        "imap",
+        &imap,
+        &exchanges,
+        &mut transport,
+    );
     assert!(outcome.record.is_none());
     assert_eq!(
         outcome.result.unwrap(),
-        vec![b"* 3 EXISTS\r\na2 OK SELECT completed\r\n".to_vec()]
+        StreamOutput {
+            reads: vec![b"* 3 EXISTS\r\na2 OK SELECT completed\r\n".to_vec()],
+            error: None,
+        }
     );
     assert_eq!(
         transport.written,
@@ -1313,9 +1478,9 @@ fn a_stream_logs_in_then_carries_the_caller() {
             b"a2 SELECT INBOX\r\n".to_vec()
         ]
     );
-    match &s.node.sink().entries().last().unwrap().entry.event {
+    match last_event(&s.node, |e| matches!(e, Event::Stream { .. })) {
         Event::Stream { host, port, .. } => {
-            assert_eq!((host.as_str(), *port), ("imap.example.com", 993));
+            assert_eq!((host.as_str(), port), ("imap.example.com", 993));
         }
         other => panic!("unexpected event {other:?}"),
     }
@@ -1327,14 +1492,26 @@ fn a_stream_logs_in_then_carries_the_caller() {
         b"a1 OK done\r\n".to_vec(),
         b"a2 BAD p4ssw0rd-imap\r\n".to_vec(),
     ]);
-    let outcome = s
-        .node
-        .stream(&s.record, "imap", &imap, &exchanges, &mut transport);
-    assert_eq!(outcome.result, Err(Error::Reflection));
+    let outcome = call_stream(
+        &s.node,
+        &s.record,
+        "imap",
+        &imap,
+        &exchanges,
+        &mut transport,
+    );
+    assert_eq!(
+        outcome.result,
+        Ok(StreamOutput {
+            reads: vec![],
+            error: Some(Error::Reflection),
+        })
+    );
 
     // Another host is refused before the log.
-    let before = s.node.sink().entries().len();
-    let outcome = s.node.stream(
+    let before = log_of(&s.node).len();
+    let outcome = call_stream(
+        &s.node,
         &s.record,
         "imap",
         &Destination::new("evil.example.net", 993),
@@ -1342,20 +1519,23 @@ fn a_stream_logs_in_then_carries_the_caller() {
         &mut FakeTransport::default(),
     );
     assert_eq!(outcome.result, Err(Error::DestinationDenied));
-    assert_eq!(s.node.sink().entries().len(), before);
+    assert_eq!(log_of(&s.node).len(), before);
 }
 
 #[test]
 fn client_certificates_reach_only_the_transport() {
-    let clock = TestClock(Cell::new(NOW));
+    let clock = TestClock::at(NOW);
     let cert = b"-----BEGIN CERTIFICATE-----\nMIIBcert\n-----END CERTIFICATE-----\n";
     let key = b"-----BEGIN PRIVATE KEY-----\nMIIBkey-0123456789\n-----END PRIVATE KEY-----\n";
     let policy = Policy {
         fields: vec![public("cert"), secret("key")],
+        callers: vec![],
         operations: vec![Operation::Http {
             name: "call".into(),
             destinations: vec![host()],
             methods: vec![Method::Get],
+            paths: vec!["/".into()],
+            caller_headers: vec![],
             identity: Some(Identity {
                 cert: "{{cert}}".into(),
                 key: "{{key}}".into(),
@@ -1363,14 +1543,781 @@ fn client_certificates_reach_only_the_transport() {
             steps: vec![caller_step(vec![])],
         }],
     };
-    let mut s = setup(&clock, policy, &[("cert", cert), ("key", key)]);
+    let s = setup(&clock, policy, &[("cert", cert), ("key", key)]);
     let mut transport = FakeTransport {
         reply: reply("200 OK", "{}"),
         ..Default::default()
     };
-    forward(&mut s.node, &s.record, &get("/"), &mut transport).unwrap();
+    forward(&s.node, &s.record, &get("/"), &mut transport).unwrap();
     assert_eq!(transport.identities, vec![(cert.to_vec(), key.to_vec())]);
     assert!(!text(&transport.sent[0]).contains("PRIVATE KEY"));
-    let logged = serde_json::to_string(s.node.sink().entries()).unwrap();
+    let logged = serde_json::to_string(&log_of(&s.node)).unwrap();
     assert!(!logged.contains("MIIBkey"));
+}
+
+// ---- regressions: what the review (code user, owner, bug hunter, hacker) found ----
+
+fn user_key() -> UserKey {
+    UserKey::from_bytes(&mut [7u8; 32])
+}
+
+fn refresh_policy() -> Policy {
+    let step = Step {
+        request: StepRequest::Fixed {
+            method: Method::Post,
+            path: "/oauth/token".into(),
+            destination: None,
+        },
+        inject: vec![inject(Target::Body, "rt={{pct(refresh_token)}}")],
+        capture: vec![capture(
+            Source::Json {
+                pointer: "/access_token".into(),
+            },
+            Store::Field {
+                name: "access_token".into(),
+            },
+        )],
+    };
+    Policy {
+        fields: vec![secret("refresh_token"), later("access_token")],
+        callers: vec![],
+        operations: vec![http("refresh", host(), vec![step])],
+    }
+}
+
+fn run_refresh(response: Vec<u8>) -> engine::Result<Response> {
+    let clock = TestClock::at(NOW);
+    let s = setup(
+        &clock,
+        refresh_policy(),
+        &[("refresh_token", b"rt_first_0123456789")],
+    );
+    let mut transport = FakeTransport::default();
+    transport.replies.push_back(response);
+    call_http(&s.node, &s.record, "refresh", None, &mut transport).result
+}
+
+#[test]
+fn a_captured_secret_split_over_chunks_is_redacted() {
+    let first = "{\"access_token\":\"at_new_abcd";
+    let second = "efghijkl\"}";
+    let wire = format!(
+        "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n{:x}\r\n{first}\r\n{:x}\r\n{second}\r\n0\r\n\r\n",
+        first.len(),
+        second.len()
+    );
+    let response = run_refresh(wire.into_bytes()).unwrap();
+    assert_eq!(response.body(), br#"{"access_token":"[redacted]"}"#);
+    assert!(response.header("transfer-encoding").is_none());
+}
+
+#[test]
+fn a_captured_secret_written_with_json_escapes_is_redacted() {
+    let body = format!(
+        r#"{{"access_token":"{}u0061t_new_abcdefghijkl"}}"#,
+        char::from(0x5c)
+    );
+    let response = run_refresh(reply("200 OK", &body)).unwrap();
+    assert_eq!(response.body(), br#"{"access_token":"[redacted]"}"#);
+}
+
+#[test]
+fn short_captured_secrets_are_redacted_or_dropped() {
+    let response = run_refresh(reply("200 OK", r#"{"access_token":"at_x7k"}"#)).unwrap();
+    assert_eq!(response.body(), br#"{"access_token":"[redacted]"}"#);
+    // Too short to redact without breaking the response: it is dropped.
+    assert_eq!(
+        run_refresh(reply("200 OK", r#"{"access_token":"a7k"}"#)).map(|_| ()),
+        Err(Error::Reflection)
+    );
+}
+
+#[test]
+fn short_secret_fields_are_searched() {
+    let clock = TestClock::at(NOW);
+    let policy = request_policy(vec![secret("pin")], vec![header("X-Pin", "{{pin}}")]);
+    let s = setup(&clock, policy, &[("pin", b"483920")]);
+    let mut transport = FakeTransport {
+        reply: reply("200 OK", "your pin is 483920"),
+        ..Default::default()
+    };
+    assert_eq!(
+        forward(&s.node, &s.record, &get("/"), &mut transport).map(|_| ()),
+        Err(Error::Reflection)
+    );
+}
+
+#[test]
+fn an_echo_split_over_chunks_is_caught_and_framing_headers_are_refused() {
+    let clock = TestClock::at(NOW);
+    let policy = request_policy(
+        vec![secret("token")],
+        vec![header("Authorization", "Bearer {{token}}")],
+    );
+    let s = setup(&clock, policy, &[("token", TOKEN)]);
+    let (first, second) = ("Bearer tok_", "live_9f8e7d6c5b4a");
+    let mut transport = FakeTransport {
+        reply: format!(
+            "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n{:x}\r\n{first}\r\n{:x}\r\n{second}\r\n0\r\n\r\n",
+            first.len(),
+            second.len()
+        )
+        .into_bytes(),
+        ..Default::default()
+    };
+    assert_eq!(
+        forward(&s.node, &s.record, &get("/echo"), &mut transport).map(|_| ()),
+        Err(Error::Reflection)
+    );
+    let sent = text(&transport.sent[0]);
+    assert!(sent.contains("Accept-Encoding: identity\r\n"), "{sent}");
+    for name in [
+        "Accept-Encoding",
+        "X-HTTP-Method-Override",
+        "Range",
+        "TE",
+        "Expect",
+    ] {
+        let mut request = get("/echo");
+        request.headers.push((name.into(), "x".into()));
+        assert_eq!(
+            forward(&s.node, &s.record, &request, &mut transport).map(|_| ()),
+            Err(Error::RequestInvalid {
+                rule: "header name or value malformed or reserved"
+            }),
+            "{name}"
+        );
+    }
+    // A compressed body cannot be searched: it is refused.
+    transport.reply = b"HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\n\r\nxx".to_vec();
+    assert_eq!(
+        forward(&s.node, &s.record, &get("/echo"), &mut transport).map(|_| ()),
+        Err(Error::ResponseInvalid {
+            rule: "encoded body"
+        })
+    );
+}
+
+#[test]
+fn a_stream_keeps_its_captured_field_when_an_exchange_fails() {
+    let clock = TestClock::at(NOW);
+    let policy = Policy {
+        fields: vec![secret("password"), later("session")],
+        callers: vec![],
+        operations: vec![Operation::Stream {
+            name: "s".into(),
+            destinations: vec![Destination::new("imap.example.com", 993)],
+            identity: None,
+            script: vec![
+                Exchange::Send {
+                    template: "LOGIN {{password}}\r\n".into(),
+                },
+                Exchange::Expect {
+                    until: vec!["\r\n".into()],
+                    capture: vec![capture(
+                        Source::Between {
+                            start: "SESSION ".into(),
+                            end: "\r\n".into(),
+                        },
+                        Store::Field {
+                            name: "session".into(),
+                        },
+                    )],
+                },
+            ],
+        }],
+    };
+    let s = setup(&clock, policy, &[("password", b"p4ssw0rd-imap")]);
+    let mut transport = FakeTransport::default();
+    transport
+        .replies
+        .push_back(b"SESSION sess_rotated_0123456789\r\n".to_vec());
+    let exchanges = [CallerExchange {
+        send: b"NOOP\r\n".to_vec(),
+        until: vec![b"\r\n".to_vec()],
+    }];
+    let imap = Destination::new("imap.example.com", 993);
+    let outcome = call_stream(&s.node, &s.record, "s", &imap, &exchanges, &mut transport);
+    assert_eq!(
+        outcome.result,
+        Ok(StreamOutput {
+            reads: vec![],
+            error: Some(Error::transport(TransportKind::Closed, false)),
+        })
+    );
+    assert_eq!(outcome.record.unwrap().generation, 2);
+}
+
+#[test]
+fn derivations_that_are_oracles_are_refused() {
+    let device = DeviceKey::generate();
+    for template in [
+        // xor(key, key) is all zeros: not a secret key.
+        r#"{{ aes_gcm_encrypt(xor(key, key), "000000000000", key) }}"#,
+        // The length tells whether the input is a part of the key.
+        r#"{{ len(replace(key, $input, "")) }}"#,
+        // Whether decoding fails tells about the key.
+        r#"{{ sha256(b64decode(key + $input)) }}"#,
+    ] {
+        let policy = with_caller(derive_policy(vec![secret("key")], template));
+        assert!(
+            matches!(device.sign_policy(policy), Err(Error::PolicyInvalid { .. })),
+            "{template}"
+        );
+    }
+}
+
+#[test]
+fn templates_read_every_token_name_and_end_with_braces() {
+    let clock = TestClock::at(NOW);
+    for name in ["api-key", "2fa"] {
+        let policy = request_policy(
+            vec![secret(name)],
+            vec![inject(
+                Target::Body,
+                &format!(r#"{{"outer":{{"token":"{{{{{name}}}}}"}}}}"#),
+            )],
+        );
+        let s = setup(&clock, policy, &[(name, TOKEN)]);
+        let mut transport = FakeTransport::default();
+        forward(&s.node, &s.record, &post("/", b""), &mut transport).unwrap();
+        assert_eq!(
+            body_of(&transport.sent[0]),
+            br#"{"outer":{"token":"tok_live_9f8e7d6c5b4a"}}"#
+        );
+    }
+}
+
+#[test]
+fn a_clock_that_goes_back_keeps_the_chain_valid() {
+    let clock = TestClock::at(NOW);
+    let policy = derive_policy(vec![secret("key")], "{{ hex(sha256(key)) }}");
+    let s = setup(&clock, policy, &[("key", b"0123456789abcdef")]);
+    clock.set(NOW - 1000);
+    call_derive(&s.node, &s.record, "derive", b"x").unwrap();
+    let entries = log_of(&s.node);
+    verify_chain(&entries, &s.node.public_key()).unwrap();
+    assert_eq!(entries.last().unwrap().entry.time_ms, NOW);
+}
+
+#[test]
+fn a_capture_into_a_public_field_is_refused() {
+    let mut step = Step {
+        request: StepRequest::Fixed {
+            method: Method::Get,
+            path: "/me".into(),
+            destination: None,
+        },
+        inject: vec![header("Authorization", "Bearer {{token}}")],
+        capture: vec![],
+    };
+    step.capture.push(capture(
+        Source::Json {
+            pointer: "/name".into(),
+        },
+        Store::Field {
+            name: "display_name".into(),
+        },
+    ));
+    let policy = with_caller(Policy {
+        fields: vec![secret("token"), public("display_name")],
+        callers: vec![],
+        operations: vec![
+            http("call", host(), vec![step]),
+            Operation::Derive {
+                name: "name".into(),
+                template: "{{display_name}}".into(),
+            },
+        ],
+    });
+    assert_eq!(
+        DeviceKey::generate().sign_policy(policy),
+        Err(Error::PolicyInvalid {
+            at: "operations[0].steps[0].capture[0]".into(),
+            rule: "capture into a public field (a derivation could hand it back)"
+        })
+    );
+}
+
+#[test]
+fn an_older_record_is_refused_after_a_newer_one_or_a_pin() {
+    let clock = TestClock::at(NOW);
+    let wide = request_policy(
+        vec![secret("token")],
+        vec![header("Authorization", "Bearer {{token}}")],
+    );
+    let s = setup(&clock, wide.clone(), &[("token", TOKEN)]);
+    let old = s.record.clone();
+    let mut transport = FakeTransport::default();
+
+    // The owner narrows the policy on the device: same values, one generation later.
+    let mut narrow = with_caller(wide);
+    if let Operation::Http { methods, .. } = &mut narrow.operations[0] {
+        *methods = vec![Method::Get];
+    }
+    let narrow = old
+        .rewrap(&user_key(), s.device.sign_policy(narrow).unwrap())
+        .unwrap();
+    assert_eq!(narrow.generation, 2);
+
+    // Until the node sees the new record or a pin, the old one still works.
+    forward(&s.node, &old, &post("/x", b""), &mut transport).unwrap();
+    s.node.pin(&s.device.pin(&narrow).unwrap()).unwrap();
+    assert_eq!(
+        forward(&s.node, &old, &post("/x", b""), &mut transport).map(|_| ()),
+        Err(Error::RecordStale { have: 1, need: 2 })
+    );
+    assert_eq!(
+        forward(&s.node, &narrow, &post("/x", b""), &mut transport).map(|_| ()),
+        Err(Error::MethodDenied)
+    );
+    forward(&s.node, &narrow, &get("/x"), &mut transport).unwrap();
+
+    // A pin signed by a key that is not a device of the owner is refused.
+    let stranger = DeviceKey::generate().pin(&narrow).unwrap();
+    assert_eq!(s.node.pin(&stranger), Err(Error::PolicySignature));
+}
+
+#[test]
+fn a_second_device_is_added_not_swapped() {
+    let clock = TestClock::at(NOW);
+    let policy = request_policy(
+        vec![secret("token")],
+        vec![header("Authorization", "Bearer {{token}}")],
+    );
+    let s = setup(&clock, policy.clone(), &[("token", TOKEN)]);
+    let mut transport = FakeTransport::default();
+    let seal = |device: &DeviceKey| {
+        Record::seal(
+            &user_key(),
+            "rec-2",
+            OWNER,
+            device.sign_policy(with_caller(policy.clone())).unwrap(),
+            &fields(&[("token", TOKEN)]),
+        )
+        .unwrap()
+    };
+
+    // The laptop grants the same user key: the phone stays a device.
+    let laptop = DeviceKey::generate();
+    s.node
+        .grant(OWNER, user_key(), laptop.public(), NOW + DAY)
+        .unwrap();
+    forward(&s.node, &s.record, &get("/"), &mut transport).unwrap();
+    forward(&s.node, &seal(&laptop), &get("/"), &mut transport).unwrap();
+
+    // A tablet the phone endorses.
+    let tablet = DeviceKey::generate();
+    let record = seal(&tablet);
+    assert_eq!(
+        forward(&s.node, &record, &get("/"), &mut transport).map(|_| ()),
+        Err(Error::PolicySignature)
+    );
+    s.node
+        .add_device(&s.device.endorse(OWNER, &tablet.public()).unwrap())
+        .unwrap();
+    forward(&s.node, &record, &get("/"), &mut transport).unwrap();
+
+    // An endorsement by a stranger is refused.
+    let stranger = DeviceKey::generate();
+    assert_eq!(
+        s.node
+            .add_device(&stranger.endorse(OWNER, &stranger.public()).unwrap()),
+        Err(Error::PolicySignature)
+    );
+
+    // A grant with another user key starts over with its own device.
+    s.node
+        .grant(
+            OWNER,
+            UserKey::from_bytes(&mut [8u8; 32]),
+            stranger.public(),
+            NOW + DAY,
+        )
+        .unwrap();
+    assert_eq!(
+        forward(&s.node, &s.record, &get("/"), &mut transport).map(|_| ()),
+        Err(Error::PolicySignature)
+    );
+}
+
+#[test]
+fn calls_need_a_listed_caller_and_a_fresh_signature() {
+    let clock = TestClock::at(NOW);
+    let mut policy = request_policy(
+        vec![secret("token")],
+        vec![header("Authorization", "Bearer {{token}}")],
+    );
+    policy.operations.push(Operation::Derive {
+        name: "hash".into(),
+        template: "{{ hex(sha256(token)) }}".into(),
+    });
+    let reader = CallerKey::from_bytes(&mut [6u8; 32]);
+    policy.callers = vec![
+        Caller {
+            name: "app".into(),
+            key: caller_key().public(),
+            operations: vec!["call".into(), "hash".into()],
+            limit: None,
+        },
+        Caller {
+            name: "reader".into(),
+            key: reader.public(),
+            operations: vec!["hash".into()],
+            limit: None,
+        },
+    ];
+    let s = setup(&clock, policy, &[("token", TOKEN)]);
+    let mut transport = FakeTransport::default();
+    let request = get("/a");
+    let payload = Payload::Http(Some(&request));
+    let sign = |key: &CallerKey, name: &str, payload: &Payload<'_>, time: u64| {
+        key.authorize(name, &s.node.public_key(), &s.record, "call", payload, time)
+            .unwrap()
+    };
+    let run = |auth: &Authorization, request: &Request, transport: &mut FakeTransport| {
+        s.node
+            .http(&s.record, "call", auth, Some(request), transport)
+            .result
+            .map(|_| ())
+    };
+
+    let cases = [
+        (
+            sign(&caller_key(), "nobody", &payload, NOW),
+            Error::CallerDenied,
+        ),
+        (sign(&reader, "reader", &payload, NOW), Error::CallerDenied),
+        (
+            sign(&reader, "app", &payload, NOW),
+            Error::CallerInvalid {
+                rule: "signature does not verify",
+            },
+        ),
+        (
+            sign(&caller_key(), "app", &payload, NOW - 6 * 60 * 1000),
+            Error::CallerInvalid {
+                rule: "authorization too old or from the future",
+            },
+        ),
+        (
+            sign(&caller_key(), "app", &Payload::Http(Some(&get("/b"))), NOW),
+            Error::CallerInvalid {
+                rule: "signature does not verify",
+            },
+        ),
+    ];
+    for (auth, error) in cases {
+        assert_eq!(run(&auth, &request, &mut transport), Err(error));
+    }
+    assert!(transport.sent.is_empty());
+    assert_eq!(log_of(&s.node).len(), 1, "only the grant entry");
+
+    let auth = sign(&caller_key(), "app", &payload, NOW);
+    run(&auth, &request, &mut transport).unwrap();
+    assert_eq!(
+        run(&auth, &request, &mut transport),
+        Err(Error::CallerInvalid {
+            rule: "authorization used before"
+        })
+    );
+    let callers: Vec<String> = log_of(&s.node)
+        .iter()
+        .map(|e| e.entry.caller.clone())
+        .collect();
+    assert_eq!(callers, ["", "app", "app"]);
+
+    // The reader may use its own operation.
+    let auth = reader
+        .authorize(
+            "reader",
+            &s.node.public_key(),
+            &s.record,
+            "hash",
+            &Payload::Derive(b""),
+            NOW,
+        )
+        .unwrap();
+    s.node.derive(&s.record, "hash", &auth, b"").unwrap();
+}
+
+#[test]
+fn a_caller_is_held_to_its_limit() {
+    let clock = TestClock::at(NOW);
+    let mut policy = with_caller(derive_policy(vec![secret("key")], "{{ hex(sha256(key)) }}"));
+    policy.callers[0].limit = Some(engine::policy::Limit {
+        count: 2,
+        window_ms: 1000,
+    });
+    let s = setup(&clock, policy, &[("key", b"0123456789abcdef")]);
+    call_derive(&s.node, &s.record, "derive", b"").unwrap();
+    call_derive(&s.node, &s.record, "derive", b"").unwrap();
+    assert_eq!(
+        call_derive(&s.node, &s.record, "derive", b""),
+        Err(Error::RateLimited)
+    );
+    clock.set(NOW + 1000);
+    call_derive(&s.node, &s.record, "derive", b"").unwrap();
+}
+
+#[test]
+fn caller_paths_and_headers_are_allowlisted() {
+    let clock = TestClock::at(NOW);
+    let mut policy = request_policy(
+        vec![secret("token")],
+        vec![header("Authorization", "Bearer {{token}}")],
+    );
+    if let Operation::Http {
+        paths,
+        caller_headers,
+        ..
+    } = &mut policy.operations[0]
+    {
+        *paths = vec!["/v1/".into(), "/health".into()];
+        *caller_headers = vec!["Accept".into()];
+    }
+    let s = setup(&clock, policy, &[("token", TOKEN)]);
+    let mut transport = FakeTransport::default();
+    let mut accept = get("/v1/repos");
+    accept
+        .headers
+        .push(("accept".into(), "application/json".into()));
+    for request in [
+        accept,
+        get("/health"),
+        get("/health?full=1"),
+        get("/v1/a.b"),
+    ] {
+        forward(&s.node, &s.record, &request, &mut transport).unwrap();
+    }
+    let mut other = get("/v1/x");
+    other.headers.push(("X-Other".into(), "1".into()));
+    let path_rule = Error::RequestInvalid {
+        rule: "path must start with / and hold no fragment, dot segment or encoded separator",
+    };
+    for (request, error) in [
+        (get("/v2/x"), Error::PathDenied),
+        (get("/healthz"), Error::PathDenied),
+        (get("/v1"), Error::PathDenied),
+        (get("/v1/../admin"), path_rule.clone()),
+        (get("/v1/%2e%2e/admin"), path_rule.clone()),
+        (get("/v1%2Fadmin"), path_rule),
+        (
+            other,
+            Error::RequestInvalid {
+                rule: "header not allowed by the operation",
+            },
+        ),
+    ] {
+        assert_eq!(
+            forward(&s.node, &s.record, &request, &mut transport).map(|_| ()),
+            Err(error)
+        );
+    }
+}
+
+#[test]
+fn a_wildcard_destination_matches_one_label() {
+    let clock = TestClock::at(NOW);
+    let mut policy = request_policy(
+        vec![secret("token")],
+        vec![header("Authorization", "Bearer {{token}}")],
+    );
+    *destinations_of(&mut policy) = vec![Destination::https("*.example.com")];
+    let s = setup(&clock, policy, &[("token", TOKEN)]);
+    let mut transport = FakeTransport::default();
+    let to = |host: &str| {
+        let mut request = get("/");
+        request.destination = Destination::https(host);
+        request
+    };
+    forward(&s.node, &s.record, &to("eu.example.com"), &mut transport).unwrap();
+    assert!(text(&transport.sent[0]).contains("Host: eu.example.com\r\n"));
+    for host in ["example.com", "a.b.example.com", "evil-example.com"] {
+        assert_eq!(
+            forward(&s.node, &s.record, &to(host), &mut transport).map(|_| ()),
+            Err(Error::DestinationDenied),
+            "{host}"
+        );
+    }
+}
+
+#[test]
+fn a_restarted_node_continues_its_chain_and_its_floors() {
+    let clock = TestClock::at(NOW);
+    let s = setup(
+        &clock,
+        refresh_policy(),
+        &[("refresh_token", b"rt_first_0123456789")],
+    );
+    let device = s.device;
+    let node_key = [9u8; 32];
+    let node = Node::new(
+        NodeKey::from_bytes(&mut node_key.clone()),
+        MemorySink::new(),
+        &clock,
+    );
+    node.grant(OWNER, user_key(), device.public(), NOW + DAY)
+        .unwrap();
+    let mut transport = FakeTransport::default();
+    transport
+        .replies
+        .push_back(reply("200 OK", r#"{"access_token":"at_new_abcdefghijkl"}"#));
+    let renewed = call_http(&node, &s.record, "refresh", None, &mut transport)
+        .record
+        .unwrap();
+    let before = log_of(&node);
+    drop(node);
+
+    let mut sink = MemorySink::new();
+    for entry in &before {
+        engine::log::LogSink::append(&mut sink, entry).unwrap();
+    }
+    let node = Node::restore(
+        NodeKey::from_bytes(&mut node_key.clone()),
+        sink,
+        &clock,
+        &before,
+    )
+    .unwrap();
+    node.grant(OWNER, user_key(), device.public(), NOW + DAY)
+        .unwrap();
+    assert_eq!(
+        call_http(&node, &s.record, "refresh", None, &mut transport)
+            .result
+            .map(|_| ()),
+        Err(Error::RecordStale { have: 1, need: 2 })
+    );
+    transport
+        .replies
+        .push_back(reply("200 OK", r#"{"access_token":"at_third_abcdefghij"}"#));
+    call_http(&node, &renewed, "refresh", None, &mut transport)
+        .result
+        .unwrap();
+    let after = log_of(&node);
+    assert!(after.len() > before.len());
+    verify_chain(&after, &node.public_key()).unwrap();
+    engine::log::verify_owner_chain(&after, OWNER, &node.public_key()).unwrap();
+}
+
+#[test]
+fn a_lost_acknowledgement_halts_until_reconciled() {
+    let clock = TestClock::at(NOW);
+    let policy = request_policy(
+        vec![secret("token")],
+        vec![header("X-Api-Key", "{{token}}")],
+    );
+    let s = setup(&clock, policy, &[("token", TOKEN)]);
+    let mut transport = FakeTransport::default();
+    s.node.with_sink(|k| k.set_store_then_fail(true));
+    assert_eq!(
+        forward(&s.node, &s.record, &get("/"), &mut transport).map(|_| ()),
+        Err(Error::LogUnconfirmed)
+    );
+    s.node.with_sink(|k| k.set_store_then_fail(false));
+    assert!(s.node.is_halted());
+    assert_eq!(
+        forward(&s.node, &s.record, &get("/"), &mut transport).map(|_| ()),
+        Err(Error::LogHalted)
+    );
+    assert!(transport.sent.is_empty());
+    let stored = log_of(&s.node);
+    s.node.reconcile(stored.last()).unwrap();
+    forward(&s.node, &s.record, &get("/"), &mut transport).unwrap();
+    verify_chain(&log_of(&s.node), &s.node.public_key()).unwrap();
+}
+
+struct FixedClock(u64);
+
+impl Clock for FixedClock {
+    fn now_ms(&self) -> u64 {
+        self.0
+    }
+}
+
+#[test]
+fn one_node_serves_many_threads() {
+    let device = DeviceKey::generate();
+    let policy = with_caller(derive_policy(
+        vec![secret("key")],
+        "{{ hex(hmac_sha256(key, $input)) }}",
+    ));
+    let record = Record::seal(
+        &user_key(),
+        "rec-1",
+        OWNER,
+        device.sign_policy(policy).unwrap(),
+        &fields(&[("key", b"0123456789abcdef")]),
+    )
+    .unwrap();
+    let node = Node::new(NodeKey::generate(), MemorySink::new(), FixedClock(NOW));
+    node.grant(OWNER, user_key(), device.public(), NOW + DAY)
+        .unwrap();
+    std::thread::scope(|scope| {
+        for t in 0..8u8 {
+            let (node, record) = (&node, &record);
+            scope.spawn(move || {
+                for i in 0..10u8 {
+                    let input = [t, i];
+                    let auth = caller_key()
+                        .authorize(
+                            "app",
+                            &node.public_key(),
+                            record,
+                            "derive",
+                            &Payload::Derive(&input),
+                            NOW,
+                        )
+                        .unwrap();
+                    node.derive(record, "derive", &auth, &input).unwrap();
+                }
+            });
+        }
+    });
+    let entries = node.with_sink(|k| k.entries().to_vec());
+    assert_eq!(entries.len(), 1 + 80);
+    verify_chain(&entries, &node.public_key()).unwrap();
+}
+
+#[test]
+fn renderings_and_responses_have_budgets() {
+    let clock = TestClock::at(NOW);
+    let blowup = format!(
+        "{{{{ len({}$input{}) }}}}",
+        "hex(".repeat(16),
+        ")".repeat(16)
+    );
+    let s = setup(
+        &clock,
+        derive_policy(vec![secret("k")], &blowup),
+        &[("k", b"0123456789")],
+    );
+    let started = std::time::Instant::now();
+    assert_eq!(
+        call_derive(&s.node, &s.record, "derive", &[b'/'; 1024]),
+        Err(Error::Budget { what: "bytes" })
+    );
+    assert!(started.elapsed().as_secs() < 10);
+
+    let policy = request_policy(
+        vec![secret("token")],
+        vec![header("Authorization", "Bearer {{token}}")],
+    );
+    let s = setup(&clock, policy, &[("token", TOKEN)]);
+    let mut transport = FakeTransport {
+        reply: vec![b'z'; engine::response::MAX_RESPONSE + 1],
+        ..Default::default()
+    };
+    assert_eq!(
+        forward(&s.node, &s.record, &get("/"), &mut transport).map(|_| ()),
+        Err(Error::transport(TransportKind::TooLarge, true))
+    );
+    let many = "X: 1\r\n".repeat(200);
+    transport.reply = format!("HTTP/1.1 200 OK\r\n{many}\r\n").into_bytes();
+    assert_eq!(
+        forward(&s.node, &s.record, &get("/"), &mut transport).map(|_| ()),
+        Err(Error::ResponseInvalid {
+            rule: "too many headers"
+        })
+    );
 }

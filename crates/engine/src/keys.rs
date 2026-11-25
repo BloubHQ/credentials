@@ -2,8 +2,12 @@
 //!
 //! - [`UserKey`]: created on the device of the owner; a node holds it only while a grant is in
 //!   force. Record keys are derived from it.
-//! - [`DeviceKey`]: stays on the device; it signs the policies of the owner.
-//! - [`NodeKey`]: created by a node at start; it signs the log entries of that node.
+//! - [`DeviceKey`]: stays on a device of the owner; it signs policies, pins and the
+//!   endorsements of other devices.
+//! - [`CallerKey`]: held by an application or agent the owner lets use a record; it signs each
+//!   call.
+//! - [`NodeKey`]: held by a node; it signs the log entries of that node. Keep its bytes
+//!   ([`NodeKey::to_bytes`]) to continue the chain after a restart.
 
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use hkdf::Hkdf;
@@ -92,6 +96,10 @@ public_key!(
     NodePublicKey,
     "The public key of a node: it verifies log entries."
 );
+public_key!(
+    CallerPublicKey,
+    "The public key of a caller: it verifies the authorizations of calls."
+);
 
 macro_rules! signing_key {
     ($name:ident, $public:ident, $doc:literal) => {
@@ -102,6 +110,18 @@ macro_rules! signing_key {
             /// Creates a random key.
             pub fn generate() -> Self {
                 Self(SigningKey::generate(&mut OsRng))
+            }
+
+            /// Takes the 32 secret bytes of a key and erases the caller's copy.
+            pub fn from_bytes(bytes: &mut [u8; 32]) -> Self {
+                let key = Self(SigningKey::from_bytes(bytes));
+                bytes.zeroize();
+                key
+            }
+
+            /// The 32 secret bytes, to store the key (encrypted) and restore it later.
+            pub fn to_bytes(&self) -> zeroize::Zeroizing<[u8; 32]> {
+                zeroize::Zeroizing::new(self.0.to_bytes())
             }
 
             /// The public key.
@@ -121,8 +141,73 @@ signing_key!(
     DevicePublicKey,
     "The signing key of a device. It never leaves the device."
 );
+signing_key!(NodeKey, NodePublicKey, "The signing key of a node.");
 signing_key!(
-    NodeKey,
-    NodePublicKey,
-    "The signing key of a node, created at start, kept in memory."
+    CallerKey,
+    CallerPublicKey,
+    "The signing key of a caller (an application or agent)."
 );
+
+const ENDORSE_DOMAIN: &[u8] = b"endorse/v1\0";
+
+/// A device of the owner vouching for another device, so a node accepts the policies and pins
+/// the new device signs.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Endorsement {
+    /// The owner.
+    pub owner: String,
+    /// The new device.
+    pub device: DevicePublicKey,
+    /// Ed25519 signature of a device the node already accepts for the owner.
+    #[serde(with = "b64_array")]
+    pub signature: [u8; 64],
+}
+
+#[derive(Serialize)]
+struct EndorseBody<'a> {
+    owner: &'a str,
+    device: &'a DevicePublicKey,
+}
+
+impl Endorsement {
+    fn message(owner: &str, device: &DevicePublicKey) -> Result<Vec<u8>> {
+        encoding::canonical(ENDORSE_DOMAIN, &EndorseBody { owner, device })
+    }
+
+    /// Verifies the signature under one of `devices`.
+    pub(crate) fn verify(&self, devices: &[DevicePublicKey]) -> Result<()> {
+        let message = Self::message(&self.owner, &self.device)?;
+        if devices
+            .iter()
+            .any(|d| d.verify(&message, &self.signature).is_ok())
+        {
+            Ok(())
+        } else {
+            Err(Error::PolicySignature)
+        }
+    }
+}
+
+impl DeviceKey {
+    /// Vouches for `device` as another device of `owner`.
+    pub fn endorse(&self, owner: &str, device: &DevicePublicKey) -> Result<Endorsement> {
+        Ok(Endorsement {
+            owner: owner.to_string(),
+            device: *device,
+            signature: self.sign(&Endorsement::message(owner, device)?),
+        })
+    }
+}
+
+impl UserKey {
+    /// True when both hold the same bytes, compared in constant time.
+    pub(crate) fn same(&self, other: &UserKey) -> bool {
+        self.0
+            .expose()
+            .iter()
+            .zip(other.0.expose())
+            .fold(0u8, |acc, (a, b)| acc | (a ^ b))
+            == 0
+    }
+}

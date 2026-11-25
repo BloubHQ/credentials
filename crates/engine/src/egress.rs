@@ -8,6 +8,7 @@
 
 use zeroize::Zeroizing;
 
+use crate::error::TransportKind;
 use crate::log::Confirmed;
 use crate::policy::Destination;
 use crate::secret::Secret;
@@ -48,20 +49,27 @@ impl core::fmt::Debug for ClientIdentity {
 pub trait Stream {
     /// Writes all of `bytes`.
     fn write(&mut self, bytes: &[u8]) -> Result<()>;
-    /// Reads until `delimiter` was read (and returns it with what came before), or fails after
-    /// `max` bytes.
-    fn read_until(&mut self, delimiter: &[u8], max: usize) -> Result<Vec<u8>>;
+    /// Reads until one of `delimiters` was read and returns it with what came before. Fails
+    /// with [`TransportKind::TooLarge`] after `max` bytes without a delimiter.
+    fn read_until(&mut self, delimiters: &[&[u8]], max: usize) -> Result<Vec<u8>>;
+
+    /// Ends the connection. The default does nothing; the connection ends when dropped.
+    fn close(&mut self) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// Sends requests and opens connections.
 pub trait Transport {
     /// Sends `wire` to `destination` over TLS (presenting `identity`, when given) and returns
-    /// the response bytes.
+    /// the response bytes. It should stop reading after `max_response` bytes and fail with
+    /// [`TransportKind::TooLarge`]; the engine refuses a longer response anyway.
     fn send(
         &mut self,
         destination: &Destination,
         identity: Option<&ClientIdentity>,
         wire: &[u8],
+        max_response: usize,
     ) -> Result<Vec<u8>>;
 
     /// Opens a TLS connection to `destination`. A transport without streams keeps the default,
@@ -72,7 +80,7 @@ pub trait Transport {
         identity: Option<&ClientIdentity>,
     ) -> Result<Box<dyn Stream + '_>> {
         let _ = (destination, identity);
-        Err(Error::Transport)
+        Err(Error::transport(TransportKind::Unsupported, false))
     }
 }
 
@@ -85,7 +93,12 @@ pub(crate) fn dispatch<T: Transport>(
     wire: &Secret<Vec<u8>>,
 ) -> Result<(u64, Vec<u8>)> {
     let seq = confirmed.seq();
-    let response = transport.send(destination, identity, wire.expose())?;
+    let max = crate::response::MAX_RESPONSE;
+    let mut response = transport.send(destination, identity, wire.expose(), max)?;
+    if response.len() > max {
+        zeroize::Zeroize::zeroize(&mut response);
+        return Err(Error::transport(TransportKind::TooLarge, true));
+    }
     Ok((seq, response))
 }
 
