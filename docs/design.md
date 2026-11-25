@@ -365,6 +365,15 @@ ways, in order of preference:
    same site, never back to the caller. The site already receives the secret, so running its
    own code on it gives it nothing new; the caller still sees nothing.
 
+Measured example (Naver login page, `login.js?v=20260918`, read 2026-11-25): the password
+goes in `eccpw`. The page fetches `/login/dynamicEcKey/<dynamicKey>` (`sessionKey,serverKey`),
+makes an ephemeral P-256 key, hashes the ECDH x-coordinate's hex string with SHA-256 into an
+AES-256-CBC key, and encrypts `len·sessionKey·len·id·len·pw` under a random IV; the form sends
+`ciphertext,iv,ephemeralPublicKey,sessionKey`. That is case 1 with three additions
+(ephemeral ECDH, a one-byte length encoder, a random IV). The anti-bot `wtoken` comes from a
+separate captcha script whose callback receives no credentials, and the page empties the id
+and password fields before calling it: case 2. `bvsd` is sent empty by this page version.
+
 Limits: code that needs a real browser environment (DOM, canvas, timing, the owner's network)
 cannot be emulated faithfully and goes through a browser fill (section 6); a site whose code
 changes on every load needs the hash left unpinned, which the approval screen flags.
