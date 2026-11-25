@@ -18,14 +18,14 @@ fuzz_target!(|data: &[u8]| {
         let _ = receiver.open(text.into());
     }
     let sender = client::start_transfer();
-    if let Ok(sender) = sender {
-        if sender.offer().is_ok() {
-            assert!(
-                sender
-                    .seal(text.into(), "alice".into(), Vec::new())
-                    .is_err(),
-                "a transfer sealed without keys"
-            );
-        }
+    if let Ok(sender) = sender
+        && sender.offer().is_ok()
+    {
+        assert!(
+            sender
+                .seal(text.into(), "alice".into(), Vec::new())
+                .is_err(),
+            "a transfer sealed without keys"
+        );
     }
 });

@@ -504,14 +504,15 @@ pub fn run(args: &[String]) -> u8 {
         }
     }
     let error = result.as_ref().err();
-    if error.is_none() && summary.owner_tail_unchecked {
-        if let Some(checkpoint) = &summary.checkpoint {
-            eprintln!(
-                "warning: the signed head covers {} entries of the node, past the last entry of {} in the file: entries of that owner after it would not be noticed if they were cut (ask for a checkpoint taken right after the owner's last entry)",
-                checkpoint.len,
-                options.owner.as_deref().unwrap_or_default()
-            );
-        }
+    if error.is_none()
+        && summary.owner_tail_unchecked
+        && let Some(checkpoint) = &summary.checkpoint
+    {
+        eprintln!(
+            "warning: the signed head covers {} entries of the node, past the last entry of {} in the file: entries of that owner after it would not be noticed if they were cut (ask for a checkpoint taken right after the owner's last entry)",
+            checkpoint.len,
+            options.owner.as_deref().unwrap_or_default()
+        );
     }
     if options.json {
         println!(

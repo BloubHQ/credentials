@@ -950,13 +950,13 @@ pub fn check_values(policy: &Policy, fields: &Fields, now_ms: Option<u64>) -> Re
     let other = |name: &str| fields.get(name).map(<[u8]>::to_vec);
     for (name, value) in fields.values() {
         kind.check_value(name, value, &binding.signoff, now_ms, &other)?;
-        if let Some(pin) = binding.pins.get(name) {
-            if pin.as_bytes() != value {
-                return Err(Error::FieldInvalid {
-                    field: name.to_string(),
-                    rule: "the value differs from its pin in the policy",
-                });
-            }
+        if let Some(pin) = binding.pins.get(name)
+            && pin.as_bytes() != value
+        {
+            return Err(Error::FieldInvalid {
+                field: name.to_string(),
+                rule: "the value differs from its pin in the policy",
+            });
         }
     }
     Ok(())

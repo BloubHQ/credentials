@@ -15,11 +15,11 @@ fuzz_target!(|data: &[u8]| {
     }
     let _ = serde_json::from_slice::<SignedStatement>(data);
     let _ = TrustRoot::from_json(data);
-    if let Ok(name) = std::str::from_utf8(data) {
-        if let Ok(version) = Version::parse(name) {
-            assert!(!is_newer(name, name));
-            assert_eq!(version, version.clone());
-        }
+    if let Ok(name) = std::str::from_utf8(data)
+        && let Ok(version) = Version::parse(name)
+    {
+        assert!(!is_newer(name, name));
+        assert_eq!(version, version.clone());
     }
     if data.len() >= 80 {
         let (head, rest) = data.split_at(16);

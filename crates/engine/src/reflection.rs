@@ -118,11 +118,9 @@ fn escaped_strings(bytes: &[u8]) -> Vec<(usize, usize, Bytes)> {
             break;
         };
         let token = bytes.get(start..end).unwrap_or_default();
-        if has_escape {
-            if let Ok(mut text) = serde_json::from_slice::<String>(token) {
-                out.push((start, end, Zeroizing::new(text.as_bytes().to_vec())));
-                text.zeroize();
-            }
+        if has_escape && let Ok(mut text) = serde_json::from_slice::<String>(token) {
+            out.push((start, end, Zeroizing::new(text.as_bytes().to_vec())));
+            text.zeroize();
         }
         i = end;
     }

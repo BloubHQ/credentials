@@ -66,9 +66,19 @@ impl Drop for Server {
     }
 }
 
+/// A port nothing listens on, never the same one twice in this run: tests run on threads of
+/// one process, and two servers given the same port would answer for each other.
 fn free_port() -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    listener.local_addr().unwrap().port()
+    static GIVEN: std::sync::Mutex<Vec<u16>> = std::sync::Mutex::new(Vec::new());
+    let mut given = GIVEN.lock().unwrap();
+    loop {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        if !given.contains(&port) {
+            given.push(port);
+            return port;
+        }
+    }
 }
 
 fn start(key: &Path, log: &Path, port: u16, anchor: Option<&Path>) -> Server {
@@ -96,11 +106,20 @@ fn start_with(key: &Path, log: &Path, port: u16, anchor: Option<&Path>, extra: &
         .stderr(Stdio::inherit())
         .spawn()
         .unwrap();
-    let server = Server(child);
+    let mut server = Server(child);
     let url = format!("http://127.0.0.1:{port}");
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
+        // A server that could not listen exits: whatever answers on the port then is not it.
+        assert!(
+            server.0.try_wait().unwrap().is_none(),
+            "the server exited before it answered"
+        );
         if run(&["node", "identity", "--url", &url]).status.success() {
+            assert!(
+                server.0.try_wait().unwrap().is_none(),
+                "the server exited before it answered"
+            );
             return server;
         }
         assert!(

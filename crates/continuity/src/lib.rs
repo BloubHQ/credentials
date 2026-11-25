@@ -15,7 +15,7 @@
 //! The `client` crate uses the same checks when an owner re-grants to a successor after the
 //! old node is gone, and `credentials verify` when it checks a chain across a hand-over.
 //!
-//! With the `testing` feature, [`testing`] makes test roots (Nitro and Sigstore) at run time,
+//! With the `testing` feature, the `testing` module makes test roots (Nitro and Sigstore) at run time,
 //! for tests only.
 
 mod der;

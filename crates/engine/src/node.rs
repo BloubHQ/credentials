@@ -282,12 +282,12 @@ impl Nonces {
                 break;
             }
             self.by_expiry.pop_first();
-            if let Some(who) = self.seen.remove(&tag) {
-                if let Some(count) = self.per_caller.get_mut(&who) {
-                    *count = count.saturating_sub(1);
-                    if *count == 0 {
-                        self.per_caller.remove(&who);
-                    }
+            if let Some(who) = self.seen.remove(&tag)
+                && let Some(count) = self.per_caller.get_mut(&who)
+            {
+                *count = count.saturating_sub(1);
+                if *count == 0 {
+                    self.per_caller.remove(&who);
                 }
             }
         }
@@ -1163,12 +1163,12 @@ impl<S: LogSink, C: Clock> Node<S, C> {
         if let Payload::Resume(id) = payload {
             return self.resume(record, name, auth, id, transport, updated);
         }
-        if let Payload::Derive(input) = payload {
-            if input.len() > MAX_INPUT {
-                return Err(Error::RequestInvalid {
-                    rule: "input larger than 1 MiB",
-                });
-            }
+        if let Payload::Derive(input) = payload
+            && input.len() > MAX_INPUT
+        {
+            return Err(Error::RequestInvalid {
+                rule: "input larger than 1 MiB",
+            });
         }
         let now = self.clock.now_ms();
         let (policy, operation, checked) = self.check_call(record, name, auth, &payload, now)?;

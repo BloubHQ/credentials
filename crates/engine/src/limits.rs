@@ -350,14 +350,14 @@ impl Ledger {
                 .map(|m| format!(" at {m}"))
                 .unwrap_or_default();
             let bound = |b: &Option<String>| b.as_deref().and_then(scaled);
-            if let Some(max) = bound(&rule.per_payment) {
-                if amount > max {
-                    lines.push(format!(
-                        "above the limit of {} {} per payment{at}",
-                        show(max),
-                        rule.currency
-                    ));
-                }
+            if let Some(max) = bound(&rule.per_payment)
+                && amount > max
+            {
+                lines.push(format!(
+                    "above the limit of {} {} per payment{at}",
+                    show(max),
+                    rule.currency
+                ));
             }
             for (max, window, what) in [
                 (bound(&rule.per_day), DAY_MS, "day"),

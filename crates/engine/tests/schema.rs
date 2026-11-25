@@ -102,57 +102,57 @@ fn check(root: &Value, schema: &Value, value: &Value, at: &str, errors: &mut Vec
             return;
         }
     }
-    if let Some(Value::Array(values)) = schema.get("enum") {
-        if !values.contains(value) {
-            fail(format!("{value} not in {values:?}"));
-        }
+    if let Some(Value::Array(values)) = schema.get("enum")
+        && !values.contains(value)
+    {
+        fail(format!("{value} not in {values:?}"));
     }
-    if let Some(c) = schema.get("const") {
-        if c != value {
-            fail(format!("{value} is not {c}"));
-        }
+    if let Some(c) = schema.get("const")
+        && c != value
+    {
+        fail(format!("{value} is not {c}"));
     }
     if let Value::String(s) = value {
         let len = s.chars().count() as u64;
-        if let Some(min) = schema.get("minLength").and_then(Value::as_u64) {
-            if len < min {
-                fail(format!("shorter than {min}"));
-            }
+        if let Some(min) = schema.get("minLength").and_then(Value::as_u64)
+            && len < min
+        {
+            fail(format!("shorter than {min}"));
         }
-        if let Some(max) = schema.get("maxLength").and_then(Value::as_u64) {
-            if len > max {
-                fail(format!("longer than {max}"));
-            }
+        if let Some(max) = schema.get("maxLength").and_then(Value::as_u64)
+            && len > max
+        {
+            fail(format!("longer than {max}"));
         }
-        if let Some(Value::String(p)) = schema.get("pattern") {
-            if !regex::Regex::new(p).unwrap().is_match(s) {
-                fail(format!("{s:?} does not match {p}"));
-            }
+        if let Some(Value::String(p)) = schema.get("pattern")
+            && !regex::Regex::new(p).unwrap().is_match(s)
+        {
+            fail(format!("{s:?} does not match {p}"));
         }
     }
     if value.is_number() {
         let n = value.as_f64().unwrap();
-        if let Some(min) = schema.get("minimum").and_then(Value::as_f64) {
-            if n < min {
-                fail(format!("below {min}"));
-            }
+        if let Some(min) = schema.get("minimum").and_then(Value::as_f64)
+            && n < min
+        {
+            fail(format!("below {min}"));
         }
-        if let Some(max) = schema.get("maximum").and_then(Value::as_f64) {
-            if n > max {
-                fail(format!("above {max}"));
-            }
+        if let Some(max) = schema.get("maximum").and_then(Value::as_f64)
+            && n > max
+        {
+            fail(format!("above {max}"));
         }
     }
     if let Value::Array(items) = value {
-        if let Some(min) = schema.get("minItems").and_then(Value::as_u64) {
-            if (items.len() as u64) < min {
-                fail(format!("fewer than {min} items"));
-            }
+        if let Some(min) = schema.get("minItems").and_then(Value::as_u64)
+            && (items.len() as u64) < min
+        {
+            fail(format!("fewer than {min} items"));
         }
-        if let Some(max) = schema.get("maxItems").and_then(Value::as_u64) {
-            if items.len() as u64 > max {
-                fail(format!("more than {max} items"));
-            }
+        if let Some(max) = schema.get("maxItems").and_then(Value::as_u64)
+            && items.len() as u64 > max
+        {
+            fail(format!("more than {max} items"));
         }
         if let Some(each) = schema.get("items") {
             for (i, item) in items.iter().enumerate() {

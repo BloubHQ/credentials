@@ -5,6 +5,10 @@ before 1.0, minor versions may break formats and APIs.
 
 ## Unreleased
 
+### Changed
+
+- Minimum Rust 1.88 (was 1.87): `time` 0.3.47, which fixes RUSTSEC-2026-0009, needs it.
+
 ### Added
 
 - Node continuity (`docs/design.md` section 11, part 10; section 10): a node hands its state

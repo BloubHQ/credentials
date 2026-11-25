@@ -929,17 +929,17 @@ fn call(common: &CallCommon, body: Body) -> Res<()> {
     let json = serde_json::to_vec(&call).map_err(|e| format!("cannot encode JSON: {e}"))?;
     let reply = client::request(url, "POST", "/call", Some(&json))?;
     println!("{}", String::from_utf8_lossy(&reply.body));
-    if let Ok(answer) = serde_json::from_slice::<Value>(&reply.body) {
-        if let Some(record) = answer.get("record").filter(|r| !r.is_null()) {
-            let record: Record = serde_json::from_value(record.clone())
-                .map_err(|e| format!("the node handed back a malformed record: {e}"))?;
-            files::write_json(&common.record, &record)?;
-            eprintln!(
-                "the node sealed the record again: generation {} written to {}",
-                record.generation,
-                common.record.display()
-            );
-        }
+    if let Ok(answer) = serde_json::from_slice::<Value>(&reply.body)
+        && let Some(record) = answer.get("record").filter(|r| !r.is_null())
+    {
+        let record: Record = serde_json::from_value(record.clone())
+            .map_err(|e| format!("the node handed back a malformed record: {e}"))?;
+        files::write_json(&common.record, &record)?;
+        eprintln!(
+            "the node sealed the record again: generation {} written to {}",
+            record.generation,
+            common.record.display()
+        );
     }
     reply.check(url)
 }
