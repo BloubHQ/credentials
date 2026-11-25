@@ -5,6 +5,19 @@ can act for its owner on any site or service without ever holding the owner's se
 It is the plan of record; each part lands as its own pull request, with its tests, threat-model
 rows and measurements.
 
+## 0. Goals
+
+1. **Free and custom everywhere, without rebuilding the node.** Sites, item kinds, policies,
+   templates, flows and protocols are data or signed modules, never a new release: an owner
+   (or an agent, with the owner's signature) can describe anything the node's primitives can
+   express. A rebuild is needed only for a new cryptographic primitive, so the release ships
+   every primitive of the standard registries up front (section 8d) to make that rare.
+2. **Security at least Pickle's.** Secrets never reach the agent, the model provider, the
+   service's servers or the parent instance; values are masked; risky actions wait for the
+   owner; the node is attested and reproducible. Freedom never lowers this: whatever is
+   custom is signed by the owner, checked by the taint analysis and confined by the node's
+   default deny.
+
 ## 1. Scope
 
 This repository is the **vault**: the node that runs in an AWS Nitro Enclave, the formats it
@@ -75,8 +88,10 @@ Each kind fixes its field names, their **disclosure level**, validation and defa
 | `vpn` | WireGuard peer (endpoint, public key), private key (secret); or IPsec/IKEv2 identity and PSK or key | endpoint pinned |
 | `api` | free-form fields with a hand-written policy (today's records) | as today |
 
-**Implementation.** `engine::item` holds the schemas as data (`items.json` compiled in, so it
-is in PCR2). A typed record is an ordinary record whose policy is generated from the schema and
+**Implementation.** `engine::item` holds the schemas as data. The reviewed kinds ship in
+`items.json` (compiled in, so in PCR2); an owner can add **custom kinds** without a release: a
+kind schema (fields, disclosure levels, validation patterns, policy shape) signed by the
+owner's device, under the same checks as a policy. A typed record is an ordinary record whose policy is generated from the schema and
 the owner's choices, then signed by the owner like any policy. The node re-derives the policy
 from the schema and refuses a typed record whose signed policy differs, so a typed item cannot
 smuggle extra destinations. Masked projections are computed by the node and returned by a new
@@ -329,6 +344,15 @@ primitive waits for the release that adds it.
 **Implementation.** crate `module` (WASM runtime, the handle table, the host functions mapped
 onto `engine::template`), operation kind `module`; a fuzz target for module inputs; a module
 SDK in Rust that compiles to `wasm32-unknown-unknown`.
+
+## 8d. Primitives shipped up front
+
+Primitives are the one part that needs a release, so the first release that adds a group
+adds all of it, taken from the registries (IANA JOSE, COSE, SASL, SSH, TLS signature schemes,
+HTTP authentication schemes) rather than from site-by-site demand: every hash, MAC, KDF,
+signature, key agreement, key wrap and cipher those registries list and that is not
+deprecated, plus the national ciphers (SEED, ARIA) and big-integer arithmetic for SRP. The
+audit of the registries against this document goes into an appendix, entry by entry.
 
 ## 9. Who sees what
 
