@@ -62,7 +62,13 @@ assert.deepEqual(
 const policy = JSON.stringify({
   fields: [{ name: "key", secret: true }],
   callers: [{ name: "app", key: callerPublic, operations: ["mac"] }],
-  operations: [{ kind: "derive", name: "mac", template: "{{ hex(hmac_sha256(key, $input)) }}" }],
+  operations: [
+    {
+      name: "mac",
+      input: { raw: { max_len: 64 } },
+      steps: [{ do: "return", template: "{{ hex(hmac_sha256(key, $input)) }}" }],
+    },
+  ],
 });
 const signed = client.signPolicy(device, policy);
 const fields = new Map([["key", new TextEncoder().encode("0123456789abcdef0123456789abcdef")]]);
