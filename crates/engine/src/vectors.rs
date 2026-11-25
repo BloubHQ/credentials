@@ -153,7 +153,11 @@ fn pbkdf2_rfc6070_rfc7914() {
             rounds.as_bytes(),
             length.as_bytes(),
         ];
-        assert_eq!(hex_call("pbkdf2", &args), out, "RFC 6070 vector, {rounds} rounds");
+        assert_eq!(
+            hex_call("pbkdf2", &args),
+            out,
+            "RFC 6070 vector, {rounds} rounds"
+        );
     }
     let rfc7914 = [
         (
