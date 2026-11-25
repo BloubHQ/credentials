@@ -9,9 +9,9 @@
 //! the owner can pin the lowest generation a node accepts ([`Pin`]); together they stop an
 //! operator from handing back an older record (a rollback).
 
-use chacha20poly1305::aead::{Aead, KeyInit, Payload};
+use chacha20poly1305::aead::{Aead, AeadCore, KeyInit, Payload};
 use chacha20poly1305::{ChaCha20Poly1305, Nonce};
-use rand_core::{OsRng, RngCore};
+use rand_core::OsRng;
 use serde::{Deserialize, Serialize};
 
 use crate::encoding::{b64_array, b64_vec, canonical};
@@ -115,8 +115,7 @@ impl Record {
         policy.policy.validate()?;
         check_fields(&policy.policy, fields)?;
         let plain = fields.encode()?;
-        let mut nonce = [0u8; 12];
-        OsRng.fill_bytes(&mut nonce);
+        let nonce: [u8; 12] = ChaCha20Poly1305::generate_nonce(&mut OsRng).into();
         let mut record = Record {
             v: VERSION,
             id: id.to_string(),
