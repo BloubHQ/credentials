@@ -25,8 +25,9 @@ What the engine protects, against whom, under which assumptions, and what is lef
 - **A1.** In deployment, the node runs inside a TEE whose attestation the owner checks, and
   the quote carries `NodeIdentity::report_data()`. The repository integrates AWS Nitro
   Enclaves (`crates/enclave`, `credentials host`): the NSM attestation document carries it as
-  `user_data`, with the owner's nonce, and the owner compares PCR0, PCR1 and PCR2 with the
-  published measurements of a reproducible release. Outside a TEE, the operator can read node
+  `user_data`, with the owner's nonce, and the owner checks it (`attest`, `credentials attest`, `credentials grant --attestation`):
+  the chain to AWS Nitro Enclaves Root-G1, the nonce, `user_data`, and PCR0, PCR1 and PCR2
+  against the published measurements of a reproducible release. Outside a TEE, the operator can read node
   memory and every guarantee that relies on the node keeping a secret falls away; the log,
   signatures and policy checks still bind an honest node.
 - **A2.** The owner's device and its keys are not compromised.
@@ -41,6 +42,9 @@ What the engine protects, against whom, under which assumptions, and what is lef
 | --- | --- | --- |
 | Operator changes where a value goes | Policy signed by a device and bound into the record's AEAD | `policy`, `record` |
 | Operator swaps in an older record (narrower policy undone, revoked token back) | Generations in the AEAD; node floors; pins in grants and `Node::pin`; unpinned records refused | `record`, `node` |
+| Operator impersonates a node: hands the owner an identity whose seal key it holds outside the enclave | The grant is sealed only after the attestation document verifies (chain to the pinned AWS Nitro root at the document's time, ES384 signature, the owner's fresh nonce) and its `user_data` equals `report_data()` of that identity; a document of another node, or replayed from an earlier request, is refused | `attest`, `cli` |
+| Operator runs the node in a debug enclave, whose memory the host can read | A document with PCR0, PCR1 and PCR2 all zero is refused even when the owner lists zero measurements | `attest` |
+| Operator runs an old or unknown release (a build with a known flaw, or its own build) | PCR0–2 must equal one entry of the owner's `measurements.json`; the owner drops a release from the list to refuse it | `attest` |
 | Operator reads a grant in transit | HPKE to the node's seal key; the key is bound to the attested identity | `grant` |
 | Operator replays a stored grant after a revocation | Issue time within ±5 min and newer than the owner's last grant, revocation or device change (restored from the log); after a restart, nothing issued before the node started is accepted | `node` |
 | Operator restarts the node with a cut log to forget revocations, devices and floors | Grants and calls made before the restart are refused, so stored ones cannot be replayed; `Node::restore_anchored` refuses a log shorter than the last checkpoint the platform kept out of the operator's reach | `node` |
@@ -90,6 +94,11 @@ These remain by design; each is listed in the README.
 - **Nitro: build supply chain.** The PCRs bind the image to the commit, the Rust image, the
   Amazon Linux image and the nitro-cli packages named by digest and version in
   `measurements.json`; a compromised input that every rebuild uses is reproduced too.
+- **Nitro attestation trusts AWS and the measurement list.** Whoever holds the AWS Nitro root
+  key can sign any document; a release in the owner's list is trusted whatever it does. The
+  attestation is checked once, before a grant: a node replaced later under the same identity
+  is not re-checked until the next grant. The document's time is the module's, not the
+  owner's clock; freshness comes from the nonce.
 - **Unknown encodings.** A server that transforms a secret in a way the search does not know
   (compression of its own, encryption, splitting across fields) can return it to the caller.
   Policies should only call services that do not echo credentials.

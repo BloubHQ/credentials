@@ -79,6 +79,16 @@ before 1.0, minor versions may break formats and APIs.
 - Release workflow: binaries for Linux, macOS and Windows, `SHA256SUMS`, CycloneDX SBOM and
   build provenance; Scorecard; Dependabot groups; CODEOWNERS; Code of Conduct; DCO sign-off.
 - READMEs in Korean, Simplified Chinese and Japanese (`docs/i18n`).
+- `attest` crate: verifies AWS Nitro Enclaves attestation documents (COSE_Sign1 with ES384,
+  certificate chain to the pinned AWS Nitro Enclaves Root-G1 at the document's time, nonce,
+  PCR0–2 against accepted `measurements.json` entries, debug enclaves refused) and binds them
+  to `NodeIdentity::report_data()`. Tested on real documents of a production and a debug
+  enclave.
+- `credentials attest --document <file|-> --nonce <b64url> --measurements <file>
+  [--identity <file>]` prints the verified release, PCRs and time; a refused document exits 3.
+- `credentials grant --attestation <file> --nonce <b64url> --measurements <file>`: the grant is
+  sealed only if the document verifies and vouches for the node identity. Without
+  `--attestation`, `grant` warns.
 
 ### Changed
 

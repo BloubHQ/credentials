@@ -1,3 +1,6 @@
 * text=auto eol=lf
 *.pem -text
 *.key -text
+*.cbor -text
+*.der -text
+*.nonce -text

@@ -3,7 +3,8 @@
 The `credentials` command: the owner's device, a caller and a node, as one tool.
 
 - **Owner** (on a device it controls): `keygen`, `policy check|sign`, `seal`, `pin`, `grant`,
-  `revoke`, `device endorse|retire`.
+  `revoke`, `device endorse|retire`, and `attest` to check a node's AWS Nitro Enclaves
+  attestation before granting.
 - **Caller** (an application or agent): `call http|derive` signs a call and can send it.
 - **Node**: `serve` runs a node behind a small HTTP/1.1 server with its log in a JSONL file;
   `node identity` prints the keys owners grant to.
@@ -118,7 +119,22 @@ credentials node identity --url http://127.0.0.1:8700 --out identity.json
 ```
 
 In a deployment, check the node's attestation against `NodeIdentity::report_data()` before
-granting (see the main README).
+granting. For a node in an AWS Nitro Enclave, ask it for an attestation document over a fresh
+random nonce (32 bytes, base64url) and check it against the `measurements.json` of the releases
+you accept:
+
+```sh
+credentials attest --document doc.cbor --nonce "$NONCE" --measurements measurements.json \
+    --identity identity.json
+```
+
+It prints the release, module, time and PCR0–2, and that the document vouches for the node
+identity. It checks the COSE_Sign1 structure (ES384), the certificate chain to the pinned AWS
+Nitro Enclaves Root-G1 at the time the document states, the signature, the nonce, that PCR0–2
+are not all zero (a debug enclave) and equal one accepted release, and with `--identity` that
+the document's `user_data` is the identity's `report_data()`. `--document -` reads stdin.
+`measurements.json` is one object `{"release", "git_commit", "pcr0", "pcr1", "pcr2"}` (PCRs as
+96 hex digits; other keys ignored) or an array of them. A refused document exits 3.
 
 ### 5. A grant
 
@@ -131,6 +147,20 @@ The grant (the user key and the signed terms) is sealed to the node's seal key; 
 can open it. `--pin` pins each record at its generation; without a pin the node refuses the
 record, and `grant` warns about it on stderr (pin later with `credentials pin`). `--out
 grant.json` keeps a copy; with neither `--out` nor `--send` it is printed.
+
+To seal the grant only to an attested node, add the document:
+
+```sh
+credentials grant --device device.key --user-key user.key --node identity.json \
+    --owner me --valid 60 --pin record.json \
+    --attestation doc.cbor --nonce "$NONCE" --measurements measurements.json \
+    --send http://127.0.0.1:8700
+```
+
+The three options go together. The grant is made only if the document passes every check of
+`credentials attest` and vouches for `identity.json`; otherwise nothing is written or sent and
+`grant` exits 3. Without `--attestation`, `grant` warns that nothing shows what code holds the
+seal key.
 
 ### 6. A call
 
@@ -209,7 +239,8 @@ fails asks whether the key given is the node's log public key.
 | `seal --user-key F --id I --owner O --policy S --field N=@path\|N=env:V... --out R` | Seals values into a new record (generation 1). |
 | `seal --user-key F --policy S --from R --out R2` | Rewraps a record under a new signed policy. |
 | `pin --device F --record R [--out\|--send]` | Pins a record at its generation (`POST /pin`). |
-| `grant --device F --user-key F --node ID --owner O --valid MIN [--pin R...] [--out\|--send]` | A sealed grant (`POST /grant`). |
+| `grant --device F --user-key F --node ID --owner O --valid MIN [--pin R...] [--attestation DOC --nonce N --measurements M] [--out\|--send]` | A sealed grant (`POST /grant`); with `--attestation`, only to a node whose document verifies and binds `ID`. |
+| `attest --document DOC\|- --nonce N --measurements M [--identity ID]` | Verifies a Nitro attestation document; prints release, module, time and PCR0–2; with `--identity`, checks the binding (refused: exit 3). |
 | `revoke --device F --owner O --node ID [--out\|--send]` | A revocation (`POST /revoke`). |
 | `device endorse\|retire --device F --owner O --node ID --target KEY [--out\|--send]` | Adds or withdraws another device (`POST /device/add`, `/device/retire`). |
 | `call http\|derive --caller-key F --caller N --node ID --record R --operation OP ... [--out\|--send]` | A signed call (`POST /call`). |
@@ -225,7 +256,7 @@ fails asks whether the key given is the node's log public key.
 | 0 | Success. |
 | 1 | Any other failure: an invalid document, a value the engine refuses. |
 | 2 | Usage error (a wrong option, a missing argument, a literal secret). |
-| 3 | Refused by the node (HTTP 400, 403 or 404). |
+| 3 | Refused by the node (HTTP 400, 403 or 404), or the node's attestation document refused (`attest`, `grant --attestation`). |
 | 4 | Rate limited by the node (HTTP 429). |
 | 5 | Connection, transport, log or file I/O failure (including HTTP 502 or 503 from the node, and `serve` failing to start). |
 
