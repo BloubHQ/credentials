@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/cli", "crates/engine", "crates/transport", "crates/verify"]
+members = ["crates/cli", "crates/enclave", "crates/engine", "crates/server", "crates/transport", "crates/verify"]
 
 [workspace.package]
 version = "0.1.0"
@@ -13,6 +13,7 @@ repository = "https://github.com/BloubHQ/credentials"
 [workspace.dependencies]
 engine = { path = "crates/engine" }
 transport = { path = "crates/transport" }
+server = { path = "crates/server" }
 aes = "0.8"
 aes-gcm = "0.10"
 cbc = { version = "0.1", features = ["alloc"] }

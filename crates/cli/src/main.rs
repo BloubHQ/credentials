@@ -4,7 +4,8 @@
 //!   `device endorse|retire`.
 //! - A caller: `call http|derive` signs a call and can send it to a node.
 //! - A node: `serve` runs a node behind a small HTTP server, its log in a JSONL file;
-//!   `node identity` prints what owners grant to.
+//!   `node identity` prints what owners grant to; `host` runs on the parent instance of a
+//!   Nitro Enclave that runs the `enclave` node (HTTP forwarding, egress relay, log writer).
 //! - Anyone: `verify` checks a node log offline (the `verify` crate).
 //!
 //! Keys are files holding base64url text; documents are JSON. Secret values are read from
@@ -12,7 +13,7 @@
 
 mod client;
 mod files;
-mod http;
+mod host;
 mod serve;
 
 use std::path::{Path, PathBuf};
@@ -105,6 +106,8 @@ enum Command {
     Call(CallCommand),
     /// Runs a node server.
     Serve(ServeArgs),
+    /// Runs the host side of a node in an AWS Nitro Enclave (Linux parent instance only).
+    Host(HostArgs),
     /// Node information.
     #[command(subcommand)]
     Node(NodeCommand),
@@ -369,6 +372,36 @@ struct ServeArgs {
     /// Largest request body, in bytes; a larger one is refused (413) before it is read.
     #[arg(long, value_name = "BYTES", default_value_t = serve::DEFAULT_MAX_BODY)]
     max_body: usize,
+}
+
+#[derive(Args)]
+struct HostArgs {
+    /// The vsock CID of the enclave (`nitro-cli describe-enclaves`).
+    #[arg(long)]
+    enclave_cid: u32,
+    /// The directory of the logs: one JSONL file per node key (a restarted enclave is a new
+    /// node), each with its latest checkpoint next to it.
+    #[arg(long)]
+    log_dir: PathBuf,
+    /// The TCP address clients connect to; each connection is forwarded to the enclave.
+    #[arg(long, default_value = "127.0.0.1:8700")]
+    listen: String,
+    /// A destination the egress relay may connect to, as host:port (repeat it). Without any,
+    /// the relay connects wherever the node asks (the node checks the signed policies).
+    #[arg(long, value_name = "HOST:PORT", value_parser = host::parse_allow)]
+    allow: Vec<String>,
+    /// The vsock port of the node server in the enclave.
+    #[arg(long, default_value_t = server::relay::HTTP_PORT)]
+    http_port: u32,
+    /// The vsock port of the egress relay on this host.
+    #[arg(long, default_value_t = server::relay::EGRESS_PORT)]
+    egress_port: u32,
+    /// The vsock port of the log writer on this host.
+    #[arg(long, default_value_t = server::relay::LOG_PORT)]
+    log_port: u32,
+    /// Most client connections open at once; beyond it the host answers 503.
+    #[arg(long, default_value_t = serve::DEFAULT_MAX_CONNECTIONS)]
+    max_connections: usize,
 }
 
 #[derive(Subcommand)]
@@ -870,6 +903,16 @@ fn run(command: Command) -> Res<()> {
         // Whatever stops the server from starting or running is a key, log or socket
         // failure.
         .map_err(|e| Failure::io(e.message)),
+        Command::Host(args) => host::run(&host::Config {
+            listen: args.listen,
+            enclave_cid: args.enclave_cid,
+            http_port: args.http_port,
+            egress_port: args.egress_port,
+            log_port: args.log_port,
+            log_dir: args.log_dir,
+            allow: args.allow,
+            max_connections: args.max_connections,
+        }),
         Command::Node(NodeCommand::Identity { key, url, out }) => {
             node_identity(key.as_deref(), url.as_deref(), out.as_deref())
         }

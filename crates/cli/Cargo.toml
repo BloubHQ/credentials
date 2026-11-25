@@ -16,6 +16,7 @@ path = "src/main.rs"
 [dependencies]
 engine.workspace = true
 transport.workspace = true
+server.workspace = true
 verify = { path = "../verify" }
 base64.workspace = true
 clap.workspace = true

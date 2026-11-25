@@ -1,0 +1,46 @@
+# The image of the enclave: the `enclave` program, linked statically for
+# x86_64-unknown-linux-musl, as the only file of an image built FROM scratch. `nitro-cli
+# build-enclave` turns it into the enclave image file (EIF) whose PCR0, PCR1 and PCR2 a release
+# publishes. Build it with build/build.sh, not by hand: the measurements depend on the build
+# arguments and the exporter options the script passes.
+#
+# Adapted from pickle-com/credential-enclave (build/Dockerfile.enclave, Apache-2.0).
+#
+# Every input of the binary is fixed:
+#   - the Rust image, by digest (Rust 1.97.1 on Alpine 3.24: the musl C library headers that
+#     the C parts of `ring` need, asserted below);
+#   - rust-toolchain.toml (checked to name the same Rust), Cargo.lock (--locked: cargo checks
+#     every package against its checksum) and the release profile of Cargo.toml;
+#   - the working directory, the path remapping and the environment below;
+#   - the time of the commit (SOURCE_DATE_EPOCH), which becomes the time of the file.
+# The build context is `git archive` of the commit: the files of the commit, nothing else.
+FROM rust:1.97.1-alpine@sha256:3c38f3f82c2f3d73da3b38e18d279393a04cb43ddded0e35088a8c3324d40900 AS build
+
+# The time of the commit. The program gets it as the time of its file, and BuildKit stamps the
+# image with it.
+ARG SOURCE_DATE_EPOCH=0
+
+# RUSTUP_TOOLCHAIN makes rustup use the toolchain of the image as it is: rust-toolchain.toml
+# would also ask for rustfmt and clippy, which the build does not need.
+ENV CARGO_INCREMENTAL=0 \
+    TZ=UTC \
+    LC_ALL=C \
+    SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH} \
+    RUSTUP_TOOLCHAIN=1.97.1-x86_64-unknown-linux-musl \
+    RUSTFLAGS="-C target-feature=+crt-static --remap-path-prefix=/build=/src --remap-path-prefix=/usr/local/cargo=/cargo --remap-path-prefix=/usr/local/rustup=/rustup"
+
+RUN test "$(rustc --version)" = "rustc 1.97.1 (8bab26f4f 2026-07-14)" \
+    && apk info -v | grep -qx 'musl-dev-1.2.6-r2'
+
+WORKDIR /build
+COPY . .
+
+RUN grep -qx 'channel = "1.97.1"' rust-toolchain.toml \
+    && cargo build --release --locked --target x86_64-unknown-linux-musl -p enclave \
+    && cp target/x86_64-unknown-linux-musl/release/enclave /enclave \
+    && touch -d "@${SOURCE_DATE_EPOCH}" /enclave
+
+# The stage the script exports. It is never taken from the layer cache (see build.sh).
+FROM scratch AS image
+COPY --from=build /enclave /enclave
+ENTRYPOINT ["/enclave"]

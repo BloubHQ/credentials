@@ -1,0 +1,23 @@
+[package]
+name = "server"
+description = "The HTTP server of a credentials node, shared by `credentials serve` and the Nitro Enclave program."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+readme = "../../README.md"
+repository.workspace = true
+
+[dependencies]
+engine.workspace = true
+transport.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+vsock = "0.5"
+
+[lints]
+workspace = true

@@ -3,10 +3,38 @@
 //!
 //! A slow client holds only its own connection thread (the number of them is capped by the
 //! server), never a worker that runs acts, and loses the connection when its deadline passes.
+//!
+//! It speaks over any [`Connection`]: a TCP stream, or a vsock stream inside a Nitro Enclave.
 
-use std::io::{ErrorKind, Read, Write};
+use std::io::{self, ErrorKind, Read, Write};
 use std::net::{Shutdown, TcpStream};
 use std::time::{Duration, Instant};
+
+/// A connection a client opened: a byte stream with timeouts that can be half closed.
+pub trait Connection: Read + Write {
+    /// Sets how long a read may block (`None`: forever).
+    fn set_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()>;
+
+    /// Sets how long a write may block (`None`: forever).
+    fn set_write_timeout(&self, timeout: Option<Duration>) -> io::Result<()>;
+
+    /// Closes the sending direction: the client reads the end of the response.
+    fn shutdown_write(&self) -> io::Result<()>;
+}
+
+impl Connection for TcpStream {
+    fn set_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
+        TcpStream::set_read_timeout(self, timeout)
+    }
+
+    fn set_write_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
+        TcpStream::set_write_timeout(self, timeout)
+    }
+
+    fn shutdown_write(&self) -> io::Result<()> {
+        self.shutdown(Shutdown::Write)
+    }
+}
 
 /// Largest request line and headers.
 pub const MAX_HEAD: usize = 16 * 1024;
@@ -23,8 +51,21 @@ pub struct Request {
     pub method: String,
     /// The path, without the query.
     pub path: String,
+    /// The query, without the `?` (empty without one).
+    pub query: String,
     /// The body (empty without `Content-Length`).
     pub body: Vec<u8>,
+}
+
+impl Request {
+    /// The value of the first parameter `name` of the query, as sent (not percent-decoded).
+    pub fn query_param(&self, name: &str) -> Option<&str> {
+        self.query
+            .split('&')
+            .filter_map(|pair| pair.split_once('=').or(Some((pair, ""))))
+            .find(|(key, _)| *key == name)
+            .map(|(_, value)| value)
+    }
 }
 
 /// Why no request was read.
@@ -40,8 +81,8 @@ fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 }
 
 /// Reads more bytes into `buf` before `deadline`. `Ok(false)` when the client closed.
-fn read_more(
-    stream: &mut TcpStream,
+fn read_more<C: Connection>(
+    stream: &mut C,
     buf: &mut Vec<u8>,
     deadline: Instant,
 ) -> Result<bool, ReadError> {
@@ -70,6 +111,7 @@ fn read_more(
 struct Head {
     method: String,
     path: String,
+    query: String,
     content_length: Option<usize>,
 }
 
@@ -109,10 +151,11 @@ fn parse_head(head: &[u8]) -> Result<Head, ReadError> {
             content_length = Some(n);
         }
     }
-    let path = target.split('?').next().unwrap_or_default().to_string();
+    let (path, query) = target.split_once('?').unwrap_or((target, ""));
     Ok(Head {
         method: method.to_string(),
-        path,
+        path: path.to_string(),
+        query: query.to_string(),
         content_length,
     })
 }
@@ -120,7 +163,7 @@ fn parse_head(head: &[u8]) -> Result<Head, ReadError> {
 /// Reads one request: the head (at most [`MAX_HEAD`] bytes), then a body of at most
 /// `max_body` bytes announced by `Content-Length`, all within [`REQUEST_DEADLINE`]. A body
 /// too large is refused before it is read.
-pub fn read_request(stream: &mut TcpStream, max_body: usize) -> Result<Request, ReadError> {
+pub fn read_request<C: Connection>(stream: &mut C, max_body: usize) -> Result<Request, ReadError> {
     let deadline = Instant::now() + REQUEST_DEADLINE;
     let mut buf = Vec::new();
     let end = loop {
@@ -161,6 +204,7 @@ pub fn read_request(stream: &mut TcpStream, max_body: usize) -> Result<Request, 
     Ok(Request {
         method: head.method,
         path: head.path,
+        query: head.query,
         body,
     })
 }
@@ -188,7 +232,7 @@ fn reason(status: u16) -> &'static str {
 /// Writes a JSON response and closes the connection. What the client still sends is read
 /// and dropped for a moment first, so the close does not reset the connection before the
 /// client read the answer.
-pub fn respond(stream: &mut TcpStream, status: u16, body: &[u8]) {
+pub fn respond<C: Connection>(stream: &mut C, status: u16, body: &[u8]) {
     let head = format!(
         "HTTP/1.1 {status} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         reason(status),
@@ -203,7 +247,7 @@ pub fn respond(stream: &mut TcpStream, status: u16, body: &[u8]) {
         eprintln!("error: cannot send the response: {e}");
         return;
     }
-    let _ = stream.shutdown(Shutdown::Write);
+    let _ = stream.shutdown_write();
     let _ = stream.set_read_timeout(Some(Duration::from_millis(200)));
-    let _ = std::io::copy(&mut stream.take(256 * 1024), &mut std::io::sink());
+    let _ = io::copy(&mut Read::by_ref(stream).take(256 * 1024), &mut io::sink());
 }
