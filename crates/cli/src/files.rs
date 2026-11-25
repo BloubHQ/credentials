@@ -187,22 +187,6 @@ pub fn write_json<T: Serialize>(path: &Path, value: &T) -> Res<()> {
         .map_err(|e| Failure::io(format!("cannot write {}: {e}", path.display())))
 }
 
-/// Writes a JSON document through a temporary file and a rename, so a reader never sees half
-/// of it.
-pub fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Res<()> {
-    let mut tmp = path.as_os_str().to_owned();
-    tmp.push(".tmp");
-    let tmp = std::path::PathBuf::from(tmp);
-    let mut file = File::create(&tmp)
-        .map_err(|e| Failure::io(format!("cannot create {}: {e}", tmp.display())))?;
-    file.write_all(to_json(value)?.as_bytes())
-        .and_then(|()| file.sync_all())
-        .map_err(|e| Failure::io(format!("cannot write {}: {e}", tmp.display())))?;
-    drop(file);
-    fs::rename(&tmp, path)
-        .map_err(|e| Failure::io(format!("cannot replace {}: {e}", path.display())))
-}
-
 /// A secret value: `@path` (the bytes of the file, as they are) or `env:VAR` (the value of an
 /// environment variable). Never a literal, so secrets stay out of shell history.
 pub fn secret_value(spec: &str) -> Res<Zeroizing<Vec<u8>>> {

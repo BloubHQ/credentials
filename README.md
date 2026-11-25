@@ -398,7 +398,7 @@ curl -s "http://127.0.0.1:8700/attestation?nonce=$(head -c 32 /dev/urandom | bas
 ```
 
 Start `credentials host` first or right after: the node connects to its log writer at boot and
-stops if it cannot. `credentials host` is described in [crates/cli](crates/cli#the-host-nitro-enclaves).
+stops if it cannot. `credentials host` is described in [crates/host](crates/host).
 
 ## What it guarantees
 
@@ -478,11 +478,13 @@ explains each.
 | --- | --- |
 | [`engine`](crates/engine) | Secrets, policies, templates, records, grants, callers, the log, responses, the node |
 | [`transport`](crates/transport) | TLS transport (rustls) over TCP or any `Connector`, and an end-to-end example |
-| [`server`](crates/server) | The HTTP server of a node, and the vsock relay protocol between an enclave and its host |
+| [`server`](crates/server) | The HTTP server of a node, and its log kept in a JSONL file |
+| [`relay`](crates/relay) | The vsock wire between an enclave and its host: ports, the egress `CONNECT` tunnel, the log protocol |
 | [`enclave`](crates/enclave) | The node program inside an AWS Nitro Enclave (NSM attestation) |
+| [`host`](crates/host) | The program on the parent instance of an enclave, run as `credentials host` |
 | [`verify`](crates/verify) | Verifier of node logs, run as `credentials verify` |
 | [`attest`](crates/attest) | Verifier of AWS Nitro Enclaves attestation documents, run as `credentials attest` |
-| [`cli`](crates/cli) | The `credentials` tool: keys, policies, records, grants, calls, a node server, and the host of an enclave |
+| [`cli`](crates/cli) | The `credentials` tool: keys, policies, records, grants, calls, a node server, and `credentials host` |
 
 ## Development
 

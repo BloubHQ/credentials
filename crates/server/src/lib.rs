@@ -17,7 +17,7 @@
 //! `/device/add`, `/device/retire`, `/call`. Bodies and answers are JSON.
 
 pub mod http;
-pub mod relay;
+pub mod logfile;
 
 use std::io;
 use std::sync::atomic::{AtomicUsize, Ordering};

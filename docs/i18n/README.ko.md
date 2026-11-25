@@ -390,7 +390,7 @@ curl -s "http://127.0.0.1:8700/attestation?nonce=$(head -c 32 /dev/urandom | bas
 ```
 
 `credentials host`를 먼저 시작하거나 바로 이어서 시작하세요. 노드는 부팅할 때 로그 작성기에 연결하며,
-연결하지 못하면 멈춥니다. `credentials host`는 [crates/cli](../../crates/cli#the-host-nitro-enclaves)에
+연결하지 못하면 멈춥니다. `credentials host`는 [crates/host](../../crates/host)에
 설명되어 있습니다.
 
 ## 보장하는 것
@@ -469,11 +469,13 @@ ring의 대안으로 RustCrypto `rsa` 0.10도 측정했습니다. 서명 하나�
 | --- | --- |
 | [`engine`](../../crates/engine) | 비밀 값, 정책, 템플릿, 레코드, grant, 호출자, 로그, 응답, 노드 |
 | [`transport`](../../crates/transport) | TCP 또는 임의의 `Connector` 위의 TLS transport (rustls), 그리고 엔드투엔드 예제 |
-| [`server`](../../crates/server) | 노드의 HTTP 서버, 그리고 enclave와 그 host 사이의 vsock 중계 프로토콜 |
+| [`server`](../../crates/server) | 노드의 HTTP 서버, 그리고 JSONL 파일에 두는 그 로그 |
+| [`relay`](../../crates/relay) | enclave와 그 host 사이의 vsock 연결: 포트, egress `CONNECT` 터널, 로그 프로토콜 |
 | [`enclave`](../../crates/enclave) | AWS Nitro Enclave 안에서 실행되는 노드 프로그램 (NSM 증명) |
+| [`host`](../../crates/host) | enclave의 부모 인스턴스에서 실행되는 프로그램, `credentials host`로 실행 |
 | [`verify`](../../crates/verify) | 노드 로그 검증기, `credentials verify`로 실행 |
 | [`attest`](../../crates/attest) | AWS Nitro Enclaves 증명 문서 검증기, `credentials attest`로 실행 |
-| [`cli`](../../crates/cli) | `credentials` 도구: 키, 정책, 레코드, grant, 호출, 노드 서버, enclave의 host |
+| [`cli`](../../crates/cli) | `credentials` 도구: 키, 정책, 레코드, grant, 호출, 노드 서버, `credentials host` |
 
 ## 개발
 

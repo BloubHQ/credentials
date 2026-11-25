@@ -15,8 +15,8 @@ use engine::grant::GrantTerms;
 use engine::keys::{DeviceKey, NodeKey, NodePublicKey, UserKey};
 use engine::log::{SignedEntry, SignedHead};
 use engine::node::{Node, SystemClock};
+use relay::{LogLink, LogStore, RelaySink, send_head, serve_log};
 use server::Sink;
-use server::relay::{LogLink, LogStore, RelaySink, send_head, serve_log};
 use transport::Socket;
 
 #[derive(Default)]
@@ -116,7 +116,7 @@ fn entries_are_confirmed_by_the_host() {
 
 #[test]
 fn the_first_message_is_hello() {
-    use server::relay::{LineReader, LogMessage, LogReply, write_json};
+    use relay::{LineReader, LogMessage, LogReply, write_json};
 
     let (address, _) = host();
     let mut stream = TcpStream::connect(address).unwrap();

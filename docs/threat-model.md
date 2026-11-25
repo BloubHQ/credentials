@@ -56,8 +56,8 @@ What the engine protects, against whom, under which assumptions, and what is lef
 | Operator edits, reorders or cuts the log | Signed chain per node and per owner; signed checkpoints; `credentials verify` | `log`, `verify` |
 | Log store reads where secrets were used | Use details sealed to the owner's user key | `log` |
 | Operator points DNS at its own server | TLS certificate checked for the signed host | `transport` |
-| Nitro host reads or changes the egress of an enclave node | TLS ends inside the enclave; the host relays only ciphertext to the `host:port` the node asked for, after the node checked it against the signed policy | `transport`, `server::relay` |
-| Nitro host confirms a log entry it did not store, or drops one | Entries are signed and chained inside the enclave; a dropped or edited entry breaks `credentials verify`. A host that lies about storing can only lose the log, not forge it | `log`, `server::relay`, `verify` |
+| Nitro host reads or changes the egress of an enclave node | TLS ends inside the enclave; the host relays only ciphertext to the `host:port` the node asked for, after the node checked it against the signed policy | `transport`, `relay` |
+| Nitro host confirms a log entry it did not store, or drops one | Entries are signed and chained inside the enclave; a dropped or edited entry breaks `credentials verify`. A host that lies about storing can only lose the log, not forge it | `log`, `relay`, `verify` |
 | Nitro host serves an attestation of other code, or of a debug-mode enclave | The document is signed by the NSM (AWS Nitro root); its PCRs must equal the published measurements, which are never zero for a production enclave; the nonce makes it fresh and `user_data` binds it to the identity granted to | `enclave` |
 | Nitro host builds a different image and claims a release | The EIF build is reproducible (`build/reproduce.sh`): anyone can rebuild a tag and compare PCR0, PCR1 and PCR2 with the release | `build` |
 | Caller not in the policy, or replaying a call | Per-call Ed25519 signature over node, record generation, operation, request digest, time, nonce; nonce cache | `caller`, `node` |

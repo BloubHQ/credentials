@@ -396,7 +396,7 @@ curl -s "http://127.0.0.1:8700/attestation?nonce=$(head -c 32 /dev/urandom | bas
 ```
 
 `credentials host` は先に、または直後に起動してください。ノードは起動時にログライターへ接続し、接続
-できなければ停止します。`credentials host` については [crates/cli](../../crates/cli#the-host-nitro-enclaves)
+できなければ停止します。`credentials host` については [crates/host](../../crates/host)
 で説明しています。
 
 ## 保証すること
@@ -475,11 +475,13 @@ ring の代替として RustCrypto `rsa` 0.10 も計測しました。署名 1 �
 | --- | --- |
 | [`engine`](../../crates/engine) | シークレット、ポリシー、テンプレート、レコード、グラント、呼び出し元、ログ、レスポンス、ノード |
 | [`transport`](../../crates/transport) | TCP または任意の `Connector` 上の TLS トランスポート (rustls) とエンドツーエンドの例 |
-| [`server`](../../crates/server) | ノードの HTTP サーバーと、エンクレーブとそのホストの間の vsock 中継プロトコル |
+| [`server`](../../crates/server) | ノードの HTTP サーバーと、JSONL ファイルに置くそのログ |
+| [`relay`](../../crates/relay) | エンクレーブとそのホストの間の vsock 接続: ポート、送信用 `CONNECT` トンネル、ログプロトコル |
 | [`enclave`](../../crates/enclave) | AWS Nitro Enclave 内で動くノードプログラム (NSM アテステーション) |
+| [`host`](../../crates/host) | エンクレーブの親インスタンスで動くプログラム。`credentials host` として実行 |
 | [`verify`](../../crates/verify) | ノードログの検証ツール。`credentials verify` として実行 |
 | [`attest`](../../crates/attest) | AWS Nitro Enclaves のアテステーションドキュメントの検証ツール。`credentials attest` として実行 |
-| [`cli`](../../crates/cli) | `credentials` ツール: 鍵、ポリシー、レコード、グラント、呼び出し、ノードサーバー、エンクレーブのホスト |
+| [`cli`](../../crates/cli) | `credentials` ツール: 鍵、ポリシー、レコード、グラント、呼び出し、ノードサーバー、`credentials host` |
 
 ## 開発
 

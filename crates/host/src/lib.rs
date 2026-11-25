@@ -9,23 +9,41 @@
 //!   synced before the node is told it is stored (the semantics of `credentials serve`'s
 //!   log file), and the latest checkpoint next to it.
 //!
-//! The wire is described in `server::relay`. Only Linux has vsock; elsewhere the command
-//! explains that and stops.
+//! The wire is described in the `relay` crate. Only Linux has vsock; elsewhere [`run`]
+//! returns [`Error::Unsupported`].
 
 // The log writer and the checks are used by the Linux program (and the tests) only.
 #![cfg_attr(not(target_os = "linux"), allow(dead_code))]
 
 use std::collections::HashMap;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, PoisonError};
 
 use engine::keys::NodePublicKey;
 use engine::log::{LogSink, SignedEntry, SignedHead};
+use relay::LogStore;
 use server::Sink;
-use server::relay::LogStore;
+use server::logfile::{self, FileSink, head_path};
 
-use crate::files::{self, Res};
-use crate::serve::{FileSink, head_path};
+/// Why the host program could not start or stopped.
+#[derive(Debug, thiserror::Error)]
+pub enum Error {
+    /// This system has no vsock: the host runs only on the Linux parent instance.
+    #[error(
+        "`credentials host` runs on the Linux parent instance of an AWS Nitro Enclave (it \
+         needs vsock); run a node elsewhere with `credentials serve`"
+    )]
+    Unsupported,
+    /// A file, a directory or a socket failed; `context` says which and what was done.
+    #[error("{context}: {source}")]
+    Io {
+        /// What was done, and with what.
+        context: String,
+        /// The failure.
+        source: io::Error,
+    },
+}
 
 /// Settings of `credentials host`.
 pub struct Config {
@@ -62,7 +80,7 @@ pub fn allowed(allow: &[String], host: &str, port: u16) -> bool {
 pub fn parse_allow(entry: &str) -> Result<String, String> {
     match entry.rsplit_once(':') {
         Some((host, port))
-            if server::relay::valid_host(host) && port.parse::<u16>().is_ok_and(|p| p > 0) =>
+            if relay::valid_host(host) && port.parse::<u16>().is_ok_and(|p| p > 0) =>
         {
             Ok(entry.to_string())
         }
@@ -79,9 +97,11 @@ pub struct LogDir {
 
 impl LogDir {
     /// The logs in `dir`, which is created when missing.
-    pub fn new(dir: &Path) -> Res<Self> {
-        std::fs::create_dir_all(dir)
-            .map_err(|e| files::Failure::io(format!("{}: {e}", dir.display())))?;
+    pub fn new(dir: &Path) -> Result<Self, Error> {
+        std::fs::create_dir_all(dir).map_err(|source| Error::Io {
+            context: dir.display().to_string(),
+            source,
+        })?;
         Ok(Self {
             dir: dir.to_path_buf(),
             open: Mutex::new(HashMap::new()),
@@ -103,7 +123,7 @@ impl LogStore for LogDir {
                 .ok_or_else(|| "the end of the log file is unknown after a failed write".into());
         }
         let path = self.path(node);
-        let (sink, entries) = FileSink::open(&path).map_err(|e| e.message)?;
+        let (sink, entries) = FileSink::open(&path).map_err(|e| e.to_string())?;
         eprintln!(
             "log of node {}: {} ({} entries)",
             node.to_b64(),
@@ -123,7 +143,7 @@ impl LogStore for LogDir {
     }
 
     fn checkpoint(&self, node: &NodePublicKey, head: &SignedHead) -> Result<(), String> {
-        files::write_json_atomic(&head_path(&self.path(node)), head).map_err(|e| e.message)
+        logfile::write_json_atomic(&head_path(&self.path(node)), head).map_err(|e| e.to_string())
     }
 }
 
@@ -132,11 +152,8 @@ pub use linux::run;
 
 /// Runs the host program: only on the Linux parent instance of an enclave.
 #[cfg(not(target_os = "linux"))]
-pub fn run(_: &Config) -> Res<()> {
-    Err(files::Failure::usage(
-        "`credentials host` runs on the Linux parent instance of an AWS Nitro Enclave (it \
-         needs vsock); run a node elsewhere with `credentials serve`",
-    ))
+pub fn run(_: &Config) -> Result<(), Error> {
+    Err(Error::Unsupported)
 }
 
 #[cfg(target_os = "linux")]
@@ -148,12 +165,11 @@ mod linux {
     use std::thread;
     use std::time::Duration;
 
-    use server::relay::vsock::{self, Vsock};
-    use server::relay::{answer_tunnel, read_tunnel_request, serve_log, splice};
+    use relay::vsock::{self, Vsock};
+    use relay::{answer_tunnel, read_tunnel_request, serve_log, splice};
     use transport::Socket;
 
-    use super::{Config, LogDir, allowed};
-    use crate::files::{Failure, Res};
+    use super::{Config, Error, LogDir, allowed};
 
     /// How long the relay waits to connect to a destination.
     const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -240,16 +256,20 @@ mod linux {
     }
 
     /// Runs the host program until the TCP listener fails.
-    pub fn run(config: &Config) -> Res<()> {
+    pub fn run(config: &Config) -> Result<(), Error> {
         let store = Arc::new(LogDir::new(&config.log_dir)?);
         let bind = |port: u32| {
-            vsock::listen(port)
-                .map_err(|e| Failure::io(format!("cannot listen on vsock port {port}: {e}")))
+            vsock::listen(port).map_err(|source| Error::Io {
+                context: format!("cannot listen on vsock port {port}"),
+                source,
+            })
         };
         let log_listener = bind(config.log_port)?;
         let egress_listener = bind(config.egress_port)?;
-        let listener = TcpListener::bind(config.listen.as_str())
-            .map_err(|e| Failure::io(format!("cannot listen on {}: {e}", config.listen)))?;
+        let listener = TcpListener::bind(config.listen.as_str()).map_err(|source| Error::Io {
+            context: format!("cannot listen on {}", config.listen),
+            source,
+        })?;
 
         spawn("log", move || {
             for link in log_listener.incoming() {
@@ -330,7 +350,7 @@ mod tests {
     #[test]
     fn log_dir_keeps_one_file_per_node() {
         let dir = std::env::temp_dir().join(format!(
-            "cli-host-{}-{}",
+            "host-logs-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)

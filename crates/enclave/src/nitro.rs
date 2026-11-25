@@ -12,8 +12,8 @@ use aws_nitro_enclaves_nsm_api::api::{Request, Response};
 use aws_nitro_enclaves_nsm_api::driver::{nsm_exit, nsm_init, nsm_process_request};
 use engine::keys::NodeKey;
 use engine::node::{Node, SystemClock};
-use server::relay::vsock::{self, Vsock};
-use server::relay::{
+use relay::vsock::{self, Vsock};
+use relay::{
     EGRESS_PORT, HTTP_PORT, LOG_PORT, LogLink, PARENT_CID, RelayConnector, RelayError, RelaySink,
 };
 use server::{Options, Server};

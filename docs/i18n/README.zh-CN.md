@@ -371,7 +371,7 @@ curl -s "http://127.0.0.1:8700/attestation?nonce=$(head -c 32 /dev/urandom | bas
 ```
 
 先启动 `credentials host`，或紧接着启动：节点在启动时会连接其日志写入端，连接不上就会停止。
-`credentials host` 的说明见 [crates/cli](../../crates/cli#the-host-nitro-enclaves)。
+`credentials host` 的说明见 [crates/host](../../crates/host)。
 
 ## 它保证什么
 
@@ -442,11 +442,13 @@ curl -s "http://127.0.0.1:8700/attestation?nonce=$(head -c 32 /dev/urandom | bas
 | --- | --- |
 | [`engine`](../../crates/engine) | 密钥、策略、模板、记录、授权、调用方、日志、响应、节点 |
 | [`transport`](../../crates/transport) | 基于 TCP 或任意 `Connector` 的 TLS 传输（rustls），以及一个端到端示例 |
-| [`server`](../../crates/server) | 节点的 HTTP 服务器，以及 enclave 与其主机之间的 vsock 中继协议 |
+| [`server`](../../crates/server) | 节点的 HTTP 服务器，以及保存在 JSONL 文件中的节点日志 |
+| [`relay`](../../crates/relay) | enclave 与其主机之间的 vsock 线路：端口、出站 `CONNECT` 隧道、日志协议 |
 | [`enclave`](../../crates/enclave) | 在 AWS Nitro Enclave 中运行的节点程序（NSM 远程证明） |
+| [`host`](../../crates/host) | 在 enclave 的父实例上运行的程序，以 `credentials host` 运行 |
 | [`verify`](../../crates/verify) | 节点日志验证器，以 `credentials verify` 运行 |
 | [`attest`](../../crates/attest) | AWS Nitro Enclaves 证明文档验证器，以 `credentials attest` 运行 |
-| [`cli`](../../crates/cli) | `credentials` 工具：密钥、策略、记录、授权、调用、节点服务器和 enclave 的主机 |
+| [`cli`](../../crates/cli) | `credentials` 工具：密钥、策略、记录、授权、调用、节点服务器和 `credentials host` |
 
 ## 开发
 

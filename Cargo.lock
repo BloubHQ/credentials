@@ -261,6 +261,8 @@ dependencies = [
  "clap",
  "engine",
  "hmac",
+ "host",
+ "relay",
  "serde",
  "serde_json",
  "server",
@@ -470,6 +472,7 @@ dependencies = [
  "aws-nitro-enclaves-nsm-api",
  "base64",
  "engine",
+ "relay",
  "serde_json",
  "server",
  "thiserror",
@@ -611,6 +614,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6303bc9732ae41b04cb554b844a762b4115a61bfaa81e3e83050991eeb56863f"
 dependencies = [
  "digest",
+]
+
+[[package]]
+name = "host"
+version = "0.1.0"
+dependencies = [
+ "engine",
+ "relay",
+ "server",
+ "thiserror",
+ "transport",
 ]
 
 [[package]]
@@ -884,6 +898,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "63b8176103e19a2643978565ca18b50549f6101881c443590420e4dc998a3c69"
 
 [[package]]
+name = "relay"
+version = "0.1.0"
+dependencies = [
+ "engine",
+ "serde",
+ "serde_json",
+ "server",
+ "thiserror",
+ "transport",
+ "vsock",
+]
+
+[[package]]
 name = "rfc6979"
 version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1052,7 +1079,6 @@ dependencies = [
  "serde_json",
  "thiserror",
  "transport",
- "vsock",
 ]
 
 [[package]]

@@ -1,0 +1,22 @@
+[package]
+name = "host"
+description = "The host program on the parent instance of an AWS Nitro Enclave that runs a credentials node, run as `credentials host`."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+readme = "README.md"
+repository.workspace = true
+
+[dependencies]
+engine.workspace = true
+relay.workspace = true
+server.workspace = true
+thiserror.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+transport.workspace = true
+
+[lints]
+workspace = true
