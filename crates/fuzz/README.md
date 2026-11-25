@@ -16,6 +16,8 @@ it needs a nightly compiler.
 | `regex_capture` | Bytes: a pattern, a group and a text | `extract::regex`, the `regex` capture source: no panic on any pattern or text; a match is a part of the text. |
 | `sandbox_module` | A byte choosing the reviewed library `lenprefix8` or a module that follows, then inputs split on 0xff | `sandbox::check` and `sandbox::run_with` (small fuel and memory) with two entry names: any module and inputs end in an output within `MAX_OUTPUT` and the fuel given, or a fixed error, never a panic; a module that runs passes the checks; the library frames inputs exactly. |
 | `log_entry` | JSON | `SignedEntry` deserialization, `SignedEntry::hash`, `verify_chain` on a one-entry chain, and that `ChainVerifier` agrees with it. |
+| `decimal_amount` | Bytes, read as lossy UTF-8; the first nine also as minor units and an exponent | `limits::scaled`, the decimal amounts of spending limits, `show`, `decimal` and `from_minor`: no panic; an accepted amount prints and reads back the same, and minor units scale exactly. |
+| `owner_waits` | JSON, then the bytes as a code | `SealedAnswer`, `Approval`, `SpendingLimits`, `Pending` and `SignedCall` (a resume) deserialization, and `Node::answer`, `approve`, `set_limits` and `run` on a node with nothing waiting and no grant; `DeviceKey::answer_challenge` of the bytes; errors, never a panic. |
 
 The HTTP response parser in `crates/engine/src/response.rs` is not public, so it has no
 target here.

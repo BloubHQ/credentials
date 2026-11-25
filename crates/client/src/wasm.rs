@@ -370,3 +370,91 @@ pub fn approval_hash(summary_json: String) -> Result<String> {
 pub fn approve(device_key: String, identity_json: String, summary_json: String) -> Result<String> {
     Ok(crate::approve(device_key, identity_json, summary_json)?)
 }
+
+/// See [`crate::answer_challenge`]. The code is erased once sealed.
+#[wasm_bindgen(js_name = answerChallenge)]
+pub fn answer_challenge(
+    device_key: String,
+    owner: String,
+    identity_json: String,
+    pending_json: String,
+    code: Vec<u8>,
+) -> Result<String> {
+    Ok(crate::answer_challenge(
+        device_key,
+        owner,
+        identity_json,
+        pending_json,
+        code,
+    )?)
+}
+
+/// See [`crate::sign_resume_call`].
+#[wasm_bindgen(js_name = signResumeCall)]
+pub fn sign_resume_call(
+    caller_key: String,
+    caller: String,
+    identity_json: String,
+    record_json: String,
+    operation: String,
+    id: String,
+) -> Result<String> {
+    Ok(crate::sign_resume_call(
+        caller_key,
+        caller,
+        identity_json,
+        record_json,
+        operation,
+        id,
+    )?)
+}
+
+/// See [`crate::sign_limits`].
+#[wasm_bindgen(js_name = signLimits)]
+pub fn sign_limits(
+    device_key: String,
+    owner: String,
+    identity_json: String,
+    record_id: String,
+    rules_json: String,
+) -> Result<String> {
+    Ok(crate::sign_limits(
+        device_key,
+        owner,
+        identity_json,
+        record_id,
+        rules_json,
+    )?)
+}
+
+/// See [`crate::update_record`]; `fields` is a `Map<string, Uint8Array>`.
+#[wasm_bindgen(js_name = updateRecord)]
+pub fn update_record(
+    user_key: String,
+    record_json: String,
+    fields: &js_sys::Map,
+) -> Result<String> {
+    let mut list = Vec::new();
+    let mut malformed = false;
+    fields.for_each(&mut |value, key| match (
+        key.as_string(),
+        value.dyn_into::<js_sys::Uint8Array>(),
+    ) {
+        (Some(name), Ok(bytes)) => list.push(Field {
+            name,
+            value: bytes.to_vec(),
+        }),
+        _ => malformed = true,
+    });
+    if malformed {
+        let mut user_key = user_key;
+        user_key.zeroize();
+        for mut field in list {
+            field.value.zeroize();
+        }
+        return Err(
+            ClientError::input("fields: a Map of string names to Uint8Array values").into(),
+        );
+    }
+    Ok(crate::update_record(user_key, record_json, list)?)
+}

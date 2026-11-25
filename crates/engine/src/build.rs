@@ -34,9 +34,10 @@
 
 use crate::keys::CallerPublicKey;
 use crate::policy::{
-    BodyProjection, Caller, CallerRequest, Capture, Compute, Connection, Destination, FieldSpec,
-    Identity, Injection, Input, Limit, Method, Open, Operation, Policy, Projection, QueryRule,
-    Receive, Relay, Return, Send, Source, Step, StepRequest, Store, Target,
+    Await, BodyProjection, Caller, CallerRequest, Capture, Challenge, ChallengeKind, Compute,
+    Connection, Destination, FieldSpec, Identity, Injection, Input, Limit, Method, Open, Operation,
+    Payment, Policy, Poll, Projection, QueryRule, Receive, Relay, Return, Send, Source, Step,
+    StepRequest, Store, Target,
 };
 
 impl Policy {
@@ -401,6 +402,52 @@ impl From<Return> for Step {
     }
 }
 
+impl From<Await> for Step {
+    fn from(step: Await) -> Self {
+        Step::Await(Box::new(step))
+    }
+}
+
+impl Challenge {
+    /// A code challenge (`sms`, `email`, `app` or `3ds`): the owner's device answers with a
+    /// code, which later steps read as the secret temporary value `into`.
+    pub fn code(kind: ChallengeKind, hint: &str, into: &str) -> Self {
+        Self {
+            kind,
+            hint: hint.into(),
+            into: Some(into.into()),
+            pattern: None,
+            poll: None,
+            timeout_ms: None,
+        }
+    }
+
+    /// An external challenge: the owner approves in another app, and the node polls the site.
+    pub fn external(hint: &str, poll: Poll) -> Self {
+        Self {
+            kind: ChallengeKind::External,
+            hint: hint.into(),
+            into: None,
+            pattern: None,
+            poll: Some(poll),
+            timeout_ms: None,
+        }
+    }
+
+    /// Sets how long the operation waits, in milliseconds.
+    #[must_use]
+    pub fn waiting_at_most(mut self, timeout_ms: u64) -> Self {
+        self.timeout_ms = Some(timeout_ms);
+        self
+    }
+}
+
+impl From<Challenge> for Step {
+    fn from(challenge: Challenge) -> Self {
+        Step::Await(Box::new(Await { challenge }))
+    }
+}
+
 impl Operation {
     fn opening(name: &str, connection: Connection, destination: Destination) -> Self {
         Self {
@@ -411,6 +458,8 @@ impl Operation {
                 destinations: vec![destination],
                 identity: None,
             })],
+            payment: None,
+            approval: false,
         }
     }
 
@@ -431,12 +480,29 @@ impl Operation {
             name: name.into(),
             input: None,
             steps: Vec::new(),
+            payment: None,
+            approval: false,
         }
     }
 
     /// An operation with no connection that hands back `template`, with no input.
     pub fn derive(name: &str, template: &str) -> Self {
         Self::local(name).then(Return::output(template))
+    }
+
+    /// Declares that the operation pays: the node checks the amount against the spending
+    /// limits of the record, and asks the owner above them.
+    #[must_use]
+    pub fn pays(mut self, payment: Payment) -> Self {
+        self.payment = Some(payment);
+        self
+    }
+
+    /// Makes every use of the operation wait for the owner's approval.
+    #[must_use]
+    pub fn approved_each_time(mut self) -> Self {
+        self.approval = true;
+        self
     }
 
     /// Declares the schema of the caller's input.

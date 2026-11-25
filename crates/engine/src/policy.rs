@@ -44,17 +44,24 @@ pub mod legacy;
 pub mod run;
 mod schema;
 pub mod summary;
+mod wait;
 
 pub use schema::JSON_SCHEMA;
 pub use summary::{Summary, summarize};
 
-pub(crate) use contract::placeholders;
 pub use contract::{
     CallerRequest, MAX_QUERY_RULES, QueryRule, RESERVED_PARAMS, path_fault, template_fault,
     template_matches,
 };
+pub(crate) use contract::{parse_query, placeholders};
 pub use input::{Input, JsonInput, JsonType, Member, NodeTime, RawInput, RlpInput, RlpItem};
 pub use run::{ModuleRef, ModuleSource, RunModule};
+pub(crate) use wait::is_currency;
+pub use wait::{
+    AmountSource, Await, Challenge, ChallengeKind, Condition, DEFAULT_CODE_PATTERN, MAX_AMOUNT,
+    MAX_AWAITS, MAX_EXPONENT, MAX_HINT, MAX_SESSION_MS, MAX_WAIT_MS, MIN_POLL_MS, Payment, Poll,
+    Renew, SessionRule,
+};
 
 const POLICY_DOMAIN: &[u8] = b"policy/v4\0";
 
@@ -125,6 +132,10 @@ pub struct FieldSpec {
     /// it.
     #[serde(default, skip_serializing_if = "is_false")]
     pub guessable: bool,
+    /// For a secret field that holds a session the node obtained: its lifetime, the field of
+    /// its expiry and how it is renewed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<SessionRule>,
 }
 
 impl FieldSpec {
@@ -135,6 +146,7 @@ impl FieldSpec {
             secret: true,
             optional: false,
             guessable: false,
+            session: None,
         }
     }
 
@@ -153,12 +165,20 @@ impl FieldSpec {
             secret: false,
             optional: false,
             guessable: false,
+            session: None,
         }
     }
 
     /// The same field, optional.
     pub fn optional(mut self) -> Self {
         self.optional = true;
+        self
+    }
+
+    /// The same field, holding a session the node obtained.
+    #[must_use]
+    pub fn session(mut self, rule: SessionRule) -> Self {
+        self.session = Some(rule);
         self
     }
 }
@@ -800,6 +820,8 @@ pub enum Step {
     Repeat(Repeat),
     /// A branch (refused for now).
     If(Branch),
+    /// Parks the operation until a challenge is answered.
+    Await(Box<Await>),
 }
 
 /// A named thing a caller may do with a record: steps over one connection.
@@ -814,6 +836,13 @@ pub struct Operation {
     pub input: Option<Input>,
     /// The steps, in order.
     pub steps: Vec<Step>,
+    /// What the operation pays, when it moves money: the node builds the approval summary
+    /// from it and applies the owner's spending limits before anything is sent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payment: Option<Payment>,
+    /// True when every use needs the owner's approval, whatever the limits say.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub approval: bool,
 }
 
 impl Operation {
@@ -861,10 +890,11 @@ impl Operation {
         })
     }
 
-    /// The captures that go into temporary values, with their secrecy, and the outputs of
-    /// `run` steps (secret: the code may copy its inputs).
+    /// The captures that go into temporary values, with their secrecy; the outputs of `run`
+    /// steps (secret: the code may copy its inputs) and the code of a challenge are secret
+    /// temporary values.
     fn temps(&self) -> Vec<(&str, bool)> {
-        let mut temps: Vec<(&str, bool)> = self
+        let mut out: Vec<(&str, bool)> = self
             .steps
             .iter()
             .flat_map(|s| match s {
@@ -876,11 +906,59 @@ impl Operation {
                 Store::Field { .. } => None,
             })
             .collect();
-        temps.extend(self.steps.iter().filter_map(|s| match s {
+        out.extend(self.steps.iter().filter_map(|s| match s {
             Step::Run(run) => Some((run.into.as_str(), true)),
             _ => None,
         }));
-        temps
+        out.extend(
+            self.awaits()
+                .filter_map(|a| a.challenge.into.as_deref())
+                .map(|name| (name, true)),
+        );
+        out
+    }
+
+    /// The `await` steps.
+    pub fn awaits(&self) -> impl Iterator<Item = &Await> {
+        self.steps.iter().filter_map(|s| match s {
+            Step::Await(a) => Some(a.as_ref()),
+            _ => None,
+        })
+    }
+
+    /// True when a step may park the operation.
+    pub fn parks(&self) -> bool {
+        self.awaits().next().is_some()
+    }
+
+    /// The names of fields the templates of the operation read.
+    pub(crate) fn field_reads(&self, policy: &Policy) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for text in self.templates() {
+            if let Ok(template) = Template::parse(text) {
+                for name in template.names() {
+                    if policy.is_field(name) && !out.iter().any(|n| n == name) {
+                        out.push(name.to_string());
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// The fields a response fills (captures into fields).
+    pub(crate) fn field_captures(&self) -> Vec<&str> {
+        self.steps
+            .iter()
+            .flat_map(|s| match s {
+                Step::Receive(r) => r.capture.as_slice(),
+                _ => &[],
+            })
+            .filter_map(|c| match &c.into {
+                Store::Field { name } => Some(name.as_str()),
+                Store::Temp { .. } => None,
+            })
+            .collect()
     }
 
     /// True when the concrete destination is one the connection names.
@@ -911,6 +989,11 @@ impl Operation {
                 Step::Compute(c) => out.push(&c.template),
                 Step::Run(run) => out.extend(run.inputs.iter().map(String::as_str)),
                 Step::Return(r) => out.extend(r.template.as_deref()),
+                Step::Await(a) => {
+                    if let Some(poll) = &a.challenge.poll {
+                        out.extend(poll.send.inject.iter().map(|i| i.template.as_str()));
+                    }
+                }
                 Step::Receive(_) | Step::Repeat(_) | Step::If(_) => {}
             }
         }
@@ -1519,6 +1602,8 @@ impl Policy {
         let kinds = self.kinds(operation);
         let mut known: Vec<&str> = Vec::new();
         let mut sends = 0usize;
+        let mut polls = 0usize;
+        let mut awaits = 0usize;
         let count = operation.steps.len();
         for (i, step) in operation.steps.iter().enumerate() {
             let at = format!("{at}.steps[{i}]");
@@ -1539,7 +1624,11 @@ impl Policy {
                 (Step::Send(send), Some(open)) => match open.connection {
                     Connection::Https => {
                         sends += 1;
-                        ensure(sends <= MAX_REQUESTS, || at.clone(), "at most 8 requests")?;
+                        ensure(
+                            sends + polls <= MAX_REQUESTS,
+                            || at.clone(),
+                            "at most 8 requests",
+                        )?;
                         self.check_https_send(&at, &kinds, open, send, &known)?;
                     }
                     Connection::Tls => {
@@ -1625,7 +1714,23 @@ impl Policy {
                         "loops and branches are part of the syntax but not run yet; write the steps out",
                     );
                 }
+                (Step::Await(wait), _) => {
+                    awaits += 1;
+                    ensure(awaits <= MAX_AWAITS, || at.clone(), "at most 4 await steps")?;
+                    if wait.challenge.poll.is_some() {
+                        polls += 1;
+                        ensure(
+                            sends + polls <= MAX_REQUESTS,
+                            || at.clone(),
+                            "at most 8 requests",
+                        )?;
+                    }
+                    self.check_await(&at, &kinds, open, wait, &mut known)?;
+                }
             }
+        }
+        if let Some(payment) = &operation.payment {
+            self.check_payment(&format!("{at}.payment"), operation, payment)?;
         }
         ensure(
             operation.returns().is_some(),
@@ -1642,6 +1747,181 @@ impl Policy {
             || format!("{at}.input"),
             "an operation that reads $input declares its input",
         )
+    }
+
+    fn check_await<'a>(
+        &self,
+        at: &str,
+        kinds: &Kinds<'_>,
+        open: Option<&Open>,
+        wait: &'a Await,
+        known: &mut Vec<&'a str>,
+    ) -> Checked {
+        let at = format!("{at}.challenge");
+        let challenge = &wait.challenge;
+        ensure(
+            open.is_none_or(|o| o.connection == Connection::Https),
+            || at.clone(),
+            "an operation on a TLS stream cannot wait: its connection would stay open",
+        )?;
+        ensure(
+            wait::is_plain_text(&challenge.hint, MAX_HINT),
+            || format!("{at}.hint"),
+            "a hint is 1 to 256 bytes without control characters",
+        )?;
+        ensure(
+            (1000..=MAX_WAIT_MS).contains(&challenge.timeout()),
+            || format!("{at}.timeout_ms"),
+            "an operation waits 1 second to 5 minutes",
+        )?;
+        if challenge.kind == ChallengeKind::External {
+            ensure(
+                challenge.into.is_none() && challenge.pattern.is_none(),
+                || at.clone(),
+                "an external challenge carries no code: no into or pattern",
+            )?;
+            let (Some(open), Some(poll)) = (open, &challenge.poll) else {
+                return fail(at, "an external challenge polls the site over HTTPS");
+            };
+            ensure(
+                (MIN_POLL_MS..=challenge.timeout()).contains(&poll.every_ms),
+                || format!("{at}.poll.every_ms"),
+                "a poll waits at least 1 second, and at most the timeout",
+            )?;
+            ensure(
+                poll.fixed().is_some(),
+                || format!("{at}.poll.send"),
+                "a poll sends a request the policy fixes",
+            )?;
+            self.check_https_send(&format!("{at}.poll.send"), kinds, open, &poll.send, known)?;
+            if let Some(rule) = poll.success.fault() {
+                return fail(format!("{at}.poll.success"), rule);
+            }
+            if let Some(rule) = poll.failure.as_ref().and_then(Condition::fault) {
+                return fail(format!("{at}.poll.failure"), rule);
+            }
+            return Ok(());
+        }
+        ensure(
+            challenge.poll.is_none(),
+            || format!("{at}.poll"),
+            "a code challenge does not poll",
+        )?;
+        let Some(into) = &challenge.into else {
+            return fail(at, "a code challenge names the value it goes into");
+        };
+        ensure(
+            is_token(into) && !self.is_field(into) && !known.contains(&into.as_str()),
+            || format!("{at}.into"),
+            "a code goes into a new token name",
+        )?;
+        ensure(
+            crate::extract::compile_whole(challenge.code_pattern()).is_some(),
+            || format!("{at}.pattern"),
+            "a regular expression of at most 256 bytes within the size limits",
+        )?;
+        known.push(into);
+        Ok(())
+    }
+
+    fn check_payment(&self, at: &str, operation: &Operation, payment: &Payment) -> Checked {
+        ensure(
+            wait::is_currency(&payment.currency),
+            || format!("{at}.currency"),
+            "an ISO 4217 code: three uppercase letters",
+        )?;
+        ensure(
+            payment.exponent <= MAX_EXPONENT,
+            || format!("{at}.exponent"),
+            "at most 8 digits after the decimal point",
+        )?;
+        let limit = MAX_AMOUNT.to_string();
+        let bounded = |min: Option<&str>, max: Option<&str>| {
+            min.is_some_and(|m| contract::is_decimal(m) && !m.starts_with('-'))
+                && max.is_some_and(|m| {
+                    contract::is_decimal(m)
+                        && !m.starts_with('-')
+                        && contract::compare_decimal(m, &limit) != core::cmp::Ordering::Greater
+                })
+        };
+        let at = format!("{at}.amount");
+        match &payment.amount {
+            AmountSource::Query { name } => {
+                let ruled = operation.caller_sends().any(|(contract, _)| {
+                    contract.query.iter().any(|q| {
+                        q.name == *name && q.required && bounded(q.min.as_deref(), q.max.as_deref())
+                    })
+                });
+                ensure(
+                    operation.connection() == Some(Connection::Https) && ruled,
+                    || at,
+                    "the amount is a required query parameter of the caller's request with min (at least 0) and max (at most 10^18)",
+                )
+            }
+            AmountSource::Input { pointer } => {
+                let ruled = match &operation.input {
+                    Some(Input::Json(schema)) => schema.members.iter().any(|m| {
+                        m.pointer == *pointer
+                            && !m.optional
+                            && m.set.is_none()
+                            && m.kind == Some(JsonType::Number)
+                            && bounded(m.min.as_deref(), m.max.as_deref())
+                    }),
+                    _ => false,
+                };
+                ensure(
+                    ruled,
+                    || at,
+                    "the amount is a required number of the JSON input with min (at least 0) and max (at most 10^18)",
+                )
+            }
+            AmountSource::Fixed { value } => ensure(
+                bounded(Some(value), Some(value)),
+                || at,
+                "a fixed amount is a decimal integer from 0 to 10^18",
+            ),
+        }
+    }
+
+    fn check_sessions(&self) -> Checked {
+        for (i, field) in self.fields.iter().enumerate() {
+            let Some(rule) = &field.session else {
+                continue;
+            };
+            let at = format!("fields[{i}].session");
+            if let Some(fault) = rule.fault() {
+                return fail(at, fault);
+            }
+            ensure(field.secret, || at.clone(), "a session is a secret field")?;
+            let expires = self.fields.iter().find(|f| f.name == rule.expires);
+            ensure(
+                expires.is_some_and(|e| !e.secret && e.optional && e.session.is_none()),
+                || format!("{at}.expires"),
+                "the expiry goes into another field of the policy, public and optional",
+            )?;
+            if let Renew::Operation { name } = &rule.renew {
+                let at = format!("{at}.renew");
+                let Ok(operation) = self.operation(name) else {
+                    return fail(at, "renew names an operation of the policy");
+                };
+                ensure(
+                    operation.connection() == Some(Connection::Https)
+                        && !operation.takes_request()
+                        && !operation.parks()
+                        && operation.payment.is_none()
+                        && !operation.approval,
+                    || at.clone(),
+                    "a renewal is an HTTPS operation of fixed requests, without await, payment or approval",
+                )?;
+                ensure(
+                    operation.field_captures().contains(&field.name.as_str())
+                        && !operation.field_reads(self).contains(&field.name),
+                    || at.clone(),
+                    "a renewal fills the session field from a response and does not read it",
+                )?;
+            }
+        }
+        Ok(())
     }
 
     fn check_callers(&self) -> Checked {
@@ -1724,6 +2004,7 @@ impl Policy {
         for (i, operation) in self.operations.iter().enumerate() {
             self.check_operation(&format!("operations[{i}]"), operation)?;
         }
+        self.check_sessions()?;
         self.check_callers()?;
         match &self.item {
             Some(binding) => crate::item::check_policy(self, binding),
@@ -1743,6 +2024,17 @@ impl Policy {
                 if field.guessable { ", guessable" } else { "" },
                 if field.optional { ", optional" } else { "" }
             ));
+            if let Some(rule) = &field.session {
+                out.push(format!(
+                    "  session: lasts {} ms (expiry in {}), renewed {}",
+                    rule.lifetime_ms,
+                    rule.expires,
+                    match &rule.renew {
+                        Renew::Operation { name } => format!("by the operation {name}"),
+                        Renew::Owner {} => "by the owner on the device".into(),
+                    }
+                ));
+            }
         }
         for operation in &self.operations {
             summarize_operation(operation, &mut out);
@@ -1872,9 +2164,42 @@ fn summarize_operation(operation: &Operation, out: &mut Vec<String>) {
     {
         out.push("  ! the caller's input is any bytes".into());
     }
+    if let Some(payment) = &operation.payment {
+        out.push(format!(
+            "  pays {} (exponent {}), the amount from {}",
+            payment.currency,
+            payment.exponent,
+            match &payment.amount {
+                AmountSource::Query { name } => format!("the query parameter {name}"),
+                AmountSource::Input { pointer } => format!("the input member {pointer}"),
+                AmountSource::Fixed { value } => format!("the policy: {value}"),
+            }
+        ));
+    }
+    if operation.approval {
+        out.push("  every use waits for the owner's approval".into());
+    }
     for step in &operation.steps {
         match step {
             Step::Open(_) | Step::Repeat(_) | Step::If(_) => {}
+            Step::Await(wait) => {
+                let c = &wait.challenge;
+                match (&c.into, &c.poll) {
+                    (Some(into), _) => out.push(format!(
+                        "  await a {} code from the owner's device into secret {into} ({:?})",
+                        c.kind.as_str(),
+                        c.hint
+                    )),
+                    (None, Some(poll)) => {
+                        out.push(format!(
+                            "  await the owner's approval in another app ({:?}); poll every {} ms:",
+                            c.hint, poll.every_ms
+                        ));
+                        summarize_send(&poll.send, out);
+                    }
+                    (None, None) => out.push(format!("  await {}", c.kind.as_str())),
+                }
+            }
             Step::Send(send) => summarize_send(send, out),
             Step::Receive(receive) => {
                 let captures = receive

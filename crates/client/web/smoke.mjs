@@ -170,4 +170,41 @@ const approval = JSON.parse(client.approve(device, identity, open));
 assert.equal(approval.device, devicePublic);
 assert.ok(Math.abs(approval.issued_ms - Date.now()) < 60_000);
 
+// Operations that wait: the pending operation the node hands back is approved as is, a code
+// challenge is answered by the device (sealed to the node), the app resumes with the id, the
+// device signs spending limits and renews a value of the record.
+const waiting = JSON.stringify({ kind: "approval_required", id: "AAAAAAAAAAAAAAAAAAAAAA", summary: JSON.parse(open) });
+assert.equal(JSON.parse(client.approve(device, identity, waiting)).id, "AAAAAAAAAAAAAAAAAAAAAA");
+const challenge = JSON.stringify({
+  kind: "challenge",
+  id: "AQEBAQEBAQEBAQEBAQEBAQ",
+  challenge: "sms",
+  hint: "The code the bank texts you",
+  expires_ms: Date.now() + 60_000,
+});
+const answer = JSON.parse(
+  client.answerChallenge(device, "alice", identity, challenge, new TextEncoder().encode("123456")),
+);
+assert.ok(answer.enc.length > 0 && answer.ciphertext.length > 0);
+assert.ok(!JSON.stringify(answer).includes("123456"), "the code is sealed");
+assert.deepEqual(
+  code(() => client.answerChallenge(device, "alice", identity, waiting, new Uint8Array([1]))),
+  ["invalid_input", undefined],
+);
+const resume = JSON.parse(
+  client.signResumeCall(caller, "app", identity, record, "mac", "AQEBAQEBAQEBAQEBAQEBAQ"),
+);
+assert.deepEqual(resume.body, { kind: "resume", id: "AQEBAQEBAQEBAQEBAQEBAQ" });
+const limits = JSON.parse(
+  client.signLimits(device, "alice", identity, "mac", JSON.stringify([{ currency: "EUR", per_day: "100" }])),
+);
+assert.equal(limits.rules[0].per_day, "100");
+assert.ok(Math.abs(limits.issued_ms - Date.now()) < 60_000);
+assert.deepEqual(
+  code(() => client.signLimits(device, "alice", identity, "mac", JSON.stringify([{ currency: "eur", per_day: "1" }]))),
+  ["refused", undefined],
+);
+const renewed = client.updateRecord(user, record, new Map([["key", new TextEncoder().encode("fedcba9876543210fedcba9876543210")]]));
+assert.equal(JSON.parse(renewed).generation, 2);
+
 console.log("web package: smoke test passed");

@@ -15,7 +15,8 @@
         {"name": "billing", "disclosure": "public", "optional": true,
          "checks": [{"check": "length", "min": 1, "max": 512}]}
       ],
-      "shape": {"connections": ["https"], "destinations": {"from": "owner"}, "returns": "json"}
+      "shape": {"connections": ["https"], "destinations": {"from": "owner"}, "returns": "json",
+                "approval": true}
     },
     {
       "name": "login",
@@ -28,7 +29,9 @@
         {"name": "password", "disclosure": "secret", "guessable": true},
         {"name": "totp", "disclosure": "secret", "optional": true,
          "checks": [{"check": "base32", "min_bits": 128}]},
-        {"name": "session", "disclosure": "secret", "optional": true}
+        {"name": "session", "disclosure": "secret", "optional": true},
+        {"name": "session_expires", "disclosure": "public", "optional": true,
+         "checks": [{"check": "integer", "min": 0, "max": 9999999999999}]}
       ],
       "shape": {"connections": ["https"], "destinations": {"from": "origin", "field": "origin"},
                 "returns": "all", "captures": ["session"]}

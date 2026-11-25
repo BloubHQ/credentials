@@ -95,6 +95,7 @@ pub mod fields;
 pub mod grant;
 pub mod item;
 pub mod keys;
+pub mod limits;
 pub mod log;
 pub mod node;
 pub mod policy;
@@ -104,6 +105,7 @@ pub mod reflection;
 pub mod request;
 pub mod response;
 pub mod secret;
+pub mod session;
 pub mod template;
 mod totp;
 #[cfg(test)]

@@ -251,6 +251,16 @@ any-bytes inputs, reversible outputs, relays, and everything a new version widen
 last). The format has a JSON Schema, `crates/engine/policy.schema.json`. Details in
 [docs/policy.md](docs/policy.md).
 
+**Operations that wait for the owner.** An `await` step parks an operation in the node's
+memory (five minutes at most, never logged, dropped on restart) until the owner's device
+answers: a one-time code signed and sealed to the node (`answer_challenge`), never typed by
+the caller, or an approval in another app that the node polls the site for. Every use of a
+card, an operation the owner marks, and a payment above the owner's spending limits (per
+item, merchant, day and 30 days, signed by the device) wait for an approval of a summary the
+node builds from what it checked: merchant, amount, currency and the masked card. Sessions
+the node obtains carry an expiry and are renewed by a login operation of the policy, or by the
+owner. The caller resumes with the id it was given, and only that caller can.
+
 ## Records, generations and rollback
 
 A record is the fields, encrypted with ChaCha20-Poly1305 under a key derived from the user
@@ -327,7 +337,8 @@ credentials verify log.jsonl <node-public-key> --owner alice --user-key key.txt 
   which refuses a cut log.
 - **Command line and server.** [`credentials`](crates/cli) makes keys, signs policies, seals
   records, makes grants and signed calls, and `credentials serve` runs a node over HTTP with a
-  durable JSONL log.
+  durable JSONL log. `POST /answer`, `/approve` and `/limits` take what the owner's device
+  signs for operations that wait; operations waiting when the node restarts are gone.
 - **Concurrency.** Every method takes `&self`; share one node between threads. Transport I/O
   runs outside the node's lock.
 
@@ -460,6 +471,10 @@ stops if it cannot. `credentials host` is described in [crates/host](crates/host
 - Grants open only on the node they were sealed to, only from a device the node knows for the
   owner (first use is trusted), and cannot be replayed. Revocations need a known device.
 - Records cannot be rolled back past a pin or a generation the node saw.
+- A challenge is answered and an approval given only by a known device of the owner, over
+  exactly what the node built; a waiting operation resumes only for the caller that started
+  it, and its values never leave the node. Payments within the owner's limits are counted
+  before anything is sent; above them, the owner approves.
 - Templates are analysed before signing; derivations cannot hand back a secret, an oracle on
   a secret, or a check for guesses of a guessable field.
 - Responses are parsed strictly (framing, encodings, sizes); captured secrets are redacted;
@@ -524,8 +539,9 @@ explains each.
   framing work only as far as a send/expect script can go.
 - **Site code is trusted as the site.** A `run` module computes on the secret; it can fail
   or take time depending on it, and an unpinned module is whatever the origin serves.
-- **Browser logins, push 2FA and hardware keys** need a person or a device and cannot be
-  delegated.
+- **Browser logins and hardware keys** need a person or a device and cannot be delegated.
+  One-time codes and approvals in another app come from the owner (an `await` step), not from
+  the node or the caller.
 - **A web page is weaker than an app.** The [`client`](crates/client) package runs in a page
   as in an app, but the server of the page can send other code at any load; grant from an
   app where you can. Its keys are not hardware keys either (the Secure Enclave and StrongBox

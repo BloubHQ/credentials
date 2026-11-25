@@ -94,3 +94,17 @@ path = "fuzz_targets/sandbox_module.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "decimal_amount"
+path = "fuzz_targets/decimal_amount.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "owner_waits"
+path = "fuzz_targets/owner_waits.rs"
+test = false
+doc = false
+bench = false

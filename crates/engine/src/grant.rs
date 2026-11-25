@@ -108,6 +108,51 @@ impl SealSecret {
     }
 }
 
+/// Seals `plain` to the node of `seal_key` with HPKE (base mode), under `info`, bound to
+/// `aad`. Returns the encapsulated key and the ciphertext.
+pub(crate) fn seal_to(
+    seal_key: &NodeSealKey,
+    info: &[u8],
+    aad: &[u8],
+    plain: &[u8],
+) -> Result<(Vec<u8>, Vec<u8>)> {
+    let recipient =
+        <Kem as hpke::Kem>::PublicKey::from_bytes(&seal_key.0).map_err(|_| Error::KeyInvalid)?;
+    let (enc, ciphertext) = hpke::single_shot_seal::<ChaCha20Poly1305, HkdfSha256, Kem>(
+        &OpModeS::Base,
+        &recipient,
+        info,
+        plain,
+        aad,
+    )
+    .map_err(|_| Error::KeyInvalid)?;
+    Ok((enc.to_bytes().to_vec(), ciphertext))
+}
+
+impl SealSecret {
+    /// Opens what [`seal_to`] sealed to this node under `info` and `aad`. `None` when it was
+    /// sealed to another node, under another `info` or `aad`, or altered.
+    pub(crate) fn open(
+        &self,
+        info: &[u8],
+        aad: &[u8],
+        enc: &[u8],
+        ciphertext: &[u8],
+    ) -> Option<Zeroizing<Vec<u8>>> {
+        let enc = <Kem as hpke::Kem>::EncappedKey::from_bytes(enc).ok()?;
+        hpke::single_shot_open::<ChaCha20Poly1305, HkdfSha256, Kem>(
+            &OpModeR::Base,
+            &self.0,
+            &enc,
+            info,
+            ciphertext,
+            aad,
+        )
+        .ok()
+        .map(Zeroizing::new)
+    }
+}
+
 /// A record generation the owner pins with a grant.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

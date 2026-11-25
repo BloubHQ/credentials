@@ -186,6 +186,15 @@ pub struct OperationSummary {
     /// The input schema of a derivation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub input: Option<Input>,
+    /// What it waits for: `sms code into otp`, `external, polls every 2000 ms`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub challenges: Vec<String>,
+    /// What it pays, and where the amount is read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payment: Option<super::Payment>,
+    /// True when every use waits for the owner's approval.
+    #[serde(default, skip_serializing_if = "core::ops::Not::not")]
+    pub approval: bool,
 }
 
 /// A caller.
@@ -504,6 +513,9 @@ fn operation_summary(operation: &Operation) -> OperationSummary {
         runs: Vec::new(),
         returns: ReturnSummary::default(),
         input: operation.input.clone(),
+        challenges: Vec::new(),
+        payment: operation.payment.clone(),
+        approval: operation.approval,
     };
     for (i, step) in operation.steps.iter().enumerate() {
         match step {
@@ -523,6 +535,25 @@ fn operation_summary(operation: &Operation) -> OperationSummary {
             }
             Step::Return(ret) => out.returns = return_summary(ret, connection),
             Step::Run(run) => out.runs.push(run_summary(i, run, operation)),
+            Step::Await(wait) => {
+                let c = &wait.challenge;
+                match (&c.into, &c.poll) {
+                    (Some(into), _) => out
+                        .challenges
+                        .push(format!("{} code into {into}", c.kind.as_str())),
+                    (None, Some(poll)) => {
+                        out.challenges.push(format!(
+                            "{}, polls every {} ms",
+                            c.kind.as_str(),
+                            poll.every_ms
+                        ));
+                        if let Some(c) = connection {
+                            out.requests.extend(request_summary(i, &poll.send, c));
+                        }
+                    }
+                    (None, None) => out.challenges.push(c.kind.as_str().into()),
+                }
+            }
             Step::Open(_) | Step::Compute(_) | Step::Repeat(_) | Step::If(_) => {}
         }
     }
@@ -564,7 +595,15 @@ fn uses_in(operation: &Operation) -> Vec<(String, SecretUse)> {
                     add(i, &identity.key, Form::Identity, &places);
                 }
             }
-            Step::Send(send) => {
+            Step::Send(_) | Step::Await(_) => {
+                let send = match step {
+                    Step::Send(send) => send,
+                    Step::Await(wait) => match &wait.challenge.poll {
+                        Some(poll) => &poll.send,
+                        None => continue,
+                    },
+                    _ => continue,
+                };
                 let to: Vec<Place> = match (&send.request, connection) {
                     (
                         Some(StepRequest::Fixed {
@@ -855,6 +894,14 @@ fn diff_operation(
     if prev.input != cur.input {
         wider.push(format!("operation {name}: the input schema changed"));
     }
+    if prev.payment != cur.payment {
+        wider.push(format!("operation {name}: what it pays changed"));
+    }
+    if prev.approval && !cur.approval {
+        wider.push(format!(
+            "operation {name}: no longer waits for the owner's approval"
+        ));
+    }
     if prev.steps.len() != cur.steps.len()
         || prev
             .steps
@@ -1041,6 +1088,9 @@ pub fn diff(previous: &Policy, current: &Policy) -> (Vec<String>, Vec<String>) {
                 }
                 if p.guessable && !f.guessable {
                     wider.push(format!("field {}: no longer guessable", f.name));
+                }
+                if p.session != f.session {
+                    wider.push(format!("field {}: the session rule changed", f.name));
                 }
             }
             None => changes.push(format!("field {} added", f.name)),

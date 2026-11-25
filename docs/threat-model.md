@@ -97,7 +97,16 @@ What the engine protects, against whom, under which assumptions, and what is lef
 | A record holds a value that defeats its kind (another origin than the pin, a card number that is not one, an expired card) | Values are checked when sealed and on every use with the node's clock; a pinned field must equal the pin the policy signed | `item`, `record`, `node` |
 | An ssh or VPN key goes to a server nobody authenticated | The ssh and vpn kinds allow no connection until their protocols exist in the node; the ssh host key is a required, checked pin | `item` |
 | Owner signs a new version without seeing what it widens | `summarize` against the previous version flags every new destination, method, path, header, query rule, injection, operation, caller and key, more of the response, looser limits, fields made public, and changed item bindings; anything it cannot rank counts as wider | `policy::summary` |
-| Node shows the owner one summary and acts on another, or a caller replays an approval | An approval signs the SHA-256 of the canonical summary the node built, its random id, the node, owner and record, within a window of at most five minutes; parking and single use are the runtime of part 5 | `approval` |
+| Node shows the owner one summary and acts on another, or a caller replays an approval | An approval signs the SHA-256 of the canonical summary the node built, its random id, the node, owner and record, within a window of at most five minutes; the node keeps that summary with the waiting operation, takes an approval only over exactly it, once, and the id is spent when the operation goes on | `approval`, `node` |
+| Caller answers a challenge itself (a code it guessed, phished or relayed) | A code reaches the node only as `SealedAnswer`: signed by a known device of the owner over the node, owner, id and code hash, sealed to the node with HPKE; the call that resumes carries only the id; the code must match the policy's pattern and is taken once | `session`, `node` |
+| Approval replayed for a different amount, or for another use | The summary holds the amount and currency the node read from the contract-checked request or input; an approval of another summary, an id already spent, or a summary edited on the way is refused | `node`, `approval` |
+| Caller splits a payment to stay under a limit | Every payment within the limits is counted under the same lock as the check, over rolling 24-hour and 30-day windows; payments no rule covers, or above one, wait for approval; limits and counts survive a restart through sealed log entries | `limits`, `node` |
+| Caller writes the amount, currency or merchant of a summary | The currency is fixed by the policy, the amount is a decimal integer from a required, bounded query parameter or JSON member the contract checked (or the policy), the merchant is the origin of the destination the node sends to; summary lines are written by the node | `policy`, `node` |
+| Another caller, or another owner's caller, resumes a waiting operation | The node resumes an id only for a signed call of the same caller name, record (the whole record) and operation; anything else gets `parked_unknown`, the answer for an id nobody parked | `node` |
+| Parked values leak (temporaries, the code, opened fields) | Kept in the node's memory only, never logged or returned; the pending reply holds the id, kind, hint and node-built summary; captured secrets and codes are redacted from responses and checked for; dropped on lapse (at most five minutes), revoke and restart | `node`, `session` |
+| Flood of waiting operations exhausts the node | At most 8 per owner, 256 in all and 128 MiB of values; an operation that may wait is refused before it sends anything when there is no room | `node` |
+| Spending limits set by someone else, or rolled back | Limits are signed by a known device of the owner for one node and record, issued within five minutes of the node clock and after the limits the node holds | `limits`, `node` |
+| A lapsed session is used, or renewal sends a secret elsewhere | The node writes a session's expiry when it captures it and checks it before every operation that reads it; renewal runs only an HTTPS operation of the same signed policy that takes no caller request, does not wait or pay, and captures the session without reading it | `policy`, `node` |
 | An agent or caller gets code to run on a secret (to encode it where the site echoes it) | `run` takes code only from a URL on one of the operation's destinations, written in the signed policy (optionally pinned by SHA-256), or from a reviewed library compiled into the node (PCR2); never from the caller's request or input | `policy::run` |
 | Output of site code leaves its origin (returned, logged, sent to another destination or in the caller's request) | Signing refuses any template that reads the output, a value computed from it, or a temporary value captured from the response of a request that carried it, unless it is injected into a request the policy fixes to the module's origin; `run` needs an HTTPS connection; all `run` steps of an operation share one origin; the output is never a field; responses that echo it are refused; log entries hold only the request's body hash and length, sealed | `policy::run`, `node` |
 | The origin serves other code than the owner approved | The SHA-256 pin is checked before the module runs (`ModuleRefused`, no later request); an unpinned module is flagged `run_unpinned` in the summary | `node`, `policy::summary` |
@@ -187,6 +196,18 @@ These remain by design; each is listed in the README.
 - **Connection slots of `credentials serve`.** Each client has 10 seconds to send a request and the server holds at most `--max-connections` (64) at once; a client that keeps reopening slow connections can make others get 503. Put the server behind a proxy that limits clients per address.
 - **Side channels.** Timing and size of responses are visible to the caller. The engine does
   not pad or delay.
+- **Waiting is per node.** Parked operations live in one node's memory: a restart or another
+  node behind a load balancer loses them, and the caller starts over. An external challenge
+  is polled only when the caller resumes.
+- **What a waiting operation tells its caller.** The kind and hint of a challenge, and the
+  summary of an approval (the masked item view, the amount and the merchant), go to the
+  caller that started the operation.
+- **Payments counted early.** A payment within the limits is counted when the node decides
+  to send it, also when the request then fails; an approved payment is counted when the
+  operation goes on. This errs toward waiting for approval sooner.
+- **Amounts the contract cannot see.** A payment whose amount is only in a request body (no
+  body contract yet) cannot declare `payment`; such an operation should require approval
+  (`"approval": true`).
 - **Availability.** The operator can always stop the node or the log; the engine fails closed.
 - **Dependencies.** ring, rustls and other crates keep internal buffers; the zeroizing
   allocator erases them when freed, not while in use.

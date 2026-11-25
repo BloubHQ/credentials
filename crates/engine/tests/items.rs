@@ -27,6 +27,7 @@ use engine::policy::{
     Caller, Destination, FieldSpec, Injection, Method, Operation, Policy, Return, Send,
 };
 use engine::record::Record;
+use engine::session::Pending;
 
 /// 2026-11-25T00:00:00Z.
 const NOW: u64 = 1_795_564_800_000;
@@ -307,9 +308,15 @@ fn an_expired_card_is_refused_before_anything_is_sent() {
             .unwrap();
         s.node.run(&call, transport).result
     };
+    // A card waits for the owner's approval of every use: nothing is sent before it.
     let mut transport = Counting::default();
-    pay(&s, &mut transport).unwrap();
-    assert_eq!(transport.0, 1);
+    let waiting = pay(&s, &mut transport).unwrap();
+    assert!(matches!(
+        waiting,
+        Output::Pending(Pending::ApprovalRequired { .. })
+    ));
+    assert_eq!(transport.0, 0);
+    assert_eq!(s.node.waiting(), 1);
     let entries = s.node.with_sink(|sink| sink.entries().len());
 
     // Six days later the card has expired; the grant has not.
@@ -324,6 +331,8 @@ fn an_expired_card_is_refused_before_anything_is_sent() {
     );
     assert_eq!(transport.0, 0);
     assert_eq!(s.node.with_sink(|sink| sink.entries().len()), entries);
+    // The approval it waited for lapsed with it.
+    assert_eq!(s.node.waiting(), 0);
 }
 
 #[test]

@@ -7,6 +7,7 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use engine::approval::ApprovalSummary;
 use engine::item::KindSchema;
 use engine::policy::{Policy, SignedPolicy};
+use engine::session::Pending;
 
 use crate::attestation::identity;
 use crate::error::{ClientError, Result};
@@ -79,9 +80,18 @@ pub fn sign_kind(device_key: String, kind_json: String) -> Result<String> {
     to_json(&signed)
 }
 
+/// A summary, or the pending operation `{"kind": "approval_required", "id", "summary"}` the
+/// node handed back with it (whose id must be the summary's).
 fn summary(json: &str) -> Result<ApprovalSummary> {
-    let summary: ApprovalSummary =
-        serde_json::from_str(json).map_err(ClientError::json("approval summary"))?;
+    let summary: ApprovalSummary = match crate::session::pending(json) {
+        Ok(Pending::ApprovalRequired { id, summary }) if id == summary.id => *summary,
+        Ok(_) => {
+            return Err(ClientError::input(
+                "the operation waits for a challenge, or the id is not the summary's",
+            ));
+        }
+        Err(_) => serde_json::from_str(json).map_err(ClientError::json("approval summary"))?,
+    };
     summary
         .validate()
         .map_err(ClientError::engine("the approval summary is malformed"))?;
@@ -98,8 +108,8 @@ pub fn approval_hash(summary_json: String) -> Result<String> {
     Ok(URL_SAFE_NO_PAD.encode(hash))
 }
 
-/// Approves a summary the node `identity_json` built, with the device key, now. Show the
-/// summary to the owner first. Refused when the summary names another node or has lapsed.
+/// Approves a summary the node `identity_json` built (or the pending operation that carries
+/// it), with the device key, now. Show the summary to the owner first. Refused when the summary names another node or has lapsed.
 /// Returns the approval JSON for the node.
 #[cfg_attr(not(target_arch = "wasm32"), uniffi::export)]
 pub fn approve(device_key: String, identity_json: String, summary_json: String) -> Result<String> {

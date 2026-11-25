@@ -97,6 +97,43 @@ pub enum Error {
         /// Which rule.
         rule: &'static str,
     },
+    /// The operation waits for a challenge or the owner's approval. [`crate::node::Node::run`]
+    /// hands back its id; the typed entry points (`http`, `stream`, `derive`) cannot.
+    #[error("the operation waits for a challenge or an approval: run it with Node::run")]
+    Pending,
+    /// No operation waits under this id for this caller, record and operation: it ended,
+    /// lapsed, was never there, or waits for another caller.
+    #[error("no operation waits under this id for this caller")]
+    ParkedUnknown,
+    /// Too many operations wait for the owner, or for all owners of the node.
+    #[error("too many operations wait for an answer or an approval")]
+    ParkedFull,
+    /// A challenge ended without an answer the operation can go on with.
+    #[error("challenge failed: {rule}")]
+    ChallengeFailed {
+        /// Why.
+        rule: &'static str,
+    },
+    /// An answer to a challenge is malformed, not for a waiting challenge, or not signed by a
+    /// device of the owner.
+    #[error("challenge answer invalid: {rule}")]
+    AnswerInvalid {
+        /// Which rule.
+        rule: &'static str,
+    },
+    /// A session field has expired and its rule says the owner renews it on the device.
+    /// `field` is its name (the value is never part of the error).
+    #[error("session {field} expired: the owner logs in again on the device")]
+    SessionExpired {
+        /// The field.
+        field: String,
+    },
+    /// Spending limits are malformed, not for this node, or stale.
+    #[error("spending limits invalid: {rule}")]
+    LimitsInvalid {
+        /// Which rule.
+        rule: &'static str,
+    },
     /// The record has no kind, so there is nothing a caller may be told of it.
     #[error("the record is not a typed item")]
     NotAnItem,
@@ -287,7 +324,7 @@ impl Error {
     pub fn is_retryable(&self) -> bool {
         match self {
             Error::Transport(fault) => !fault.sent,
-            Error::RateLimited | Error::LogUnconfirmed => true,
+            Error::RateLimited | Error::LogUnconfirmed | Error::ParkedFull => true,
             _ => false,
         }
     }
@@ -305,6 +342,7 @@ impl Error {
                 | Error::OperationUnknown { .. }
                 | Error::RequestInvalid { .. }
                 | Error::InputInvalid { .. }
+                | Error::ParkedUnknown
         )
     }
 }

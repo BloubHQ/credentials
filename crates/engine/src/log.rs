@@ -117,6 +117,46 @@ pub enum Event {
         /// The fields that changed.
         fields: Vec<String>,
     },
+    /// A device of the owner answered a challenge an operation waited for. The code is never
+    /// written anywhere.
+    Answer {
+        /// The operation that waited.
+        operation: String,
+        /// The device that answered.
+        device: DevicePublicKey,
+    },
+    /// A device of the owner approved the summary of an operation that waited.
+    Approve {
+        /// The operation.
+        operation: String,
+        /// The generation of the record.
+        generation: u64,
+        /// The device that approved.
+        device: DevicePublicKey,
+        /// The SHA-256 of the summary it approved.
+        #[serde(with = "b64_array")]
+        summary_sha256: [u8; 32],
+    },
+    /// A device of the owner set the spending limits of the record, sealed so only this node
+    /// reads them.
+    Limits {
+        /// When the device signed them.
+        issued_ms: u64,
+        /// The device.
+        device: DevicePublicKey,
+        /// The rules, sealed under the node's own state key.
+        sealed: SealedDetail,
+    },
+    /// The node counted a payment of the record against its spending limits; the amount and
+    /// the merchant are sealed so only this node reads them.
+    Spend {
+        /// The operation that pays.
+        operation: String,
+        /// The generation of the record.
+        generation: u64,
+        /// The payment, sealed under the node's own state key.
+        sealed: SealedDetail,
+    },
     /// How the act of an earlier entry ended.
     Done {
         /// The sequence number of the act.

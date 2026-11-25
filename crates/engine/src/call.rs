@@ -15,6 +15,7 @@ use crate::node::{Clock, Response, StreamOutput, SystemClock};
 use crate::policy::Destination;
 use crate::record::Record;
 use crate::request::Request;
+use crate::session::Pending;
 
 /// What a call asks for.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -41,6 +42,13 @@ pub enum Body {
     },
     /// The description of a typed item; the operation is [`crate::caller::DESCRIBE`].
     Describe {},
+    /// Goes on with an operation that waits ([`crate::session::Pending`]): the same caller,
+    /// record and operation, and the id the node handed back.
+    Resume {
+        /// The id of the waiting operation.
+        #[serde(with = "crate::encoding::b64_array")]
+        id: [u8; 16],
+    },
 }
 
 impl Body {
@@ -80,7 +88,13 @@ impl Body {
             },
             Body::Derive { input } => Payload::Derive(input),
             Body::Describe {} => Payload::Describe,
+            Body::Resume { id } => Payload::Resume(id),
         }
+    }
+
+    /// Goes on with the waiting operation `id`.
+    pub fn resume(id: [u8; 16]) -> Self {
+        Body::Resume { id }
     }
 }
 
@@ -109,6 +123,8 @@ pub enum Output {
     Derive(Vec<u8>),
     /// The description of a typed item.
     Describe(Description),
+    /// The operation waits for a challenge or the owner's approval; resume it with the id.
+    Pending(Pending),
 }
 
 impl CallerKey {
