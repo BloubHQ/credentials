@@ -301,8 +301,12 @@ The enclave reaches the network only through TCP connections the host relays (vs
 
 ## 8c. Extension modules: schemes no list names
 
-Lists end; sites invent their own schemes. An **auth module** is a WebAssembly module that
-describes one scheme, run by the node in a sandbox (`wasmtime`-style, fuel and memory limits,
+Policies are already open: an agent writes one for any site, and any scheme that is a
+composition of the template functions and the step kinds works without a node release. Two
+things are closed: the **primitives** (a scheme needing a function the node lacks, such as
+SEED or SRP arithmetic) and the **control flow** (the template language has no loops,
+branches or binary framing, on purpose, so the taint analysis stays exact). An **auth module**
+opens the second: a WebAssembly module that describes one scheme, run by the node in a sandbox (`wasmtime`-style, fuel and memory limits,
 no clock, no randomness and no I/O of its own).
 
 - **Secrets are handles.** A module never reads a secret's bytes. It gets opaque handles and
@@ -318,9 +322,9 @@ no clock, no randomness and no I/O of its own).
 - **What a module cannot do** is decided by the node, not by the module: destinations, methods,
   reflection scrubbing, limits and the log stay with the node.
 
-This closes the gap between "every scheme in a list" and "any scheme": a new scheme needs a
-module and the owner's signature, not a node release, unless it needs a primitive the node
-does not have, which then goes into the next release.
+Primitives stay closed by design: a module that computed on secret bytes itself could
+return them, so cryptography stays in reviewed node code, and a scheme that needs a new
+primitive waits for the release that adds it.
 
 **Implementation.** crate `module` (WASM runtime, the handle table, the host functions mapped
 onto `engine::template`), operation kind `module`; a fuzz target for module inputs; a module
