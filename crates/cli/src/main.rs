@@ -150,7 +150,8 @@ enum PolicyCommand {
         /// The public key of the device that should have signed it (base64url, or @file
         /// holding it). A signed policy does not carry its signer, so without it the
         /// signature is not checked.
-        #[arg(long, value_name = "KEY")]
+        // Keys are base64url and may start with `-`.
+        #[arg(long, value_name = "KEY", allow_hyphen_values = true)]
         device: Option<String>,
     },
     /// Validates a policy, prints its summary to stderr and writes it signed.
@@ -265,7 +266,7 @@ struct DeviceArgs {
     #[arg(long)]
     node: PathBuf,
     /// The public key of the other device (base64url, or @file holding it).
-    #[arg(long)]
+    #[arg(long, allow_hyphen_values = true)]
     target: String,
     #[command(flatten)]
     deliver: Deliver,

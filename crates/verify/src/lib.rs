@@ -132,7 +132,8 @@ fn parse(args: &[String]) -> Result<Option<Options>, String> {
             positional.extend(rest.by_ref().cloned());
             break;
         }
-        if !arg.starts_with('-') || arg == "-" {
+        // Only `--name` is an option: keys are URL-safe base64 and may start with `-`.
+        if !arg.starts_with("--") {
             positional.push(arg.clone());
             continue;
         }
@@ -507,6 +508,17 @@ mod tests {
             assert!(parse(&args(bad)).is_err(), "{bad:?}");
         }
         assert!(parse(&args(&["log", "-h"])).unwrap().is_none());
+    }
+
+    #[test]
+    fn a_key_may_start_with_a_dash() {
+        // URL-safe base64: one key in 64 starts with `-`.
+        let options = parse(&args(&["log", "-Ab3", "--owner", "-x"]))
+            .unwrap()
+            .unwrap();
+        assert_eq!(options.node_key, "-Ab3");
+        assert_eq!(options.owner.as_deref(), Some("-x"));
+        assert!(parse(&args(&["log", "-Ab3", "--json"])).unwrap().is_some());
     }
 
     #[test]
