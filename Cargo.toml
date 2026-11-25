@@ -23,7 +23,7 @@ md-5 = "0.10"
 pbkdf2 = "0.12"
 ring = "0.17"
 p384 = { version = "0.14", features = ["ecdsa", "pkcs8"] }
-sha3 = "0.10"
+sha3 = "0.12"
 base64 = "0.22"
 chacha20poly1305 = "0.10"
 clap = { version = "4.5", default-features = false, features = ["std", "derive", "help", "usage", "error-context"] }
