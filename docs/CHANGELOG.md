@@ -7,6 +7,19 @@ before 1.0, minor versions may break formats and APIs.
 
 ### Added
 
+- Trusted code sandbox (`docs/design.md` section 11, part 7; `docs/sandbox.md`): the IR step
+  `run {module, entry, inputs, into}` runs a WebAssembly module fetched from the
+  destination's own origin (`{"url": ..., "sha256": ...}`, fetched as a logged `GET` over the
+  operation's connection, pin checked) or a reviewed library compiled into the node
+  (`{"library": "lenprefix8"}`). Its output may only go into a request the policy fixes to
+  that origin; signing refuses `return`, the caller's request, another destination, a field,
+  a second origin, and temporary values captured from a response to a request that carried
+  it. New crate `sandbox` (wasmi 1.1.0, chosen over wasmtime 51 and wasmi 2.0.3 by
+  measurement): fuel (10⁹), 64 MiB memory, 64 KiB output, four host functions, no WASI,
+  clock or randomness. Errors `ModuleRefused` and `Sandbox`. Summaries list `runs` and a
+  `module_input` form, and flag `run_unpinned`. Fuzz target `sandbox_module`. JavaScript:
+  boa compiled to WebAssembly measured inside the sandbox; shipping plan in
+  `docs/sandbox.md`.
 - Typed items (`docs/design.md` section 11, part 3): a policy may bind its record to a kind
   (`"item": {"kind": ..., "pins": {...}, "signoff": [...]}`), a schema of secret, masked
   and public fields with checks and a shape of what its policies may do. Twelve reviewed

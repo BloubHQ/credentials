@@ -905,7 +905,8 @@ fn check_operation(
                     "the kind does not relay the caller's exchanges",
                 )?;
             }
-            Step::Send(_) | Step::Compute(_) | Step::Repeat(_) | Step::If(_) => {}
+            // A run step's origin is one of the connection's destinations, checked above.
+            Step::Send(_) | Step::Compute(_) | Step::Run(_) | Step::Repeat(_) | Step::If(_) => {}
         }
     }
     Ok(())

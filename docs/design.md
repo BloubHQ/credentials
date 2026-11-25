@@ -391,7 +391,8 @@ changes on every load needs the hash left unpinned, which the approval screen fl
 **Implementation.** this is layer 3: IR step `run {module, entry, inputs}`; one WebAssembly
 runtime in the node, and a JavaScript engine compiled to WebAssembly as a reviewed module, so
 there is one sandbox to audit. Runtime and engine are chosen by measured size, speed and audit
-surface in their pull request.
+surface in their pull request: the runtime is wasmi 1.1.0, an interpreter (measurements and
+the JavaScript plan in `docs/sandbox.md`; the step in `docs/policy.md`, `run`).
 
 ## 8d. Primitives shipped up front
 
@@ -445,7 +446,7 @@ each, or a node hands its grants to a peer of the same release.
 | 4 | Policy JSON Schema, `client::summarize` with risk flags, approval format (done: `docs/policy.md`; the approval runtime is part 5) | 2, 3 |
 | 5 | Sessions, challenges, approvals, spending limits | 2 |
 | 6 | Connection kinds in layer 1: HTTP/2, WebSocket, streamed responses, then SSH, databases, FTP, mail, queues; tunnels as an IR relay step | 2 |
-| 7 | Trusted code sandbox (layer 3): WebAssembly runtime, JavaScript module, origin-pinned site code | 2 |
+| 7 | Trusted code sandbox (layer 3): WebAssembly runtime, JavaScript module, origin-pinned site code (done: `run` step, `crates/sandbox`, wasmi 1.1.0 chosen by measurement; JavaScript measured with boa in the sandbox, its shipping plan in `docs/sandbox.md`) | 2 |
 | 8 | Browser fills over CDP | 4, 5 |
 | 9 | Remaining primitive families (Appendices A, B), UDP relay and its protocols | 1 |
 | 10 | Node hand-over; key backup and device transfer in `client` | 3 |

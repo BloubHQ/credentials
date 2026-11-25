@@ -233,6 +233,14 @@ step 이전 형식(`"kind": "http" | "stream" | "derive"`)의 정책은 `credent
 `describe`해 공개 필드와 `visa ••••4242` 같은 마스킹 값을 받을 뿐, 비밀 필드는 절대 받지
 못합니다.
 
+**사이트 코드.** 로그인이 사이트 자신의 WebAssembly로 비밀번호를 암호화하거나 포장하고 그 과정을
+템플릿으로 쓸 수 없을 때, `run` step이 목적지 자신의 출처(origin)에서 모듈을 받아 오거나(URL과,
+가능하면 SHA-256을 서명된 정책에 둠) 노드에 컴파일된 검토된 라이브러리를 골라 샌드박스에서 실행합니다
+(인터프리터 wasmi: I/O, 시계, 난수 없음, 연료와 메모리 한도). 그 출력은 정책이 같은 출처로 고정한
+요청에만 들어갈 수 있고, 호출자에게도, 다른 목적지에도, 로그에도 가지 않습니다. 다른 쓰임은 서명할 때
+모두 거부됩니다. 해시를 고정하지 않은 모듈은 표시됩니다. 측정 결과와 JavaScript 계획은
+[docs/sandbox.md](../sandbox.md)에 있습니다.
+
 **서명 전에.** `summarize`는 비밀마다 갈 수 있는 곳과 형태, 돌아오는 것, 위험 플래그(항목의
 origin 밖 목적지, 와일드카드, 평문 HTTP, 아무 바이트나 받는 입력, 되돌릴 수 있는 출력, 릴레이,
 새 버전이 이전보다 넓힌 모든 것)를 보여 줍니다. 형식에는 JSON Schema
@@ -520,6 +528,7 @@ PKCS#1 v1.5 서명을 하지 못하므로 `rsa_sign_pkcs1("sha1", …)`만 RustC
 | [`verify`](../../crates/verify) | 노드 로그 검증기, `credentials verify`로 실행 |
 | [`attest`](../../crates/attest) | AWS Nitro Enclaves 증명 문서 검증기, `credentials attest`로 실행 |
 | [`client`](../../crates/client) | iOS, Android, 웹 앱 쪽 라이브러리: 키, 노드 증명 검증, grant, 레코드, 호출. Swift와 Kotlin(UniFFI), JavaScript(wasm-bindgen) 바인딩 |
+| [`sandbox`](../../crates/sandbox) | `run` step의 WebAssembly 샌드박스(wasmi): 연료·메모리 한도, 입력을 받고 출력 하나를 냄, 검토된 라이브러리 모듈 |
 | [`cli`](../../crates/cli) | `credentials` 도구: 키, 정책, 레코드, grant, 호출, 노드 서버, `credentials host` |
 
 ## 개발

@@ -222,6 +222,13 @@ let outcome = node.run(&call, &mut TlsTransport::new());
 什么；即使已签名，节点也会拒绝比类型更宽的类型化策略。调用方可以对类型化记录执行 `describe`，
 只得到公开字段和 `visa ••••4242` 之类的掩码值，绝不会得到 secret 字段。
 
+**站点自己的代码。** 当登录在站点自己的 WebAssembly 中加密或封装密码、而这些步骤无法写成模板时，
+`run` 步骤从目的地自己的源（origin）获取模块（URL 以及最好还有 SHA-256 写在已签名的策略中），
+或使用编译进节点的经过审查的库，并在沙箱中运行它（解释器 wasmi：没有 I/O、时钟和随机数，有燃料与
+内存上限）。它的输出只能进入策略固定发往同一源的请求：不会回到调用方，不会去往其他目的地，也不会
+进入日志；签名检查会拒绝其他一切用法。未固定哈希的模块会被标记。测量结果和 JavaScript 的计划见
+[docs/sandbox.md](../sandbox.md)。
+
 **签名之前。** `summarize` 按每个 secret 列出它能去哪里、以什么形式、返回什么，以及风险标记
 （条目 origin 之外的目的地、通配符、明文 HTTP、接受任意字节的输入、可逆的输出、中继，以及新
 版本相对旧版本放宽的一切）。该格式有 JSON Schema：`crates/engine/policy.schema.json`。详见
@@ -486,6 +493,7 @@ curl -s "http://127.0.0.1:8700/attestation?nonce=$(head -c 32 /dev/urandom | bas
 | [`verify`](../../crates/verify) | 节点日志验证器，以 `credentials verify` 运行 |
 | [`attest`](../../crates/attest) | AWS Nitro Enclaves 证明文档验证器，以 `credentials attest` 运行 |
 | [`client`](../../crates/client) | 面向 iOS、Android 和 Web 应用的库：密钥、节点证明验证、授权、记录和调用；通过 UniFFI 绑定 Swift 和 Kotlin，通过 wasm-bindgen 绑定 JavaScript |
+| [`sandbox`](../../crates/sandbox) | `run` 步骤的 WebAssembly 沙箱（wasmi）：燃料与内存上限，接收输入、给出一个输出，经过审查的库模块 |
 | [`cli`](../../crates/cli) | `credentials` 工具：密钥、策略、记录、授权、调用、节点服务器和 `credentials host` |
 
 ## 开发

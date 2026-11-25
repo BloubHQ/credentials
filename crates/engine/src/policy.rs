@@ -13,6 +13,9 @@
 //! - [`Step::Receive`] reads and [`Capture`]s values: into a secret field of the record (the
 //!   node seals a new record) or into a temporary value later steps read.
 //! - [`Step::Compute`] renders a template into a temporary value.
+//! - [`Step::Run`] runs code from the destination's own origin, or a reviewed library, in the
+//!   sandbox on rendered inputs; its output may only go into a request the policy fixes to
+//!   that origin ([`run`]).
 //! - [`Step::Return`] says what goes back to the caller: the declared parts of the last
 //!   response ([`Projection`]), the caller's exchanges on the stream within the patterns of
 //!   a [`Relay`], or the output of a template that must hand no secret back.
@@ -38,6 +41,7 @@ use crate::{Error, Result};
 mod contract;
 mod input;
 pub mod legacy;
+pub mod run;
 mod schema;
 pub mod summary;
 
@@ -50,6 +54,7 @@ pub use contract::{
     template_matches,
 };
 pub use input::{Input, JsonInput, JsonType, Member, NodeTime, RawInput, RlpInput, RlpItem};
+pub use run::{ModuleRef, ModuleSource, RunModule};
 
 const POLICY_DOMAIN: &[u8] = b"policy/v4\0";
 
@@ -787,6 +792,8 @@ pub enum Step {
     Receive(Receive),
     /// Computes a value.
     Compute(Compute),
+    /// Runs site code or a reviewed library in the sandbox.
+    Run(RunModule),
     /// Says what goes back to the caller; the last step.
     Return(Return),
     /// A bounded loop (refused for now).
@@ -854,9 +861,11 @@ impl Operation {
         })
     }
 
-    /// The captures that go into temporary values, with their secrecy.
+    /// The captures that go into temporary values, with their secrecy, and the outputs of
+    /// `run` steps (secret: the code may copy its inputs).
     fn temps(&self) -> Vec<(&str, bool)> {
-        self.steps
+        let mut temps: Vec<(&str, bool)> = self
+            .steps
             .iter()
             .flat_map(|s| match s {
                 Step::Receive(r) => r.capture.as_slice(),
@@ -866,7 +875,12 @@ impl Operation {
                 Store::Temp { name, secret } => Some((name.as_str(), *secret)),
                 Store::Field { .. } => None,
             })
-            .collect()
+            .collect();
+        temps.extend(self.steps.iter().filter_map(|s| match s {
+            Step::Run(run) => Some((run.into.as_str(), true)),
+            _ => None,
+        }));
+        temps
     }
 
     /// True when the concrete destination is one the connection names.
@@ -895,6 +909,7 @@ impl Operation {
                     out.extend(send.template.as_deref());
                 }
                 Step::Compute(c) => out.push(&c.template),
+                Step::Run(run) => out.extend(run.inputs.iter().map(String::as_str)),
                 Step::Return(r) => out.extend(r.template.as_deref()),
                 Step::Receive(_) | Step::Repeat(_) | Step::If(_) => {}
             }
@@ -1596,6 +1611,10 @@ impl Policy {
                     )?;
                     known.push(&compute.into);
                 }
+                (Step::Run(run), _) => {
+                    self.check_run(&at, &kinds, open, run, &known)?;
+                    known.push(&run.into);
+                }
                 (Step::Return(ret), _) => {
                     ensure(i + 1 == count, || at.clone(), "return is the last step")?;
                     self.check_return(&at, &kinds, connection, ret, &known, sends > 0)?;
@@ -1613,6 +1632,7 @@ impl Policy {
             || format!("{at}.steps"),
             "an operation ends with return",
         )?;
+        run::check_confined(at, operation)?;
         let reads_input = operation
             .templates()
             .into_iter()
@@ -1882,6 +1902,7 @@ fn summarize_operation(operation: &Operation, out: &mut Vec<String>) {
                 ));
             }
             Step::Compute(c) => out.push(format!("  compute {} = {}", c.into, c.template)),
+            Step::Run(run) => out.extend(run::summary_line(run, operation.open())),
             Step::Return(ret) => match (&ret.response, &ret.relay, &ret.template) {
                 (_, _, Some(template)) => out.push(format!("  return {template}")),
                 (_, Some(relay), _) => {

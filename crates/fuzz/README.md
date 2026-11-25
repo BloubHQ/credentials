@@ -14,6 +14,7 @@ it needs a nightly compiler.
 | `input_schema` | A byte choosing a JSON, RLP or raw schema, then the input | `Input::apply`; what a schema accepts it accepts again once checked. |
 | `html_capture` | Bytes: a selector, an attribute choice and a page | `extract::html`, the `html` capture source: no panic on any selector or page, pages over `MAX_SCAN` refused, texts within `MAX_CAPTURE`. |
 | `regex_capture` | Bytes: a pattern, a group and a text | `extract::regex`, the `regex` capture source: no panic on any pattern or text; a match is a part of the text. |
+| `sandbox_module` | A byte choosing the reviewed library `lenprefix8` or a module that follows, then inputs split on 0xff | `sandbox::check` and `sandbox::run_with` (small fuel and memory) with two entry names: any module and inputs end in an output within `MAX_OUTPUT` and the fuel given, or a fixed error, never a panic; a module that runs passes the checks; the library frames inputs exactly. |
 | `log_entry` | JSON | `SignedEntry` deserialization, `SignedEntry::hash`, `verify_chain` on a one-entry chain, and that `ChainVerifier` agrees with it. |
 
 The HTTP response parser in `crates/engine/src/response.rs` is not public, so it has no

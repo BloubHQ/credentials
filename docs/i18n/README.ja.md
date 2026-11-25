@@ -235,6 +235,14 @@ let outcome = node.run(&call, &mut TlsTransport::new());
 側は型付きレコードを `describe` して公開フィールドと `visa ••••4242` のようなマスク値を
 得るだけで、secret フィールドは決して得られません。
 
+**サイトのコード。** ログインがサイト自身の WebAssembly でパスワードを暗号化・梱包し、その手順を
+テンプレートで書けないとき、`run` ステップは宛先自身のオリジンからモジュールを取得する (URL と、
+できれば SHA-256 を署名済みポリシーに置く) か、ノードにコンパイルされたレビュー済みライブラリを使い、
+サンドボックスで実行します (インタプリタ wasmi: I/O・時計・乱数なし、燃料とメモリの上限)。出力は
+ポリシーが同じオリジンに固定したリクエストにしか入れられず、呼び出し元にも、ほかの宛先にも、ログにも
+行きません。それ以外の使い方は署名時にすべて拒否されます。ハッシュを固定しないモジュールはフラグが
+付きます。測定結果と JavaScript の計画は [docs/sandbox.md](../sandbox.md) にあります。
+
 **署名の前に。** `summarize` は secret ごとに送り先と形式、返るもの、リスクフラグ (アイテムの
 オリジン外の宛先、ワイルドカード、平文 HTTP、任意バイトの入力、可逆な出力、リレー、新しい
 バージョンが前より広げたものすべて) を示します。形式には JSON Schema
@@ -526,6 +534,7 @@ PKCS#1 v1.5 署名ができないので、`rsa_sign_pkcs1("sha1", …)` だけ�
 | [`verify`](../../crates/verify) | ノードログの検証ツール。`credentials verify` として実行 |
 | [`attest`](../../crates/attest) | AWS Nitro Enclaves のアテステーションドキュメントの検証ツール。`credentials attest` として実行 |
 | [`client`](../../crates/client) | iOS・Android・Web のアプリ側ライブラリ: 鍵、ノードのアテステーション検証、グラント、レコード、呼び出し。Swift と Kotlin (UniFFI)、JavaScript (wasm-bindgen) のバインディング |
+| [`sandbox`](../../crates/sandbox) | `run` ステップの WebAssembly サンドボックス (wasmi): 燃料とメモリの上限、入力を受け取り出力を 1 つ返す、レビュー済みライブラリモジュール |
 | [`cli`](../../crates/cli) | `credentials` ツール: 鍵、ポリシー、レコード、グラント、呼び出し、ノードサーバー、`credentials host` |
 
 ## 開発

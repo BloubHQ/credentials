@@ -175,7 +175,8 @@ reference is in [docs/policy.md](docs/policy.md).
 
 An operation is a list of **steps** over one connection: `open` (HTTPS, a TLS stream, or
 none), `send`, `receive` (with captures), `compute` (a template into a name later steps
-read), and `return`, which says what goes back to the caller.
+read), `run` (the site's own code in a sandbox, below), and `return`, which says what goes
+back to the caller.
 
 | Connection | What it does |
 | --- | --- |
@@ -233,6 +234,16 @@ values (Luhn, expiry by the node's clock, code length per card brand, exact orig
 keys, TLS unless signed off) and bounds what its policies may do; the node refuses a typed
 policy wider than its kind, even a signed one. A caller may `describe` a typed record and gets
 the public fields and masks such as `visa ••••4242`, never a secret field.
+
+**Site code.** When a login encrypts or packages the password in the site's own
+WebAssembly and the steps cannot be written as templates, a `run` step fetches the module
+from the destination's own origin (its URL and, ideally, its SHA-256 are in the signed
+policy) or takes a reviewed library compiled into the node, and runs it in a sandbox
+(wasmi, an interpreter: no I/O, no clock, no randomness, fuel and memory limits). Its output
+may go only into a request the policy fixes to that same origin: never back to the caller,
+to another destination or into the log; the signing check refuses every other use. An
+unpinned module is flagged. Measurements and the plan for JavaScript are in
+[docs/sandbox.md](docs/sandbox.md).
 
 **Before signing.** `summarize` lists, per secret, where it can go and in what form, what
 comes back, and risk flags (a destination outside the item's origin, wildcards, plain HTTP,
@@ -511,6 +522,8 @@ explains each.
   owner who loses every device starts a new owner name.
 - **Stream sessions** end with the call. SSH, database wire protocols, gRPC and WebSocket
   framing work only as far as a send/expect script can go.
+- **Site code is trusted as the site.** A `run` module computes on the secret; it can fail
+  or take time depending on it, and an unpinned module is whatever the origin serves.
 - **Browser logins, push 2FA and hardware keys** need a person or a device and cannot be
   delegated.
 - **A web page is weaker than an app.** The [`client`](crates/client) package runs in a page
@@ -531,6 +544,7 @@ explains each.
 | [`verify`](crates/verify) | Verifier of node logs, run as `credentials verify` |
 | [`attest`](crates/attest) | Verifier of AWS Nitro Enclaves attestation documents, run as `credentials attest` |
 | [`client`](crates/client) | The app side for iOS, Android and the web: keys, node attestation, grants, records and calls, bound to Swift and Kotlin (UniFFI) and JavaScript (wasm-bindgen) |
+| [`sandbox`](crates/sandbox) | The WebAssembly sandbox of the `run` step (wasmi): fuel and memory limits, inputs in and one output out, reviewed library modules |
 | [`cli`](crates/cli) | The `credentials` tool: keys, policies, records, grants, calls, a node server, and `credentials host` |
 
 ## Development

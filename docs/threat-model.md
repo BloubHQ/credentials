@@ -98,12 +98,22 @@ What the engine protects, against whom, under which assumptions, and what is lef
 | An ssh or VPN key goes to a server nobody authenticated | The ssh and vpn kinds allow no connection until their protocols exist in the node; the ssh host key is a required, checked pin | `item` |
 | Owner signs a new version without seeing what it widens | `summarize` against the previous version flags every new destination, method, path, header, query rule, injection, operation, caller and key, more of the response, looser limits, fields made public, and changed item bindings; anything it cannot rank counts as wider | `policy::summary` |
 | Node shows the owner one summary and acts on another, or a caller replays an approval | An approval signs the SHA-256 of the canonical summary the node built, its random id, the node, owner and record, within a window of at most five minutes; parking and single use are the runtime of part 5 | `approval` |
+| An agent or caller gets code to run on a secret (to encode it where the site echoes it) | `run` takes code only from a URL on one of the operation's destinations, written in the signed policy (optionally pinned by SHA-256), or from a reviewed library compiled into the node (PCR2); never from the caller's request or input | `policy::run` |
+| Output of site code leaves its origin (returned, logged, sent to another destination or in the caller's request) | Signing refuses any template that reads the output, a value computed from it, or a temporary value captured from the response of a request that carried it, unless it is injected into a request the policy fixes to the module's origin; `run` needs an HTTPS connection; all `run` steps of an operation share one origin; the output is never a field; responses that echo it are refused; log entries hold only the request's body hash and length, sealed | `policy::run`, `node` |
+| The origin serves other code than the owner approved | The SHA-256 pin is checked before the module runs (`ModuleRefused`, no later request); an unpinned module is flagged `run_unpinned` in the summary | `node`, `policy::summary` |
+| Site code exhausts the node (loop, memory, output, stack) or reaches its host | wasmi interpreter, no JIT; fuel (10⁹), 64 MiB memory, 64 KiB output, strict structural limits; only four host functions (no WASI, clock, randomness or I/O); one engine and store per run; memory erased after; errors are fixed values | `sandbox` |
 | Memory disclosure of freed buffers | `Secret`/`Zeroizing` everywhere in the engine; exact-size buffers; erasing growth in the transport; zeroizing allocator for dependencies | all |
 
 ## Residual risks
 
 These remain by design; each is listed in the README.
 
+- **Site code: timing and failure.** Whether a `run` module succeeds, runs out of fuel or
+  traps, and how long it takes, may depend on the secret, and the caller sees the outcome and
+  the time of its call. The code is the site's own or reviewed, and the site already holds
+  the secret; accepted. A module fetched without a pin is whatever the origin serves at the
+  time (flagged). A site that echoes the output transformed is not recognised by the search
+  (see `docs/sandbox.md`).
 - **One TEE (A1).** Only AWS Nitro Enclaves are integrated. Elsewhere the node is an ordinary
   process. The attestation document must be verified by the owner (certificate chain, PCRs,
   nonce, `user_data`); the node only produces it.

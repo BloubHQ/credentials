@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 
 use super::{
     BodyProjection, Caller, CallerRequest, Connection, Destination, Input, Limit, Operation,
-    Policy, QueryRule, Return, Send, Step, StepRequest, Store, Target,
+    Policy, QueryRule, Return, RunModule, Send, Step, StepRequest, Store, Target,
 };
 use crate::item::{Disclosure, Origin};
 use crate::template::Template;
@@ -53,6 +53,12 @@ pub enum Form {
     Identity,
     /// Bytes written on a TLS stream.
     StreamSend,
+    /// An input of code run in the sandbox (a `run` step); the code's output goes only to
+    /// the module's origin.
+    ModuleInput {
+        /// The module: its URL, or `library <name>`.
+        module: String,
+    },
     /// The output of a derivation, handed to the caller.
     Output {
         /// False when the output is an encryption (or another reversible function) of the
@@ -113,6 +119,30 @@ pub struct RequestSummary {
     pub destination: Option<Place>,
 }
 
+/// A `run` step: code that computes on secret values in the sandbox.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RunSummary {
+    /// The step, from 0.
+    pub step: usize,
+    /// The module: its URL, or `library <name>`.
+    pub module: String,
+    /// Where the module and its output go: the module's origin.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<Place>,
+    /// The SHA-256 pin of a fetched module; `None` when it is not pinned or is a library.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sha256: Option<String>,
+    /// True for a module fetched without a pin: the site can change the code.
+    pub unpinned: bool,
+    /// The exported function called.
+    pub entry: String,
+    /// The templates of the inputs.
+    pub inputs: Vec<String>,
+    /// The name of the output.
+    pub into: String,
+}
+
 /// What goes back to the caller.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -148,6 +178,9 @@ pub struct OperationSummary {
     pub requests: Vec<RequestSummary>,
     /// What responses fill: `field x`, `secret temp y`, `public temp z`.
     pub captures: Vec<String>,
+    /// The code it runs in the sandbox.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub runs: Vec<RunSummary>,
     /// What goes back.
     pub returns: ReturnSummary,
     /// The input schema of a derivation.
@@ -217,6 +250,9 @@ pub enum FlagCode {
     OverrideParams,
     /// A client certificate goes to a destination.
     ClientCertificate,
+    /// Code fetched from a site runs on secret values without a SHA-256 pin: the site can
+    /// change it at any time.
+    RunUnpinned,
     /// Wider than the previous version of the policy.
     Wider,
     /// A destination the previous version did not have.
@@ -341,10 +377,18 @@ impl Reads {
             computed: Vec::new(),
         };
         for step in &operation.steps {
-            if let Step::Compute(c) = step {
-                let fields = reads.fields_of(&c.template);
-                let rev = reads.reversible_in(&c.template);
-                reads.computed.push((c.into.clone(), fields, rev));
+            match step {
+                Step::Compute(c) => {
+                    let fields = reads.fields_of(&c.template);
+                    let rev = reads.reversible_in(&c.template);
+                    reads.computed.push((c.into.clone(), fields, rev));
+                }
+                Step::Run(run) => {
+                    // The code's output may hold its inputs in any form.
+                    let fields = reads.fields_of(&run.inputs.concat());
+                    reads.computed.push((run.into.clone(), fields, true));
+                }
+                _ => {}
             }
         }
         reads
@@ -457,6 +501,7 @@ fn operation_summary(operation: &Operation) -> OperationSummary {
         client_certificate: open.is_some_and(|o| o.identity.is_some()),
         requests: Vec::new(),
         captures: Vec::new(),
+        runs: Vec::new(),
         returns: ReturnSummary::default(),
         input: operation.input.clone(),
     };
@@ -477,6 +522,7 @@ fn operation_summary(operation: &Operation) -> OperationSummary {
                     }));
             }
             Step::Return(ret) => out.returns = return_summary(ret, connection),
+            Step::Run(run) => out.runs.push(run_summary(i, run, operation)),
             Step::Open(_) | Step::Compute(_) | Step::Repeat(_) | Step::If(_) => {}
         }
     }
@@ -550,10 +596,38 @@ fn uses_in(operation: &Operation) -> Vec<(String, SecretUse)> {
                     add(i, template, Form::Output { one_way }, &[]);
                 }
             }
+            Step::Run(run) => {
+                let to: Vec<Place> = operation
+                    .open()
+                    .and_then(|o| run.origin(o).map(|d| place(o.connection, &d)))
+                    .into_iter()
+                    .collect();
+                let form = Form::ModuleInput {
+                    module: run.module_name(),
+                };
+                for input in &run.inputs {
+                    add(i, input, form.clone(), &to);
+                }
+            }
             Step::Receive(_) | Step::Compute(_) | Step::Repeat(_) | Step::If(_) => {}
         }
     }
     out
+}
+
+fn run_summary(step: usize, run: &RunModule, operation: &Operation) -> RunSummary {
+    RunSummary {
+        step,
+        module: run.module_name(),
+        origin: operation
+            .open()
+            .and_then(|o| run.origin(o).map(|d| place(o.connection, &d))),
+        sha256: run.module.sha256.clone(),
+        unpinned: run.unpinned(),
+        entry: run.entry.clone(),
+        inputs: run.inputs.clone(),
+        into: run.into.clone(),
+    }
 }
 
 fn flag(flags: &mut Vec<Flag>, code: FlagCode, at: impl Into<String>, detail: impl Into<String>) {
@@ -647,6 +721,21 @@ fn risk_flags(policy: &Policy, origin: Option<&Origin>, flags: &mut Vec<Flag>) {
         }
         for (c, _) in operation.caller_sends() {
             caller_flags(c, &at, flags);
+        }
+        for step in &operation.steps {
+            if let Step::Run(run) = step {
+                if run.unpinned() {
+                    flag(
+                        flags,
+                        FlagCode::RunUnpinned,
+                        &at,
+                        format!(
+                            "the module {} runs on secret values without a sha256 pin: the site can change it",
+                            run.module_name()
+                        ),
+                    );
+                }
+            }
         }
         if let Some(ret) = operation.returns() {
             if let Some(p) = &ret.response {

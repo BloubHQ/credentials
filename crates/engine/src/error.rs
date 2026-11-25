@@ -251,6 +251,16 @@ pub enum Error {
     /// The response holds a secret in a form the search knows. It was dropped.
     #[error("response reflects a secret")]
     Reflection,
+    /// The module of a `run` step was refused: its origin did not answer 200, it is too
+    /// large, it does not match its pin, or the library is unknown.
+    #[error("module refused: {rule}")]
+    ModuleRefused {
+        /// Which rule.
+        rule: &'static str,
+    },
+    /// The sandbox stopped a `run` step. The message is fixed: nothing the module computed.
+    #[error("sandbox: {0}")]
+    Sandbox(sandbox::Error),
     /// The transport failed.
     #[error("transport failed: {0}")]
     Transport(TransportFault),

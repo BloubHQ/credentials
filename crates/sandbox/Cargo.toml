@@ -1,0 +1,23 @@
+[package]
+name = "sandbox"
+description = "The trusted code sandbox of the credentials node: WebAssembly with fuel and memory limits, no I/O, no clock, no randomness, inputs in and one output out."
+version.workspace = true
+edition.workspace = true
+# wasmi 2 needs Rust 1.86.
+rust-version = "1.87"
+license.workspace = true
+publish.workspace = true
+repository.workspace = true
+readme = "../../README.md"
+
+[dependencies]
+wasmi.workspace = true
+thiserror.workspace = true
+zeroize.workspace = true
+
+[dev-dependencies]
+wat.workspace = true
+sha2.workspace = true
+
+[lints]
+workspace = true

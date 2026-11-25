@@ -25,6 +25,7 @@ Policy
         ├── send     https: request (caller contract | fixed) + inject;  tls: template
         ├── receive  https: the response of the send;  tls: until a delimiter;  + capture
         ├── compute  into a name, from a template
+        ├── run      site code or a reviewed library in the sandbox; output only to its origin
         ├── return   https: response projection;  tls: relay;  none: template
         ├── repeat   (syntax only, refused)
         └── if       (syntax only, refused)
@@ -108,11 +109,12 @@ Rules for every operation:
 - `return` is the last step, and every operation ends with one.
 - On HTTPS, a `receive` follows the `send` whose response it reads; at most 8 sends.
 - `compute` may appear anywhere after `open`.
+- `run` needs an HTTPS connection and may appear anywhere after `open`.
 - `repeat` and `if` are refused for now (see [Loops and branches](#loops-and-branches)).
 
-New kinds of connection (WebSocket, SSH, database handshakes, a browser over CDP, a WASM
-`run`) fit the same steps: each kind says what its `send`, `receive` and `return` carry, and
-the template analysis stays the same. None is implemented yet.
+New kinds of connection (WebSocket, SSH, database handshakes, a browser over CDP) fit the
+same steps: each kind says what its `send`, `receive` and `return` carry, and the template
+analysis stays the same. None is implemented yet.
 
 ### `open`
 
@@ -256,6 +258,64 @@ the same as writing its template inline: every rule below applies across steps. 
 connection, `compute` reads what the `return` template reads (`$input` included); with a
 connection, the clock and `$nonce`.
 
+### `run`
+
+```json
+{"name": "login",
+ "steps": [
+   {"do": "open", "connection": "https",
+    "destinations": [{"host": "login.example.com", "port": 443}]},
+   {"do": "run",
+    "module": {"url": "https://login.example.com/static/enc.wasm",
+               "sha256": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"},
+    "entry": "encrypt", "inputs": ["{{password}}", "{{ $unix }}"], "into": "enc"},
+   {"do": "send",
+    "request": {"from": "fixed", "method": "POST", "path": "/login"},
+    "inject": [{"target": {"kind": "body"}, "template": "pw={{ b64url(enc) }}"}]},
+   {"do": "return"}
+ ]}
+```
+
+Runs code that must compute on secret bytes (a site's own JavaScript or WebAssembly that
+encrypts or packages a password before the login call) in the sandbox of layer 3
+(`docs/design.md`, section 8e; the runtime and its measurements are in
+[`docs/sandbox.md`](sandbox.md)). The code is never the caller's or an agent's:
+
+| `module` | The code |
+| --- | --- |
+| `{"url": "https://host[:port]/path", "sha256": "<64 hex>"}` | Fetched by the node with `GET` from the destination's own origin, over the operation's connection, as a logged request. The host and port must be one of the connection's destinations (concrete or matched by a `*.` pattern). `sha256` (optional) pins the bytes; without it the summary flags `run_unpinned`, since the site may change the code at any time. A status other than 200, a module over 8 MiB or a pin mismatch stops the operation (`ModuleRefused`) before any later request. |
+| `{"library": "lenprefix8"}` | A reviewed module compiled into the node (and so into its measurement, PCR2). `destination` names where its output may go; it may be left out when the connection has one concrete destination. |
+
+| Member | Meaning |
+| --- | --- |
+| `entry` | The exported function `() -> ()` to call (a token). |
+| `inputs` | 0 to 16 templates, rendered like a `compute` (fields, temporaries, the clock and `$nonce`; no request variable): secrets may go in. |
+| `into` | A new token name for the output; never a field. |
+| `destination` | For a library only: the destination its output may go to. |
+
+The module sees only its inputs: it imports at most `input_count`, `input_len`,
+`input_read` and `output` of the module `credentials` (no WASI, no clock, no randomness
+unless an input carries it, no I/O), exports its memory as `memory`, and runs under a fuel
+limit (10⁹ units, 1.25 s measured) and a memory limit (64 MiB), with at most 64 KiB of output.
+A failure is `Sandbox` with a fixed reason (`Fuel`, `Memory`, `Trap`, `Import`, ...):
+nothing the module computed reaches an error.
+
+The output is **confined to the module's origin** (the URL's host and port, or a library's
+`destination`). When the policy is signed:
+
+- `run` needs an HTTPS connection; an operation with no connection or a TLS stream cannot
+  have one (its output could only go back to the caller or to a stream the caller drives).
+- the output, every `compute` that reads it, and every temporary value captured from the
+  response of a request that carried it, may only be injected into a `send` whose request the
+  policy **fixes** to that origin: not a request of the caller (the caller would choose the
+  path, for example an endpoint that echoes), not another destination, not `return`;
+- every `run` of an operation has the same origin.
+
+At run time the output is also searched for in every response, like a rendered secret: a
+response that echoes it is refused (`Reflection`). The log records the request as for any
+`send` (method, host, path, the SHA-256 and length of the body, sealed to the owner), never
+the output.
+
 ### `return`
 
 #### HTTPS: the response projection
@@ -358,6 +418,10 @@ one that gives the caller less:
 | --- | --- |
 | The status is the only thing an HTTPS operation returns unless `response` says more. | A server's answer may hold what the policy never meant to hand out (temporary credentials minted by the call); the owner lists what the caller needs. |
 | A caller may send no query parameter that is not listed; there is no wildcard for names. | An unlisted parameter can change what the signed request does (an action, a scope, a limit). |
+| A `run` output goes only into a request the policy fixes, not one of the caller's, even to the same origin. | The caller would choose the path and query around it, and so could send it to an endpoint of the site that echoes what it receives. |
+| The output of a `run`, and what the response to a request that carried it gives into temporary values, are confined alike. | A site that echoes the output would otherwise hand it to a capture that may go anywhere. |
+| A `run` module's limits (fuel, memory, output) are the node's, not the policy's. | One bound to audit; a policy cannot raise them. |
+| The sandbox runtime is an interpreter (wasmi), not a JIT. | No code is generated at run time, and it adds about 1.3 MB to the node instead of 11.5 MB (`docs/sandbox.md`). |
 | A caller may never send a query name the `send` injects. | Servers disagree on which of two equal names wins. |
 | `%25` in a caller's path is refused unless `encoded_percent`. | A server or proxy that decodes twice reads another path than the one checked. Measured: no test or example of the repository needed it. |
 | Dot segments are checked as sent, after `;` parameters are stripped and after one and two decodings. | Servers strip path parameters (`..;`) or decode twice. |
@@ -496,7 +560,10 @@ crate, which checks the policy first) gives the owner, in JSON:
   derivation and whether that is one-way);
 - per operation: the connection and destinations, each request (fixed, or the caller's
   methods, path templates, headers and query allow-list), the injections, the response
-  projection or relay patterns, and the input schema;
+  projection or relay patterns, the input schema, and each `run` step (`runs`: the module's
+  URL or library, its origin, its pin or `unpinned`, the entry, the inputs and the output
+  name); a secret read by a module's input is listed as going in `module_input` to the
+  module's origin;
 - the callers with their operations and limits, and the item with its pins and sign-offs;
 - `lines`, the text of `Policy::summary()`;
 - the risk flags, each with a code, a place and words:
@@ -516,6 +583,7 @@ crate, which checks the policy first) gives the owner, in JSON:
 | `encoded_percent` | The caller's path may hold `%25`. |
 | `override_params` | The caller may send method-override parameters. |
 | `client_certificate` | A client certificate goes to a destination. |
+| `run_unpinned` | A `run` step fetches its module without a `sha256` pin: the site can change the code that reads the secrets. |
 | `wider` | Against `previous`: a new destination, method, path, header, query rule, injection, operation, caller or caller key; more of the response; a looser limit; a field made public or not guessable; the item unbound or its pins and sign-offs changed. |
 | `new_destination` | Against `previous`: a destination it did not have. |
 

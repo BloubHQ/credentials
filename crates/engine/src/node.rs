@@ -36,7 +36,7 @@ use crate::keys::{DevicePublicKey, Endorsement, NodeKey, NodePublicKey, Retireme
 use crate::log::{Detail, Event, Log, LogSink, SignedEntry, SignedHead};
 use crate::policy::{
     Capture, Compute, Connection, Destination, Identity, Kinds, MAX_DELIMITER, MAX_DELIMITERS,
-    Open, Operation, Policy, Send, Step, Store,
+    Method, ModuleRef, Open, Operation, Policy, RunModule, Send, Step, StepRequest, Store,
 };
 use crate::record::{Pin, Record, check_name};
 use crate::reflection::{self, MIN_NEEDLE, Secrets};
@@ -1186,6 +1186,14 @@ impl<S: LogSink, C: Clock> Node<S, C> {
                     stored.and(persisted).map(|()| None)
                 }
                 Step::Compute(compute) => run.compute(compute, compute_vars(now)).map(|()| None),
+                Step::Run(step) => {
+                    // A module fetch is a request of its own: the one before it is done.
+                    if let Some((seq, status)) = pending.take() {
+                        self.done(now, who, seq, Some(status), true);
+                    }
+                    self.run_module(run, open, step, transport, updated)
+                        .map(|()| None)
+                }
                 Step::Return(ret) => {
                     let response = last
                         .take()
@@ -1219,6 +1227,104 @@ impl<S: LogSink, C: Clock> Node<S, C> {
             }
         }
         Err(operation.unknown())
+    }
+
+    /// A `run` step: gets the module (a reviewed library, or `GET` on the module's origin
+    /// over the operation's connection, logged like any request, its pin checked), renders
+    /// the inputs, runs the module in the sandbox and keeps the output as a secret temporary
+    /// value. The output is added to what responses are searched for; the policy check made
+    /// sure it goes nowhere but a fixed request to the module's origin.
+    fn run_module<T: Transport>(
+        &self,
+        run: &mut Run<'_>,
+        open: &Open,
+        step: &RunModule,
+        transport: &mut T,
+        updated: &Option<Record>,
+    ) -> Result<()> {
+        let fetched;
+        let module: &[u8] = match step.source() {
+            Some(ModuleRef::Library(name)) => {
+                sandbox::library(name).ok_or(Error::ModuleRefused {
+                    rule: "unknown library module",
+                })?
+            }
+            Some(ModuleRef::Url {
+                origin,
+                path,
+                sha256,
+            }) => {
+                fetched = self.fetch_module(run, open, origin, path, sha256, transport, updated)?;
+                &fetched
+            }
+            None => return Err(run.operation.unknown()),
+        };
+        let ctx = Context {
+            fields: &run.fields,
+            temps: &run.captured.temps,
+            vars: compute_vars(run.now),
+            unix: run.now / 1000,
+            budget: &run.budget,
+        };
+        let inputs = step
+            .inputs
+            .iter()
+            .map(|text| Template::parse(text).and_then(|t| t.render(&ctx)))
+            .collect::<Result<Vec<_>>>()?;
+        let slices: Vec<&[u8]> = inputs.iter().map(|i| i.as_slice()).collect();
+        let ran = sandbox::run(module, &step.entry, &slices).map_err(Error::Sandbox)?;
+        drop(inputs);
+        let output = ran.output;
+        run.captured.temps_len = run.captured.temps_len.saturating_add(output.len());
+        if run.captured.temps_len > MAX_TEMPS {
+            return Err(Error::Budget {
+                what: "captured values",
+            });
+        }
+        run.tainted.push(output.clone());
+        run.captured.temps.insert(step.into.clone(), output);
+        Ok(())
+    }
+
+    /// Fetches a module with `GET` from its origin, as a logged request of the operation,
+    /// and checks the status, the size and the pin.
+    #[allow(clippy::too_many_arguments)]
+    fn fetch_module<T: Transport>(
+        &self,
+        run: &mut Run<'_>,
+        open: &Open,
+        origin: Destination,
+        path: &str,
+        sha256: Option<[u8; 32]>,
+        transport: &mut T,
+        updated: &Option<Record>,
+    ) -> Result<Vec<u8>> {
+        let send = Send {
+            request: Some(StepRequest::Fixed {
+                method: Method::Get,
+                path: path.to_string(),
+                destination: Some(origin),
+            }),
+            ..Send::default()
+        };
+        let (seq, http) = self.https_send(run, open, &send, None, transport, updated)?;
+        let checked = if http.status != 200 {
+            Err(Error::ModuleRefused {
+                rule: "the module's origin did not answer 200",
+            })
+        } else if http.body.len() > sandbox::MAX_MODULE {
+            Err(Error::ModuleRefused {
+                rule: "module larger than the limit",
+            })
+        } else if sha256.is_some_and(|pin| <[u8; 32]>::from(Sha256::digest(&*http.body)) != pin) {
+            Err(Error::ModuleRefused {
+                rule: "the module does not match its sha256 pin",
+            })
+        } else {
+            Ok(http.body.to_vec())
+        };
+        self.done(run.now, run.who, seq, Some(http.status), checked.is_ok());
+        checked
     }
 
     /// Builds, logs and sends one HTTPS request, and parses its response.
@@ -1355,7 +1461,7 @@ impl<S: LogSink, C: Clock> Node<S, C> {
                         })
                 }
                 Step::Compute(compute) => run.compute(compute, compute_vars(now)),
-                Step::Repeat(_) | Step::If(_) => Err(operation.unknown()),
+                Step::Run(_) | Step::Repeat(_) | Step::If(_) => Err(operation.unknown()),
             };
             if let Err(error) = result {
                 steps_result = Err(error);
@@ -1436,6 +1542,7 @@ impl<S: LogSink, C: Clock> Node<S, C> {
                 Step::Open(_)
                 | Step::Send(_)
                 | Step::Receive(_)
+                | Step::Run(_)
                 | Step::Repeat(_)
                 | Step::If(_) => return Err(operation.unknown()),
             }
