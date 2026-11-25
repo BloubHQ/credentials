@@ -285,6 +285,11 @@ impl Http {
                 .find_map(|v| set_cookie(v, name)),
             Source::Json { pointer } => json_pointer(&self.body, pointer)?,
             Source::Between { start, end } => between(&self.body, start, end),
+            Source::Html {
+                selector,
+                attribute,
+            } => crate::extract::html(&self.body, selector, attribute.as_deref())?,
+            Source::Regex { pattern, group } => crate::extract::regex(&self.body, pattern, *group)?,
             Source::All => Some(self.body.clone()),
         };
         limit(value)
@@ -325,10 +330,11 @@ fn limit(value: Option<Zeroizing<Vec<u8>>>) -> Result<Option<Zeroizing<Vec<u8>>>
     }
 }
 
-/// The value a stream source (`between` or `all`) names in bytes read from a stream.
+/// The value a stream source (`between`, `regex` or `all`) names in bytes read from a stream.
 pub(crate) fn capture_bytes(bytes: &[u8], source: &Source) -> Result<Option<Zeroizing<Vec<u8>>>> {
     limit(match source {
         Source::Between { start, end } => between(bytes, start, end),
+        Source::Regex { pattern, group } => crate::extract::regex(bytes, pattern, *group)?,
         Source::All => Some(Zeroizing::new(bytes.to_vec())),
         _ => return Err(invalid("source not available on a stream")),
     })

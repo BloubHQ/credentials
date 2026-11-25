@@ -44,3 +44,17 @@ path = "fuzz_targets/attestation.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "html_capture"
+path = "fuzz_targets/html_capture.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "regex_capture"
+path = "fuzz_targets/regex_capture.rs"
+test = false
+doc = false
+bench = false

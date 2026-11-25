@@ -414,6 +414,24 @@ pub enum Source {
         /// Text after the value.
         end: String,
     },
+    /// The first element of an HTML body that a compound selector (`input[name=csrf]`,
+    /// `meta[name="token"]`, `#id.class`) matches: the value of `attribute`, or its text.
+    Html {
+        /// The selector, at most 256 bytes.
+        selector: String,
+        /// The attribute read; without it, the text of the element.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        attribute: Option<String>,
+    },
+    /// A group of the first match of a regular expression (linear time, no backreferences
+    /// or look-around, ASCII classes).
+    Regex {
+        /// The pattern, at most 256 bytes.
+        pattern: String,
+        /// The group; by default 1 when the pattern has a group, else the whole match.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        group: Option<u8>,
+    },
     /// The whole body.
     All,
 }
@@ -498,6 +516,16 @@ mod wire {
             start: String,
             end: String,
         },
+        Html {
+            selector: String,
+            #[serde(default)]
+            attribute: Option<String>,
+        },
+        Regex {
+            pattern: String,
+            #[serde(default)]
+            group: Option<u8>,
+        },
         All {},
     }
 
@@ -518,6 +546,14 @@ mod wire {
                 Source::Cookie { name } => Self::Cookie { name },
                 Source::Json { pointer } => Self::Json { pointer },
                 Source::Between { start, end } => Self::Between { start, end },
+                Source::Html {
+                    selector,
+                    attribute,
+                } => Self::Html {
+                    selector,
+                    attribute,
+                },
+                Source::Regex { pattern, group } => Self::Regex { pattern, group },
                 Source::All {} => Self::All,
             }
         }
@@ -535,6 +571,7 @@ impl Source {
             | Source::Cookie { .. }
             | Source::HeaderParam { .. }
             | Source::Json { .. }
+            | Source::Html { .. }
                 if stream =>
             {
                 Some(http_only)
@@ -555,6 +592,16 @@ impl Source {
                 || start.len() > MAX_DELIMITER
                 || end.len() > MAX_DELIMITER)
                 .then_some("between needs delimiters of 1 to 256 bytes"),
+            Source::Html {
+                selector,
+                attribute,
+            } => (crate::extract::Selector::parse(selector).is_none()
+                || !attribute.as_deref().is_none_or(is_token))
+            .then_some("html needs a compound selector of at most 256 bytes and a token attribute"),
+            Source::Regex { pattern, group } => crate::extract::compile(pattern)
+                .and_then(|r| crate::extract::group_of(&r, *group))
+                .is_none()
+                .then_some("regex needs a pattern of at most 256 bytes within the size limits, and an existing group"),
         }
     }
 }
@@ -1482,6 +1529,79 @@ mod tests {
         }
         let back = serde_json::to_string(&Target::Body).unwrap();
         assert_eq!(serde_json::from_str::<Target>(&back).unwrap(), Target::Body);
+    }
+
+    #[test]
+    fn html_and_regex_sources_are_checked() {
+        let html = r#"{"from":"html","selector":"input[name=\"_csrf\"]","attribute":"value"}"#;
+        let regex = r#"{"from":"regex","pattern":"sid=([a-z0-9]+)","group":1}"#;
+        for json in [html, regex, r#"{"from":"html","selector":"title"}"#] {
+            let source: Source = serde_json::from_str(json).unwrap();
+            assert_eq!(source.rule(false), None, "{json}");
+            let back = serde_json::to_string(&source).unwrap();
+            assert_eq!(serde_json::from_str::<Source>(&back).unwrap(), source);
+        }
+        assert!(serde_json::from_str::<Source>(r#"{"from":"regex","pattern":"a","x":1}"#).is_err());
+        let html_rule = "html needs a compound selector of at most 256 bytes and a token attribute";
+        let regex_rule = "regex needs a pattern of at most 256 bytes within the size limits, and an existing group";
+        for (source, stream, rule) in [
+            (
+                Source::Html {
+                    selector: "form input".into(),
+                    attribute: None,
+                },
+                false,
+                html_rule,
+            ),
+            (
+                Source::Html {
+                    selector: "input".into(),
+                    attribute: Some("a b".into()),
+                },
+                false,
+                html_rule,
+            ),
+            (
+                Source::Html {
+                    selector: "input".into(),
+                    attribute: None,
+                },
+                true,
+                "source not available on a stream",
+            ),
+            (
+                Source::Regex {
+                    pattern: r"(a)\1".into(),
+                    group: None,
+                },
+                false,
+                regex_rule,
+            ),
+            (
+                Source::Regex {
+                    pattern: "(a)".into(),
+                    group: Some(2),
+                },
+                true,
+                regex_rule,
+            ),
+            (
+                Source::Regex {
+                    pattern: "x".repeat(257),
+                    group: None,
+                },
+                false,
+                regex_rule,
+            ),
+        ] {
+            assert_eq!(source.rule(stream), Some(rule), "{source:?}");
+        }
+        // A regular expression also reads stream bytes.
+        let stream_regex = Source::Regex {
+            pattern: r"\[CAPABILITY ([^\]]+)\]".into(),
+            group: None,
+        };
+        assert_eq!(stream_regex.rule(true), None);
     }
 
     #[test]
