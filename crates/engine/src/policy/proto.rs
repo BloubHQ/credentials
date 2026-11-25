@@ -43,6 +43,7 @@ pub enum Mechanism {
     /// SSH `keyboard-interactive`.
     KeyboardInteractive,
     /// SASL `SCRAM-SHA-256` (PostgreSQL).
+    #[serde(rename = "scram-sha-256")]
     ScramSha256,
     /// SASL `PLAIN` (SMTP, IMAP `AUTHENTICATE`).
     Plain,

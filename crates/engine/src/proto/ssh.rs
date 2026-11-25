@@ -878,13 +878,11 @@ impl<'s> Client<'s> {
         Err(invalid("no SSH identification line"))
     }
 
-    fn kexinit() -> Zeroizing<Vec<u8>> {
-        Self::kexinit_with(&[], &[])
-    }
-
-    fn kexinit_with(host: &[&str], _: &[&str]) -> Zeroizing<Vec<u8>> {
+    /// The node's KEXINIT, offering `host` as host key algorithms.
+    fn kexinit(host: &[&str]) -> Result<Zeroizing<Vec<u8>>> {
         let mut cookie = [0u8; 16];
-        let _ = ring::rand::SecureRandom::fill(&SystemRandom::new(), &mut cookie);
+        ring::rand::SecureRandom::fill(&SystemRandom::new(), &mut cookie)
+            .map_err(|_| Error::Encoding)?;
         let mut kex: Vec<&str> = KEX.to_vec();
         kex.push(STRICT_CLIENT);
         let mut put = Put::message(KEXINIT);
@@ -901,7 +899,7 @@ impl<'s> Client<'s> {
             .names(&[])
             .bool(false)
             .u32(0);
-        put.into_bytes()
+        Ok(put.into_bytes())
     }
 
     /// The key exchange (RFC 4253, 7 and 8; RFC 5656 and RFC 8731 for ECDH).
@@ -910,8 +908,7 @@ impl<'s> Client<'s> {
             .iter()
             .flat_map(|k| k.algorithms().iter().copied())
             .collect();
-        let _ = Self::kexinit();
-        let ours = Self::kexinit_with(&host_algs, &[]);
+        let ours = Self::kexinit(&host_algs)?;
         self.send(&ours)?;
         // Before the server's KEXINIT, only messages that strict key exchange forbids may come;
         // they are counted and refused once strict mode is known.
@@ -1029,7 +1026,8 @@ impl<'s> Client<'s> {
         packet.push(u8::try_from(padding).map_err(|_| Error::Encoding)?);
         packet.extend_from_slice(payload);
         let mut pad = vec![0u8; padding];
-        let _ = ring::rand::SecureRandom::fill(&SystemRandom::new(), &mut pad);
+        ring::rand::SecureRandom::fill(&SystemRandom::new(), &mut pad)
+            .map_err(|_| Error::Encoding)?;
         packet.extend_from_slice(&pad);
         match &mut dir.cipher {
             Cipher::Clear => {}

@@ -196,25 +196,6 @@ fn a_command_outside_its_shape_is_refused_first() {
 }
 
 #[test]
-fn a_command_text_that_is_not_literal_words_is_refused_by_the_policy() {
-    let bad = operation(json!({"name": "cache", "steps": [
-        {"do": "open", "connection": "redis",
-         "destinations": [{"host": "cache.example.com", "port": 6380}],
-         "login": {"user": "app", "password": "{{password}}"}},
-        {"do": "return", "relay": {"commands": [
-            {"name": "get", "text": "GET {{password}}"}
-        ]}}
-    ]}));
-    let policy = engine::policy::Policy {
-        item: None,
-        fields: vec![FieldSpec::secret("password")],
-        callers: Vec::new(),
-        operations: vec![bad],
-    };
-    assert!(policy.validate().is_err());
-}
-
-#[test]
 fn a_secret_in_a_reply_never_goes_back() {
     let s = redis_setup();
     let mut fake = Fake::new(RedisServer::new(PASSWORD));

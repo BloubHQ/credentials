@@ -11,6 +11,31 @@ before 1.0, minor versions may break formats and APIs.
 
 ### Added
 
+- Protocol connections (`docs/design.md` section 11, part 6, second half): `open` takes
+  `connection` `ssh`, `postgres`, `smtp`, `imap` or `redis`, with `login` (user and one
+  credential: `password`, `key`, `token` or keyboard-interactive `answers`; optional
+  `mechanism` and PostgreSQL `database`), `host_keys` (SSH, required, 1 to 16 pinned keys)
+  and `tls` (SMTP and IMAP: `implicit` or `starttls`). `send` takes `command` (fixed text and
+  parameter templates); `return.relay` takes `commands` (named rules, the caller's parameters
+  under a whole-match `pattern` and `max_len`, PostgreSQL `columns`) and `mail` (SMTP sender
+  and recipient patterns, `max_recipients`, `max_bytes`); an SSH shell runs on a streaming
+  call with `frames` and `server`. Callers send `Body::Session` (`{"session": {"destination",
+  "commands", "mail"}}`) and get `Output::Session` (`{"kind": "session", "results": [{"name",
+  "status", "data", "utf8", "stderr"}], "error"}`). New module `engine::proto`: own
+  synchronous clients on ring for SSH (curve25519 and NIST ECDH key exchange with strict
+  KEX, AES-GCM and ChaCha20-Poly1305 only, pinned host keys verified before any credential,
+  password, public-key signing inside the node and keyboard-interactive, exec and shell,
+  rekey refused), PostgreSQL (TLS required, SCRAM-SHA-256 only with the server signature
+  verified, extended query protocol with bound parameters), SMTP submission (AUTH PLAIN,
+  LOGIN, XOAUTH2, dot-stuffing, bare CR/LF refused), IMAP (LOGIN, AUTHENTICATE PLAIN and
+  XOAUTH2, quoted parameters, literals) and Redis (AUTH, RESP bulk-string commands, JSON
+  replies). Results are searched for secrets raw and as returned; connections take the
+  caller, owner and node slots of open connections and log `use` and `closed`. Transport:
+  `Transport::open_plain` and `Transport::open_starttls` (`TlsTransport` implements both).
+  Errors `ServerUntrusted` and `AuthRefused` (502 in the server). Summary: forms `login` and
+  `command`, flags `password_to_server`, `param_unpinned`, `mail_relay`, `shell_relay`, and
+  widening on a new sign-in, host key, TLS mode, command or mail rule. JSON Schema, fuzz
+  target `protocol_servers`. MySQL, MQTT and AMQP are not done.
 - Node continuity (`docs/design.md` section 11, part 10; section 10): a node hands its state
   to a node of a newer release. New crate `continuity`: successor statements
   (`successor.json`, "release X may hand over to the measurements of release Y") signed in the
