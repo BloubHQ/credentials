@@ -308,12 +308,7 @@ pub struct Summary {
 
 fn place(connection: Connection, d: &Destination) -> Place {
     Place {
-        scheme: match connection {
-            Connection::Https => "https",
-            Connection::Tls => "tls",
-            Connection::Websocket => "wss",
-        }
-        .into(),
+        scheme: connection.scheme().into(),
         host: d.host.clone(),
         port: d.port,
     }
@@ -324,6 +319,7 @@ fn connection_name(connection: Option<Connection>) -> &'static str {
         Some(Connection::Https) => "https",
         Some(Connection::Tls) => "tls",
         Some(Connection::Websocket) => "websocket",
+        Some(c) => c.scheme(),
         None => "none",
     }
 }

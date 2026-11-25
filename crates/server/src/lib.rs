@@ -520,7 +520,7 @@ fn status_of(error: &Error) -> u16 {
         | Error::RecordStale { .. }
         | Error::PolicySignature => 403,
         Error::LogUnconfirmed | Error::LogHalted => 503,
-        Error::Transport(_) => 502,
+        Error::Transport(_) | Error::ServerUntrusted { .. } | Error::AuthRefused { .. } => 502,
         Error::RateLimited | Error::ParkedFull | Error::StreamsFull { .. } => 429,
         e if e.is_caller_error() => 400,
         _ => 403,
@@ -565,6 +565,19 @@ pub fn output_json(output: &Output) -> Value {
         // `{"kind": "challenge", "id", "challenge", "hint", "expires_ms"}` or
         // `{"kind": "approval_required", "id", "summary"}`: resume with the id.
         Output::Pending(pending) => serde_json::to_value(pending).unwrap_or(Value::Null),
+        // One result per command or message of a protocol call; data is the server's output
+        // (base64url, with `utf8` when it is text), after the reflection search.
+        Output::Session(session) => json!({
+            "kind": "session",
+            "results": session.results.iter().map(|r| json!({
+                "name": r.name,
+                "status": r.status,
+                "data": to_b64(&r.data),
+                "utf8": std::str::from_utf8(&r.data).ok(),
+                "stderr": to_b64(&r.stderr),
+            })).collect::<Vec<_>>(),
+            "error": session.error.as_ref().map(ToString::to_string),
+        }),
         // How a streaming call ended: its reason, status, trailers and counts.
         Output::Closed(closed) => json!({
             "kind": "closed",

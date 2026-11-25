@@ -41,6 +41,7 @@ use crate::{Error, Result};
 mod contract;
 mod input;
 pub mod legacy;
+mod proto;
 pub mod run;
 mod schema;
 pub mod summary;
@@ -55,6 +56,10 @@ pub use contract::{
 };
 pub(crate) use contract::{parse_query, placeholders};
 pub use input::{Input, JsonInput, JsonType, Member, NodeTime, RawInput, RlpInput, RlpItem};
+pub use proto::{
+    Answer, Command, CommandRule, Login, MAX_COMMANDS, MAX_HOST_KEYS, MAX_MAIL, MAX_PARAM,
+    MAX_PARAMS, MAX_RECIPIENTS, MailRule, Mechanism, ParamRule, TlsMode,
+};
 pub use run::{ModuleRef, ModuleSource, RunModule};
 pub(crate) use wait::is_currency;
 pub use wait::{
@@ -667,6 +672,18 @@ pub enum Connection {
     /// request under the same contracts; later sends write messages from templates, and the
     /// `return` relays the caller's frames within declared shapes.
     Websocket,
+    /// SSH (RFC 4253): the server proves a pinned host key, the node signs in, `send` runs a
+    /// command, and `return` relays the caller's commands or an interactive shell.
+    Ssh,
+    /// PostgreSQL over TLS: SCRAM-SHA-256, then queries with bound parameters.
+    Postgres,
+    /// SMTP submission over TLS (implicit or `STARTTLS`): the caller's messages within the
+    /// sender and recipient rules of the policy.
+    Smtp,
+    /// IMAP over TLS (implicit or `STARTTLS`): commands fixed or shaped by the policy.
+    Imap,
+    /// Redis over TLS: `AUTH`, then commands with bulk-string parameters.
+    Redis,
 }
 
 /// The `open` step: the connection and where it may go.
@@ -685,10 +702,19 @@ pub struct Open {
     /// request before anything is sent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub protocol: Option<crate::egress::Versions>,
-    /// Bounds of a connection that stays open (a WebSocket, a streamed response); the
-    /// defaults when absent.
+    /// Bounds of a connection that stays open (a WebSocket, a streamed response, a protocol
+    /// connection); the defaults when absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limits: Option<StreamLimits>,
+    /// How the node signs in on a protocol connection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub login: Option<Login>,
+    /// The SSH host keys the server must prove it holds one of (`type base64`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub host_keys: Vec<String>,
+    /// How SMTP and IMAP reach TLS (implicit by default).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls: Option<TlsMode>,
 }
 
 /// Bounds of a connection that stays open: it is closed when one is reached.
@@ -811,6 +837,9 @@ pub struct Send {
     /// The kind of message a WebSocket send writes (after the handshake).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub frame: Option<FrameKind>,
+    /// The command a protocol connection runs (SSH, PostgreSQL, IMAP, Redis).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<Command>,
 }
 
 /// The `receive` step. On HTTPS it reads the response of the `send` just before it; on a TLS
@@ -881,10 +910,16 @@ pub struct Relay {
     /// kind; any other is refused and ends the connection.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub frames: Vec<FrameRule>,
-    /// True when the server's messages go back to the caller (WebSocket), after the stream
-    /// search. A summary flags it: whatever the server sends reaches the caller.
+    /// True when the server's messages go back to the caller (WebSocket, SSH shell), after
+    /// the stream search. A summary flags it: whatever the server sends reaches the caller.
     #[serde(default, skip_serializing_if = "is_false")]
     pub server: bool,
+    /// The commands the caller may run on a protocol connection, by name.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub commands: Vec<CommandRule>,
+    /// The messages the caller may send over SMTP.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mail: Option<MailRule>,
 }
 
 /// The `return` step: what goes back to the caller. HTTPS takes `response`, TLS `relay`, an
@@ -1115,14 +1150,30 @@ impl Operation {
                         out.push(identity.cert.as_str());
                         out.push(identity.key.as_str());
                     }
+                    if let Some(login) = &open.login {
+                        out.extend(login.templates());
+                    }
                 }
                 Step::Send(send) => {
                     out.extend(send.inject.iter().map(|i| i.template.as_str()));
                     out.extend(send.template.as_deref());
+                    if let Some(command) = &send.command {
+                        out.push(command.text.as_str());
+                        out.extend(command.params.iter().map(String::as_str));
+                    }
                 }
                 Step::Compute(c) => out.push(&c.template),
                 Step::Run(run) => out.extend(run.inputs.iter().map(String::as_str)),
-                Step::Return(r) => out.extend(r.template.as_deref()),
+                Step::Return(r) => {
+                    out.extend(r.template.as_deref());
+                    if let Some(relay) = &r.relay {
+                        for rule in &relay.commands {
+                            out.push(rule.text.as_str());
+                            out.extend(rule.params.iter().filter_map(|p| p.template.as_deref()));
+                        }
+                        out.extend(relay.frames.iter().filter_map(|f| f.template.as_deref()));
+                    }
+                }
                 Step::Await(a) => {
                     if let Some(poll) = &a.challenge.poll {
                         out.extend(poll.send.inject.iter().map(|i| i.template.as_str()));
@@ -1704,6 +1755,22 @@ impl Policy {
                     check_projection(at, projection)?;
                 }
             }
+            Some(
+                c @ (Connection::Ssh
+                | Connection::Postgres
+                | Connection::Smtp
+                | Connection::Imap
+                | Connection::Redis),
+            ) => {
+                ensure(
+                    ret.response.is_none() && ret.template.is_none(),
+                    || at.to_string(),
+                    "a protocol connection's return takes relay only",
+                )?;
+                if let Some(relay) = &ret.relay {
+                    self.check_proto_relay(at, kinds, c, relay, known)?;
+                }
+            }
             Some(Connection::Tls) => {
                 ensure(
                     ret.response.is_none() && ret.template.is_none(),
@@ -1712,7 +1779,10 @@ impl Policy {
                 )?;
                 if let Some(relay) = &ret.relay {
                     ensure(
-                        relay.frames.is_empty() && !relay.server,
+                        relay.frames.is_empty()
+                            && !relay.server
+                            && relay.commands.is_empty()
+                            && relay.mail.is_none(),
                         || format!("{at}.relay"),
                         "frames and server are for a WebSocket",
                     )?;
@@ -1743,7 +1813,10 @@ impl Policy {
                     return Ok(());
                 };
                 ensure(
-                    relay.sends.is_empty() && relay.frames.len() <= MAX_RELAY_PATTERNS,
+                    relay.sends.is_empty()
+                        && relay.commands.is_empty()
+                        && relay.mail.is_none()
+                        && relay.frames.len() <= MAX_RELAY_PATTERNS,
                     || format!("{at}.relay"),
                     "a WebSocket relays frames (at most 16 rules), not sends",
                 )?;
@@ -1837,7 +1910,17 @@ impl Policy {
                         || format!("{at}.protocol"),
                         "protocol is for an HTTPS connection (a WebSocket handshake is HTTP/1.1)",
                     )?;
+                    if open.connection.is_protocol() {
+                        self.check_proto_open(&at, &kinds, open)?;
+                    } else {
+                        ensure(
+                            open.login.is_none() && open.host_keys.is_empty() && open.tls.is_none(),
+                            || at.clone(),
+                            "login, host_keys and tls are for protocol connections",
+                        )?;
+                    }
                     let streams = open.connection == Connection::Websocket
+                        || open.connection.is_protocol()
                         || operation.returns().is_some_and(|r| {
                             r.response
                                 .as_ref()
@@ -1846,7 +1929,7 @@ impl Policy {
                     ensure(
                         open.limits.is_none() || streams,
                         || format!("{at}.limits"),
-                        "limits are for a WebSocket or a streamed response",
+                        "limits are for a WebSocket, a streamed response or a protocol connection",
                     )?;
                     if let Some(rule) = open.limits.as_ref().and_then(StreamLimits::fault) {
                         return fail(format!("{at}.limits"), rule);
@@ -1854,6 +1937,27 @@ impl Policy {
                 }
                 (Step::Send(_) | Step::Receive(_), None) => {
                     return fail(at, "send and receive need an open connection");
+                }
+                (Step::Send(send), Some(open)) if open.connection.is_protocol() => {
+                    sends += 1;
+                    ensure(sends <= MAX_REQUESTS, || at.clone(), "at most 8 sends")?;
+                    self.check_proto_send(&at, &kinds, open.connection, send, &known)?;
+                }
+                (Step::Send(send), Some(_)) if send.command.is_some() => {
+                    return fail(at, "command is for a protocol connection");
+                }
+                (Step::Receive(receive), Some(open)) if open.connection.is_protocol() => {
+                    ensure(
+                        matches!(previous, Some(Step::Send(_))),
+                        || at.clone(),
+                        "a receive follows the send whose result it reads",
+                    )?;
+                    ensure(
+                        receive.until.is_empty(),
+                        || format!("{at}.until"),
+                        "a protocol receive reads the result of its command; until is for TLS streams",
+                    )?;
+                    self.check_captures(&at, &receive.capture, true, true, &mut known)?;
                 }
                 (Step::Send(send), Some(open)) => match open.connection {
                     Connection::Https => {
@@ -1889,6 +1993,13 @@ impl Policy {
                             Var::in_stream,
                         )?;
                     }
+                    Connection::Ssh
+                    | Connection::Postgres
+                    | Connection::Smtp
+                    | Connection::Imap
+                    | Connection::Redis => {
+                        return fail(at, "a send on a protocol connection takes command only");
+                    }
                     Connection::Tls => {
                         ensure(
                             send.request.is_none()
@@ -1911,6 +2022,13 @@ impl Policy {
                     }
                 },
                 (Step::Receive(receive), Some(open)) => match open.connection {
+                    Connection::Ssh
+                    | Connection::Postgres
+                    | Connection::Smtp
+                    | Connection::Imap
+                    | Connection::Redis => {
+                        return fail(at, "a protocol receive follows its send");
+                    }
                     Connection::Https => {
                         let fixed = match previous {
                             Some(Step::Send(send)) => {
@@ -1995,7 +2113,8 @@ impl Policy {
                 }
                 (Step::Run(run), _) => {
                     ensure(
-                        connection != Some(Connection::Websocket),
+                        connection != Some(Connection::Websocket)
+                            && !connection.is_some_and(Connection::is_protocol),
                         || at.clone(),
                         "run is not available on a WebSocket",
                     )?;
@@ -2379,6 +2498,18 @@ fn destination_names(destinations: &[Destination]) -> String {
 }
 
 fn summarize_send(send: &Send, out: &mut Vec<String>) {
+    if let Some(command) = &send.command {
+        out.push(format!(
+            "  send command {:?}{}",
+            command.text,
+            if command.params.is_empty() {
+                String::new()
+            } else {
+                format!(" with parameters {:?}", command.params)
+            }
+        ));
+        return;
+    }
     let injects = send
         .inject
         .iter()
@@ -2467,6 +2598,11 @@ fn summarize_operation(operation: &Operation, out: &mut Vec<String>) {
                 Connection::Https => "HTTPS",
                 Connection::Tls => "TLS stream",
                 Connection::Websocket => "WebSocket",
+                Connection::Ssh => "SSH",
+                Connection::Postgres => "PostgreSQL",
+                Connection::Smtp => "SMTP",
+                Connection::Imap => "IMAP",
+                Connection::Redis => "Redis",
             },
             destination_names(&open.destinations),
             if open.identity.is_some() {
@@ -2502,6 +2638,9 @@ fn summarize_operation(operation: &Operation, out: &mut Vec<String>) {
     }
     if operation.approval {
         out.push("  every use waits for the owner's approval".into());
+    }
+    if let Some(open) = operation.open() {
+        proto::open_lines(open, out);
     }
     for step in &operation.steps {
         match step {
@@ -2554,6 +2693,9 @@ fn summarize_operation(operation: &Operation, out: &mut Vec<String>) {
             Step::Run(run) => out.extend(run::summary_line(run, operation.open())),
             Step::Return(ret) => match (&ret.response, &ret.relay, &ret.template) {
                 (_, _, Some(template)) => out.push(format!("  return {template}")),
+                (_, Some(relay), _) if !relay.commands.is_empty() || relay.mail.is_some() => {
+                    proto::relay_lines(relay, out);
+                }
                 (_, Some(relay), _) if relay.frames.is_empty() && !relay.server => {
                     out.push(format!(
                         "  return: relays caller sends matching {:?}",
