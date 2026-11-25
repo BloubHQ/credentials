@@ -512,6 +512,8 @@ pub fn serve_log<S: Read + Write, L: LogStore + ?Sized>(
     Ok(())
 }
 
+pub mod datagram;
+
 /// vsock streams as sockets and connections (Linux: in an enclave and on its parent).
 #[cfg(target_os = "linux")]
 pub mod vsock {

@@ -36,6 +36,7 @@ use std::collections::HashMap;
 
 use zeroize::Zeroizing;
 
+use crate::egress::Stream;
 use crate::fields::Fields;
 use crate::primitives;
 use crate::{Error, Result};
@@ -252,6 +253,20 @@ funcs! {
     CborArray = "cbor_array"(0, 32): "`cbor_array(item, ...)`: a CBOR array of up to 32 encoded items.",
     CborMap = "cbor_map"(0, 32): "`cbor_map(key, value, ...)`: a CBOR map of up to 16 pairs of encoded items, keys sorted (RFC 8949 section 4.2.1).",
     CborTag = "cbor_tag"(2, 2): "`cbor_tag(number, item)`: a CBOR tag around one encoded item.",
+    Turboshake128 = "turboshake128"(3, 3): "`turboshake128(message, domain, length)`: `length` bytes of TurboSHAKE128 (RFC 9861) with the domain byte 1 to 127, 1 to 8192 (one-way).",
+    Turboshake256 = "turboshake256"(3, 3): "`turboshake256(message, domain, length)`: `length` bytes of TurboSHAKE256 (RFC 9861) with the domain byte 1 to 127, 1 to 8192 (one-way).",
+    Kt128 = "kt128"(3, 3): "`kt128(message, customization, length)`: `length` bytes of KangarooTwelve KT128 (RFC 9861), 1 to 8192 (one-way).",
+    Kt256 = "kt256"(3, 3): "`kt256(message, customization, length)`: `length` bytes of KangarooTwelve KT256 (RFC 9861), 1 to 8192 (one-way).",
+    HpkeSeal = "hpke_seal"(6, 9): "`hpke_seal(suite, mode, recipient_public, info, aad, plaintext[, psk, psk_id][, sender_private])`: HPKE (RFC 9180) single-shot encryption, `enc` then the ciphertext; a fresh ephemeral key each call.",
+    HpkeOpen = "hpke_open"(7, 10): "`hpke_open(suite, mode, recipient_private, enc, info, aad, ciphertext[, psk, psk_id][, sender_public])`: HPKE (RFC 9180) single-shot decryption, the plaintext; always a secret.",
+    HpkeExport = "hpke_export"(6, 9): "`hpke_export(suite, mode, recipient_public, info, exporter_context, length[, psk, psk_id][, sender_private])`: `enc` then `length` bytes exported on the sending side; a secret.",
+    HpkeReceiverExport = "hpke_receiver_export"(7, 10): "`hpke_receiver_export(suite, mode, recipient_private, enc, info, exporter_context, length[, psk, psk_id][, sender_public])`: `length` bytes exported on the receiving side; a secret.",
+    HpkePublic = "hpke_public"(2, 2): "`hpke_public(kem, private_key)`: the serialized public key of an HPKE KEM private key (one-way).",
+    HpkeDeriveKey = "hpke_derive_key"(2, 2): "`hpke_derive_key(kem, ikm)`: the private key of HPKE `DeriveKeyPair` from at least 32 bytes; a secret when the input is.",
+    MldsaSign = "mldsa_sign"(3, 4): "`mldsa_sign(level, seed, message[, context])`: ML-DSA (FIPS 204) with the parameter set `44`, `65` or `87`, hedged; the key is the 32-byte seed.",
+    MldsaPublic = "mldsa_public"(2, 2): "`mldsa_public(level, seed)`: the encoded ML-DSA public key of a 32-byte seed (one-way).",
+    Sm2Sign = "sm2_sign"(2, 3): "`sm2_sign(key, message[, id])`: SM2 with SM3 (GB/T 32918.2, RFC 8998), `r || s`; the identifier defaults to `1234567812345678`.",
+    TlsExporter = "tls_exporter"(3, 3): "`tls_exporter(label, context, length)`: keying material exported from the TLS 1.3 connection of the operation (RFC 8446 section 7.5), 1 to 8192 bytes; only in a TLS send, after the handshake; a secret.",
 }
 
 impl Func {
@@ -285,6 +300,12 @@ impl Func {
                 | Func::Pbkdf2Sha256
                 | Func::Pbkdf2
                 | Func::Totp
+                | Func::Turboshake128
+                | Func::Turboshake256
+                | Func::Kt128
+                | Func::Kt256
+                | Func::HpkePublic
+                | Func::MldsaPublic
         ) || self.signs()
     }
 
@@ -306,6 +327,10 @@ impl Func {
                 | Func::Sha3_512
                 | Func::Shake128
                 | Func::Shake256
+                | Func::Turboshake128
+                | Func::Turboshake256
+                | Func::Kt128
+                | Func::Kt256
         )
     }
 
@@ -313,8 +338,35 @@ impl Func {
     fn derives_key(self) -> bool {
         matches!(
             self,
-            Func::Hkdf | Func::HkdfExpand | Func::ConcatKdf | Func::KbkdfCounter | Func::KerberosDk
+            Func::Hkdf
+                | Func::HkdfExpand
+                | Func::ConcatKdf
+                | Func::KbkdfCounter
+                | Func::KerberosDk
+                | Func::HpkeDeriveKey
         )
+    }
+
+    /// A value that is a secret whatever its arguments, of which the caller chooses no byte:
+    /// a shared secret, keying material exported from HPKE or from a TLS connection. Known to
+    /// the node and its peer only.
+    fn always_secret(self) -> bool {
+        matches!(
+            self,
+            Func::Ecdh | Func::HpkeExport | Func::HpkeReceiverExport | Func::TlsExporter
+        )
+    }
+
+    /// The key arguments of the HPKE functions: a secret mixed with a chosen value may not
+    /// reach them. On the receiving side every argument after the mode is one, since whether
+    /// the call fails tells whether it matches what the sender used (an AEAD tag, the KEM
+    /// output).
+    fn key_args(self) -> &'static [usize] {
+        match self {
+            Func::HpkeSeal | Func::HpkeExport => &[2, 6, 7, 8],
+            Func::HpkeOpen | Func::HpkeReceiverExport => &[2, 3, 4, 5, 6, 7, 8, 9],
+            _ => &[],
+        }
     }
 
     /// A MAC built on a block cipher: one-way only under a secret key. Under a known key
@@ -348,6 +400,13 @@ impl Func {
             Func::AesCcmEncrypt => &[2],
             Func::Pbkdf2Sha256 | Func::HkdfExpand | Func::ConcatKdf | Func::KbkdfCounter => &[3],
             Func::Pbkdf2 | Func::Hkdf => &[4],
+            Func::Turboshake128
+            | Func::Turboshake256
+            | Func::Kt128
+            | Func::Kt256
+            | Func::TlsExporter => &[2],
+            Func::HpkeExport => &[5],
+            Func::HpkeReceiverExport => &[6],
             _ => &[],
         }
     }
@@ -370,10 +429,28 @@ impl Func {
                 | Func::EcdsaSignPrehash
                 | Func::DsaSign
                 | Func::DsaSignDer
+                | Func::MldsaSign
+                | Func::Sm2Sign
         )
     }
 
-    /// The index of an argument that names a hash or a curve: it must be fixed by the policy.
+    /// The arguments that name a hash, a curve, a suite, a mode or a domain byte: they must be
+    /// fixed by the policy.
+    fn algorithm_args(self) -> &'static [usize] {
+        match self {
+            Func::HpkeSeal | Func::HpkeOpen | Func::HpkeExport | Func::HpkeReceiverExport => {
+                &[0, 1]
+            }
+            Func::Turboshake128 | Func::Turboshake256 => &[1],
+            Func::HpkePublic | Func::HpkeDeriveKey | Func::MldsaSign | Func::MldsaPublic => &[0],
+            f => match f.algorithm_arg() {
+                Some(0) => &[0],
+                _ => &[],
+            },
+        }
+    }
+
+    /// The index of an argument that names a hash or a curve, in the first families.
     fn algorithm_arg(self) -> Option<usize> {
         match self {
             Func::Pbkdf2
@@ -393,12 +470,16 @@ impl Func {
         }
     }
 
-    /// The index of the public key argument of an encryption to a public key.
-    fn public_key_arg(self) -> Option<usize> {
+    /// The arguments that hold the public key of an encryption to a public key, or what
+    /// authenticates an HPKE exchange (the PSK, its id, the sender's key): they must not come
+    /// from the caller, who would encrypt the secret to itself or pass as the sender.
+    fn public_key_args(self) -> &'static [usize] {
         match self {
-            Func::RsaEncryptOaep => Some(1),
-            Func::RsaEncryptPkcs1 => Some(0),
-            _ => None,
+            Func::RsaEncryptOaep => &[1],
+            Func::RsaEncryptPkcs1 => &[0],
+            Func::HpkeSeal | Func::HpkeExport => &[2, 6, 7, 8],
+            Func::HpkeOpen | Func::HpkeReceiverExport => &[7, 8, 9],
+            _ => &[],
         }
     }
 
@@ -442,6 +523,13 @@ impl Func {
             | Func::AesKwpWrap
             | Func::KerberosDk => 0..1,
             Func::Shake128 | Func::Shake256 | Func::Nfold => 1..2,
+            Func::Turboshake128 | Func::Turboshake256 => 1..3,
+            Func::Kt128 | Func::Kt256 | Func::TlsExporter => 2..3,
+            Func::HpkePublic | Func::HpkeDeriveKey | Func::MldsaSign | Func::MldsaPublic => 1..2,
+            Func::Sm2Sign => 0..1,
+            // The HPKE functions name their key arguments in `key_args`.
+            Func::HpkeExport => 5..6,
+            Func::HpkeReceiverExport => 6..7,
             Func::HkdfExpand | Func::ConcatKdf | Func::KbkdfCounter => 3..4,
             Func::Hkdf => 4..5,
             Func::AesCbcHmacEncrypt | Func::AesEaxEncrypt | Func::AesCtsEncrypt => 0..2,
@@ -747,17 +835,20 @@ fn call_info(func: Func, args: &[Info]) -> core::result::Result<Info, Rule> {
     let at = |i: usize| args.get(i).copied().unwrap_or_default();
     let any_tainted = args.iter().any(|i| i.tainted);
     let any_controlled = args.iter().any(|i| i.controlled);
-    if let Some(i) = func.algorithm_arg()
-        && (at(i).tainted || at(i).controlled)
+    if func
+        .algorithm_args()
+        .iter()
+        .any(|&i| at(i).tainted || at(i).controlled)
     {
         return Err("a hash or curve name must be fixed by the policy");
     }
-    if let Some(i) = func.public_key_arg()
-        && at(i).caller
-    {
+    if func.public_key_args().iter().any(|&i| at(i).caller) {
         return Err(
             "an encryption key must come from the policy or the destination, not the caller",
         );
+    }
+    if func.key_args().iter().any(|&i| at(i).mixed()) {
+        return Err("a secret mixed with a chosen value reaches a decoder, number or key");
     }
     if func.no_mixing() && any_tainted && any_controlled {
         return Err("a secret and a chosen value meet in a function that compares or cuts them");
@@ -795,13 +886,28 @@ fn call_info(func: Func, args: &[Info]) -> core::result::Result<Info, Rule> {
         // A hash of nothing but secret bytes is as good as the secret where the secret is
         // hashed first: an HMAC key longer than its block, an Ed25519 seed, a password hash.
         // Only a hash that also covers bytes the caller or server chooses hides the secret.
-        at(0).tainted && !at(0).controlled
+        // KangarooTwelve hashes its customization string too.
+        let input = if matches!(func, Func::Kt128 | Func::Kt256) {
+            Info {
+                tainted: at(0).tainted || at(1).tainted,
+                controlled: at(0).controlled || at(1).controlled,
+                ..Info::default()
+            }
+        } else {
+            at(0)
+        };
+        input.tainted && !input.controlled
     } else if func.one_way() {
         false
-    } else if func == Func::Ecdh {
-        // A shared secret is known to the node and the peer only: a secret, whatever the
-        // arguments.
+    } else if func.always_secret() || func == Func::HpkeOpen {
+        // A shared secret, exported keying material and a decrypted plaintext are known to
+        // the node and the peer only: a secret, whatever the arguments.
         true
+    } else if func == Func::HpkeSeal {
+        // Encryption to a public key: whoever holds the private key reads the plaintext, the
+        // info and the AAD. A PSK or sender key that is a secret key is hidden by the KDF;
+        // any other secret there keeps the taint.
+        (3..6).any(|i| at(i).tainted) || (6..9).any(|i| at(i).tainted && !at(i).secret_key)
     } else if func.derives_key() {
         // A key derived from a secret is a secret (rule 8), whatever else went in.
         any_tainted
@@ -832,7 +938,8 @@ fn call_info(func: Func, args: &[Info]) -> core::result::Result<Info, Rule> {
     // A key derived from a secret is in the same position: the caller may choose its other
     // inputs, but not one byte of the output. A key derived from nothing secret is as
     // controlled as its inputs.
-    let controlled = func != Func::Ecdh && !(func.derives_key() && any_tainted) && any_controlled;
+    let controlled =
+        !func.always_secret() && !(func.derives_key() && any_tainted) && any_controlled;
     // Only a secret field itself, or a decoding or a fixed part of it, is a key nobody else
     // knows. A hash or MAC of it is a new value that some operation may hand back, after
     // which it hides nothing.
@@ -982,6 +1089,15 @@ impl Template {
     }
 
     pub(crate) fn render(&self, ctx: &Context<'_>) -> Result<Bytes> {
+        self.render_with(ctx, None)
+    }
+
+    /// Renders on an open connection, after its handshake: `tls_exporter` reads it.
+    pub(crate) fn render_on(&self, ctx: &Context<'_>, connection: &dyn Stream) -> Result<Bytes> {
+        self.render_with(ctx, Some(connection))
+    }
+
+    fn render_with(&self, ctx: &Context<'_>, connection: Option<&dyn Stream>) -> Result<Bytes> {
         let mut parts = Vec::with_capacity(self.segments.len());
         for segment in &self.segments {
             parts.push(match segment {
@@ -989,10 +1105,21 @@ impl Template {
                     ctx.budget.bytes(t.len())?;
                     Zeroizing::new(t.clone())
                 }
-                Segment::Expr(e) => eval(e, ctx)?,
+                Segment::Expr(e) => eval(e, ctx, connection)?,
             });
         }
         concat(&parts, ctx.budget)
+    }
+
+    /// True when the template calls `function`.
+    pub fn calls(&self, function: Func) -> bool {
+        let mut found = false;
+        for expr in self.exprs() {
+            walk(expr, &mut |e| {
+                found |= matches!(e, Expr::Call(f, _) if *f == function);
+            });
+        }
+        found
     }
 }
 
@@ -1079,7 +1206,7 @@ pub(crate) struct Context<'a> {
 
 pub(crate) type Bytes = Zeroizing<Vec<u8>>;
 
-fn eval(expr: &Expr, ctx: &Context<'_>) -> Result<Bytes> {
+fn eval(expr: &Expr, ctx: &Context<'_>, connection: Option<&dyn Stream>) -> Result<Bytes> {
     Ok(match expr {
         Expr::Lit(b) => {
             ctx.budget.bytes(b.len())?;
@@ -1106,17 +1233,22 @@ fn eval(expr: &Expr, ctx: &Context<'_>) -> Result<Bytes> {
         Expr::Concat(parts) => {
             let values = parts
                 .iter()
-                .map(|p| eval(p, ctx))
+                .map(|p| eval(p, ctx, connection))
                 .collect::<Result<Vec<_>>>()?;
             concat(&values, ctx.budget)?
         }
         Expr::Call(func, args) => {
             let args = args
                 .iter()
-                .map(|a| eval(a, ctx))
+                .map(|a| eval(a, ctx, connection))
                 .collect::<Result<Vec<_>>>()?;
             ctx.budget.room(primitives::output_bound(*func, &args))?;
-            let out = primitives::call(*func, &args, ctx.unix, ctx.budget)?;
+            let out = match (*func, connection) {
+                (Func::TlsExporter, Some(connection)) => {
+                    primitives::tls_exporter(connection, &args)?
+                }
+                _ => primitives::call(*func, &args, ctx.unix, ctx.budget)?,
+            };
             ctx.budget.bytes(out.len())?;
             out
         }

@@ -27,6 +27,7 @@
 
 pub mod h2;
 pub mod hpack;
+pub mod udp;
 
 use std::io::{self, Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpStream, ToSocketAddrs};
@@ -205,6 +206,7 @@ pub struct TlsTransport {
     total_timeout: Duration,
     stream_timeout: Duration,
     connector: Box<dyn Connector>,
+    datagrams: Box<dyn udp::DatagramConnector>,
 }
 
 impl Default for TlsTransport {
@@ -234,6 +236,7 @@ impl TlsTransport {
             total_timeout: Duration::from_secs(120),
             stream_timeout: Duration::from_secs(3600),
             connector: Box::new(TcpConnector::new()),
+            datagrams: Box::new(udp::UdpConnector::new()),
         }
     }
 
@@ -257,6 +260,13 @@ impl TlsTransport {
         resolve: impl Fn(&str, u16) -> io::Result<Vec<SocketAddr>> + Send + Sync + 'static,
     ) -> Self {
         self.connector(TcpConnector::with_resolver(resolve))
+    }
+
+    /// Replaces what opens the datagram sockets of `udp` operations ([`udp::UdpConnector`] by
+    /// default; in an enclave, the relay's).
+    pub fn datagrams(mut self, connector: impl udp::DatagramConnector + 'static) -> Self {
+        self.datagrams = Box::new(connector);
+        self
     }
 
     /// Replaces what opens the byte streams TLS runs over ([`TcpConnector`] by default).
@@ -492,6 +502,19 @@ impl Transport for TlsTransport {
             deadline,
         }))
     }
+
+    fn open_datagrams(&mut self, destination: &Destination) -> Result<Box<dyn Stream + '_>> {
+        let deadline = Instant::now() + self.total_timeout;
+        let socket = self
+            .datagrams
+            .open(&destination.host, destination.port, deadline)
+            .map_err(|e| fault(io_kind(&e), false))?;
+        Ok(Box::new(udp::DatagramStream::new(
+            socket,
+            self.io_timeout.min(udp::READ_WAIT),
+            deadline,
+        )))
+    }
 }
 
 fn close_tls(stream: &mut Tls) {
@@ -680,6 +703,25 @@ impl Stream for TlsStream {
     fn close(&mut self) -> Result<()> {
         close_tls(&mut self.inner);
         Ok(())
+    }
+
+    fn tls_exporter(
+        &self,
+        label: &[u8],
+        context: &[u8],
+        length: usize,
+    ) -> Result<Zeroizing<Vec<u8>>> {
+        // TLS 1.3 only: over TLS 1.2 an exporter binds the connection only with the extended
+        // master secret (RFC 9266 section 3), which rustls does not report.
+        if self.inner.conn.protocol_version() != Some(rustls::ProtocolVersion::TLSv1_3) {
+            return Err(fault(TransportKind::Unsupported, true));
+        }
+        let mut out = Zeroizing::new(vec![0u8; length]);
+        self.inner
+            .conn
+            .export_keying_material(out.as_mut_slice(), label, Some(context))
+            .map_err(|_| fault(TransportKind::Tls, true))?;
+        Ok(out)
     }
 }
 

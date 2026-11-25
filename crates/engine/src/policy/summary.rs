@@ -270,6 +270,9 @@ pub enum FlagCode {
     FramesUnpinned,
     /// A WebSocket hands the server's messages back to the caller.
     ServerFrames,
+    /// An operation sends UDP datagrams, without TLS: what they carry is readable on the
+    /// path (and by the host of an enclave).
+    PlainDatagram,
 }
 
 /// A risk flag.
@@ -312,6 +315,7 @@ fn place(connection: Connection, d: &Destination) -> Place {
             Connection::Https => "https",
             Connection::Tls => "tls",
             Connection::Websocket => "wss",
+            Connection::Udp => "udp",
         }
         .into(),
         host: d.host.clone(),
@@ -324,6 +328,7 @@ fn connection_name(connection: Option<Connection>) -> &'static str {
         Some(Connection::Https) => "https",
         Some(Connection::Tls) => "tls",
         Some(Connection::Websocket) => "websocket",
+        Some(Connection::Udp) => "udp",
         None => "none",
     }
 }
@@ -377,7 +382,11 @@ fn calls_of(text: &str) -> Vec<String> {
 /// True for a function whose output can be turned back into its input by someone (a key
 /// holder, or anyone).
 fn reversible(name: &str) -> bool {
-    name.contains("encrypt") || name == "xor" || name == "ecdh"
+    name.contains("encrypt")
+        || name == "xor"
+        || name == "ecdh"
+        || name == "tls_exporter"
+        || (name.starts_with("hpke_") && name != "hpke_public")
 }
 
 /// The fields each name of the operation stands for: a field itself, or the fields a
@@ -768,6 +777,14 @@ fn risk_flags(policy: &Policy, origin: Option<&Origin>, flags: &mut Vec<Flag>) {
         }
         for (c, _) in operation.caller_sends() {
             caller_flags(c, &at, flags);
+        }
+        if operation.connection() == Some(Connection::Udp) {
+            flag(
+                flags,
+                FlagCode::PlainDatagram,
+                &at,
+                "the operation sends UDP datagrams without TLS: what they carry is readable on the path",
+            );
         }
         for step in &operation.steps {
             if let Step::Run(run) = step

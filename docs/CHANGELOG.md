@@ -11,6 +11,28 @@ before 1.0, minor versions may break formats and APIs.
 
 ### Added
 
+- Primitive families of part 9 (`docs/design.md` section 11 and Appendix A, Part 9), checked
+  against official vectors where a crate ships them (`crates/engine/tests/fixtures/vectors/README.md`;
+  SM2 signing and brainpool by verification only):
+  HPKE (RFC 9180; `hpke_seal`, `hpke_open`, `hpke_export`, `hpke_receiver_export`,
+  `hpke_public`, `hpke_derive_key`; DHKEM P-256/P-384/P-521/X25519/X448, HKDF-SHA256/384/512,
+  AES-128/256-GCM, ChaCha20-Poly1305 and export-only, modes base, psk, auth and auth_psk; a
+  PSK of at least 32 bytes); TurboSHAKE128/256 and KT128/256 (RFC 9861; crates `keccak` 0.2,
+  `k12` 0.5.1); ML-DSA 44/65/87 (`mldsa_sign`, hedged, and `mldsa_public`; crate `ml-dsa`
+  0.1.2); SM2 with SM3 (`sm2_sign`; crate `sm2` 0.14); brainpool P256r1 and P384r1 in
+  `ecdsa_sign_prehash` (`bp256`, `bp384` 0.14). Each is classified by the template analysis
+  (lengths, algorithms and keys fixed by the policy; exported and decrypted values tainted).
+- `tls_exporter(label, context, length)` (RFC 8446 section 7.5, the RFC 9266 binding) in the
+  `send` templates of a TLS stream, rendered after the handshake; refused at signing anywhere
+  else and at run time over TLS 1.2. `Stream::tls_exporter` in the engine.
+- The `udp` connection kind: one datagram per `send` and `receive`, resent after 1, 2 and 4 s,
+  10 s per read, 65,507 bytes at most; caller exchanges of one datagram each; reads searched
+  for reflected secrets; a `send` template may not be tainted (datagrams are not encrypted).
+  Summary flag `plain_datagram`. Engine `Transport::open_datagrams`; `transport::udp`
+  (`UdpConnector`, `DatagramStream`, `TlsTransport::datagrams`); `relay::datagram` (the
+  `DATAGRAM host:port` request on the egress port and its frames) and the host relay, with
+  `--allow udp/host:port` entries; the enclave sends datagrams through the host. Fuzz target
+  `relay_datagrams`.
 - Node continuity (`docs/design.md` section 11, part 10; section 10): a node hands its state
   to a node of a newer release. New crate `continuity`: successor statements
   (`successor.json`, "release X may hand over to the measurements of release Y") signed in the

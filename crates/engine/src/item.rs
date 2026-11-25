@@ -853,6 +853,13 @@ fn check_operation(
                 "a typed item has no WebSocket operation",
             );
         }
+        Some(Connection::Udp) => {
+            return shape_ensure(
+                false,
+                || at.to_string(),
+                "a typed item has no UDP operation",
+            );
+        }
         None => ShapeConnection::None,
     };
     shape_ensure(

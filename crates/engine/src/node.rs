@@ -66,6 +66,8 @@ pub const MAX_GRANT_MS: u64 = 30 * 24 * 60 * 60 * 1000;
 pub const MAX_INPUT: usize = 1024 * 1024;
 /// Most exchanges of the caller on one stream.
 pub const MAX_EXCHANGES: usize = 64;
+/// Largest datagram of a `udp` operation: the largest UDP payload over IPv4.
+pub const MAX_DATAGRAM: usize = 65_507;
 /// Most bytes of all temporary values of one operation.
 pub const MAX_TEMPS: usize = 1024 * 1024;
 /// Most nonces a node remembers.
@@ -987,7 +989,10 @@ impl<S: LogSink, C: Clock> Node<S, C> {
                 let kind_ok = matches!(
                     (operation.connection(), payload),
                     (Some(Connection::Https), Payload::Http(_))
-                        | (Some(Connection::Tls), Payload::Stream { .. })
+                        | (
+                            Some(Connection::Tls | Connection::Udp),
+                            Payload::Stream { .. }
+                        )
                         | (Some(Connection::Websocket), Payload::Socket(_))
                         | (None, Payload::Derive(_))
                         | (_, Payload::Resume(_))
@@ -1704,8 +1709,12 @@ impl<S: LogSink, C: Clock> Node<S, C> {
             detail: detail.seal(&run.user_key, &run.record.owner, &run.record.id)?,
         };
         let (seq, confirmed) = self.lock().commit(now, who, event)?;
-        let (_, mut stream) = match open_stream(confirmed, transport, destination, client.as_ref())
-        {
+        let opened = if open.connection == Connection::Udp {
+            crate::egress::open_datagrams(confirmed, transport, destination)
+        } else {
+            open_stream(confirmed, transport, destination, client.as_ref())
+        };
+        let (_, mut stream) = match opened {
             Ok(opened) => opened,
             Err(error) => {
                 self.done(now, who, seq, None, false);
@@ -1882,10 +1891,23 @@ fn check_exchanges(
     if !operation.allows_destination(destination) {
         return Err(destination.denied());
     }
+    if operation.connection() == Some(Connection::Udp) {
+        // One datagram each way: no delimiter, and a send that fits one datagram.
+        let datagrams_ok = exchanges.len() <= MAX_EXCHANGES
+            && exchanges
+                .iter()
+                .all(|e| !e.send.is_empty() && e.send.len() <= MAX_DATAGRAM && e.until.is_empty());
+        if !datagrams_ok {
+            return Err(Error::RequestInvalid {
+                rule: "exchanges: at most 64 datagrams of 1 to 65507 bytes, with no delimiters",
+            });
+        }
+    }
+    let delimited = operation.connection() != Some(Connection::Udp);
     let exchanges_ok = exchanges.len() <= MAX_EXCHANGES
         && exchanges.iter().all(|e| {
             e.send.len() <= MAX_BODY
-                && !e.until.is_empty()
+                && (!delimited || !e.until.is_empty())
                 && e.until.len() <= MAX_DELIMITERS
                 && e.until
                     .iter()
@@ -1988,7 +2010,8 @@ impl Run<'_> {
             unix: self.now / 1000,
             budget: &self.budget,
         };
-        let bytes = template.render(&ctx)?;
+        // Rendered on the connection, after its handshake: `tls_exporter` reads it.
+        let bytes = template.render_on(&ctx, &*stream)?;
         if template.tainted(&|n| self.kinds.kind(n)) {
             self.tainted.push(bytes.clone());
         }
