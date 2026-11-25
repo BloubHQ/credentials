@@ -22,7 +22,7 @@ rustup toolchain install nightly --profile minimal
 cargo install cargo-fuzz
 ```
 
-Then, from the repository root or this directory:
+Then, from the repository root:
 
 ```sh
 cargo +nightly fuzz list --fuzz-dir crates/fuzz
@@ -33,7 +33,7 @@ cargo +nightly fuzz run --fuzz-dir crates/fuzz policy_json -- -max_total_time=60
 CI runs every target for 60 seconds on each push to `main` and each pull request, and keeps
 crashing inputs as the `fuzz-artifacts` artifact of a failed run.
 
-A crash is written to `artifacts/<target>/`. Reproduce it with
+A crash is written to `crates/fuzz/artifacts/<target>/`. Reproduce it with
 
 ```sh
 cargo +nightly fuzz run --fuzz-dir crates/fuzz <target> crates/fuzz/artifacts/<target>/<crash-file>
