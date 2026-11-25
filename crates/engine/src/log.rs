@@ -207,14 +207,11 @@ impl Detail {
     ) -> Result<SealedDetail> {
         use chacha20poly1305::aead::{Aead, Payload};
         let plain = serde_json::to_vec(self).map_err(|_| Error::Encoding)?;
-        let nonce: [u8; 12] =
-            <ChaCha20Poly1305 as chacha20poly1305::aead::AeadCore>::generate_nonce(
-                &mut rand_core::OsRng,
-            )
-            .into();
+        use chacha20poly1305::aead::Generate as _;
+        let nonce: [u8; 12] = Nonce::generate().into();
         let ct = detail_cipher(user_key)?
             .encrypt(
-                Nonce::from_slice(&nonce),
+                &Nonce::from(nonce),
                 Payload {
                     msg: &plain,
                     aad: &detail_aad(owner, record_id),
@@ -236,7 +233,7 @@ pub fn open_detail(user_key: &UserKey, entry: &Entry) -> Result<Option<Detail>> 
     };
     let plain = detail_cipher(user_key)?
         .decrypt(
-            Nonce::from_slice(&sealed.nonce),
+            &Nonce::from(sealed.nonce),
             Payload {
                 msg: &sealed.ct,
                 aad: &detail_aad(&entry.owner, &entry.record_id),

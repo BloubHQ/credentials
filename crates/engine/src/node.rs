@@ -20,7 +20,8 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use rand_core::{OsRng, RngCore};
+use getrandom::SysRng;
+use getrandom::rand_core::{Rng as _, UnwrapErr};
 use sha2::{Digest, Sha256};
 use zeroize::{Zeroize, Zeroizing};
 
@@ -173,7 +174,7 @@ fn reflection_contains(haystack: &[u8], needle: &[u8]) -> bool {
 
 fn stream_vars(host: &str, now: u64) -> HashMap<Var, Vec<u8>> {
     let mut random = [0u8; 16];
-    OsRng.fill_bytes(&mut random);
+    UnwrapErr(SysRng).fill_bytes(&mut random);
     HashMap::from([
         (Var::Host, host.as_bytes().to_vec()),
         (Var::Unix, (now / 1000).to_string().into_bytes()),

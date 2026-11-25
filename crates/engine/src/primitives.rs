@@ -389,8 +389,8 @@ fn number(args: &[Bytes], i: usize, default: u64) -> Result<u64> {
     }
 }
 
-fn mac<M: Mac + hmac::digest::KeyInit>(key: &[u8], message: &[u8]) -> Result<Bytes> {
-    let mut mac = <M as Mac>::new_from_slice(key).map_err(|_| Error::KeyInvalid)?;
+fn mac<M: Mac + hmac::KeyInit>(key: &[u8], message: &[u8]) -> Result<Bytes> {
+    let mut mac = <M as hmac::KeyInit>::new_from_slice(key).map_err(|_| Error::KeyInvalid)?;
     mac.update(message);
     Ok(Zeroizing::new(mac.finalize().into_bytes().to_vec()))
 }
@@ -455,10 +455,8 @@ fn p384_sign(key: &[u8], message: &[u8]) -> Result<Bytes> {
 fn aes_gcm(key: &[u8], nonce: &[u8], message: &[u8], aad: &[u8]) -> Result<Bytes> {
     use aes_gcm::aead::{Aead, KeyInit, Payload};
     use aes_gcm::{Aes128Gcm, Aes256Gcm, Nonce};
-    if nonce.len() != 12 {
-        return Err(Error::KeyInvalid);
-    }
-    let nonce = Nonce::from_slice(nonce);
+    let nonce =
+        &Nonce::<aes_gcm::aead::consts::U12>::try_from(nonce).map_err(|_| Error::KeyInvalid)?;
     let payload = Payload { msg: message, aad };
     let out = match key.len() {
         16 => Aes128Gcm::new_from_slice(key)
@@ -473,17 +471,17 @@ fn aes_gcm(key: &[u8], nonce: &[u8], message: &[u8], aad: &[u8]) -> Result<Bytes
 }
 
 fn aes_cbc(key: &[u8], iv: &[u8], message: &[u8]) -> Result<Bytes> {
-    use cbc::cipher::{BlockEncryptMut, KeyIvInit, block_padding::Pkcs7};
+    use cbc::cipher::{BlockModeEncrypt, KeyIvInit, block_padding::Pkcs7};
     let out = match key.len() {
         16 => cbc::Encryptor::<aes::Aes128>::new_from_slices(key, iv)
             .map_err(|_| Error::KeyInvalid)?
-            .encrypt_padded_vec_mut::<Pkcs7>(message),
+            .encrypt_padded_vec::<Pkcs7>(message),
         24 => cbc::Encryptor::<aes::Aes192>::new_from_slices(key, iv)
             .map_err(|_| Error::KeyInvalid)?
-            .encrypt_padded_vec_mut::<Pkcs7>(message),
+            .encrypt_padded_vec::<Pkcs7>(message),
         32 => cbc::Encryptor::<aes::Aes256>::new_from_slices(key, iv)
             .map_err(|_| Error::KeyInvalid)?
-            .encrypt_padded_vec_mut::<Pkcs7>(message),
+            .encrypt_padded_vec::<Pkcs7>(message),
         _ => return Err(Error::KeyInvalid),
     };
     Ok(Zeroizing::new(out))

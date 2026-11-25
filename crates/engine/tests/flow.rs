@@ -872,7 +872,7 @@ fn derivations_hand_back_only_one_way_outputs() {
         })
     );
 
-    use hmac::{Hmac, Mac};
+    use hmac::{Hmac, KeyInit, Mac};
     let key = b"exchange-secret-key-0123456789";
     let s = setup(
         &clock,
@@ -1418,11 +1418,11 @@ fn aes_encrypts_only_under_a_secret_key() {
     );
     let s = setup(&clock, policy, &[("key", &key)]);
     let sealed = call_derive(&s.node, &s.record, "derive", b"card 4111").unwrap();
-    let nonce: Vec<u8> = (0u8..12).collect();
+    let nonce: [u8; 12] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11];
     let plain = Aes256Gcm::new_from_slice(&key)
         .unwrap()
         .decrypt(
-            Nonce::from_slice(&nonce),
+            &Nonce::from(nonce),
             Payload {
                 msg: &sealed,
                 aad: b"v1",

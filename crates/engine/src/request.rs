@@ -7,7 +7,8 @@
 
 use std::collections::HashMap;
 
-use rand_core::{OsRng, RngCore};
+use getrandom::SysRng;
+use getrandom::rand_core::{Rng as _, UnwrapErr};
 use zeroize::Zeroizing;
 
 use crate::fields::Fields;
@@ -182,9 +183,9 @@ impl<'a> Outbound<'a> {
 
     fn vars(&self, unix_ms: u64) -> HashMap<Var, Vec<u8>> {
         let mut random = [0u8; 16];
-        OsRng.fill_bytes(&mut random);
+        UnwrapErr(SysRng).fill_bytes(&mut random);
         let nonce = hex(&random).to_vec();
-        OsRng.fill_bytes(&mut random);
+        UnwrapErr(SysRng).fill_bytes(&mut random);
         let boundary = format!("boundary-{}", String::from_utf8_lossy(&hex(&random)));
         let (pathname, query) = self.path.split_once('?').unwrap_or((self.path, ""));
         HashMap::from([

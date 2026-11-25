@@ -5,7 +5,8 @@
 //! random nonce. A node accepts it only from a caller the policy lists for that operation,
 //! within [`MAX_SKEW_MS`] of its clock, once.
 
-use rand_core::{OsRng, RngCore};
+use getrandom::SysRng;
+use getrandom::rand_core::{Rng as _, UnwrapErr};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -185,7 +186,7 @@ impl CallerKey {
         time_ms: u64,
     ) -> Result<Authorization> {
         let mut nonce = [0u8; 16];
-        OsRng.fill_bytes(&mut nonce);
+        UnwrapErr(SysRng).fill_bytes(&mut nonce);
         let mut auth = Authorization {
             caller: caller.to_string(),
             time_ms,

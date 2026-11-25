@@ -15,29 +15,29 @@ attest = { path = "crates/attest" }
 engine = { path = "crates/engine" }
 transport = { path = "crates/transport" }
 server = { path = "crates/server" }
-aes = "0.8"
-aes-gcm = "0.10"
-cbc = { version = "0.1", features = ["alloc"] }
+aes = "0.9.2"
+aes-gcm = "0.11"
+cbc = { version = "0.2.1", features = ["alloc"] }
 k256 = { version = "0.14", features = ["ecdsa", "pkcs8"] }
-md-5 = "0.10"
-pbkdf2 = "0.12"
+md-5 = "0.11"
+pbkdf2 = "0.13"
 ring = "0.17"
 p384 = { version = "0.14", features = ["ecdsa", "pkcs8"] }
-sha3 = "0.10"
+sha3 = "0.12"
 base64 = "0.22"
-chacha20poly1305 = "0.10"
+chacha20poly1305 = "0.11"
 clap = { version = "4.5", default-features = false, features = ["std", "derive", "help", "usage", "error-context"] }
-ed25519-dalek = { version = "2", features = ["rand_core", "zeroize", "pkcs8", "pem"] }
-hkdf = "0.12"
+ed25519-dalek = { version = "3", features = ["rand_core", "zeroize", "pkcs8", "pem"] }
+getrandom = { version = "0.4", features = ["sys_rng"] }
+hkdf = "0.13"
 hpke = { version = "0.15", default-features = false, features = ["alloc", "x25519", "chacha", "getrandom"] }
-hmac = "0.12"
+hmac = "0.13"
 p256 = { version = "0.14", features = ["ecdsa", "pkcs8", "pem"] }
-rand_core = { version = "0.6", features = ["getrandom"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["raw_value"] }
 memchr = "2"
-sha1 = "0.10"
-sha2 = "0.10"
+sha1 = "0.11"
+sha2 = "0.11"
 thiserror = "2"
 # Attestation documents: CBOR, and the X.509 chain of the Nitro Secure Module.
 ciborium = { version = "0.2", default-features = false, features = ["std"] }

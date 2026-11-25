@@ -1,6 +1,6 @@
 //! TOTP (RFC 6238) with HMAC-SHA-1.
 
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use sha1::Sha1;
 
 use crate::{Error, Result};
