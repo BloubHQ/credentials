@@ -10,8 +10,9 @@
 //!   ([`NodeKey::to_bytes`]) to continue the chain after a restart.
 
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
+use getrandom::SysRng;
+use getrandom::rand_core::{Rng as _, UnwrapErr};
 use hkdf::Hkdf;
-use rand_core::{OsRng, RngCore};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use zeroize::Zeroize;
@@ -32,7 +33,7 @@ impl UserKey {
     /// Creates a random user key.
     pub fn generate() -> Self {
         let mut bytes = [0u8; KEY_LEN];
-        OsRng.fill_bytes(&mut bytes);
+        UnwrapErr(SysRng).fill_bytes(&mut bytes);
         let key = Self(Secret::new(bytes));
         bytes.zeroize();
         key
@@ -109,7 +110,7 @@ macro_rules! signing_key {
         impl $name {
             /// Creates a random key.
             pub fn generate() -> Self {
-                Self(SigningKey::generate(&mut OsRng))
+                Self(SigningKey::generate(&mut UnwrapErr(SysRng)))
             }
 
             /// Takes the 32 secret bytes of a key and erases the caller's copy.
