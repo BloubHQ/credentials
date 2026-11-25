@@ -36,7 +36,7 @@ rand_core = { version = "0.6", features = ["getrandom"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["raw_value"] }
 memchr = "2"
-sha1 = "0.10"
+sha1 = "0.11"
 sha2 = "0.10"
 thiserror = "2"
 # Attestation documents: CBOR, and the X.509 chain of the Nitro Secure Module.
