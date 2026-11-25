@@ -17,7 +17,7 @@ transport = { path = "crates/transport" }
 server = { path = "crates/server" }
 aes = "0.8"
 aes-gcm = "0.10"
-cbc = { version = "0.1", features = ["alloc"] }
+cbc = { version = "0.2", features = ["alloc"] }
 k256 = { version = "0.14", features = ["ecdsa", "pkcs8"] }
 md-5 = "0.10"
 pbkdf2 = "0.12"
