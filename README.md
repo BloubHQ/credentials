@@ -3,6 +3,8 @@
 [![ci](https://github.com/BloubHQ/credentials/actions/workflows/ci.yml/badge.svg)](https://github.com/BloubHQ/credentials/actions/workflows/ci.yml)
 [![license](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
+**English** | [한국어](README.ko.md) | [简体中文](README.zh-CN.md) | [日本語](README.ja.md)
+
 A vault engine that lets applications and AI agents **use** a credential without ever
 **seeing** it. The owner's device decides, in a signed policy, exactly where a secret may go
 and in what form. A node holds the secret only while the owner allows it, writes a
