@@ -86,7 +86,7 @@ sequenceDiagram
     C->>N: 레코드 + operation + 요청 + Authorization
     N->>N: grant가 유효한가? 레코드가 pin되어 있고 오래되지 않았나?<br/>알려진 기기가 정책에 서명했나?
     N->>N: operation에 호출자가 등록되어 있나? 서명,<br/>±5분, 일회용 nonce, 속도 제한
-    N->>N: 요청이 operation 범위 안인가 (host, method,<br/>path 접두사, 헤더), 복호화, 예산 안에서 렌더링
+    N->>N: 요청이 operation 범위 안인가 (host, method,<br/>path 템플릿, 쿼리, 헤더), 복호화, 예산 안에서 렌더링
     N->>L: 항목 (seq, 이전 해시, 소유자 체인, 호출자, 봉인된 상세)
     L-->>N: 확정
     N->>D: 주입된 비밀 값을 담은 TLS 요청
@@ -147,29 +147,44 @@ let outcome = node.run(&call, &mut TlsTransport::new());
      "operations": ["refresh", "call"], "limit": {"count": 100, "window_ms": 60000}}
   ],
   "operations": [
-    {"kind": "http", "name": "refresh",
-     "destinations": [{"host": "auth.example.com", "port": 443}],
-     "steps": [{
-       "request": {"from": "fixed", "method": "POST", "path": "/oauth/token"},
+    {"name": "refresh", "steps": [
+      {"do": "open", "connection": "https",
+       "destinations": [{"host": "auth.example.com", "port": 443}]},
+      {"do": "send", "request": {"from": "fixed", "method": "POST", "path": "/oauth/token"},
        "inject": [{"target": {"kind": "body"},
-                   "template": "grant_type=refresh_token&refresh_token={{pct(refresh_token)}}&client_id={{pct(client_id)}}&client_secret={{pct(client_secret)}}"}],
-       "capture": [{"source": {"from": "json", "pointer": "/access_token"},
-                    "into": {"kind": "field", "name": "access_token"}}]
-     }]},
-    {"kind": "http", "name": "call",
-     "destinations": [{"host": "*.api.example.com", "port": 443}],
-     "methods": ["GET", "POST"], "paths": ["/v1/"], "caller_headers": ["Accept"],
-     "steps": [{"inject": [{"target": {"kind": "header", "name": "Authorization"},
-                            "template": "Bearer {{access_token}}"}]}]}
+                   "template": "grant_type=refresh_token&refresh_token={{pct(refresh_token)}}&client_id={{pct(client_id)}}&client_secret={{pct(client_secret)}}"}]},
+      {"do": "receive", "capture": [{"source": {"from": "json", "pointer": "/access_token"},
+                                     "into": {"kind": "field", "name": "access_token"}}]},
+      {"do": "return", "response": {"body": {"json": ["/expires_in"]}}}
+    ]},
+    {"name": "call", "steps": [
+      {"do": "open", "connection": "https",
+       "destinations": [{"host": "*.api.example.com", "port": 443}]},
+      {"do": "send",
+       "request": {"from": "caller", "methods": ["GET", "POST"],
+                   "paths": ["/v1/invoices", "/v1/invoices/*"], "headers": ["Accept"],
+                   "query": [{"name": "status", "one_of": ["open", "paid"]},
+                             {"name": "limit", "min": "1", "max": "100"}]},
+       "inject": [{"target": {"kind": "header", "name": "Authorization"},
+                   "template": "Bearer {{access_token}}"}]},
+      {"do": "return", "response": {"headers": ["Content-Type"], "body": "all"}}
+    ]}
   ]
 }
 ```
 
-| Operation | 하는 일 |
+operation은 연결 하나 위의 **step** 목록입니다: `open`(HTTPS, TLS 스트림, 또는 연결 없음),
+`send`, `receive`(캡처 포함), `compute`(템플릿을 이후 step이 읽는 이름에 담음), 그리고 호출자에게
+무엇이 돌아가는지 정하는 `return`.
+
+| 연결 | 하는 일 |
 | --- | --- |
-| `http` | 1~8개의 step. 각 step은 호출자의 요청이나 정책이 고정한 요청을 보내고, 값을 주입하며, 응답에서 값을 캡처해 필드(새 레코드 세대) 또는 이후 step에서 쓸 임시 값에 넣습니다. 마지막 응답만 돌려줍니다. |
-| `stream` | TLS 연결 하나 위에서 send/expect 스크립트를 실행한 뒤(IMAP, SMTP, 라인 기반 프로토콜), 인증된 연결로 호출자의 교환을 이어 갑니다. |
-| `derive` | 템플릿의 출력을 호출자에게 돌려줍니다: 서명, HMAC, TOTP 코드, JWT. |
+| `https` | 요청 1~8개. 각 `send`는 **계약**(method, path 템플릿, 헤더, 쿼리 파라미터와 그 값) 안의 호출자 요청이나 정책이 고정한 요청을 값을 주입해 보내고, `receive`는 그 응답에서 값을 캡처해 필드(새 레코드 세대) 또는 임시 값에 넣습니다. `return`은 상태 코드와, 나열한 헤더와 JSON 멤버만 돌려줍니다(전부는 `"body": "all"`). |
+| `tls` | TLS 연결 하나 위의 send/receive 스크립트(IMAP, SMTP, 라인 기반 프로토콜). 그다음 `return`이 중계하는 패턴에 send가 맞는 호출자의 교환만 이어 갑니다. |
+| 없음 | `return`이 템플릿을 렌더링해 호출자에게 돌려줍니다: 서명, HMAC, TOTP 코드, JWT. 호출자의 `$input`은 먼저 operation의 `input` 스키마(raw 바이트, JSON, RLP: 고정 멤버, 허용 값, 숫자 범위, 노드가 넣는 시각)로 검사합니다. |
+
+step 이전 형식(`"kind": "http" | "stream" | "derive"`)의 정책은 `credentials policy upgrade`로
+변환합니다. 결과는 호출자가 받는 것을 좁히고 그 내용을 알려 주며, 다시 서명해야 합니다.
 
 값은 **템플릿**을 통해 들어갑니다: `{{ hex(hmac_sha256(secret, $query)) }}`. 템플릿 언어에는 이름,
 변수, 문자열 리터럴, 함수 호출, `+`가 있고 분기나 반복은 없습니다. 정책에 서명하기 전에 모든 템플릿을
@@ -186,13 +201,15 @@ let outcome = node.run(&call, &mut TlsTransport::new());
 - **추측 가능한 필드.** derivation은 `guessable`로 표시한 필드(PIN, 비밀번호)에 `len`을 통해서만
   의존할 수 있습니다. 그 필드의 해시, 서명, MAC, 암호문은 모두 호출자가 추측을 대조하는 데 쓸 수
   있습니다.
+- **step.** `compute` step의 이름은 그 템플릿과 정확히 같은 성질을 가지므로, step 사이로 넘기는 값도
+  인라인으로 쓴 것과 똑같이 분석합니다.
 - **예산(budget).** operation 하나가 렌더링할 수 있는 양은 최대 128 MiB, PBKDF2 1,000,000 라운드,
   서명과 키 합의 합쳐 32개입니다.
 
 | 자격 증명 | 정책 |
 | --- | --- |
 | Bearer 토큰, 쿠키, API 키 | 헤더 템플릿 하나 |
-| Telegram 봇 | `/bot{token}/getMe`의 `path_param` `{{token}}` |
+| Telegram 봇 | path 템플릿 `/{token}/getMe`에서 `path_param` `token` = `bot{{token}}` |
 | 거래소 HMAC 서명 | 쿼리 `signature` = `{{ hex(hmac_sha256(secret, $query)) }}` |
 | AWS SigV4 | 헤더 템플릿 두 개(`time`, `canonical_query`, 중첩 `hmac_sha256`). 공식 벡터를 재현하는 테스트 있음 |
 | HTTP Digest | step 1에서 `header_param`으로 `realm`/`nonce`를 캡처, step 2에서 `md5`로 응답. RFC 2617 벡터 |
@@ -200,12 +217,12 @@ let outcome = node.run(&call, &mut TlsTransport::new());
 | 세션 로그인 | `fixed` POST /login, `cookie` 캡처를 임시 값으로, 호출자 요청에 `Cookie` |
 | CSRF 토큰이 있는 로그인 폼 | `html` 캡처 `input[name=_csrf]`(`value`)를 임시 값으로, 이어서 `fixed` POST /login |
 | 브라우저에서 암호화하는 비밀번호 | `ecdh("p256", server_key)` + `sha256` + `aes_cbc_encrypt`, `u8(len(…))` 길이 접두사와 `ecdh_public("p256")`; 또는 서버에서 캡처한 키로 `rsa_encrypt_oaep("sha256", key, password)` |
-| JWT RS256 | derive `b64urlraw(header) + "." + b64urlraw($input) + "." + b64urlraw(rsa_sign_pkcs1_sha256(pem(key), …))` |
-| 정책이 수명을 정하는 JWT | derive에서 `json_set_number(..., "exp", add($unix, "300"))`와 `rsa_sign_pkcs1("sha512", pem(key), …)`: `iat`/`exp`는 노드가 넣습니다 |
-| Ethereum | derive `{{ k256_sign_recoverable(key, keccak256($input)) }}` |
-| IMAP | stream: 인사말 expect, `a1 LOGIN {{user}} {{password}}` send, expect, 중계 |
-| TOTP | derive `{{ totp(b32decode(seed)) }}` |
-| 상호 TLS | `"identity": {"cert": "{{cert}}", "key": "{{key}}"}` |
+| JWT RS256 | 연결 없음: `b64urlraw(header) + "." + b64urlraw($input) + "." + b64urlraw(rsa_sign_pkcs1_sha256(pem(key), …))` |
+| 정책이 수명을 정하는 JWT | `iss`/`aud`를 고정하고 `iat`/`exp`를 노드가 `set`하는 `json` input 스키마, 또는 템플릿의 `json_set_number(..., "exp", add($unix, "300"))` |
+| Ethereum | 연결 없음: `{{ k256_sign_recoverable(key, keccak256($input)) }}`와, 받는 주소·체인·data를 고정하고 금액을 제한하는 `rlp` input 스키마 |
+| IMAP | tls: 인사말 receive, `a1 LOGIN {{user}} {{password}}` send, receive, 정책이 나열한 명령만 중계 |
+| TOTP | 연결 없음: `{{ totp(b32decode(seed)) }}` |
+| 상호 TLS | `open`의 `"identity": {"cert": "{{cert}}", "key": "{{key}}"}` |
 
 ## 레코드, 세대, 롤백
 

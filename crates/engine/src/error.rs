@@ -129,6 +129,12 @@ pub enum Error {
         /// Which rule.
         rule: &'static str,
     },
+    /// The caller's input breaks the input schema of the operation.
+    #[error("input invalid: {rule}")]
+    InputInvalid {
+        /// Which rule.
+        rule: &'static str,
+    },
     /// The caller is not one the policy lists, or not for this operation. Names are not
     /// secret; `operation` is empty when the caller is unknown to the policy.
     #[error("caller {caller} not allowed{}", if operation.is_empty() { String::new() } else { format!(" to call {operation}") })]
@@ -259,6 +265,7 @@ impl Error {
                 | Error::PathDenied { .. }
                 | Error::OperationUnknown { .. }
                 | Error::RequestInvalid { .. }
+                | Error::InputInvalid { .. }
         )
     }
 }

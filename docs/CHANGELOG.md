@@ -7,6 +7,14 @@ before 1.0, minor versions may break formats and APIs.
 
 ### Added
 
+- `compute` steps: a template rendered into a name later steps read, with exactly the
+  properties of its template in the analysis.
+- Input schemas for operations with no connection: `raw` (length, pattern), `json` (closed:
+  types, fixed values, allowed values, pattern, decimal bounds, members the node sets from its
+  clock; duplicate keys refused, the checked value re-serialized) and `rlp` (closed,
+  canonical, optional prefix, fixed and allowed items, integer bounds).
+- `credentials policy upgrade OLD --out NEW`, and `upgrade_policy` in the `client` crate.
+- Fuzz targets `policy_upgrade`, `caller_request` and `input_schema`.
 - Template functions, the first group of the primitives of `docs/design.md` section 8d, each
   with its taint rule (`docs/policy.md`) and threat-model rows:
   - structure: `slice(value, start, length)`, `between(value, start, end)` (empty delimiters
@@ -139,6 +147,26 @@ before 1.0, minor versions may break formats and APIs.
 
 ### Changed
 
+- **Policy format (breaking).** Operations are one step language over a connection instead of
+  the kinds `http`, `stream` and `derive`: `open` (`https`, `tls`, or none), `send`,
+  `receive`, `compute`, `return`; `repeat` and `if` are parsed and refused for now. The policy
+  signing domain is `policy/v4`: every policy must be converted and **signed again**.
+  `credentials policy upgrade` and `engine::policy::legacy::upgrade_json` convert the old
+  format and print what they narrowed. In Rust, `Operation::https`, `Operation::tls`,
+  `Operation::local` and `Operation::then` with `Send`, `Receive`, `Return` and
+  `CallerRequest` replace `Operation::http`, `Operation::stream`, `Step` and `Exchange`.
+- A caller's HTTPS request is checked against a contract on its `send`: methods, path
+  templates matched exactly (`*`, `**`, whole-segment `{name}` placeholders) instead of path
+  prefixes, headers, and query parameters with their values.
+- An HTTPS operation returns the status and only the headers and JSON members its `return`
+  lists (`"body": "all"` for the whole body); before, the whole response went back.
+- A stream relays the caller's exchanges only when its `return` lists patterns their sends
+  match whole; before, any exchange ran.
+- An operation that reads `$input` declares an `input` schema; new error
+  `Error::InputInvalid { rule }` (a caller error, HTTP 400 from the server).
+- Policy errors that name a step use its index in `steps` (`operations[0].steps[2].capture[0]`)
+  and path errors name the rule that failed (`path holds an encoded /, \ or .`).
+- `crates/engine/src/vectors.rs` is formatted (the base branch failed `cargo fmt --check`).
 - The render budget of 32 signatures per operation also counts key agreements.
 - `crates/engine/src/primitives.rs` is stored with LF line endings, like every other file.
 
@@ -171,6 +199,25 @@ before 1.0, minor versions may break formats and APIs.
 
 ### Security
 
+- Closes the gaps of the policy audit; each has a regression test in
+  `crates/engine/tests/audit_bounds.rs` that shows the attack refused before the log:
+  - a caller could add query parameters to a signed request (another action for the same
+    signature) and read whatever the server returned: query allow-list per name and value,
+    and response projection;
+  - a caller could send a query name the policy injects, first: refused;
+  - `..;`, `%252e%252e` and `..%3b` passed the path check: segments are checked as sent,
+    without `;` parameters, after one and two decodings, and `%25` is refused unless the
+    contract allows it;
+  - `_method` in the query or body could turn a POST into a DELETE: refused unless the
+    contract allows it;
+  - a caller could place a path parameter (a secret) in its own query: placeholders are whole
+    segments of signed templates;
+  - a derivation signed any input: input schemas;
+  - a stream relayed any command after the login: relay patterns.
+- `crates/transport/examples/aws_sigv4.rs` claimed the caller could only send
+  `GET https://sts.amazonaws.com/`, but the caller could pick the action; the example now pins
+  `Action` and `Version` and projects the response. `docs/threat-model.md` claimed dot
+  segments and encoded separators were refused; `..;` and double encoding were not.
 - Template analysis: encryption under a secret field hides only the key; a secret in its
   message, nonce or data stays tainted. Hashes and MACs of a secret no longer count as secret
   keys. A `guessable` field may reach a derivation output only through `len`.

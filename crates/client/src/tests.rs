@@ -17,7 +17,7 @@ use engine::grant::{NodeIdentity, Revocation, SealedGrant};
 use engine::keys::{Endorsement, NodeKey, Retirement};
 use engine::log::MemorySink;
 use engine::node::{Node, SystemClock};
-use engine::policy::{Caller, Destination, FieldSpec, Operation, Policy};
+use engine::policy::{Caller, Destination, FieldSpec, Input, Operation, Policy};
 use engine::record::{Pin, Record};
 
 use crate::attestation::{MAX_AGE_MS, Nonce, VerifiedNode};
@@ -268,10 +268,9 @@ fn policy_json(caller_public: &str) -> String {
     let caller = engine::keys::CallerPublicKey::from_b64(caller_public).unwrap();
     let policy = Policy::new()
         .with_field(FieldSpec::secret("key"))
-        .with_operation(Operation::derive(
-            "mac",
-            "{{ hex(hmac_sha256(key, $input)) }}",
-        ))
+        .with_operation(
+            Operation::derive("mac", "{{ hex(hmac_sha256(key, $input)) }}").input(Input::any()),
+        )
         .with_caller(Caller::new("app", caller, ["mac"]));
     serde_json::to_string(&policy).unwrap()
 }
@@ -593,4 +592,30 @@ fn error_codes_are_stable_and_distinct() {
             "refused"
         ]
     );
+}
+
+#[test]
+fn an_old_policy_converts_and_signs_again() {
+    let device = generate_key(KeyKind::Device);
+    let caller_public = public_key(KeyKind::Caller, generate_key(KeyKind::Caller)).unwrap();
+    let old = serde_json::json!({
+        "fields": [{"name": "key", "secret": true}],
+        "callers": [{"name": "app", "key": caller_public, "operations": ["sign"]}],
+        "operations": [{"kind": "derive", "name": "sign",
+                        "template": "{{ hex(hmac_sha256(key, $input)) }}"}]
+    })
+    .to_string();
+    // The old format no longer signs.
+    assert_eq!(
+        code(sign_policy(device.clone(), old.clone())),
+        "invalid_input"
+    );
+    let upgrade: serde_json::Value = serde_json::from_str(&upgrade_policy(old).unwrap()).unwrap();
+    let notes = upgrade["notes"].as_array().unwrap();
+    assert!(
+        notes[0].as_str().unwrap().contains("signed again"),
+        "{notes:?}"
+    );
+    sign_policy(device, upgrade["policy"].to_string()).unwrap();
+    assert_eq!(code(upgrade_policy("{".into())), "refused");
 }

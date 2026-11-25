@@ -23,7 +23,10 @@ use engine::grant::GrantTerms;
 use engine::keys::{CallerKey, DeviceKey, NodeKey, UserKey};
 use engine::log::{MemorySink, open_detail, verify_chain};
 use engine::node::{Node, SystemClock};
-use engine::policy::{Caller, Destination, FieldSpec, Injection, Method, Operation, Policy, Step};
+use engine::policy::{
+    Caller, CallerRequest, Destination, FieldSpec, Injection, Method, Operation, Policy, Return,
+    Send,
+};
 use engine::record::Record;
 use engine::request::Request;
 use transport::TlsTransport;
@@ -56,13 +59,16 @@ fn run(token: String) -> Result<(), Box<dyn std::error::Error>> {
     let policy = Policy::new()
         .with_field(FieldSpec::secret("token"))
         .with_operation(
-            Operation::http("github", Destination::https("api.github.com"))
-                .methods([Method::Get])
-                .paths(["/user"])
-                .caller_headers(["Accept", "User-Agent"])
-                .step(
-                    Step::caller().inject(Injection::header("Authorization", "Bearer {{token}}")),
-                ),
+            Operation::https("github", Destination::https("api.github.com"))
+                .then(
+                    Send::caller(
+                        CallerRequest::new([Method::Get])
+                            .paths(["/user"])
+                            .headers(["Accept", "User-Agent"]),
+                    )
+                    .inject(Injection::header("Authorization", "Bearer {{token}}")),
+                )
+                .then(Return::status().json("/login").json("/name")),
         )
         .with_caller(Caller::new("example", app.public(), ["github"]));
     for line in policy.summary() {

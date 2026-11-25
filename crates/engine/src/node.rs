@@ -27,14 +27,15 @@ use zeroize::{Zeroize, Zeroizing};
 
 use crate::call::{Body, Output, SignedCall};
 use crate::caller::{Authorization, Call, MAX_SKEW_MS, Payload};
+use crate::egress::Stream;
 use crate::egress::{ClientIdentity, Transport, dispatch, open_stream};
 use crate::fields::Fields;
 use crate::grant::{NodeIdentity, NodeSealKey, OpenedGrant, Revocation, SealSecret, SealedGrant};
 use crate::keys::{DevicePublicKey, Endorsement, NodeKey, NodePublicKey, Retirement, UserKey};
 use crate::log::{Detail, Event, Log, LogSink, SignedEntry, SignedHead};
 use crate::policy::{
-    Capture, Destination, Exchange, Identity, MAX_DELIMITER, MAX_DELIMITERS, Operation, Policy,
-    Store,
+    Capture, Compute, Connection, Destination, Identity, Kinds, MAX_DELIMITER, MAX_DELIMITERS,
+    Open, Operation, Policy, Send, Step, Store,
 };
 use crate::record::{Pin, Record, check_name};
 use crate::reflection::{self, MIN_NEEDLE, Secrets};
@@ -206,9 +207,15 @@ fn render_identity(
     Ok(Some(ClientIdentity::new(cert, key)))
 }
 
-/// Redacts and checks a parsed response before it is handed back.
-fn release_http(http: Http, log_seqs: Vec<u64>, secrets: &Secrets<'_>) -> Result<Response> {
-    let mut response = http.into_response(log_seqs);
+/// The clock and a fresh nonce, for a `compute` step of an operation with a connection.
+fn compute_vars(now: u64) -> HashMap<Var, Vec<u8>> {
+    let mut vars = stream_vars("", now);
+    vars.remove(&Var::Host);
+    vars
+}
+
+/// Redacts and checks the projected response before it is handed back.
+fn release_http(mut response: Response, secrets: &Secrets<'_>) -> Result<Response> {
     for (_, value) in &mut response.headers {
         reflection::redact(value, secrets.captured);
     }
@@ -792,12 +799,13 @@ impl<S: LogSink, C: Clock> Node<S, C> {
         };
         let policy = record.policy.verify_any(&devices)?;
         let operation = policy.operation(name)?;
-        // A call of the wrong kind is refused before it spends a nonce or the rate limit.
+        // A call whose payload does not fit the connection of the operation is refused
+        // before it spends a nonce or the rate limit.
         let kind_ok = matches!(
-            (operation, payload),
-            (Operation::Http { .. }, Payload::Http(_))
-                | (Operation::Stream { .. }, Payload::Stream { .. })
-                | (Operation::Derive { .. }, Payload::Derive(_))
+            (operation.connection(), payload),
+            (Some(Connection::Https), Payload::Http(_))
+                | (Some(Connection::Tls), Payload::Stream { .. })
+                | (None, Payload::Derive(_))
         );
         if !kind_ok {
             return Err(operation.unknown());
@@ -881,7 +889,7 @@ impl<S: LogSink, C: Clock> Node<S, C> {
         Ok(fields)
     }
 
-    /// Runs the HTTP operation `operation` of `record` for the caller of `auth`. `request` is
+    /// Runs the HTTPS operation `operation` of `record` for the caller of `auth`. `request` is
     /// the request of the caller; it is required exactly when a step sends the request of the
     /// caller.
     pub fn http<T: Transport>(
@@ -893,207 +901,31 @@ impl<S: LogSink, C: Clock> Node<S, C> {
         transport: &mut T,
     ) -> Outcome<Response> {
         let mut updated = None;
-        let result = self.http_steps(record, operation, auth, request, transport, &mut updated);
+        let result = self
+            .execute(
+                record,
+                operation,
+                auth,
+                Payload::Http(request),
+                transport,
+                &mut updated,
+            )
+            .and_then(|output| match output {
+                Output::Http(response) => Ok(response),
+                _ => Err(Error::OperationUnknown {
+                    name: operation.to_string(),
+                }),
+            });
         Outcome {
             result,
             record: updated,
         }
     }
 
-    fn http_steps<T: Transport>(
-        &self,
-        record: &Record,
-        name: &str,
-        auth: &Authorization,
-        request: Option<&Request>,
-        transport: &mut T,
-        updated: &mut Option<Record>,
-    ) -> Result<Response> {
-        let now = self.clock.now_ms();
-        let (policy, operation, checked) =
-            self.check_call(record, name, auth, &Payload::Http(request), now)?;
-        let Operation::Http {
-            destinations,
-            identity,
-            steps,
-            ..
-        } = operation
-        else {
-            return Err(operation.unknown());
-        };
-        match request {
-            Some(request) if operation.takes_request() => request.validate(operation)?,
-            None if !operation.takes_request() => {}
-            Some(_) => {
-                return Err(Error::RequestInvalid {
-                    rule: "the operation takes no request",
-                });
-            }
-            None => {
-                return Err(Error::RequestInvalid {
-                    rule: "the operation needs a request",
-                });
-            }
-        }
-        let user_key = checked.policy_owner;
-        let mut fields = self.open(record, &user_key)?;
-        let budget = Budget::default();
-        let mut captured = Captured::default();
-        let mut tainted = Vec::new();
-        let mut log_seqs = Vec::with_capacity(steps.len());
-        let who = (
-            record.owner.as_str(),
-            record.id.as_str(),
-            checked.caller.as_str(),
-        );
-
-        for (index, step) in steps.iter().enumerate() {
-            let outbound = Outbound::of(step, destinations, request)?;
-            if !operation.allows_destination(outbound.destination) {
-                return Err(outbound.destination.denied());
-            }
-            let built = request::build(
-                step,
-                &outbound,
-                &Inputs {
-                    policy,
-                    operation,
-                    fields: &fields,
-                    temps: &captured.temps,
-                    unix_ms: now,
-                    budget: &budget,
-                },
-            )?;
-            let client = render_identity(
-                identity.as_ref(),
-                &fields,
-                &outbound.destination.host,
-                now,
-                &budget,
-            )?;
-            let detail = Detail::Use {
-                method: outbound.method,
-                host: outbound.destination.host.clone(),
-                port: outbound.destination.port,
-                path: outbound.path.to_string(),
-                body_sha256: Sha256::digest(outbound.body).into(),
-                body_len: outbound.body.len() as u64,
-            };
-            let event = Event::Use {
-                operation: name.to_string(),
-                generation: updated.as_ref().unwrap_or(record).generation,
-                detail: detail.seal(&user_key, &record.owner, &record.id)?,
-            };
-            let (seq, confirmed) = self.lock().commit(now, who, event)?;
-            log_seqs.push(seq);
-            let sent = dispatch(
-                confirmed,
-                transport,
-                outbound.destination,
-                client.as_ref(),
-                &built.wire,
-            );
-            drop(client);
-            let (_, mut bytes) = match sent {
-                Ok(sent) => sent,
-                Err(error) => {
-                    self.done(now, who, seq, None, false);
-                    return Err(error);
-                }
-            };
-            tainted.extend(built.tainted);
-            let parsed = Http::parse(&bytes);
-            bytes.zeroize();
-            let http = match parsed {
-                Ok(http) => http,
-                Err(error) => {
-                    self.done(now, who, seq, None, false);
-                    return Err(error);
-                }
-            };
-            let status = http.status;
-            let mut stored = Ok(());
-            for capture in &step.capture {
-                stored = http
-                    .capture(&capture.source)
-                    .and_then(|value| captured.store(policy, &mut fields, capture, value));
-                if stored.is_err() {
-                    break;
-                }
-            }
-            let persisted = self.persist(
-                record,
-                name,
-                who,
-                &fields,
-                &mut captured,
-                &user_key,
-                now,
-                updated,
-            );
-            if let Err(error) = stored.and(persisted) {
-                self.done(now, who, seq, Some(status), false);
-                return Err(error);
-            }
-            if index + 1 == steps.len() {
-                let secrets = Secrets {
-                    policy,
-                    fields: &fields,
-                    captured: &captured.secrets,
-                    rendered: &tainted,
-                };
-                let released = release_http(http, log_seqs, &secrets);
-                self.done(now, who, seq, Some(status), released.is_ok());
-                return released;
-            }
-            self.done(now, who, seq, Some(status), true);
-        }
-        Err(operation.unknown())
-    }
-
-    /// Records how an act ended. A failure halts the log, so the next act fails; the result of
-    /// this one is already decided.
-    fn done(&self, now: u64, who: (&str, &str, &str), of: u64, status: Option<u16>, ok: bool) {
-        let _ = self.lock().commit(now, who, Event::Done { of, status, ok });
-    }
-
-    /// Logs the fields an operation changed and seals them into a new record.
-    #[allow(clippy::too_many_arguments)]
-    fn persist(
-        &self,
-        record: &Record,
-        operation: &str,
-        who: (&str, &str, &str),
-        fields: &Fields,
-        captured: &mut Captured,
-        user_key: &UserKey,
-        now: u64,
-        updated: &mut Option<Record>,
-    ) -> Result<()> {
-        if captured.changed.is_empty() {
-            return Ok(());
-        }
-        let current = updated.as_ref().unwrap_or(record);
-        let generation = current
-            .generation
-            .checked_add(1)
-            .ok_or(Error::RecordInvalid)?;
-        let next = current.reseal(user_key, fields)?;
-        let event = Event::Update {
-            operation: operation.to_string(),
-            generation,
-            fields: core::mem::take(&mut captured.changed),
-        };
-        let mut state = self.lock();
-        state.commit(now, who, event)?;
-        state.raise(&record.owner, &record.id, generation);
-        *updated = Some(next);
-        Ok(())
-    }
-
-    /// Runs the stream operation `operation` of `record` on a connection to `destination`:
-    /// the script of the policy, then the exchanges of the caller, whose reads are handed
-    /// back. Values the script captured are sealed before the exchanges of the caller run.
+    /// Runs the TLS stream operation `operation` of `record` on a connection to
+    /// `destination`: the steps of the policy, then the exchanges of the caller its `return`
+    /// relays, whose reads are handed back. Values the steps captured are sealed before the
+    /// exchanges of the caller run.
     pub fn stream<T: Transport>(
         &self,
         record: &Record,
@@ -1104,72 +936,317 @@ impl<S: LogSink, C: Clock> Node<S, C> {
         transport: &mut T,
     ) -> Outcome<StreamOutput> {
         let mut updated = None;
-        let result = self.stream_script(
-            record,
-            operation,
-            auth,
+        let payload = Payload::Stream {
             destination,
             exchanges,
-            transport,
-            &mut updated,
-        );
+        };
+        let result = self
+            .execute(record, operation, auth, payload, transport, &mut updated)
+            .and_then(|output| match output {
+                Output::Stream(output) => Ok(output),
+                _ => Err(Error::OperationUnknown {
+                    name: operation.to_string(),
+                }),
+            });
         Outcome {
             result,
             record: updated,
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn stream_script<T: Transport>(
+    /// Runs the operation with no connection `operation` of `record`: the caller's `input`,
+    /// checked by the input schema, is `$input`, and the output of its `return` is handed
+    /// back. The policy was checked to hand back no secret in reversible form.
+    pub fn derive(
+        &self,
+        record: &Record,
+        operation: &str,
+        auth: &Authorization,
+        input: &[u8],
+    ) -> Result<Vec<u8>> {
+        let mut updated = None;
+        let output = self.execute(
+            record,
+            operation,
+            auth,
+            Payload::Derive(input),
+            &mut NoTransport,
+            &mut updated,
+        )?;
+        match output {
+            Output::Derive(bytes) => Ok(bytes),
+            _ => Err(Error::OperationUnknown {
+                name: operation.to_string(),
+            }),
+        }
+    }
+
+    /// Checks the call and what the caller sends against the operation, then runs its steps
+    /// over its connection.
+    fn execute<T: Transport>(
         &self,
         record: &Record,
         name: &str,
         auth: &Authorization,
+        payload: Payload<'_>,
+        transport: &mut T,
+        updated: &mut Option<Record>,
+    ) -> Result<Output> {
+        if let Payload::Derive(input) = payload {
+            if input.len() > MAX_INPUT {
+                return Err(Error::RequestInvalid {
+                    rule: "input larger than 1 MiB",
+                });
+            }
+        }
+        let now = self.clock.now_ms();
+        let (policy, operation, checked) = self.check_call(record, name, auth, &payload, now)?;
+        // What the caller sends is checked in full before the record is opened, so a refused
+        // request leaves no entry and reaches no server.
+        let mut input = Vec::new();
+        match payload {
+            Payload::Http(request) => match (request, operation.takes_request()) {
+                (Some(request), true) => request.validate(operation)?,
+                (None, false) => {}
+                (Some(_), false) => {
+                    return Err(Error::RequestInvalid {
+                        rule: "the operation takes no request",
+                    });
+                }
+                (None, true) => {
+                    return Err(Error::RequestInvalid {
+                        rule: "the operation needs a request",
+                    });
+                }
+            },
+            Payload::Stream {
+                destination,
+                exchanges,
+            } => check_exchanges(operation, destination, exchanges)?,
+            Payload::Derive(given) => {
+                input = match &operation.input {
+                    Some(schema) => schema.apply(given, now)?,
+                    None if given.is_empty() => Vec::new(),
+                    None => {
+                        return Err(Error::InputInvalid {
+                            rule: "the operation takes no input",
+                        });
+                    }
+                };
+            }
+        }
+        let user_key = checked.policy_owner;
+        let fields = self.open(record, &user_key)?;
+        let mut run = Run {
+            record,
+            name,
+            who: (
+                record.owner.as_str(),
+                record.id.as_str(),
+                checked.caller.as_str(),
+            ),
+            policy,
+            operation,
+            kinds: policy.kinds(operation),
+            fields,
+            user_key,
+            budget: Budget::default(),
+            captured: Captured::default(),
+            tainted: Vec::new(),
+            now,
+        };
+        match payload {
+            Payload::Http(request) => self
+                .run_https(&mut run, request, transport, updated)
+                .map(Output::Http),
+            Payload::Stream {
+                destination,
+                exchanges,
+            } => self
+                .run_tls(
+                    &mut run,
+                    &payload,
+                    destination,
+                    exchanges,
+                    transport,
+                    updated,
+                )
+                .map(Output::Stream),
+            Payload::Derive(given) => self.run_local(&mut run, given, input).map(Output::Derive),
+        }
+    }
+
+    fn run_https<T: Transport>(
+        &self,
+        run: &mut Run<'_>,
+        request: Option<&Request>,
+        transport: &mut T,
+        updated: &mut Option<Record>,
+    ) -> Result<Response> {
+        let operation = run.operation;
+        let open = operation.open().ok_or_else(|| operation.unknown())?;
+        let (now, who) = (run.now, run.who);
+        let mut last: Option<Http> = None;
+        // The log entry of the last request, until its outcome is known.
+        let mut pending: Option<(u64, u16)> = None;
+        let mut log_seqs = Vec::new();
+        for step in &operation.steps {
+            let result: Result<Option<Response>> = match step {
+                Step::Open(_) => Ok(None),
+                Step::Send(send) => {
+                    if let Some((seq, status)) = pending.take() {
+                        self.done(now, who, seq, Some(status), true);
+                    }
+                    self.https_send(run, open, send, request, transport, updated)
+                        .map(|(seq, http)| {
+                            log_seqs.push(seq);
+                            pending = Some((seq, http.status));
+                            last = Some(http);
+                            None
+                        })
+                }
+                Step::Receive(receive) => {
+                    let stored = match &last {
+                        Some(http) => receive.capture.iter().try_for_each(|capture| {
+                            let value = http.capture(&capture.source)?;
+                            run.captured
+                                .store(run.policy, &mut run.fields, capture, value)
+                        }),
+                        None => Err(operation.unknown()),
+                    };
+                    let persisted = self.persist(run, updated);
+                    stored.and(persisted).map(|()| None)
+                }
+                Step::Compute(compute) => run.compute(compute, compute_vars(now)).map(|()| None),
+                Step::Return(ret) => {
+                    let response = last
+                        .take()
+                        .ok_or_else(|| operation.unknown())
+                        .and_then(|http| http.project(ret.response.as_ref(), log_seqs.clone()))
+                        .and_then(|response| {
+                            let secrets = Secrets {
+                                policy: run.policy,
+                                fields: &run.fields,
+                                captured: &run.captured.secrets,
+                                rendered: &run.tainted,
+                            };
+                            release_http(response, &secrets)
+                        });
+                    if let Some((seq, status)) = pending.take() {
+                        self.done(now, who, seq, Some(status), response.is_ok());
+                    }
+                    response.map(Some)
+                }
+                Step::Repeat(_) | Step::If(_) => Err(operation.unknown()),
+            };
+            match result {
+                Ok(Some(response)) => return Ok(response),
+                Ok(None) => {}
+                Err(error) => {
+                    if let Some((seq, status)) = pending.take() {
+                        self.done(now, who, seq, Some(status), false);
+                    }
+                    return Err(error);
+                }
+            }
+        }
+        Err(operation.unknown())
+    }
+
+    /// Builds, logs and sends one HTTPS request, and parses its response.
+    fn https_send<T: Transport>(
+        &self,
+        run: &mut Run<'_>,
+        open: &Open,
+        send: &Send,
+        request: Option<&Request>,
+        transport: &mut T,
+        updated: &Option<Record>,
+    ) -> Result<(u64, Http)> {
+        let (now, who) = (run.now, run.who);
+        let outbound = Outbound::of(send, &open.destinations, request)?;
+        if !run.operation.allows_destination(outbound.destination) {
+            return Err(outbound.destination.denied());
+        }
+        let built = request::build(
+            send,
+            &outbound,
+            &Inputs {
+                kinds: &run.kinds,
+                fields: &run.fields,
+                temps: &run.captured.temps,
+                unix_ms: now,
+                budget: &run.budget,
+            },
+        )?;
+        let client = render_identity(
+            open.identity.as_ref(),
+            &run.fields,
+            &outbound.destination.host,
+            now,
+            &run.budget,
+        )?;
+        let detail = Detail::Use {
+            method: outbound.method,
+            host: outbound.destination.host.clone(),
+            port: outbound.destination.port,
+            path: outbound.path.to_string(),
+            body_sha256: Sha256::digest(outbound.body).into(),
+            body_len: outbound.body.len() as u64,
+        };
+        let event = Event::Use {
+            operation: run.name.to_string(),
+            generation: updated.as_ref().unwrap_or(run.record).generation,
+            detail: detail.seal(&run.user_key, &run.record.owner, &run.record.id)?,
+        };
+        let (seq, confirmed) = self.lock().commit(now, who, event)?;
+        let sent = dispatch(
+            confirmed,
+            transport,
+            outbound.destination,
+            client.as_ref(),
+            &built.wire,
+        );
+        drop(client);
+        let (_, mut bytes) = match sent {
+            Ok(sent) => sent,
+            Err(error) => {
+                self.done(now, who, seq, None, false);
+                return Err(error);
+            }
+        };
+        run.tainted.extend(built.tainted);
+        let parsed = Http::parse(&bytes);
+        bytes.zeroize();
+        match parsed {
+            Ok(http) => Ok((seq, http)),
+            Err(error) => {
+                self.done(now, who, seq, None, false);
+                Err(error)
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_tls<T: Transport>(
+        &self,
+        run: &mut Run<'_>,
+        payload: &Payload<'_>,
         destination: &Destination,
         exchanges: &[CallerExchange],
         transport: &mut T,
         updated: &mut Option<Record>,
     ) -> Result<StreamOutput> {
-        let now = self.clock.now_ms();
-        let payload = Payload::Stream {
-            destination,
-            exchanges,
-        };
-        let (policy, operation, checked) = self.check_call(record, name, auth, &payload, now)?;
-        let Operation::Stream {
-            identity, script, ..
-        } = operation
-        else {
-            return Err(operation.unknown());
-        };
-        if !operation.allows_destination(destination) {
-            return Err(destination.denied());
-        }
-        let exchanges_ok = exchanges.len() <= MAX_EXCHANGES
-            && exchanges.iter().all(|e| {
-                e.send.len() <= MAX_BODY
-                    && !e.until.is_empty()
-                    && e.until.len() <= MAX_DELIMITERS
-                    && e.until
-                        .iter()
-                        .all(|u| !u.is_empty() && u.len() <= MAX_DELIMITER)
-            });
-        if !exchanges_ok {
-            return Err(Error::RequestInvalid {
-                rule: "exchanges: at most 64, sends of at most 8 MiB, 1 to 8 delimiters",
-            });
-        }
-        let user_key = checked.policy_owner;
-        let mut fields = self.open(record, &user_key)?;
-        let budget = Budget::default();
-        let kind = |n: &str| policy.name_kind(operation, n);
-        let client = render_identity(identity.as_ref(), &fields, &destination.host, now, &budget)?;
-        let who = (
-            record.owner.as_str(),
-            record.id.as_str(),
-            checked.caller.as_str(),
-        );
-
+        let operation = run.operation;
+        let open = operation.open().ok_or_else(|| operation.unknown())?;
+        let (now, who) = (run.now, run.who);
+        let client = render_identity(
+            open.identity.as_ref(),
+            &run.fields,
+            &destination.host,
+            now,
+            &run.budget,
+        )?;
         let detail = Detail::Stream {
             host: destination.host.clone(),
             port: destination.port,
@@ -1177,15 +1254,11 @@ impl<S: LogSink, C: Clock> Node<S, C> {
             exchanges: u32::try_from(exchanges.len()).unwrap_or(u32::MAX),
         };
         let event = Event::Stream {
-            operation: name.to_string(),
-            generation: record.generation,
-            detail: detail.seal(&user_key, &record.owner, &record.id)?,
+            operation: run.name.to_string(),
+            generation: run.record.generation,
+            detail: detail.seal(&run.user_key, &run.record.owner, &run.record.id)?,
         };
         let (seq, confirmed) = self.lock().commit(now, who, event)?;
-
-        let mut captured = Captured::default();
-        let mut output = StreamOutput::default();
-        let mut tainted = Vec::new();
         let (_, mut stream) = match open_stream(confirmed, transport, destination, client.as_ref())
         {
             Ok(opened) => opened,
@@ -1195,63 +1268,46 @@ impl<S: LogSink, C: Clock> Node<S, C> {
             }
         };
         drop(client);
-        let mut script_result = Ok(());
-        for exchange in script {
-            let step = match exchange {
-                Exchange::Send { template } => Template::parse(template).and_then(|template| {
-                    let ctx = Context {
-                        fields: &fields,
-                        temps: &captured.temps,
-                        vars: stream_vars(&destination.host, now),
-                        unix: now / 1000,
-                        budget: &budget,
-                    };
-                    let bytes = template.render(&ctx)?;
-                    if template.tainted(&kind) {
-                        tainted.push(bytes.clone());
-                    }
-                    stream.write(&bytes)
-                }),
-                Exchange::Expect { until, capture } => {
-                    let delimiters: Vec<&[u8]> = until.iter().map(|u| u.as_bytes()).collect();
+        let mut steps_result = Ok(());
+        for step in &operation.steps {
+            let result = match step {
+                Step::Open(_) | Step::Return(_) => Ok(()),
+                Step::Send(send) => run.stream_send(send, &destination.host, &mut *stream),
+                Step::Receive(receive) => {
+                    let delimiters: Vec<&[u8]> =
+                        receive.until.iter().map(|u| u.as_bytes()).collect();
                     stream
                         .read_until(&delimiters, MAX_RESPONSE)
                         .map(Zeroizing::new)
                         .and_then(|read| {
-                            capture.iter().try_for_each(|c| {
+                            receive.capture.iter().try_for_each(|c| {
                                 let value = crate::response::capture_bytes(&read, &c.source)?;
-                                captured.store(policy, &mut fields, c, value)
+                                run.captured.store(run.policy, &mut run.fields, c, value)
                             })
                         })
                 }
+                Step::Compute(compute) => run.compute(compute, compute_vars(now)),
+                Step::Repeat(_) | Step::If(_) => Err(operation.unknown()),
             };
-            if let Err(error) = step {
-                script_result = Err(error);
+            if let Err(error) = result {
+                steps_result = Err(error);
                 break;
             }
         }
-        let persisted = self.persist(
-            record,
-            name,
-            who,
-            &fields,
-            &mut captured,
-            &user_key,
-            now,
-            updated,
-        );
-        if let Err(error) = script_result.and(persisted) {
+        let persisted = self.persist(run, updated);
+        if let Err(error) = steps_result.and(persisted) {
             let _ = stream.close();
             self.done(now, who, seq, None, false);
             return Err(error);
         }
 
         let secrets = Secrets {
-            policy,
-            fields: &fields,
-            captured: &captured.secrets,
-            rendered: &tainted,
+            policy: run.policy,
+            fields: &run.fields,
+            captured: &run.captured.secrets,
+            rendered: &run.tainted,
         };
+        let mut output = StreamOutput::default();
         let mut history = Zeroizing::new(Vec::new());
         for exchange in exchanges {
             let delimiters: Vec<&[u8]> = exchange.until.iter().map(Vec::as_slice).collect();
@@ -1276,52 +1332,203 @@ impl<S: LogSink, C: Clock> Node<S, C> {
         Ok(output)
     }
 
-    /// Renders the derivation `operation` of `record` with `input` as `$input` and hands the
-    /// output back. The policy was checked to hand back no secret in reversible form.
-    pub fn derive(
-        &self,
-        record: &Record,
-        operation: &str,
-        auth: &Authorization,
-        input: &[u8],
+    /// Runs an operation with no connection: its `compute` steps, then the template of its
+    /// `return`, logged before the output is handed back.
+    fn run_local(&self, run: &mut Run<'_>, given: &[u8], input: Vec<u8>) -> Result<Vec<u8>> {
+        let operation = run.operation;
+        // One nonce and one clock reading for the whole derivation.
+        let mut vars = compute_vars(run.now);
+        vars.insert(Var::Input, input);
+        for step in &operation.steps {
+            match step {
+                Step::Compute(compute) => run.compute(compute, vars.clone())?,
+                Step::Return(ret) => {
+                    let template = ret.template.as_deref().ok_or_else(|| operation.unknown())?;
+                    let template = Template::parse(template)?;
+                    let ctx = Context {
+                        fields: &run.fields,
+                        temps: &run.captured.temps,
+                        vars,
+                        unix: run.now / 1000,
+                        budget: &run.budget,
+                    };
+                    let output = template.render(&ctx)?;
+                    let detail = Detail::Derive {
+                        input_sha256: Sha256::digest(given).into(),
+                        input_len: given.len() as u64,
+                    };
+                    let event = Event::Derive {
+                        operation: run.name.to_string(),
+                        generation: run.record.generation,
+                        detail: detail.seal(&run.user_key, &run.record.owner, &run.record.id)?,
+                    };
+                    self.lock().commit(run.now, run.who, event)?;
+                    return Ok(output.to_vec());
+                }
+                Step::Open(_)
+                | Step::Send(_)
+                | Step::Receive(_)
+                | Step::Repeat(_)
+                | Step::If(_) => return Err(operation.unknown()),
+            }
+        }
+        Err(operation.unknown())
+    }
+
+    /// Records how an act ended. A failure halts the log, so the next act fails; the result of
+    /// this one is already decided.
+    fn done(&self, now: u64, who: (&str, &str, &str), of: u64, status: Option<u16>, ok: bool) {
+        let _ = self.lock().commit(now, who, Event::Done { of, status, ok });
+    }
+
+    /// Logs the fields an operation changed and seals them into a new record.
+    fn persist(&self, run: &mut Run<'_>, updated: &mut Option<Record>) -> Result<()> {
+        if run.captured.changed.is_empty() {
+            return Ok(());
+        }
+        let record = run.record;
+        let current = updated.as_ref().unwrap_or(record);
+        let generation = current
+            .generation
+            .checked_add(1)
+            .ok_or(Error::RecordInvalid)?;
+        let next = current.reseal(&run.user_key, &run.fields)?;
+        let event = Event::Update {
+            operation: run.name.to_string(),
+            generation,
+            fields: core::mem::take(&mut run.captured.changed),
+        };
+        let mut state = self.lock();
+        state.commit(run.now, run.who, event)?;
+        state.raise(&record.owner, &record.id, generation);
+        *updated = Some(next);
+        Ok(())
+    }
+}
+
+/// A transport for operations with no connection: they send nothing.
+struct NoTransport;
+
+impl Transport for NoTransport {
+    fn send(
+        &mut self,
+        _: &Destination,
+        _: Option<&ClientIdentity>,
+        _: &[u8],
+        _: usize,
     ) -> Result<Vec<u8>> {
-        if input.len() > MAX_INPUT {
-            return Err(Error::RequestInvalid {
-                rule: "input larger than 1 MiB",
+        Err(Error::transport(crate::error::TransportKind::Closed, false))
+    }
+}
+
+/// Checks the caller's side of a stream call before anything happens: the destination, the
+/// bounds of the exchanges, and each send against the patterns the `return` relays.
+fn check_exchanges(
+    operation: &Operation,
+    destination: &Destination,
+    exchanges: &[CallerExchange],
+) -> Result<()> {
+    if !operation.allows_destination(destination) {
+        return Err(destination.denied());
+    }
+    let exchanges_ok = exchanges.len() <= MAX_EXCHANGES
+        && exchanges.iter().all(|e| {
+            e.send.len() <= MAX_BODY
+                && !e.until.is_empty()
+                && e.until.len() <= MAX_DELIMITERS
+                && e.until
+                    .iter()
+                    .all(|u| !u.is_empty() && u.len() <= MAX_DELIMITER)
+        });
+    if !exchanges_ok {
+        return Err(Error::RequestInvalid {
+            rule: "exchanges: at most 64, sends of at most 8 MiB, 1 to 8 delimiters",
+        });
+    }
+    if exchanges.is_empty() {
+        return Ok(());
+    }
+    let Some(relay) = operation.returns().and_then(|r| r.relay.as_ref()) else {
+        return Err(Error::RequestInvalid {
+            rule: "the operation relays no exchange of the caller",
+        });
+    };
+    let patterns = relay
+        .sends
+        .iter()
+        .map(|p| crate::extract::compile_whole(p).ok_or_else(|| operation.unknown()))
+        .collect::<Result<Vec<_>>>()?;
+    if exchanges
+        .iter()
+        .any(|e| !patterns.iter().any(|p| p.is_match(&e.send)))
+    {
+        return Err(Error::RequestInvalid {
+            rule: "a send of the caller matches no pattern the operation relays",
+        });
+    }
+    Ok(())
+}
+
+/// The state of one operation while its steps run.
+struct Run<'a> {
+    record: &'a Record,
+    name: &'a str,
+    who: (&'a str, &'a str, &'a str),
+    policy: &'a Policy,
+    operation: &'a Operation,
+    kinds: Kinds<'a>,
+    fields: Fields,
+    user_key: Arc<UserKey>,
+    budget: Budget,
+    captured: Captured,
+    /// Rendered values that hold a secret in reversible form.
+    tainted: Vec<Zeroizing<Vec<u8>>>,
+    now: u64,
+}
+
+impl Run<'_> {
+    /// Renders a `compute` step into a temporary value.
+    fn compute(&mut self, compute: &Compute, vars: HashMap<Var, Vec<u8>>) -> Result<()> {
+        let template = Template::parse(&compute.template)?;
+        let ctx = Context {
+            fields: &self.fields,
+            temps: &self.captured.temps,
+            vars,
+            unix: self.now / 1000,
+            budget: &self.budget,
+        };
+        let value = template.render(&ctx)?;
+        if template.tainted(&|n| self.kinds.kind(n)) {
+            self.tainted.push(value.clone());
+        }
+        self.captured.temps_len = self.captured.temps_len.saturating_add(value.len());
+        if self.captured.temps_len > MAX_TEMPS {
+            return Err(Error::Budget {
+                what: "captured values",
             });
         }
-        let now = self.clock.now_ms();
-        let (_, operation_ref, checked) =
-            self.check_call(record, operation, auth, &Payload::Derive(input), now)?;
-        let Operation::Derive { template, .. } = operation_ref else {
-            return Err(operation_ref.unknown());
-        };
-        let template = Template::parse(template)?;
-        let fields = self.open(record, &checked.policy_owner)?;
-        let temps = Temps::new();
-        let mut vars = stream_vars("", now);
-        vars.remove(&Var::Host);
-        vars.insert(Var::Input, input.to_vec());
-        let budget = Budget::default();
+        self.captured.temps.insert(compute.into.clone(), value);
+        Ok(())
+    }
+
+    /// Renders the template of a `send` on a stream and writes it.
+    fn stream_send(&mut self, send: &Send, host: &str, stream: &mut dyn Stream) -> Result<()> {
+        let text = send
+            .template
+            .as_deref()
+            .ok_or_else(|| self.operation.unknown())?;
+        let template = Template::parse(text)?;
         let ctx = Context {
-            fields: &fields,
-            temps: &temps,
-            vars,
-            unix: now / 1000,
-            budget: &budget,
+            fields: &self.fields,
+            temps: &self.captured.temps,
+            vars: stream_vars(host, self.now),
+            unix: self.now / 1000,
+            budget: &self.budget,
         };
-        let output = template.render(&ctx)?;
-        let detail = Detail::Derive {
-            input_sha256: Sha256::digest(input).into(),
-            input_len: input.len() as u64,
-        };
-        let event = Event::Derive {
-            operation: operation.to_string(),
-            generation: record.generation,
-            detail: detail.seal(&checked.policy_owner, &record.owner, &record.id)?,
-        };
-        self.lock()
-            .commit(now, (&record.owner, &record.id, &checked.caller), event)?;
-        Ok(output.to_vec())
+        let bytes = template.render(&ctx)?;
+        if template.tainted(&|n| self.kinds.kind(n)) {
+            self.tainted.push(bytes.clone());
+        }
+        stream.write(&bytes)
     }
 }

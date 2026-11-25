@@ -84,7 +84,7 @@ sequenceDiagram
     C->>N: 记录 + 操作 + 请求 + Authorization
     N->>N: 授权是否有效？记录是否已固定且未过期？<br/>策略是否由已知设备签名？
     N->>N: 调用方是否列在该操作下？签名、<br/>±5 分钟、一次性 nonce、速率限制
-    N->>N: 请求是否在操作范围内 (主机、方法、<br/>路径前缀、头部)，解密，在预算内渲染
+    N->>N: 请求是否在操作范围内 (主机、方法、<br/>路径模板、查询、头部)，解密，在预算内渲染
     N->>L: 条目 (seq、前一哈希、所有者链、调用方、封装的详情)
     L-->>N: 已确认
     N->>D: 注入了密钥的 TLS 请求
@@ -144,29 +144,43 @@ let outcome = node.run(&call, &mut TlsTransport::new());
      "operations": ["refresh", "call"], "limit": {"count": 100, "window_ms": 60000}}
   ],
   "operations": [
-    {"kind": "http", "name": "refresh",
-     "destinations": [{"host": "auth.example.com", "port": 443}],
-     "steps": [{
-       "request": {"from": "fixed", "method": "POST", "path": "/oauth/token"},
+    {"name": "refresh", "steps": [
+      {"do": "open", "connection": "https",
+       "destinations": [{"host": "auth.example.com", "port": 443}]},
+      {"do": "send", "request": {"from": "fixed", "method": "POST", "path": "/oauth/token"},
        "inject": [{"target": {"kind": "body"},
-                   "template": "grant_type=refresh_token&refresh_token={{pct(refresh_token)}}&client_id={{pct(client_id)}}&client_secret={{pct(client_secret)}}"}],
-       "capture": [{"source": {"from": "json", "pointer": "/access_token"},
-                    "into": {"kind": "field", "name": "access_token"}}]
-     }]},
-    {"kind": "http", "name": "call",
-     "destinations": [{"host": "*.api.example.com", "port": 443}],
-     "methods": ["GET", "POST"], "paths": ["/v1/"], "caller_headers": ["Accept"],
-     "steps": [{"inject": [{"target": {"kind": "header", "name": "Authorization"},
-                            "template": "Bearer {{access_token}}"}]}]}
+                   "template": "grant_type=refresh_token&refresh_token={{pct(refresh_token)}}&client_id={{pct(client_id)}}&client_secret={{pct(client_secret)}}"}]},
+      {"do": "receive", "capture": [{"source": {"from": "json", "pointer": "/access_token"},
+                                     "into": {"kind": "field", "name": "access_token"}}]},
+      {"do": "return", "response": {"body": {"json": ["/expires_in"]}}}
+    ]},
+    {"name": "call", "steps": [
+      {"do": "open", "connection": "https",
+       "destinations": [{"host": "*.api.example.com", "port": 443}]},
+      {"do": "send",
+       "request": {"from": "caller", "methods": ["GET", "POST"],
+                   "paths": ["/v1/invoices", "/v1/invoices/*"], "headers": ["Accept"],
+                   "query": [{"name": "status", "one_of": ["open", "paid"]},
+                             {"name": "limit", "min": "1", "max": "100"}]},
+       "inject": [{"target": {"kind": "header", "name": "Authorization"},
+                   "template": "Bearer {{access_token}}"}]},
+      {"do": "return", "response": {"headers": ["Content-Type"], "body": "all"}}
+    ]}
   ]
 }
 ```
 
-| 操作 | 作用 |
+一个操作是一条连接上的**步骤**列表：`open`（HTTPS、TLS 流，或无连接）、`send`、`receive`（含捕获）、
+`compute`（把模板的结果放入后续步骤可读的名字），以及决定返回给调用方什么的 `return`。
+
+| 连接 | 作用 |
 | --- | --- |
-| `http` | 1 到 8 个步骤。每一步发送调用方的请求或策略固定的请求，注入值，并把响应中的值捕获到一个字段（产生新的记录代数）或供后续步骤使用的临时值中。只有最后一个响应会返回。 |
-| `stream` | 在一条 TLS 连接上运行 send/expect 脚本（IMAP、SMTP、行协议），之后调用方在已认证的连接上进行交互。 |
-| `derive` | 模板的输出返回给调用方：签名、HMAC、TOTP 码、JWT。 |
+| `https` | 1 到 8 个请求。每个 `send` 发送在**契约**（方法、路径模板、请求头、查询参数及其取值）之内的调用方请求，或策略固定的请求，并注入值；`receive` 从其响应中捕获值，放入字段（产生新的记录代数）或临时值。`return` 只返回状态码以及列出的请求头和 JSON 成员（全部返回用 `"body": "all"`）。 |
+| `tls` | 在一条 TLS 连接上运行 send/receive 脚本（IMAP、SMTP、行协议）；之后只进行其 send 与 `return` 所转发模式相匹配的调用方交互。 |
+| 无 | `return` 渲染模板并返回给调用方：签名、HMAC、TOTP 码、JWT。调用方的 `$input` 先按操作的 `input` 模式检查（原始字节、JSON 或 RLP：固定成员、允许的值、数值范围、由节点写入的时间）。 |
+
+步骤之前格式（`"kind": "http" | "stream" | "derive"`）的策略用 `credentials policy upgrade` 转换；
+结果会收窄调用方得到的内容并给出说明，且必须重新签名。
 
 值通过**模板**（templates）注入：`{{ hex(hmac_sha256(secret, $query)) }}`。该语言支持
 名称、变量、字符串字面量、函数调用和 `+`；没有分支或循环。在策略签名之前，每个模板都会被分析：
@@ -180,12 +194,13 @@ let outcome = node.run(&call, &mut TlsTransport::new());
   RSA 加密的公钥绝不来自调用方。
 - **可猜测字段。** 派生只能通过 `len` 依赖标记为 `guessable` 的字段（PIN、密码）：
   它的哈希、签名、MAC 或密文都能让调用方验证猜测。
+- **步骤。** `compute` 步骤的名字与其模板的性质完全相同，因此在步骤之间传递的值与内联写出时一样受到分析。
 - **预算。** 一个操作最多可渲染 128 MiB、1,000,000 轮 PBKDF2，签名与密钥协商合计 32 次。
 
 | 凭据 | 策略 |
 | --- | --- |
 | Bearer 令牌、Cookie、API 密钥 | 一个头部模板 |
-| Telegram 机器人 | `/bot{token}/getMe` 中的 `path_param` `{{token}}` |
+| Telegram 机器人 | 路径模板 `/{token}/getMe` 中的 `path_param` `token` = `bot{{token}}` |
 | 交易所 HMAC 签名 | 查询参数 `signature` = `{{ hex(hmac_sha256(secret, $query)) }}` |
 | AWS SigV4 | 两个头部模板（`time`、`canonical_query`、嵌套的 `hmac_sha256`）；有测试复现官方向量 |
 | HTTP Digest | 第 1 步用 `header_param` 捕获 `realm`/`nonce`；第 2 步用 `md5` 应答；RFC 2617 向量 |
@@ -193,12 +208,12 @@ let outcome = node.run(&call, &mut TlsTransport::new());
 | 会话登录 | `fixed` POST /login，`cookie` 捕获到临时值，在调用方的请求上加 `Cookie` |
 | 带 CSRF 令牌的登录表单 | `html` 捕获 `input[name=_csrf]`（`value`）到临时值，然后 `fixed` POST /login |
 | 在浏览器中加密的密码 | `ecdh("p256", server_key)` + `sha256` + `aes_cbc_encrypt`，加 `u8(len(…))` 长度前缀和 `ecdh_public("p256")`；或用从服务器捕获的公钥 `rsa_encrypt_oaep("sha256", key, password)` |
-| JWT RS256 | derive `b64urlraw(header) + "." + b64urlraw($input) + "." + b64urlraw(rsa_sign_pkcs1_sha256(pem(key), …))` |
-| 由策略限定有效期的 JWT | 在 derive 中用 `json_set_number(..., "exp", add($unix, "300"))` 和 `rsa_sign_pkcs1("sha512", pem(key), …)`：`iat`/`exp` 由节点填入 |
-| 以太坊 | derive `{{ k256_sign_recoverable(key, keccak256($input)) }}` |
-| IMAP | stream：expect 问候，send `a1 LOGIN {{user}} {{password}}`，expect，转发 |
-| TOTP | derive `{{ totp(b32decode(seed)) }}` |
-| 双向 TLS | `"identity": {"cert": "{{cert}}", "key": "{{key}}"}` |
+| JWT RS256 | 无连接：`b64urlraw(header) + "." + b64urlraw($input) + "." + b64urlraw(rsa_sign_pkcs1_sha256(pem(key), …))` |
+| 由策略限定有效期的 JWT | 固定 `iss`/`aud`、由节点 `set` `iat`/`exp` 的 `json` input 模式；或在模板中用 `json_set_number(..., "exp", add($unix, "300"))` |
+| 以太坊 | 无连接：`{{ k256_sign_recoverable(key, keccak256($input)) }}`，配合固定收款地址、链和 data 并限制金额的 `rlp` input 模式 |
+| IMAP | tls：receive 问候，send `a1 LOGIN {{user}} {{password}}`，receive，只转发策略列出的命令 |
+| TOTP | 无连接：`{{ totp(b32decode(seed)) }}` |
+| 双向 TLS | `open` 的 `"identity": {"cert": "{{cert}}", "key": "{{key}}"}` |
 
 ## 记录、代数与回滚
 

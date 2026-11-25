@@ -6,9 +6,11 @@
 //!     cargo run -p transport --example imap_stream
 //! ```
 //!
-//! A stream operation is a send/expect script on one TLS connection (port 993 here): wait for
+//! A TLS operation is a send/receive script on one TLS connection (port 993 here): wait for
 //! the greeting, send `a1 LOGIN` with the values of the record, read the tagged answer. Then
-//! the caller's exchanges run on the same connection (`a2 NOOP`, `a3 LOGOUT`); each read is
+//! the caller's exchanges run on the same connection (`a2 NOOP`, `a3 LOGOUT`): its `return`
+//! relays only sends that match one of its patterns whole, here `NOOP`, `LOGOUT` and
+//! `CAPABILITY`, so the caller cannot use the session for anything else. Each read is
 //! checked for the password before it goes back. The script does not quote the values, so a
 //! user name or password with spaces or quotes needs a different template.
 //!
@@ -22,7 +24,7 @@ use engine::grant::GrantTerms;
 use engine::keys::{CallerKey, DeviceKey, NodeKey, UserKey};
 use engine::log::MemorySink;
 use engine::node::{CallerExchange, Node, SystemClock};
-use engine::policy::{Caller, Destination, Exchange, FieldSpec, Operation, Policy};
+use engine::policy::{Caller, Destination, FieldSpec, Operation, Policy, Receive, Return, Send};
 use engine::record::Record;
 use transport::TlsTransport;
 
@@ -33,10 +35,11 @@ fn policy(host: &str, app: &CallerKey) -> Policy {
         .with_field(FieldSpec::public("user"))
         .with_field(FieldSpec::secret("password"))
         .with_operation(
-            Operation::stream("imap", Destination::new(host, PORT))
-                .exchange(Exchange::expect(["\r\n"]))
-                .exchange(Exchange::send("a1 LOGIN {{user}} {{password}}\r\n"))
-                .exchange(Exchange::expect(["a1 OK", "a1 NO", "a1 BAD"])),
+            Operation::tls("imap", Destination::new(host, PORT))
+                .then(Receive::until(["\r\n"]))
+                .then(Send::write("a1 LOGIN {{user}} {{password}}\r\n"))
+                .then(Receive::until(["a1 OK", "a1 NO", "a1 BAD"]))
+                .then(Return::relay([r"a[0-9]{1,4} (NOOP|LOGOUT|CAPABILITY)\r\n"])),
         )
         .with_caller(Caller::new("app", app.public(), ["imap"]))
 }

@@ -86,7 +86,7 @@ sequenceDiagram
     C->>N: record + operation + request + Authorization
     N->>N: grant in force? record pinned and not stale?<br/>policy signed by a known device?
     N->>N: caller listed for the operation? signature,<br/>±5 min, one-time nonce, rate limit
-    N->>N: request within the operation (host, method,<br/>path prefix, headers), decrypt, render within budget
+    N->>N: request within the contract (host, method,<br/>path template, query, headers), decrypt, render within budget
     N->>L: entry (seq, prev hash, owner chain, caller, sealed detail)
     L-->>N: confirmed
     N->>D: TLS request with the injected secret
@@ -147,29 +147,45 @@ reference is in [docs/policy.md](docs/policy.md).
      "operations": ["refresh", "call"], "limit": {"count": 100, "window_ms": 60000}}
   ],
   "operations": [
-    {"kind": "http", "name": "refresh",
-     "destinations": [{"host": "auth.example.com", "port": 443}],
-     "steps": [{
-       "request": {"from": "fixed", "method": "POST", "path": "/oauth/token"},
+    {"name": "refresh", "steps": [
+      {"do": "open", "connection": "https",
+       "destinations": [{"host": "auth.example.com", "port": 443}]},
+      {"do": "send", "request": {"from": "fixed", "method": "POST", "path": "/oauth/token"},
        "inject": [{"target": {"kind": "body"},
-                   "template": "grant_type=refresh_token&refresh_token={{pct(refresh_token)}}&client_id={{pct(client_id)}}&client_secret={{pct(client_secret)}}"}],
-       "capture": [{"source": {"from": "json", "pointer": "/access_token"},
-                    "into": {"kind": "field", "name": "access_token"}}]
-     }]},
-    {"kind": "http", "name": "call",
-     "destinations": [{"host": "*.api.example.com", "port": 443}],
-     "methods": ["GET", "POST"], "paths": ["/v1/"], "caller_headers": ["Accept"],
-     "steps": [{"inject": [{"target": {"kind": "header", "name": "Authorization"},
-                            "template": "Bearer {{access_token}}"}]}]}
+                   "template": "grant_type=refresh_token&refresh_token={{pct(refresh_token)}}&client_id={{pct(client_id)}}&client_secret={{pct(client_secret)}}"}]},
+      {"do": "receive", "capture": [{"source": {"from": "json", "pointer": "/access_token"},
+                                     "into": {"kind": "field", "name": "access_token"}}]},
+      {"do": "return", "response": {"body": {"json": ["/expires_in"]}}}
+    ]},
+    {"name": "call", "steps": [
+      {"do": "open", "connection": "https",
+       "destinations": [{"host": "*.api.example.com", "port": 443}]},
+      {"do": "send",
+       "request": {"from": "caller", "methods": ["GET", "POST"],
+                   "paths": ["/v1/invoices", "/v1/invoices/*"], "headers": ["Accept"],
+                   "query": [{"name": "status", "one_of": ["open", "paid"]},
+                             {"name": "limit", "min": "1", "max": "100"}]},
+       "inject": [{"target": {"kind": "header", "name": "Authorization"},
+                   "template": "Bearer {{access_token}}"}]},
+      {"do": "return", "response": {"headers": ["Content-Type"], "body": "all"}}
+    ]}
   ]
 }
 ```
 
-| Operation | What it does |
+An operation is a list of **steps** over one connection: `open` (HTTPS, a TLS stream, or
+none), `send`, `receive` (with captures), `compute` (a template into a name later steps
+read), and `return`, which says what goes back to the caller.
+
+| Connection | What it does |
 | --- | --- |
-| `http` | 1 to 8 steps. Each sends the caller's request or a request the policy fixes, injects values, and captures values from the response into a field (a new record generation) or a temporary value for later steps. Only the last response goes back. |
-| `stream` | A send/expect script on one TLS connection (IMAP, SMTP, line protocols), then the caller's exchanges on the authenticated connection. |
-| `derive` | A template's output goes back to the caller: signatures, HMACs, TOTP codes, JWTs. |
+| `https` | 1 to 8 requests. Each `send` carries the caller's request within a **contract** (methods, path templates, headers, query parameters and their values) or a request the policy fixes, with injected values; a `receive` captures from its response into a field (a new record generation) or a temporary value. `return` lets back the status and only the headers and JSON members it lists (`"body": "all"` for everything). |
+| `tls` | A send/receive script on one TLS connection (IMAP, SMTP, line protocols); then the caller's exchanges whose sends match the patterns `return` relays. |
+| none | `return` renders a template for the caller: signatures, HMACs, TOTP codes, JWTs. The caller's `$input` is checked first against the operation's `input` schema (raw bytes, JSON or RLP: fixed members, allowed values, numeric bounds, times the node sets). |
+
+Policies of the format before steps (`"kind": "http" | "stream" | "derive"`) convert with
+`credentials policy upgrade`; the result narrows what the caller gets, notes it, and must be
+signed again.
 
 Values go in through **templates**: `{{ hex(hmac_sha256(secret, $query)) }}`. The language
 has names, variables, string literals, function calls and `+`; no branches or loops. Before a
@@ -187,13 +203,15 @@ policy is signed, every template is analysed:
 - **Guessable fields.** A derivation may depend on a field marked `guessable` (PIN, password)
   only through `len`: a hash, signature, MAC or encryption of it would let the caller check
   guesses.
+- **Steps.** A `compute` step gives its name exactly the properties of its template, so a
+  value passed between steps is analysed as if it were written inline.
 - **Budgets.** One operation may render at most 128 MiB, 1,000,000 PBKDF2 rounds and 32
   signatures and key agreements.
 
 | Credential | Policy |
 | --- | --- |
 | Bearer token, cookie, API key | one header template |
-| Telegram bot | `path_param` `{{token}}` in `/bot{token}/getMe` |
+| Telegram bot | `path_param` `token` = `bot{{token}}` in the path template `/{token}/getMe` |
 | Exchange HMAC signature | query `signature` = `{{ hex(hmac_sha256(secret, $query)) }}` |
 | AWS SigV4 | two header templates (`time`, `canonical_query`, nested `hmac_sha256`); a test reproduces the official vector |
 | HTTP Digest | step 1 captures `realm`/`nonce` with `header_param`; step 2 answers with `md5`; RFC 2617 vector |
@@ -201,12 +219,12 @@ policy is signed, every template is analysed:
 | Session login | `fixed` POST /login, `cookie` capture into a temp, `Cookie` on the caller's request |
 | Login form with a CSRF token | `html` capture `input[name=_csrf]` (`value`) into a temp, then `fixed` POST /login |
 | Password encrypted in the browser | `ecdh("p256", server_key)` + `sha256` + `aes_cbc_encrypt` with `u8(len(…))` prefixes and `ecdh_public("p256")`; or `rsa_encrypt_oaep("sha256", key, password)` with the key captured from the server |
-| JWT RS256 | derive `b64urlraw(header) + "." + b64urlraw($input) + "." + b64urlraw(rsa_sign_pkcs1_sha256(pem(key), …))` |
-| JWT with a lifetime the policy bounds | derive with `json_set_number(..., "exp", add($unix, "300"))` and `rsa_sign_pkcs1("sha512", pem(key), …)`: the node sets `iat`/`exp` |
-| Ethereum | derive `{{ k256_sign_recoverable(key, keccak256($input)) }}` |
-| IMAP | stream: expect greeting, send `a1 LOGIN {{user}} {{password}}`, expect, relay |
-| TOTP | derive `{{ totp(b32decode(seed)) }}` |
-| Mutual TLS | `"identity": {"cert": "{{cert}}", "key": "{{key}}"}` |
+| JWT RS256 | no connection: `b64urlraw(header) + "." + b64urlraw($input) + "." + b64urlraw(rsa_sign_pkcs1_sha256(pem(key), …))` |
+| JWT with a lifetime the policy bounds | a `json` input schema that fixes `iss`/`aud` and has the node `set` `iat`/`exp`; or `json_set_number(..., "exp", add($unix, "300"))` in the template |
+| Ethereum | no connection: `{{ k256_sign_recoverable(key, keccak256($input)) }}` with an `rlp` input schema that fixes the recipient, chain and data and bounds the value |
+| IMAP | tls: receive the greeting, send `a1 LOGIN {{user}} {{password}}`, receive, relay the commands the policy lists |
+| TOTP | no connection: `{{ totp(b32decode(seed)) }}` |
+| Mutual TLS | `open` with `"identity": {"cert": "{{cert}}", "key": "{{key}}"}` |
 
 ## Records, generations and rollback
 

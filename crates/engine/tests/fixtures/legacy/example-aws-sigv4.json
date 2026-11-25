@@ -1,0 +1,15 @@
+{
+  "fields": [{"name": "access_key", "secret": false}, {"name": "secret_key", "secret": true}],
+  "callers": [{"name": "app", "key": "<caller public key>", "operations": ["sts"]}],
+  "operations": [
+    {"kind": "http", "name": "sts",
+     "destinations": [{"host": "sts.amazonaws.com", "port": 443}],
+     "methods": ["GET"], "paths": ["/"], "caller_headers": ["Accept"],
+     "steps": [{"inject": [
+       {"target": {"kind": "header", "name": "X-Amz-Date"},
+        "template": "{{ time($unix, \"%Y%m%dT%H%M%SZ\") }}"},
+       {"target": {"kind": "header", "name": "Authorization"},
+        "template": "AWS4-HMAC-SHA256 Credential={{access_key}}/{{ time($unix, \"%Y%m%d\") }}/us-east-1/sts/aws4_request, SignedHeaders=host;x-amz-date, Signature={{ hex(hmac_sha256(hmac_sha256(hmac_sha256(hmac_sha256(hmac_sha256(\"AWS4\" + secret_key, time($unix, \"%Y%m%d\")), \"us-east-1\"), \"sts\"), \"aws4_request\"), \"AWS4-HMAC-SHA256\\n\" + time($unix, \"%Y%m%dT%H%M%SZ\") + \"\\n\" + time($unix, \"%Y%m%d\") + \"/us-east-1/sts/aws4_request\\n\" + hex(sha256($method + \"\\n\" + $pathname + \"\\n\" + canonical_query($query) + \"\\nhost:\" + $host + \"\\nx-amz-date:\" + time($unix, \"%Y%m%dT%H%M%SZ\") + \"\\n\\nhost;x-amz-date\\n\" + hex(sha256($body)))))) }}"}
+     ]}]}
+  ]
+}

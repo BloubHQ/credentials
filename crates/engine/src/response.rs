@@ -9,7 +9,7 @@
 use serde_json::value::RawValue;
 use zeroize::{Zeroize, Zeroizing};
 
-use crate::policy::Source;
+use crate::policy::{BodyProjection, Projection, Source};
 use crate::{Error, Result};
 
 /// Longest response the engine reads, in bytes.
@@ -295,6 +295,26 @@ impl Http {
         limit(value)
     }
 
+    /// The parts of the response `projection` lets back to the caller: the status, the
+    /// headers it names and the body as it says (nothing without a projection or a body
+    /// rule).
+    pub fn project(
+        mut self,
+        projection: Option<&Projection>,
+        log_seqs: Vec<u64>,
+    ) -> Result<Response> {
+        let headers = projection.map_or(&[][..], |p| p.headers.as_slice());
+        self.headers
+            .retain(|(n, _)| headers.iter().any(|h| h.eq_ignore_ascii_case(n)));
+        let body = match projection.and_then(|p| p.body.as_ref()) {
+            None => Zeroizing::new(Vec::new()),
+            Some(BodyProjection::All) => core::mem::take(&mut self.body),
+            Some(BodyProjection::Json(pointers)) => project_json(&self.body, pointers)?,
+        };
+        self.body = body;
+        Ok(self.into_response(log_seqs))
+    }
+
     /// The parsed response, for the caller.
     pub fn into_response(mut self, log_seqs: Vec<u64>) -> Response {
         Response {
@@ -475,6 +495,76 @@ impl<'de> serde::de::Visitor<'de> for Pick<'_> {
         }
         Ok(found)
     }
+}
+
+/// The JSON text of the value at `tokens`, or of every value a `*` token reaches (as an
+/// array), or `None` when nothing is there.
+fn resolve(raw: &RawValue, tokens: &[String]) -> Result<Option<Zeroizing<String>>> {
+    use serde::Deserializer as _;
+    let bad = || invalid("body is not JSON");
+    let Some((token, rest)) = tokens.split_first() else {
+        return Ok(Some(Zeroizing::new(raw.get().trim().to_string())));
+    };
+    let text = raw.get().trim_start();
+    if token == "*" {
+        if !text.starts_with('[') {
+            return Ok(None);
+        }
+        let items: Vec<&RawValue> = serde_json::from_str(text).map_err(|_| bad())?;
+        let mut out = Zeroizing::new(String::from("["));
+        let mut first = true;
+        for item in items {
+            if let Some(value) = resolve(item, rest)? {
+                if !first {
+                    out.push(',');
+                }
+                first = false;
+                out.push_str(&value);
+                if out.len() > MAX_RESPONSE {
+                    return Err(invalid("projected body too large"));
+                }
+            }
+        }
+        out.push(']');
+        return Ok(Some(out));
+    }
+    if !text.starts_with('{') && !text.starts_with('[') {
+        return Ok(None);
+    }
+    let mut de = serde_json::Deserializer::from_str(text);
+    match de.deserialize_any(Pick(token)).map_err(|_| bad())? {
+        Some(next) => resolve(next, rest),
+        None => Ok(None),
+    }
+}
+
+/// A JSON object from each pointer to the value it reaches; pointers that reach nothing are
+/// left out.
+fn project_json(body: &[u8], pointers: &[String]) -> Result<Zeroizing<Vec<u8>>> {
+    let root: &RawValue = serde_json::from_slice(body).map_err(|_| invalid("body is not JSON"))?;
+    let mut out = Zeroizing::new(String::from("{"));
+    let mut first = true;
+    for pointer in pointers {
+        let tokens: Vec<String> = pointer
+            .split('/')
+            .skip(1)
+            .map(|t| t.replace("~1", "/").replace("~0", "~"))
+            .collect();
+        if let Some(value) = resolve(root, &tokens)? {
+            if !first {
+                out.push(',');
+            }
+            first = false;
+            out.push_str(&serde_json::to_string(pointer).map_err(|_| Error::Encoding)?);
+            out.push(':');
+            out.push_str(&value);
+            if out.len() > MAX_RESPONSE {
+                return Err(invalid("projected body too large"));
+            }
+        }
+    }
+    out.push('}');
+    Ok(Zeroizing::new(out.as_bytes().to_vec()))
 }
 
 /// Follows a JSON pointer one level at a time over borrowed raw values. Strings come back

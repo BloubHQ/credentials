@@ -12,10 +12,7 @@ use getrandom::rand_core::{Rng as _, UnwrapErr};
 use zeroize::Zeroizing;
 
 use crate::fields::Fields;
-use crate::policy::{
-    Destination, Method, Operation, Policy, RESERVED_HEADERS, Step, StepRequest, Target,
-    check_path, is_token, under,
-};
+use crate::policy::{Destination, Kinds, Method, Operation, Send, StepRequest, Target};
 use crate::primitives::{hex, pct};
 use crate::secret::Secret;
 use crate::template::{Budget, Context, Template, Temps, Var};
@@ -65,72 +62,29 @@ impl Request {
         }
     }
 
-    /// Checks the request against an HTTP operation: destination, method, path, the path
-    /// parameters its steps fill, and the headers.
+    /// Checks the request against an HTTPS operation: the destination against its
+    /// connection, and the method, path, path parameters, query, headers and body against the
+    /// contract of every `send` that takes the caller's request.
     pub fn validate(&self, operation: &Operation) -> Result<()> {
-        let Operation::Http {
-            methods,
-            paths,
-            caller_headers,
-            steps,
-            ..
-        } = operation
-        else {
-            return Err(operation.unknown());
-        };
+        if !operation.takes_request() {
+            return Err(invalid("the operation takes no request"));
+        }
         if !operation.allows_destination(&self.destination) {
             return Err(self.destination.denied());
         }
-        if !methods.contains(&self.method) {
-            return Err(Error::MethodDenied {
-                method: self.method.as_str().to_string(),
+        for (contract, send) in operation.caller_sends() {
+            let names = |pick: fn(&Target) -> Option<&str>| -> Vec<&str> {
+                send.inject.iter().filter_map(|i| pick(&i.target)).collect()
+            };
+            let injected = names(|t| match t {
+                Target::Query { name } => Some(name),
+                _ => None,
             });
-        }
-        if !check_path(&self.path) {
-            return Err(invalid(
-                "path must start with / and hold no fragment, dot segment or encoded separator",
-            ));
-        }
-        if !paths.iter().any(|p| under(&self.path, p)) {
-            return Err(Error::PathDenied {
-                path: self.path.split('?').next().unwrap_or_default().to_string(),
+            let params = names(|t| match t {
+                Target::PathParam { name } => Some(name),
+                _ => None,
             });
-        }
-        let caller_steps = || steps.iter().filter(|s| s.request == StepRequest::Caller);
-        let params_ok = caller_steps()
-            .flat_map(|s| &s.inject)
-            .all(|i| match &i.target {
-                Target::PathParam { name } => {
-                    self.path.matches(&format!("{{{name}}}")).count() == 1
-                }
-                _ => true,
-            });
-        if !params_ok {
-            return Err(invalid("path must hold each path parameter once"));
-        }
-        if self.body.len() > MAX_BODY {
-            return Err(invalid("body too large"));
-        }
-        if self.headers.len() > MAX_HEADERS {
-            return Err(invalid("too many headers"));
-        }
-        let mut seen: Vec<String> = Vec::with_capacity(self.headers.len());
-        for (name, value) in &self.headers {
-            let lower = name.to_ascii_lowercase();
-            let value_ok = value.len() <= MAX_HEADER_VALUE
-                && value
-                    .bytes()
-                    .all(|b| b == b'\t' || (0x20..=0x7e).contains(&b));
-            if !is_token(name) || !value_ok || RESERVED_HEADERS.contains(&lower.as_str()) {
-                return Err(invalid("header name or value malformed or reserved"));
-            }
-            if !caller_headers.iter().any(|h| h.eq_ignore_ascii_case(name)) {
-                return Err(invalid("header not allowed by the operation"));
-            }
-            if seen.contains(&lower) {
-                return Err(invalid("header repeated"));
-            }
-            seen.push(lower);
+            contract.check(self, &injected, &params)?;
         }
         Ok(())
     }
@@ -146,14 +100,14 @@ pub(crate) struct Outbound<'a> {
 }
 
 impl<'a> Outbound<'a> {
-    /// The request of `step`: the caller request, or the one the policy fixes.
+    /// The request of `send`: the caller request, or the one the policy fixes.
     pub fn of(
-        step: &'a Step,
+        send: &'a Send,
         destinations: &'a [Destination],
         caller: Option<&'a Request>,
     ) -> Result<Self> {
-        Ok(match &step.request {
-            StepRequest::Caller => {
+        Ok(match &send.request {
+            Some(StepRequest::Caller(_)) => {
                 let request = caller.ok_or(invalid("the operation needs a request"))?;
                 Self {
                     method: request.method,
@@ -163,21 +117,22 @@ impl<'a> Outbound<'a> {
                     body: &request.body,
                 }
             }
-            StepRequest::Fixed {
+            Some(StepRequest::Fixed {
                 method,
                 path,
                 destination,
-            } => Self {
+            }) => Self {
                 method: *method,
                 destination: match (destination, destinations) {
                     (Some(d), _) => d,
                     (None, [only]) => only,
-                    _ => return Err(Error::policy("step", "fixed request without destination")),
+                    _ => return Err(Error::policy("send", "fixed request without destination")),
                 },
                 path,
                 headers: &[],
                 body: &[],
             },
+            None => return Err(Error::policy("send", "an HTTPS send needs a request")),
         })
     }
 
@@ -211,16 +166,15 @@ pub(crate) struct Built {
 
 /// What a build reads besides the step and its request.
 pub(crate) struct Inputs<'a> {
-    pub policy: &'a Policy,
-    pub operation: &'a Operation,
+    pub kinds: &'a Kinds<'a>,
     pub fields: &'a Fields,
     pub temps: &'a Temps,
     pub unix_ms: u64,
     pub budget: &'a Budget,
 }
 
-/// Renders the injections of `step` and builds the HTTP/1.1 bytes.
-pub(crate) fn build(step: &Step, request: &Outbound<'_>, inputs: &Inputs<'_>) -> Result<Built> {
+/// Renders the injections of `send` and builds the HTTP/1.1 bytes.
+pub(crate) fn build(send: &Send, request: &Outbound<'_>, inputs: &Inputs<'_>) -> Result<Built> {
     let ctx = Context {
         fields: inputs.fields,
         temps: inputs.temps,
@@ -228,7 +182,7 @@ pub(crate) fn build(step: &Step, request: &Outbound<'_>, inputs: &Inputs<'_>) ->
         unix: inputs.unix_ms / 1000,
         budget: inputs.budget,
     };
-    let kind = |name: &str| inputs.policy.name_kind(inputs.operation, name);
+    let kind = |name: &str| inputs.kinds.kind(name);
 
     let mut headers: Vec<(&str, Zeroizing<Vec<u8>>)> = Vec::new();
     let mut query: Vec<(&str, Zeroizing<Vec<u8>>)> = Vec::new();
@@ -236,7 +190,7 @@ pub(crate) fn build(step: &Step, request: &Outbound<'_>, inputs: &Inputs<'_>) ->
     let mut body: Option<Zeroizing<Vec<u8>>> = None;
     let mut tainted = Vec::new();
 
-    for injection in &step.inject {
+    for injection in &send.inject {
         let template = Template::parse(&injection.template)?;
         let value = template.render(&ctx)?;
         if template.tainted(&kind) && !matches!(injection.target, Target::Body) {

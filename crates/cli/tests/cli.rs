@@ -161,16 +161,40 @@ fn owner_node_and_caller_end_to_end() {
             .success()
     );
 
-    // Policy: one derive operation for one caller.
-    let policy = serde_json::json!({
+    // Policy: one operation with no connection for one caller, written in the format before
+    // the step language and converted.
+    let old = serde_json::json!({
         "fields": [{"name": "key", "secret": true}],
         "callers": [{"name": "app", "key": caller_pub.trim(), "operations": ["sign"]}],
         "operations": [{"kind": "derive", "name": "sign",
                         "template": "{{ hex(hmac_sha256(key, $input)) }}"}],
     });
-    std::fs::write(path("policy.json"), policy.to_string()).unwrap();
+    std::fs::write(path("old.json"), old.to_string()).unwrap();
+    assert!(
+        !run(&["policy", "check", s(&path("old.json"))])
+            .status
+            .success()
+    );
+    let upgrade = run(&[
+        "policy",
+        "upgrade",
+        s(&path("old.json")),
+        "--out",
+        s(&path("policy.json")),
+    ]);
+    assert!(upgrade.status.success());
+    let notes = String::from_utf8_lossy(&upgrade.stderr);
+    assert!(notes.contains("must be signed again"), "{notes}");
+    assert!(notes.contains("declare an input schema"), "{notes}");
     let summary = ok(&["policy", "check", s(&path("policy.json"))]);
-    assert!(summary.contains("operation sign: derive"), "{summary}");
+    assert!(
+        summary.contains("operation sign: no connection"),
+        "{summary}"
+    );
+    assert!(
+        summary.contains("! the caller's input is any bytes"),
+        "{summary}"
+    );
     ok(&[
         "policy",
         "sign",
@@ -184,7 +208,10 @@ fn owner_node_and_caller_end_to_end() {
     // A signed policy checks too; with --device its signature is verified.
     let summary = ok(&["policy", "check", s(&path("signed.json"))]);
     assert!(summary.contains("signature not checked"), "{summary}");
-    assert!(summary.contains("operation sign: derive"), "{summary}");
+    assert!(
+        summary.contains("operation sign: no connection"),
+        "{summary}"
+    );
     let summary = ok(&[
         "policy",
         "check",
@@ -525,7 +552,7 @@ fn policy_check_names_the_rule() {
         &policy,
         r#"{"fields": [{"name": "bad name", "secret": true}],
             "callers": [],
-            "operations": [{"kind": "derive", "name": "d", "template": "x"}]}"#,
+            "operations": [{"name": "d", "steps": [{"do": "return", "template": "x"}]}]}"#,
     )
     .unwrap();
     let out = run(&["policy", "check", s(&policy)]);

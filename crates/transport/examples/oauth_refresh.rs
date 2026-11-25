@@ -25,8 +25,8 @@ use engine::keys::{CallerKey, DeviceKey, NodeKey, UserKey};
 use engine::log::MemorySink;
 use engine::node::{Node, SystemClock};
 use engine::policy::{
-    Caller, Capture, Destination, FieldSpec, Injection, Method, Operation, Policy, Source, Step,
-    Store,
+    Caller, Capture, Destination, FieldSpec, Injection, Method, Operation, Policy, Receive, Return,
+    Send, Source, Store,
 };
 use engine::record::Record;
 use transport::TlsTransport;
@@ -41,25 +41,30 @@ fn policy(host: &str, path: &str, app: &CallerKey) -> Policy {
         .with_field(FieldSpec::secret("refresh_token"))
         .with_field(FieldSpec::secret("access_token").optional())
         .with_operation(
-            Operation::http("refresh", Destination::https(host)).step(
-                Step::fixed(Method::Post, path)
-                    .inject(Injection::header(
-                        "Content-Type",
-                        "application/x-www-form-urlencoded",
-                    ))
-                    .inject(Injection::body(BODY))
-                    .capture(Capture::new(
-                        Source::json("/access_token"),
-                        Store::field("access_token"),
-                    ))
-                    .capture(
-                        Capture::new(
-                            Source::json("/refresh_token"),
-                            Store::field("refresh_token"),
-                        )
-                        .optional(),
-                    ),
-            ),
+            Operation::https("refresh", Destination::https(host))
+                .then(
+                    Send::fixed(Method::Post, path)
+                        .inject(Injection::header(
+                            "Content-Type",
+                            "application/x-www-form-urlencoded",
+                        ))
+                        .inject(Injection::body(BODY)),
+                )
+                .then(
+                    Receive::response()
+                        .capture(Capture::new(
+                            Source::json("/access_token"),
+                            Store::field("access_token"),
+                        ))
+                        .capture(
+                            Capture::new(
+                                Source::json("/refresh_token"),
+                                Store::field("refresh_token"),
+                            )
+                            .optional(),
+                        ),
+                )
+                .then(Return::status().json("/expires_in")),
         )
         .with_caller(Caller::new("app", app.public(), ["refresh"]).limit(10, 60_000))
 }

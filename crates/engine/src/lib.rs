@@ -29,7 +29,7 @@
 //! use engine::keys::{CallerKey, DeviceKey, NodeKey, UserKey};
 //! use engine::log::{MemorySink, verify_chain};
 //! use engine::node::{Node, SystemClock};
-//! use engine::policy::{Caller, Destination, FieldSpec, Operation, Policy};
+//! use engine::policy::{Caller, Destination, FieldSpec, Input, Operation, Policy, RawInput};
 //! use engine::record::Record;
 //!
 //! /// A transport that sends nothing: a derivation needs none.
@@ -48,13 +48,17 @@
 //! }
 //!
 //! # fn main() -> Result<(), Box<dyn std::error::Error>> {
-//! // On the owner's device: the policy lets the caller "app" get an HMAC of its input.
+//! // On the owner's device: the policy lets the caller "app" get an HMAC of its input, of at
+//! // most 256 bytes.
 //! let device = DeviceKey::generate();
 //! let user_key = UserKey::generate();
 //! let app = CallerKey::generate();
 //! let policy = Policy::new()
 //!     .with_field(FieldSpec::secret("key"))
-//!     .with_operation(Operation::derive("mac", "{{ hex(hmac_sha256(key, $input)) }}"))
+//!     .with_operation(
+//!         Operation::derive("mac", "{{ hex(hmac_sha256(key, $input)) }}")
+//!             .input(Input::Raw(RawInput { max_len: Some(256), pattern: None })),
+//!     )
 //!     .with_caller(Caller::new("app", app.public(), ["mac"]));
 //! let mut values = Fields::new();
 //! values.insert("key", b"0123456789abcdef0123456789abcdef".to_vec())?;

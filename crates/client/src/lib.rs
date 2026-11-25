@@ -57,7 +57,7 @@ pub use error::{ClientError, Result};
 pub use keys::{KeyKind, generate_key, import_key, public_key};
 pub use owner::{
     Field, endorse_device, grant, pin_record, retire_device, revoke, rewrap_record, seal_record,
-    sign_policy,
+    sign_policy, upgrade_policy,
 };
 
 #[cfg(not(target_arch = "wasm32"))]

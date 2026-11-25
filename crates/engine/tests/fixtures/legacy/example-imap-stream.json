@@ -1,0 +1,13 @@
+{
+  "fields": [{"name": "user", "secret": false}, {"name": "password", "secret": true}],
+  "callers": [{"name": "app", "key": "<caller public key>", "operations": ["imap"]}],
+  "operations": [
+    {"kind": "stream", "name": "imap",
+     "destinations": [{"host": "imap.example.com", "port": 993}],
+     "script": [
+       {"kind": "expect", "until": ["\r\n"]},
+       {"kind": "send", "template": "a1 LOGIN {{user}} {{password}}\r\n"},
+       {"kind": "expect", "until": ["a1 OK", "a1 NO", "a1 BAD"]}
+     ]}
+  ]
+}

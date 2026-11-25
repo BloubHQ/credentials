@@ -17,11 +17,11 @@ set.
 
 | Example | What it shows | Environment | Network |
 | --- | --- | --- | --- |
-| [`github_user`](github_user.rs) | A bearer token injected into `GET https://api.github.com/user`; the log and the owner's details. The README quick start quotes this file. | `GITHUB_TOKEN` (required) | yes |
-| [`oauth_refresh`](oauth_refresh.rs) | A fixed `POST` to a token endpoint; `json` captures into fields; the new record from `Outcome::record` replaces the old one, which is then refused. | `OAUTH_HOST`, `OAUTH_PATH`, `OAUTH_CLIENT_ID`, `OAUTH_CLIENT_SECRET`, `OAUTH_REFRESH_TOKEN` | yes, when set |
-| [`aws_sigv4`](aws_sigv4.rs) | AWS Signature Version 4 as two header templates; calls STS `GetCallerIdentity`. Long-term keys only. | `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` | yes, when set |
-| [`jwt_derive`](jwt_derive.rs) | A derive operation that signs an RS256 JWT with a PEM key. | `JWT_KEY_FILE` (PKCS#8 PEM; default: the public test key in `crates/engine/tests/fixtures`), `JWT_CLAIMS` (optional JSON) | no |
-| [`imap_stream`](imap_stream.rs) | A stream operation: the node logs into IMAP (port 993), then the caller runs `NOOP` and `LOGOUT` on the connection. | `IMAP_HOST`, `IMAP_USER`, `IMAP_PASSWORD` | yes, when set |
+| [`github_user`](github_user.rs) | A bearer token injected into `GET https://api.github.com/user`; the caller gets the status and the `login` and `name` members only; the log and the owner's details. The README quick start quotes this file. | `GITHUB_TOKEN` (required) | yes |
+| [`oauth_refresh`](oauth_refresh.rs) | A fixed `POST` to a token endpoint (`send`), `json` captures into fields (`receive`), and only `expires_in` back (`return`); the new record from `Outcome::record` replaces the old one, which is then refused. | `OAUTH_HOST`, `OAUTH_PATH`, `OAUTH_CLIENT_ID`, `OAUTH_CLIENT_SECRET`, `OAUTH_REFRESH_TOKEN` | yes, when set |
+| [`aws_sigv4`](aws_sigv4.rs) | AWS Signature Version 4 as two header templates; calls STS `GetCallerIdentity`, with `Action` and `Version` pinned by query rules and the response projected to its result. Long-term keys only. | `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` | yes, when set |
+| [`jwt_derive`](jwt_derive.rs) | An operation with no connection that signs an RS256 JWT with a PEM key; a JSON input schema fixes `iss` and `aud` and the node sets `iat` and `exp`. | `JWT_KEY_FILE` (PKCS#8 PEM; default: the public test key in `crates/engine/tests/fixtures`), `JWT_CLAIMS` (optional JSON) | no |
+| [`imap_stream`](imap_stream.rs) | A TLS operation: the node logs into IMAP (port 993), then the caller runs `NOOP` and `LOGOUT`, the only commands its `return` relays. | `IMAP_HOST`, `IMAP_USER`, `IMAP_PASSWORD` | yes, when set |
 | [`node_restore`](node_restore.rs) | A checkpoint, a restart with `Node::restore_anchored`, a saved grant and an old call refused, a cut log refused, and the owner checking its own entries. | none | no |
 
 The owner can check the log of a node offline with `credentials verify` (see `--help`):

@@ -1,28 +1,39 @@
 # Policy reference
 
 A policy is JSON. Unknown members are refused everywhere, including next to a tag:
-`{"from": "caller", "path": "/x"}`, `{"from": "all", "junk": 1}` and
-`{"kind": "body", "junk": 1}` are errors, not the plain forms. A device signs it with
+`{"from": "fixed", "method": "GET", "path": "/x", "junk": 1}`, `{"do": "open", "junk": 1}`
+and `{"kind": "body", "junk": 1}` are errors, not the plain forms. A device signs it with
 `DeviceKey::sign_policy`, which also checks every rule below; an error names the place and
 the rule, for example `policy invalid at operations[0].steps[1].inject[2]: header must be a
 token, not reserved, and set once`. `Policy::summary()` prints a policy as one line per
-field, caller and operation, for the owner to read before signing.
+field, caller, operation and step, for the owner to read before signing; a line that starts
+with `!` marks something that widens what the caller may do.
 
 ```text
 Policy
 ├── fields:     [FieldSpec]          1–32
 ├── callers:    [Caller]             1–32
 └── operations: [Operation]          1–16
-    ├── http    → steps: [Step]      1–8
-    │             ├── request: caller | fixed
-    │             ├── inject:  [Injection]  ≤16
-    │             └── capture: [Capture]    ≤16
-    ├── stream  → script: [Exchange] 1–32
-    └── derive  → template
+    ├── name
+    ├── input:  raw | json | rlp     (operations with no connection)
+    └── steps:  [Step]               1–64
+        ├── open     connection: https | tls, destinations, identity
+        ├── send     https: request (caller contract | fixed) + inject;  tls: template
+        ├── receive  https: the response of the send;  tls: until a delimiter;  + capture
+        ├── compute  into a name, from a template
+        ├── return   https: response projection;  tls: relay;  none: template
+        ├── repeat   (syntax only, refused)
+        └── if       (syntax only, refused)
 ```
 
-Names (fields, callers, operations, temporaries, path parameters) are tokens: 1 to 64 of
-`A–Z a–z 0–9 - _`.
+Names (fields, callers, operations, temporaries, computed values, path parameters) are
+tokens: 1 to 64 of `A–Z a–z 0–9 - _`.
+
+This format replaces the operations of kind `http`, `stream` and `derive`. A policy of the
+old format is converted with `credentials policy upgrade old.json --out new.json` (or
+`engine::policy::legacy::upgrade_json`): see [Converting a policy](#converting-a-policy).
+A converted policy is a new policy and **must be signed again**; the signing domain changed
+too (`policy/v4`), so no old signature verifies.
 
 ## Fields
 
@@ -48,69 +59,159 @@ A record holds at most 32 fields and 16 MiB in all.
 
 Each call carries an `Authorization` that `CallerKey::authorize` makes: an Ed25519 signature
 over the node key, the owner, record id and generation, the operation, the SHA-256 of the
-request (or stream exchanges, or derivation input), the time and a random 16-byte nonce. A
-node accepts it within ±5 minutes of its clock, once. `limit` (optional) allows `count` calls
-(1 to 1,000,000) per `window_ms` for this caller on this record. The caller name is written
-to each log entry.
+request (or stream exchanges, or input), the time and a random 16-byte nonce. A node accepts
+it within ±5 minutes of its clock, once. `limit` (optional) allows `count` calls (1 to
+1,000,000) per `window_ms` for this caller on this record. The caller name is written to each
+log entry.
 
 ## Operations
 
-### `http`
+An operation is a name, an optional input schema and 1 to 64 steps over at most one
+connection:
 
 ```json
-{"kind": "http", "name": "call",
- "destinations": [{"host": "*.api.example.com", "port": 443}],
- "methods": ["GET", "POST"],
- "paths": ["/v1/"],
- "caller_headers": ["Accept", "Content-Type"],
- "identity": {"cert": "{{cert}}", "key": "{{key}}"},
- "steps": [ ... ]}
+{"name": "call",
+ "steps": [
+   {"do": "open", "connection": "https",
+    "destinations": [{"host": "*.api.example.com", "port": 443}],
+    "identity": {"cert": "{{cert}}", "key": "{{key}}"}},
+   {"do": "send",
+    "request": {"from": "caller", "methods": ["GET", "POST"],
+                "paths": ["/v1/repos/{repo}/issues", "/v1/repos/{repo}"],
+                "headers": ["Accept", "Content-Type"],
+                "query": [{"name": "page", "min": "1", "max": "100"},
+                          {"name": "state", "one_of": ["open", "closed"]}]},
+    "inject": [{"target": {"kind": "header", "name": "Authorization"},
+                "template": "Bearer {{access_token}}"},
+               {"target": {"kind": "path_param", "name": "repo"}, "template": "{{repo_id}}"}]},
+   {"do": "return", "response": {"headers": ["ETag"],
+                                 "body": {"json": ["/total", "/items/*/id", "/items/*/title"]}}}
+ ]}
 ```
+
+The kind of connection decides what `send`, `receive` and `return` mean:
+
+| Connection | `send` | `receive` | `return` | What the caller sends |
+| --- | --- | --- | --- | --- |
+| `https` | One HTTP/1.1 request on its own TLS connection: `request` and `inject`. | Reads the response of the `send` just before it, for its captures. | `response`: the projection of the last response. | A request within the contract of each `send` that takes it. |
+| `tls` | Writes a rendered `template`. | Reads up to and including the first of `until` (1 to 8 delimiters of 1 to 256 bytes). | `relay`: which of the caller's exchanges run after the steps. | Exchanges, each matched against `relay`. |
+| none (no `open`) | — | — | `template`: the output. | Its `input`, checked by the `input` schema. |
+
+Rules for every operation:
+
+- `open`, when present, is the first step; an operation opens one connection. Without it the
+  operation has no connection and only `compute` and `return` are allowed.
+- `return` is the last step, and every operation ends with one.
+- On HTTPS, a `receive` follows the `send` whose response it reads; at most 8 sends.
+- `compute` may appear anywhere after `open`.
+- `repeat` and `if` are refused for now (see [Loops and branches](#loops-and-branches)).
+
+New kinds of connection (WebSocket, SSH, database handshakes, a browser over CDP, a WASM
+`run`) fit the same steps: each kind says what its `send`, `receive` and `return` carry, and
+the template analysis stays the same. None is implemented yet.
+
+### `open`
 
 | Member | Meaning |
 | --- | --- |
-| `destinations` | 1–32 hosts and ports. `*.example.com` matches exactly one label (`eu.example.com`, not `example.com` or `a.b.example.com`); `*.` must be followed by at least two labels, so `*.com` is refused. Hosts are lowercase labels of `a–z 0–9 -` (at most 253 bytes), and the port is not 0. |
-| `methods` | Methods the caller may use. Required exactly when a step sends the caller's request. `GET HEAD POST PUT PATCH DELETE OPTIONS PROPFIND REPORT MKCOL COPY MOVE`. |
-| `paths` | 1–32 path prefixes the caller may use, matched at a segment boundary (`/v1/` allows `/v1/repos`, not `/v10`). A prefix starts with `/` and holds no query (`?`) and no dot segment. Required exactly when a step sends the caller's request. |
-| `caller_headers` | Headers the caller may set (none by default), each a token. A header an injection sets cannot also be a caller header. |
+| `connection` | `https` or `tls`. |
+| `destinations` | 1–32 hosts and ports. `*.example.com` matches exactly one label (`eu.example.com`, not `example.com` or `a.b.example.com`); `*.` must be followed by at least two labels, so `*.com` is refused. Hosts are lowercase labels of `a–z 0–9 -` (at most 253 bytes), and the port is not 0. The caller's request or stream names one of them. |
 | `identity` | Optional client certificate for mutual TLS: two templates, handed to the transport only. |
-| `steps` | 1–8 steps, sent in order. Only the last response goes back to the caller. |
 
-A caller's path must start with `/` and may not hold `.`/`..` segments, `%2e`, `%2f`,
-`%5c` or `\`. Nobody can set `Host`, `Content-Length`, `Transfer-Encoding`, `Connection`,
-`Upgrade`, `TE`, `Trailer`, `Expect`, `Accept-Encoding`, `Range`, `If-Range`, `Keep-Alive` or
-the method-override headers; the engine sends `Accept-Encoding: identity` and
-`Connection: close`.
+### `send` on HTTPS
 
-#### Steps
+`request` is `{"from": "caller", ...}`, the caller's request within a contract, or
+`{"from": "fixed", "method": "POST", "path": "/oauth/token", "destination": {...}}`, a
+request the policy fixes. A fixed request needs a `destination` unless the connection has
+exactly one concrete destination; its path is checked like a caller's (strict) and a
+placeholder in it is a whole segment.
+
+#### The caller contract
+
+| Member | Meaning |
+| --- | --- |
+| `methods` | Methods the caller may use (required): `GET HEAD POST PUT PATCH DELETE OPTIONS PROPFIND REPORT MKCOL COPY MOVE`. |
+| `paths` | 1–32 path **templates** the caller's path (without its query) must match exactly. |
+| `headers` | Headers the caller may set (none by default), each a token. A header an injection sets cannot also be a caller header. |
+| `query` | Query parameters the caller may send (none by default), at most 32. |
+| `encoded_percent` | `true` allows `%25` in the caller's path. Off by default (strict). |
+| `override_params` | `true` allows the method-override parameter names in the query and the body. Off by default. |
+
+A path template is segments separated by `/`:
+
+| Segment | Matches |
+| --- | --- |
+| a literal (`repos`, `{repo}`) | exactly that text. A `{name}` segment is a placeholder: it must be a path parameter the `send` injects, and the caller writes `{name}` there for the node to fill. |
+| `*` | one non-empty segment that holds no `{` or `}`. |
+| `**` (last segment only) | one or more remaining segments that hold no `{` or `}`. |
+
+`/v1/**` matches `/v1/` and `/v1/a/b`, not `/v1` or `/v10/a`; list `/v1` too when the bare
+path is allowed. Every template of a `send` holds each of its path parameters exactly once,
+as a whole segment. A placeholder anywhere else (inside a segment, in the query) is refused,
+in the policy and in the caller's request: the node fills `{name}` only where the owner put
+it.
+
+A query rule:
 
 ```json
-{"request": {"from": "fixed", "method": "POST", "path": "/oauth/token",
-             "destination": {"host": "auth.example.com", "port": 443}},
- "inject": [ ... ],
- "capture": [ ... ]}
+{"name": "page", "required": false, "equals": "1", "one_of": ["1", "2"],
+ "pattern": "[0-9]{1,3}", "min": "1", "max": "100"}
 ```
 
-`request` is `{"from": "caller"}` (the default) or `{"from": "fixed", ...}`. A fixed request
-needs a `destination` unless the operation has exactly one concrete destination. A caller
-request takes no other member.
+`name` is the name as the server reads it (percent-decoded; visible ASCII without
+`& = # + %`). Without `equals`, `one_of`, `pattern`, `min` or `max` any value is allowed, and
+the summary flags it. `pattern` is a regular expression the whole decoded value must match
+(the `regex` crate: linear time, at most 256 bytes). `min` and `max` are decimal integers of
+up to 80 digits; the value must then be one too. A value checked by a rule may not hold `+`
+(servers disagree whether it is a space): write `%20` or `%2B`. `required` makes the
+parameter mandatory.
+
+The node checks the caller's request before it writes a log entry or opens a connection:
+
+1. the destination is one of `open`, the method one of `methods`;
+2. the path: it starts with `/`, is visible ASCII, holds no `#` and no `\`; holds no `%2f`,
+   `%5c` or `%2e`; holds no `%25` unless `encoded_percent`; and no segment reads as `.` or
+   `..`, or holds a separator, as sent, with its `;` parameters stripped, after one decoding
+   and after a second decoding (also with `;` parameters stripped);
+3. placeholders: only whole segments that are path parameters of the `send`, each once, none
+   in the query;
+4. the pathname matches one of `paths`;
+5. the query: every parameter is listed, appears once, is not a name the `send` injects (case
+   and percent-encoding do not matter), is not a method-override name unless
+   `override_params`, and has an allowed value; every `required` one is present;
+6. the body: at most 8 MiB, and unless `override_params` it names no method-override
+   parameter as a form field (decoded), a top-level JSON member or a multipart part;
+7. the headers: listed, each once, values of visible ASCII and tabs.
+
+The method-override names are `_method`, `__method`, `_httpmethod`,
+`x-http-method-override`, `x-http-method` and `x-method-override` (any case). Nobody can set
+`Host`, `Content-Length`, `Transfer-Encoding`, `Connection`, `Upgrade`, `TE`, `Trailer`,
+`Expect`, `Accept-Encoding`, `Range`, `If-Range`, `Keep-Alive` or the method-override
+headers; the engine sends `Accept-Encoding: identity` and `Connection: close`.
 
 #### Injections
 
 | `target` | Effect |
 | --- | --- |
 | `{"kind": "header", "name": "Authorization"}` | Sets a header (once). |
-| `{"kind": "query", "name": "signature"}` | Appends a query parameter (the value is percent-encoded). The name must be a token. |
-| `{"kind": "path_param", "name": "token"}` | Replaces `{token}` in the path, which must hold it exactly once. |
-| `{"kind": "body"}` | Sets the body (at most one per step). |
+| `{"kind": "query", "name": "signature"}` | Appends a query parameter (the value is percent-encoded). The name must be a token, and the caller may not send it. |
+| `{"kind": "path_param", "name": "token"}` | Replaces the `{token}` segment of the path. |
+| `{"kind": "body"}` | Sets the body (at most one per send). |
 
-#### Captures
+### `send` on TLS
+
+`{"do": "send", "template": "a1 LOGIN {{user}} {{password}}\r\n"}` writes the rendered
+template.
+
+### `receive` and captures
 
 ```json
-{"source": {"from": "json", "pointer": "/access_token"},
- "into": {"kind": "field", "name": "access_token"},
- "optional": false}
+{"do": "receive", "capture": [{"source": {"from": "json", "pointer": "/access_token"},
+                               "into": {"kind": "field", "name": "access_token"},
+                               "optional": false}]}
 ```
+
+On TLS, `receive` also takes `until`: `{"do": "receive", "until": ["a1 OK", "a1 NO"]}`.
 
 | `source` | Reads |
 | --- | --- |
@@ -124,47 +225,164 @@ request takes no other member.
 | `{"from": "regex", "pattern": "sid=([a-z0-9]+)", "group": 1}` | A group of the first match of a regular expression of at most 256 bytes: group 1 when the pattern has a group, else the whole match, unless `group` says otherwise (it must exist). Linear time (the `regex` crate: no backreferences or look-around), ASCII classes, matched on bytes; the compiled program is at most 256 KiB and its cache 1 MiB. |
 | `{"from": "all"}` | The whole body. |
 
-`html` and `regex` read at most 2 MiB (`extract::MAX_SCAN`); a longer body fails the capture.
-A value with two parts, such as `key,value`, is split either by two `regex` captures or by one
-capture and `between(v, "", ",")` / `between(v, ",", "")` in the templates that read it.
+On TLS only `between`, `regex` and `all` apply. `html` and `regex` read at most 2 MiB
+(`extract::MAX_SCAN`); a longer body fails the capture. A value with two parts, such as
+`key,value`, is split either by two `regex` captures or by one capture and
+`between(v, "", ",")` / `between(v, ",", "")` in the templates that read it.
 
 | `into` | Effect |
 | --- | --- |
-| `{"kind": "field", "name": "..."}` | Replaces a **secret** field, from a **fixed** request or a stream script only. The node logs an `update` and returns a new record one generation later, even if a later step fails. A captured value that holds another secret field is refused. |
+| `{"kind": "field", "name": "..."}` | Replaces a **secret** field, from the response of a **fixed** request or a TLS read only. The node logs an `update` and returns a new record one generation later, even if a later step fails. A captured value that holds another secret field is refused. |
 | `{"kind": "temp", "name": "...", "secret": true}` | A temporary value later steps of the same operation may read (a session cookie, a challenge nonce). At most 1 MiB of temporaries per operation. |
 
-A captured value is at most 64 KiB. Captured secrets are replaced by `[redacted]` in the
-response before the caller sees it.
+A captured value is at most 64 KiB. Captured secrets are replaced by `[redacted]` in what the
+caller receives.
 
-### `stream`
-
-```json
-{"kind": "stream", "name": "imap",
- "destinations": [{"host": "imap.example.com", "port": 993}],
- "script": [
-   {"kind": "expect", "until": ["\r\n"]},
-   {"kind": "send", "template": "a1 LOGIN {{user}} {{password}}\r\n"},
-   {"kind": "expect", "until": ["a1 OK", "a1 NO"],
-    "capture": [{"source": {"from": "between", "start": "[", "end": "]"},
-                 "into": {"kind": "temp", "name": "caps", "secret": false}}]}
- ]}
-```
-
-The script holds 1 to 32 entries (`send` or `expect`); each `expect` reads until one of 1 to 8
-delimiters, each 1 to 256 bytes. The script runs on one TLS connection, then the caller's exchanges (at most 64, each a send
-and the delimiters to read until) run on it. Every read is redacted and searched before it is
-returned; an error stops the exchanges and is returned next to the reads that completed.
-Streams capture with `between`, `regex` and `all` only.
-
-### `derive`
+### `compute`
 
 ```json
-{"kind": "derive", "name": "sign", "template": "{{ k256_sign_recoverable(key, keccak256($input)) }}"}
+{"do": "compute", "into": "signature", "template": "{{ hex(hmac_sha256(secret, $unix + $nonce)) }}"}
 ```
 
-The output of the template goes back to the caller. `$input` is the caller's input (at most
-1 MiB). A template whose output could hand a secret back is refused when the policy is
-signed.
+Renders a template once into a new name later steps read like a temporary value. The name
+is new (no field, temporary or other computed value has it) and is read only after the step.
+For the analysis the name has **exactly the properties of its template** (tainted,
+controlled, caller-chosen, secret key, guessable), so writing a value through `compute` is
+the same as writing its template inline: every rule below applies across steps. With no
+connection, `compute` reads what the `return` template reads (`$input` included); with a
+connection, the clock and `$nonce`.
+
+### `return`
+
+#### HTTPS: the response projection
+
+```json
+{"do": "return", "response": {"headers": ["ETag", "Location"],
+                              "body": {"json": ["/id", "/items/*/name"]}}}
+```
+
+The status always goes back. A header goes back only when it is listed (at most 32, case does
+not matter), and the body only as `body` says:
+
+| `body` | What goes back |
+| --- | --- |
+| absent | nothing |
+| `"all"` | the whole body (the summary flags it) |
+| `{"json": [pointers]}` | a JSON object from each pointer to the JSON text of its value, numbers as written; a `*` token stands for every element of an array (`/items/*/id` gives an array of ids). A pointer that reaches nothing is left out. A body that is not JSON fails the call. At most 32 pointers. |
+
+`{"do": "return"}` alone returns the status only. Whatever goes back is still redacted and
+searched for secrets.
+
+#### TLS: the relay
+
+```json
+{"do": "return", "relay": {"sends": ["a[0-9]{1,4} (NOOP|LOGOUT)\\r\\n", "a[0-9]{1,4} FETCH [0-9]+ BODY\\[\\]\\r\\n"]}}
+```
+
+After the steps, the caller's exchanges (at most 64, each a send and the delimiters to read
+until) run on the connection when **every** send matches one of 1 to 16 patterns **whole**
+(linear-time regular expressions of at most 256 bytes; `.` does not match a line end). The
+sends are checked before anything is logged or the connection opens. Without `relay`, a
+call with exchanges is refused. Every read is redacted and searched before it is returned;
+an error stops the exchanges and is returned next to the reads that completed.
+
+#### No connection: the output
+
+```json
+{"do": "return", "template": "{{ k256_sign_recoverable(key, keccak256($input)) }}"}
+```
+
+The output of the template goes back to the caller. A template whose output could hand a
+secret back is refused when the policy is signed.
+
+### Input schemas
+
+An operation with no connection that reads `$input` declares what the input may be; the
+node checks it before it opens the record, and the templates read the checked input. At most
+1 MiB.
+
+```json
+{"name": "sign-token",
+ "input": {"json": {"members": [
+   {"pointer": "/aud", "type": "string", "equals": "https://api.example.com"},
+   {"pointer": "/scope", "one_of": ["read", "write"]},
+   {"pointer": "/amount", "type": "number", "min": "1", "max": "100000"},
+   {"pointer": "/note", "optional": true},
+   {"pointer": "/iat", "set": "unix"},
+   {"pointer": "/exp", "set": "unix", "offset": 300}
+ ]}},
+ "steps": [{"do": "return", "template": "{{ b64urlraw(hmac_sha256(key, $input)) }}"}]}
+```
+
+| Schema | Input |
+| --- | --- |
+| `{"raw": {"max_len": 64, "pattern": "[a-z0-9]+"}}` | Bytes; both members optional. `{"raw": {}}` is any bytes, and the summary flags it. |
+| `{"json": {"members": [...]}}` | A JSON value. The schema is **closed**: a member that is not declared (and not under a declared member without rules) is refused, and so are duplicate keys. The checked value is written back compactly; numbers keep their digits. |
+| `{"rlp": {"prefix": "02", "items": [...]}}` | Optional prefix bytes (hex), then one canonical RLP value. Closed like JSON: every item is declared. |
+
+A JSON member has a `pointer` (RFC 6901, empty for the whole value) and optionally `optional`,
+`type` (`string`, `number`, `boolean`, `null`, `object`, `array`), `equals`, `one_of`,
+`pattern`, `min`, `max` (as for query values: they read the text of a string, or a number,
+`true`, `false` or `null` as written), or `set` (`unix` or `unix_ms`) with an `offset`: the node
+writes its clock there, whatever the caller sent. An RLP item has a `pointer` of list indexes
+(`/3`, `/8/0`), `optional`, `equals` or `one_of` in hex, and `min` and `max` read as a
+big-endian unsigned integer (no leading zero byte; the empty string is 0). At most 64 members
+or items, 32 levels deep.
+
+EIP-712 typed data can be bounded with a JSON schema today, but no template function hashes it
+yet; an `eip712` schema and hash are next.
+
+### Loops and branches
+
+```json
+{"do": "repeat", "times": 3, "until": "done", "steps": [ ... ]}
+{"do": "if", "name": "status", "equals": "OK", "then": [ ... ], "else": [ ... ]}
+```
+
+This is the syntax of the next part of the language: a loop with a fixed bound and a branch
+on a public captured value. A policy that uses them is refused (`loops and branches are part
+of the syntax but not run yet; write the steps out`) until the analysis covers them: each
+path through the steps must keep the properties above, and a branch on a value must not tell
+the caller anything about a secret.
+
+## Secure defaults
+
+Where two answers were reasonable and the design left the choice open, the policy takes the
+one that gives the caller less:
+
+| Choice | Why |
+| --- | --- |
+| The status is the only thing an HTTPS operation returns unless `response` says more. | A server's answer may hold what the policy never meant to hand out (temporary credentials minted by the call); the owner lists what the caller needs. |
+| A caller may send no query parameter that is not listed; there is no wildcard for names. | An unlisted parameter can change what the signed request does (an action, a scope, a limit). |
+| A caller may never send a query name the `send` injects. | Servers disagree on which of two equal names wins. |
+| `%25` in a caller's path is refused unless `encoded_percent`. | A server or proxy that decodes twice reads another path than the one checked. Measured: no test or example of the repository needed it. |
+| Dot segments are checked as sent, after `;` parameters are stripped and after one and two decodings. | Servers strip path parameters (`..;`) or decode twice. |
+| Method-override parameters are refused in the query and the body unless `override_params`. | Frameworks read them as the method, so an allowed POST becomes a DELETE. |
+| Placeholders are whole segments of a template the owner signs. | A placeholder the caller places can carry a secret into a parameter of its choice. |
+| Old prefixes convert to templates that match the same paths (`/v1/` → `/v1/**`; `/v1` → `/v1` and `/v1/**`; `/` → `/**`). | The conversion neither widens nor silently narrows paths. |
+| A stream relays nothing until `relay` lists the sends, and a send must match a pattern whole. | After the login, a caller's command runs under the owner's session. |
+| An operation that reads `$input` must declare `input`; JSON and RLP schemas are closed; duplicate JSON keys are refused; the checked JSON is written back. | A key signs what the owner bounded, not what a parser disagreement lets through. |
+| One `open` per operation, first; an HTTPS `receive` directly follows its `send`. | Every response read is the one of the request before it, and every step runs on the connection the log names. |
+| Loops and branches are refused. | The analysis does not cover them yet. |
+
+## Converting a policy
+
+`credentials policy upgrade old.json --out new.json` (or
+`engine::policy::legacy::upgrade_json`, or `upgrade_policy` of the `client` crate) reads a
+policy of the old format, signed or not, and writes the step language, with notes (on stderr)
+for what it narrowed:
+
+| Old | New |
+| --- | --- |
+| `{"kind": "http", destinations, methods, paths, caller_headers, identity, steps}` | `open` (https) with the destinations and identity; for each step a `send` (the caller's request with `methods`, the paths as templates and `caller_headers` as `headers`, or the fixed request) and, when it captures, a `receive`; then `{"do": "return"}`. |
+| `{"kind": "stream", destinations, identity, script}` | `open` (tls); `send` for each script `send`, `receive` for each `expect`; then `{"do": "return"}` (no relay). |
+| `{"kind": "derive", template}` | `{"do": "return", "template": ...}`, with `"input": {"raw": {}}` when the template reads `$input`. |
+
+The result returns the status only, takes no caller query parameter, relays no stream
+exchange and accepts any input where it did before (flagged). A caller path parameter that
+the old format let the caller place anywhere has to be written by the owner as a `{name}`
+segment of a template: until then the converted policy does not validate. Read the summary,
+widen what is needed, and **sign the result again**.
 
 ## Templates
 
@@ -174,13 +392,15 @@ with nested braces work. A template is at most 8 KiB, 512 nodes and 24 levels de
 
 | Variable | Value | Where |
 | --- | --- | --- |
-| `$method` `$host` `$path` `$pathname` `$query` `$body` | The request being built | HTTP |
+| `$method` `$host` `$path` `$pathname` `$query` `$body` | The request being built | HTTPS `send` injections |
 | `$unix` `$unix_ms` | The node's clock | everywhere |
-| `$nonce` | 32 random hex characters, the same throughout one request (or stream send, or derivation) | everywhere |
-| `$boundary` | A random multipart boundary | HTTP |
-| `$input` | The caller's input | derive |
+| `$nonce` | 32 random hex characters, the same throughout one request (or TLS send, or operation with no connection) | everywhere |
+| `$boundary` | A random multipart boundary | HTTPS `send` injections |
+| `$input` | The caller's input, after its schema | operations with no connection |
 
-Stream scripts and identities can read `$host`, `$unix`, `$unix_ms` and `$nonce`.
+TLS sends and identities can read `$host`, `$unix`, `$unix_ms` and `$nonce`; `compute` on a
+connection reads `$unix`, `$unix_ms` and `$nonce`, and with no connection what the `return`
+reads.
 
 | Group | Functions |
 | --- | --- |
@@ -285,7 +505,8 @@ Rules:
    operation may encrypt chosen bytes under the same key and a chosen nonce and so give back
    the keystream. Under a key that is not a secret key, the output is tainted when any
    argument is.
-5. A derivation's output may not be tainted or guessable. Since only `len` removes
+5. The output of an operation with no connection (a derivation) may not be tainted or
+   guessable. Since only `len` removes
    *guessable*, a derivation may depend on a guessable field only through `len`.
 6. An argument that names a hash or a curve (`pbkdf2`, `rsa_sign_pkcs1`, `rsa_sign_pss`,
    `rsa_encrypt_oaep`, `ecdh`, `ecdh_public`) must be neither tainted nor controlled: the
@@ -295,8 +516,9 @@ Rules:
    response. A key from `$input`, `$body`, `$query` or another request variable would let the
    caller encrypt the secret to itself.
 
-A template that breaks rule 1, 2, 6 or 7 is refused wherever it appears; rule 5 applies to
-`derive` operations.
+A template that breaks rule 1, 2, 6 or 7 is refused wherever it appears; rule 5 applies to the
+`return` of an operation with no connection. A computed name carries the properties of its
+template, so the rules hold across steps exactly as they do inside one template.
 
 A short tainted value in a request (a byte cut by `slice`, a `u8` of a secret) is shorter
 than the 4 bytes the reflection search needs; the rules above keep its position fixed by the
