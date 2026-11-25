@@ -1,10 +1,12 @@
 //! Reading responses: the parts a capture names, and the response handed back.
 //!
-//! A response is parsed into status, headers and a decoded body before anything is captured or
-//! handed back, so a secret cannot hide in the framing: interim `1xx` responses are skipped, a
-//! chunked body is joined, and a body the engine cannot read as plain bytes (`Content-Encoding`
-//! other than `identity`, a partial `Content-Range`, a transfer coding other than `chunked`) is
-//! refused. The caller gets the parsed response ([`Response`]), never the bytes of the wire.
+//! A response is parsed into status, headers, a decoded body and trailers before anything is
+//! captured or handed back, so a secret cannot hide in the framing: interim `1xx` responses
+//! are skipped, a chunked body is joined, and a body the engine cannot read as plain bytes
+//! (`Content-Encoding` other than `identity`, a partial `Content-Range`, a transfer coding
+//! other than `chunked`) is refused. The caller gets the parsed response ([`Response`]), never
+//! the bytes of the wire. A response read as it arrives goes through the same rules, part by
+//! part ([`BodyDecoder`]).
 
 use serde_json::value::RawValue;
 use zeroize::{Zeroize, Zeroizing};
@@ -14,12 +16,14 @@ use crate::{Error, Result};
 
 /// Longest response the engine reads, in bytes.
 pub const MAX_RESPONSE: usize = 16 * 1024 * 1024;
-/// Longest status line and headers of one response, in bytes.
+/// Longest status line and headers of one response, in bytes; also the longest trailers.
 pub const MAX_HEAD: usize = 64 * 1024;
-/// Most headers of one response.
+/// Most headers of one response; also the most trailers.
 pub const MAX_RESPONSE_HEADERS: usize = 128;
 /// Longest captured value, in bytes.
 pub const MAX_CAPTURE: usize = 64 * 1024;
+/// Longest chunk size line, in bytes.
+const MAX_CHUNK_LINE: usize = 1024;
 /// What replaces a captured secret in a response handed back.
 pub const REDACTED: &[u8] = b"[redacted]";
 
@@ -27,9 +31,12 @@ fn invalid(rule: &'static str) -> Error {
     Error::ResponseInvalid { rule }
 }
 
+pub(crate) type Fields = Vec<(String, Zeroizing<Vec<u8>>)>;
+
 /// The response of an operation, as the caller gets it: after redaction and the reflection
 /// check. The body is decoded (no chunked framing); `Content-Length` and `Transfer-Encoding`
-/// are not among the headers.
+/// are not among the headers. Trailers (gRPC's `grpc-status`, say) come apart from the
+/// headers.
 ///
 /// In JSON, header values and the body are base64url.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -40,6 +47,12 @@ pub struct Response {
     pub(crate) headers: Vec<(String, Vec<u8>)>,
     #[serde(with = "crate::encoding::b64_vec")]
     pub(crate) body: Vec<u8>,
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        with = "crate::encoding::b64_pairs"
+    )]
+    pub(crate) trailers: Vec<(String, Vec<u8>)>,
     pub(crate) log_seqs: Vec<u64>,
 }
 
@@ -62,6 +75,19 @@ impl Response {
         &self.headers
     }
 
+    /// The value of the first trailer with this name (case does not matter).
+    pub fn trailer(&self, name: &str) -> Option<&[u8]> {
+        self.trailers
+            .iter()
+            .find(|(n, _)| n.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.as_slice())
+    }
+
+    /// All trailers the projection lets back, in order.
+    pub fn trailers(&self) -> &[(String, Vec<u8>)] {
+        &self.trailers
+    }
+
     /// The body.
     pub fn body(&self) -> &[u8] {
         &self.body
@@ -72,12 +98,14 @@ impl Response {
         &self.log_seqs
     }
 
-    /// The response as HTTP/1.1 bytes with a `Content-Length`.
+    /// The response as HTTP/1.1 bytes with a `Content-Length`; trailers follow the body as
+    /// field lines, so the reflection search covers them too.
     pub fn to_bytes(&self) -> Vec<u8> {
         let len = 32
             + self
                 .headers
                 .iter()
+                .chain(&self.trailers)
                 .map(|(n, v)| n.len() + v.len() + 4)
                 .sum::<usize>()
             + self.body.len();
@@ -91,12 +119,18 @@ impl Response {
         }
         out.extend_from_slice(format!("Content-Length: {}\r\n\r\n", self.body.len()).as_bytes());
         out.extend_from_slice(&self.body);
+        for (name, value) in &self.trailers {
+            out.extend_from_slice(b"\r\n");
+            out.extend_from_slice(name.as_bytes());
+            out.extend_from_slice(b": ");
+            out.extend_from_slice(value);
+        }
         out
     }
 
     fn wipe(&mut self) {
         self.body.zeroize();
-        for (_, value) in &mut self.headers {
+        for (_, value) in self.headers.iter_mut().chain(self.trailers.iter_mut()) {
             value.zeroize();
         }
     }
@@ -111,8 +145,9 @@ impl Drop for Response {
 /// An HTTP/1.1 response, parsed.
 pub(crate) struct Http {
     pub status: u16,
-    pub headers: Vec<(String, Zeroizing<Vec<u8>>)>,
+    pub headers: Fields,
     pub body: Zeroizing<Vec<u8>>,
+    pub trailers: Fields,
 }
 
 pub(crate) fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
@@ -122,18 +157,38 @@ pub(crate) fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     memchr::memmem::find(haystack, needle)
 }
 
-fn dechunk(mut rest: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
+/// The size of a chunk from its size line (extensions after `;` are ignored).
+fn chunk_size(line: &[u8]) -> Result<usize> {
+    let size_text = line.split(|b| *b == b';').next().unwrap_or_default();
+    let size_text = core::str::from_utf8(size_text).map_err(|_| invalid("chunk size"))?;
+    usize::from_str_radix(size_text.trim(), 16).map_err(|_| invalid("chunk size"))
+}
+
+/// Reads the trailer section after the last chunk: field lines up to an empty line (or the
+/// end of the bytes).
+fn trailer_fields(rest: &[u8]) -> Result<Fields> {
+    let mut trailers = Vec::new();
+    let mut rest = rest.get(..rest.len().min(MAX_HEAD)).unwrap_or_default();
+    while let Some(end) = find(rest, b"\r\n") {
+        let (line, tail) = rest.split_at(end);
+        if line.is_empty() {
+            break;
+        }
+        push_field(&mut trailers, line)?;
+        rest = tail.get(2..).unwrap_or_default();
+    }
+    Ok(trailers)
+}
+
+fn dechunk(mut rest: &[u8]) -> Result<(Zeroizing<Vec<u8>>, Fields)> {
     let mut out = Zeroizing::new(Vec::with_capacity(rest.len()));
     loop {
         let line_end = find(rest, b"\r\n").ok_or(invalid("chunk size line"))?;
         let (line, tail) = rest.split_at(line_end);
-        let size_text = line.split(|b| *b == b';').next().unwrap_or_default();
-        let size_text = core::str::from_utf8(size_text).map_err(|_| invalid("chunk size"))?;
-        let size =
-            usize::from_str_radix(size_text.trim(), 16).map_err(|_| invalid("chunk size"))?;
+        let size = chunk_size(line)?;
         let tail = tail.get(2..).ok_or(invalid("chunk size line"))?;
         if size == 0 {
-            return Ok(out);
+            return Ok((out, trailer_fields(tail)?));
         }
         let chunk = tail
             .get(..size)
@@ -153,6 +208,289 @@ fn is_header_name(name: &[u8]) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(b))
 }
 
+/// Parses one field line into `fields`.
+fn push_field(fields: &mut Fields, line: &[u8]) -> Result<()> {
+    if line.first().is_some_and(|b| *b == b' ' || *b == b'\t') {
+        return Err(invalid("folded header"));
+    }
+    let colon = line
+        .iter()
+        .position(|b| *b == b':')
+        .ok_or(invalid("header line"))?;
+    let (name, value) = line.split_at(colon);
+    if !is_header_name(name) {
+        return Err(invalid("header name"));
+    }
+    let name = String::from_utf8(name.to_vec()).map_err(|_| invalid("header name"))?;
+    let value = value.get(1..).unwrap_or_default().trim_ascii();
+    fields.push((name, Zeroizing::new(value.to_vec())));
+    if fields.len() > MAX_RESPONSE_HEADERS {
+        return Err(invalid("too many headers"));
+    }
+    Ok(())
+}
+
+/// The status and fields of a head (the bytes before its empty line, which may be given).
+fn head_fields(head: &[u8]) -> Result<(u16, Fields)> {
+    let head = head.strip_suffix(b"\r\n\r\n").unwrap_or(head);
+    let mut lines = head
+        .split(|b| *b == b'\n')
+        .map(|l| l.strip_suffix(b"\r").unwrap_or(l));
+    let status = parse_status(lines.next().ok_or(invalid("status line"))?)?;
+    let mut headers = Vec::new();
+    for line in lines {
+        push_field(&mut headers, line)?;
+    }
+    Ok((status, headers))
+}
+
+/// The status and headers of a response head. `None` for an interim `1xx` response, which is
+/// skipped; `101` is refused.
+pub(crate) fn parse_head(head: &[u8]) -> Result<Option<(u16, Fields)>> {
+    let (status, headers) = head_fields(head)?;
+    if (100..200).contains(&status) {
+        if status == 101 {
+            return Err(invalid("protocol switch"));
+        }
+        return Ok(None);
+    }
+    Ok(Some((status, headers)))
+}
+
+/// The head of the answer to a WebSocket handshake: any status (the caller checks `101`).
+pub(crate) fn parse_upgrade(head: &[u8]) -> Result<(u16, Fields)> {
+    head_fields(head)
+}
+
+fn named(headers: &Fields, name: &str) -> Vec<Vec<u8>> {
+    headers
+        .iter()
+        .filter(|(n, _)| n.eq_ignore_ascii_case(name))
+        .map(|(_, v)| v.to_vec())
+        .collect()
+}
+
+/// How a body is delimited.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Framing {
+    /// `Content-Length`.
+    Length(usize),
+    /// `Transfer-Encoding: chunked`.
+    Chunked,
+    /// Until the connection ends.
+    Close,
+}
+
+/// The framing of a body, under the rules every response follows: no content coding but
+/// `identity`, no partial body, no transfer coding but `chunked`, one length at most.
+pub(crate) fn framing(status: u16, headers: &Fields) -> Result<Framing> {
+    if named(headers, "content-encoding")
+        .iter()
+        .any(|v| !v.trim_ascii().eq_ignore_ascii_case(b"identity"))
+    {
+        return Err(invalid("encoded body"));
+    }
+    if status == 206 || !named(headers, "content-range").is_empty() {
+        return Err(invalid("partial body"));
+    }
+    let codings = named(headers, "transfer-encoding");
+    let lengths = named(headers, "content-length");
+    match codings.as_slice() {
+        [] => match lengths.as_slice() {
+            [] => Ok(Framing::Close),
+            [one] => core::str::from_utf8(one)
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .map(Framing::Length)
+                .ok_or(invalid("content length")),
+            _ => Err(invalid("several content lengths")),
+        },
+        [one] if one.trim_ascii().eq_ignore_ascii_case(b"chunked") => Ok(Framing::Chunked),
+        _ => Err(invalid("transfer coding other than chunked")),
+    }
+}
+
+/// Where a [`BodyDecoder`] is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Part {
+    /// So many bytes of a `Content-Length` body left.
+    Length(usize),
+    /// Up to the end of the connection.
+    Close,
+    /// A chunk size line.
+    Size,
+    /// So many bytes of a chunk left.
+    Data(usize),
+    /// The CRLF after a chunk.
+    DataEnd,
+    /// The trailer section.
+    Trailers,
+    /// The body ended; what follows is ignored.
+    Done,
+}
+
+/// Decodes a body as it arrives, under the same framing rules as a whole response, and
+/// collects its trailers.
+pub struct BodyDecoder {
+    part: Part,
+    buf: Zeroizing<Vec<u8>>,
+    trailers: Fields,
+    trailer_bytes: usize,
+}
+
+impl BodyDecoder {
+    pub(crate) fn new(framing: Framing) -> Self {
+        Self {
+            part: match framing {
+                Framing::Length(0) => Part::Done,
+                Framing::Length(n) => Part::Length(n),
+                Framing::Chunked => Part::Size,
+                Framing::Close => Part::Close,
+            },
+            buf: Zeroizing::new(Vec::new()),
+            trailers: Vec::new(),
+            trailer_bytes: 0,
+        }
+    }
+
+    /// A decoder of a chunked body (for tests and the fuzz target).
+    pub fn chunked() -> Self {
+        Self::new(Framing::Chunked)
+    }
+
+    /// True once the body ended by its framing.
+    pub fn is_done(&self) -> bool {
+        self.part == Part::Done
+    }
+
+    /// The trailers read so far, as name and value.
+    pub fn trailers(&self) -> impl Iterator<Item = (&str, &[u8])> {
+        self.trailers
+            .iter()
+            .map(|(n, v)| (n.as_str(), v.as_slice()))
+    }
+
+    pub(crate) fn take_trailers(&mut self) -> Fields {
+        core::mem::take(&mut self.trailers)
+    }
+
+    /// Decodes the bytes that arrived; returns the body bytes they complete.
+    pub fn push(&mut self, bytes: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
+        let mut out = Zeroizing::new(Vec::new());
+        match self.part {
+            Part::Done => return Ok(out),
+            Part::Close => {
+                out.extend_from_slice(bytes);
+                return Ok(out);
+            }
+            Part::Length(left) => {
+                let take = left.min(bytes.len());
+                out.extend_from_slice(bytes.get(..take).unwrap_or_default());
+                self.part = match left - take {
+                    0 => Part::Done,
+                    n => Part::Length(n),
+                };
+                return Ok(out);
+            }
+            _ => {}
+        }
+        self.buf.extend_from_slice(bytes);
+        let mut at = 0usize;
+        loop {
+            let rest = self.buf.get(at..).unwrap_or_default();
+            match self.part {
+                Part::Size => {
+                    let Some(end) = find(rest, b"\r\n") else {
+                        if rest.len() > MAX_CHUNK_LINE {
+                            return Err(invalid("chunk size line"));
+                        }
+                        break;
+                    };
+                    let size = chunk_size(rest.get(..end).unwrap_or_default())?;
+                    at += end + 2;
+                    self.part = if size == 0 {
+                        Part::Trailers
+                    } else {
+                        Part::Data(size)
+                    };
+                }
+                Part::Data(left) => {
+                    if rest.is_empty() {
+                        break;
+                    }
+                    let take = left.min(rest.len());
+                    out.extend_from_slice(rest.get(..take).unwrap_or_default());
+                    at += take;
+                    self.part = match left - take {
+                        0 => Part::DataEnd,
+                        n => Part::Data(n),
+                    };
+                }
+                Part::DataEnd => match rest.get(..2) {
+                    None => {
+                        if rest.first().is_some_and(|b| *b != b'\r') {
+                            return Err(invalid("chunk not followed by CRLF"));
+                        }
+                        break;
+                    }
+                    Some(b"\r\n") => {
+                        at += 2;
+                        self.part = Part::Size;
+                    }
+                    Some(_) => return Err(invalid("chunk not followed by CRLF")),
+                },
+                Part::Trailers => {
+                    let Some(end) = find(rest, b"\r\n") else {
+                        if self.trailer_bytes.saturating_add(rest.len()) > MAX_HEAD {
+                            return Err(invalid("trailers too long"));
+                        }
+                        break;
+                    };
+                    let line = rest.get(..end).unwrap_or_default();
+                    self.trailer_bytes = self.trailer_bytes.saturating_add(end + 2);
+                    if self.trailer_bytes > MAX_HEAD {
+                        return Err(invalid("trailers too long"));
+                    }
+                    at += end + 2;
+                    if line.is_empty() {
+                        self.part = Part::Done;
+                    } else {
+                        push_field(&mut self.trailers, line)?;
+                    }
+                }
+                Part::Done | Part::Close | Part::Length(_) => break,
+            }
+        }
+        let rest = if self.part == Part::Done {
+            Vec::new()
+        } else {
+            self.buf.get(at..).unwrap_or_default().to_vec()
+        };
+        self.buf = Zeroizing::new(rest);
+        Ok(out)
+    }
+
+    /// The connection ended: fine for a body delimited by the end, or one already complete.
+    /// A chunked body may end right after its last chunk, without the empty line after its
+    /// trailers, as a whole response may.
+    pub fn end(&mut self) -> Result<()> {
+        match self.part {
+            Part::Close | Part::Done => {
+                self.part = Part::Done;
+                Ok(())
+            }
+            Part::Trailers => {
+                // A last trailer line without its CRLF is dropped, as the whole parser does.
+                self.buf = Zeroizing::new(Vec::new());
+                self.part = Part::Done;
+                Ok(())
+            }
+            Part::Length(_) => Err(invalid("body shorter than its length")),
+            _ => Err(invalid("chunk framing")),
+        }
+    }
+}
+
 impl Http {
     /// Parses a response.
     pub fn parse(mut bytes: &[u8]) -> Result<Self> {
@@ -167,85 +505,26 @@ impl Http {
             let split = find(window, b"\r\n\r\n").ok_or(invalid("head missing or too long"))?;
             let (head, rest) = bytes.split_at(split);
             let rest = rest.get(4..).unwrap_or_default();
-            let mut lines = head
-                .split(|b| *b == b'\n')
-                .map(|l| l.strip_suffix(b"\r").unwrap_or(l));
-            let status_line = lines.next().ok_or(invalid("status line"))?;
-            let status = parse_status(status_line)?;
-            if (100..200).contains(&status) {
-                if status == 101 {
-                    return Err(invalid("protocol switch"));
-                }
-                bytes = rest;
-                continue;
+            match parse_head(head)? {
+                None => bytes = rest,
+                Some((status, headers)) => return Self::framed(status, headers, rest),
             }
-            let mut headers = Vec::new();
-            for line in lines {
-                if line.first().is_some_and(|b| *b == b' ' || *b == b'\t') {
-                    return Err(invalid("folded header"));
-                }
-                let colon = line
-                    .iter()
-                    .position(|b| *b == b':')
-                    .ok_or(invalid("header line"))?;
-                let (name, value) = line.split_at(colon);
-                if !is_header_name(name) {
-                    return Err(invalid("header name"));
-                }
-                let name = String::from_utf8(name.to_vec()).map_err(|_| invalid("header name"))?;
-                let value = value.get(1..).unwrap_or_default().trim_ascii();
-                headers.push((name, Zeroizing::new(value.to_vec())));
-                if headers.len() > MAX_RESPONSE_HEADERS {
-                    return Err(invalid("too many headers"));
-                }
-            }
-            return Self::framed(status, headers, rest);
         }
     }
 
-    fn framed(
-        status: u16,
-        mut headers: Vec<(String, Zeroizing<Vec<u8>>)>,
-        raw_body: &[u8],
-    ) -> Result<Self> {
-        let named = |headers: &[(String, Zeroizing<Vec<u8>>)], name: &str| {
-            headers
-                .iter()
-                .filter(|(n, _)| n.eq_ignore_ascii_case(name))
-                .map(|(_, v)| v.to_vec())
-                .collect::<Vec<_>>()
-        };
-        let encodings = named(&headers, "content-encoding");
-        if encodings
-            .iter()
-            .any(|v| !v.trim_ascii().eq_ignore_ascii_case(b"identity"))
-        {
-            return Err(invalid("encoded body"));
-        }
-        if status == 206 || !named(&headers, "content-range").is_empty() {
-            return Err(invalid("partial body"));
-        }
-        let codings = named(&headers, "transfer-encoding");
-        let lengths = named(&headers, "content-length");
-        let body = match codings.as_slice() {
-            [] => match lengths.as_slice() {
-                [] => Zeroizing::new(raw_body.to_vec()),
-                [one] => {
-                    let length = core::str::from_utf8(one)
-                        .ok()
-                        .and_then(|v| v.parse::<usize>().ok())
-                        .ok_or(invalid("content length"))?;
-                    Zeroizing::new(
-                        raw_body
-                            .get(..length)
-                            .ok_or(invalid("body shorter than its length"))?
-                            .to_vec(),
-                    )
-                }
-                _ => return Err(invalid("several content lengths")),
-            },
-            [one] if one.trim_ascii().eq_ignore_ascii_case(b"chunked") => dechunk(raw_body)?,
-            _ => return Err(invalid("transfer coding other than chunked")),
+    fn framed(status: u16, mut headers: Fields, raw_body: &[u8]) -> Result<Self> {
+        let (body, trailers) = match framing(status, &headers)? {
+            Framing::Close => (Zeroizing::new(raw_body.to_vec()), Vec::new()),
+            Framing::Length(length) => (
+                Zeroizing::new(
+                    raw_body
+                        .get(..length)
+                        .ok_or(invalid("body shorter than its length"))?
+                        .to_vec(),
+                ),
+                Vec::new(),
+            ),
+            Framing::Chunked => dechunk(raw_body)?,
         };
         headers.retain(|(n, _)| {
             !n.eq_ignore_ascii_case("transfer-encoding")
@@ -255,6 +534,7 @@ impl Http {
             status,
             headers,
             body,
+            trailers,
         })
     }
 
@@ -273,6 +553,16 @@ impl Http {
                 .headers_named(name)
                 .next()
                 .map(|v| Zeroizing::new(v.to_vec())),
+            Source::Trailer { name } => self
+                .trailers
+                .iter()
+                .find(|(n, _)| n.eq_ignore_ascii_case(name))
+                .map(|(_, v)| v.clone())
+                .or_else(|| {
+                    self.headers_named(name)
+                        .next()
+                        .map(|v| Zeroizing::new(v.to_vec()))
+                }),
             Source::HeaderParam {
                 name,
                 param,
@@ -296,8 +586,8 @@ impl Http {
     }
 
     /// The parts of the response `projection` lets back to the caller: the status, the
-    /// headers it names and the body as it says (nothing without a projection or a body
-    /// rule).
+    /// headers and trailers it names and the body as it says (nothing without a projection or
+    /// a body rule).
     pub fn project(
         mut self,
         projection: Option<&Projection>,
@@ -306,9 +596,12 @@ impl Http {
         let headers = projection.map_or(&[][..], |p| p.headers.as_slice());
         self.headers
             .retain(|(n, _)| headers.iter().any(|h| h.eq_ignore_ascii_case(n)));
+        let trailers = projection.map_or(&[][..], |p| p.trailers.as_slice());
+        self.trailers
+            .retain(|(n, _)| trailers.iter().any(|h| h.eq_ignore_ascii_case(n)));
         let body = match projection.and_then(|p| p.body.as_ref()) {
             None => Zeroizing::new(Vec::new()),
-            Some(BodyProjection::All) => core::mem::take(&mut self.body),
+            Some(BodyProjection::All | BodyProjection::Stream) => core::mem::take(&mut self.body),
             Some(BodyProjection::Json(pointers)) => project_json(&self.body, pointers)?,
         };
         self.body = body;
@@ -319,14 +612,45 @@ impl Http {
     pub fn into_response(mut self, log_seqs: Vec<u64>) -> Response {
         Response {
             status: self.status,
-            headers: core::mem::take(&mut self.headers)
-                .into_iter()
-                .map(|(n, v)| (n, v.to_vec()))
-                .collect(),
+            headers: plain(core::mem::take(&mut self.headers)),
             body: self.body.to_vec(),
+            trailers: plain(core::mem::take(&mut self.trailers)),
             log_seqs,
         }
     }
+}
+
+fn plain(fields: Fields) -> Vec<(String, Vec<u8>)> {
+    fields.into_iter().map(|(n, v)| (n, v.to_vec())).collect()
+}
+
+/// The projected head of a response read as it arrives: the status and the headers the
+/// projection names, no body (it goes back in parts).
+pub(crate) fn project_head(
+    status: u16,
+    mut headers: Fields,
+    projection: Option<&Projection>,
+    log_seqs: Vec<u64>,
+) -> Response {
+    let names = projection.map_or(&[][..], |p| p.headers.as_slice());
+    headers.retain(|(n, _)| names.iter().any(|h| h.eq_ignore_ascii_case(n)));
+    Response {
+        status,
+        headers: plain(headers),
+        body: Vec::new(),
+        trailers: Vec::new(),
+        log_seqs,
+    }
+}
+
+/// The trailers a projection names, at the end of a response read as it arrives.
+pub(crate) fn project_trailers(
+    mut trailers: Fields,
+    projection: Option<&Projection>,
+) -> Vec<(String, Vec<u8>)> {
+    let names = projection.map_or(&[][..], |p| p.trailers.as_slice());
+    trailers.retain(|(n, _)| names.iter().any(|h| h.eq_ignore_ascii_case(n)));
+    plain(trailers)
 }
 
 fn parse_status(line: &[u8]) -> Result<u16> {

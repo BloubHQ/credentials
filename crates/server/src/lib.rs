@@ -20,6 +20,7 @@
 
 pub mod http;
 pub mod logfile;
+pub mod stream;
 
 use std::io;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -52,6 +53,9 @@ pub const DEFAULT_MAX_CONNECTIONS: usize = 64;
 
 /// Acts that run at once by default.
 pub const DEFAULT_THREADS: usize = 4;
+
+/// Streaming calls (`/stream`) that run at once by default, each with its own transport.
+pub const DEFAULT_STREAMS: usize = 16;
 
 /// A status and a JSON body.
 pub type Reply = (u16, Value);
@@ -96,6 +100,9 @@ pub struct Options {
     pub max_connections: usize,
     /// Largest request body, in bytes.
     pub max_body: usize,
+    /// Streaming calls that run at once, each with its own transport; beyond it `/stream`
+    /// answers 503 (the node bounds them per caller and owner too).
+    pub streams: usize,
 }
 
 impl Default for Options {
@@ -104,6 +111,7 @@ impl Default for Options {
             threads: DEFAULT_THREADS,
             max_connections: DEFAULT_MAX_CONNECTIONS,
             max_body: DEFAULT_MAX_BODY,
+            streams: DEFAULT_STREAMS,
         }
     }
 }
@@ -121,6 +129,8 @@ struct Shared<S: Sink, T> {
     hooks: Box<dyn Hooks>,
     head_lock: Mutex<()>,
     pool: Pool<T>,
+    /// The transports of streaming calls: they stay open, so they do not hold up acts.
+    streams: Pool<T>,
     open: Arc<AtomicUsize>,
     options: Options,
 }
@@ -141,14 +151,17 @@ where
             threads: options.threads.max(1),
             max_connections: options.max_connections.max(1),
             max_body: options.max_body,
+            streams: options.streams,
         };
         let pool = Pool::new((0..options.threads).map(|_| transport()).collect());
+        let streams = Pool::new((0..options.streams).map(|_| transport()).collect());
         Self {
             shared: Arc::new(Shared {
                 node,
                 hooks: Box::new(hooks),
                 head_lock: Mutex::new(()),
                 pool,
+                streams,
                 open: Arc::new(AtomicUsize::new(0)),
                 options,
             }),
@@ -237,6 +250,20 @@ impl<T> Pool<T> {
             give,
             take: Mutex::new(take),
         }
+    }
+
+    /// A free transport, without waiting.
+    fn try_lease(&self) -> Option<Lease<'_, T>> {
+        let transport = self
+            .take
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .try_recv()
+            .ok()?;
+        Some(Lease {
+            pool: self,
+            transport: Some(transport),
+        })
     }
 
     /// Waits for a free transport.
@@ -363,6 +390,46 @@ impl<S: Sink, T: Transport> Shared<S, T> {
         }
     }
 
+    /// A streaming call on `conn`: `None` when it streamed (the end frame is written), else
+    /// the JSON reply of a call refused before anything was handed back.
+    fn stream_call<C: Connection>(&self, conn: &mut C, body: &[u8]) -> Option<Reply> {
+        let call: SignedCall = match parse(body) {
+            Ok(call) => call,
+            Err(reply) => return Some(reply),
+        };
+        if let Some(reply) = self.halted() {
+            return Some(reply);
+        }
+        let Some(mut lease) = self.streams.try_lease() else {
+            return Some(error_reply(
+                503,
+                "too many streaming calls; try again later".into(),
+            ));
+        };
+        let transport = lease.transport.as_mut()?;
+        let before = self.confirmed();
+        let mut relay = stream::ConnectionRelay::new(conn);
+        let outcome = self.node.relay(&call, transport, &mut relay);
+        self.write_head_if(Some(before));
+        let record = match &outcome.record {
+            None => Value::Null,
+            Some(record) => serde_json::to_value(record).unwrap_or(Value::Null),
+        };
+        let (status, end) = match &outcome.result {
+            Ok(output) => (200, json!({ "ok": output_json(output), "record": record })),
+            Err(e) => (
+                status_of(e),
+                json!({ "error": e.to_string(), "status": status_of(e), "record": record }),
+            ),
+        };
+        if !relay.started {
+            return Some((status, end));
+        }
+        let data = serde_json::to_vec(&end).unwrap_or_else(|_| b"{}".to_vec());
+        relay.finish(&data);
+        None
+    }
+
     fn route(&self, request: &Request) -> Reply {
         let body = request.body.as_slice();
         let path = request.path.as_str();
@@ -406,7 +473,7 @@ impl<S: Sink, T: Transport> Shared<S, T> {
             (
                 method,
                 "/identity" | "/checkpoint" | "/grant" | "/revoke" | "/pin" | "/device/add"
-                | "/device/retire" | "/call" | "/answer" | "/approve" | "/limits",
+                | "/device/retire" | "/call" | "/answer" | "/approve" | "/limits" | "/stream",
             ) => error_reply(405, format!("method {method} not allowed here")),
             _ => self
                 .hooks
@@ -417,6 +484,15 @@ impl<S: Sink, T: Transport> Shared<S, T> {
 
     fn handle<C: Connection>(&self, mut stream: C) {
         let (status, body, label) = match http::read_request(&mut stream, self.options.max_body) {
+            Ok(request) if request.method == "POST" && request.path == "/stream" => {
+                match self.stream_call(&mut stream, &request.body) {
+                    Some((status, body)) => (status, body, "POST /stream".to_string()),
+                    None => {
+                        eprintln!("POST /stream -> 200 (streamed)");
+                        return;
+                    }
+                }
+            }
             Ok(request) => {
                 let (status, body) = self.route(&request);
                 (status, body, format!("{} {}", request.method, request.path))
@@ -445,7 +521,7 @@ fn status_of(error: &Error) -> u16 {
         | Error::PolicySignature => 403,
         Error::LogUnconfirmed | Error::LogHalted => 503,
         Error::Transport(_) => 502,
-        Error::RateLimited | Error::ParkedFull => 429,
+        Error::RateLimited | Error::ParkedFull | Error::StreamsFull { .. } => 429,
         e if e.is_caller_error() => 400,
         _ => 403,
     }
@@ -489,6 +565,11 @@ pub fn output_json(output: &Output) -> Value {
         // `{"kind": "challenge", "id", "challenge", "hint", "expires_ms"}` or
         // `{"kind": "approval_required", "id", "summary"}`: resume with the id.
         Output::Pending(pending) => serde_json::to_value(pending).unwrap_or(Value::Null),
+        // How a streaming call ended: its reason, status, trailers and counts.
+        Output::Closed(closed) => json!({
+            "kind": "closed",
+            "closed": serde_json::to_value(closed).unwrap_or(Value::Null),
+        }),
     }
 }
 

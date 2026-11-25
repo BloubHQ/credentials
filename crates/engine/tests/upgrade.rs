@@ -71,7 +71,9 @@ fn assert_safe_defaults(name: &str, policy: &Policy) {
                     }
                 }
             }
-            Some(Connection::Tls) => assert_eq!(returns.relay, None, "{name}: no relay"),
+            Some(Connection::Tls | Connection::Websocket) => {
+                assert_eq!(returns.relay, None, "{name}: no relay")
+            }
             None => {
                 let reads_input = returns
                     .template

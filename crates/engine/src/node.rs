@@ -46,10 +46,15 @@ use crate::template::{Budget, Context, Template, Temps, Var};
 use crate::{Error, Result};
 
 mod handover;
+mod live;
 mod park;
 mod waits;
 
 pub use handover::{HandOver, MAX_PACKAGE, Successor, TakenOver};
+pub use live::{
+    CallerFrame, Closed, FromCaller, MAX_STREAMS, MAX_STREAMS_PER_CALLER, MAX_STREAMS_PER_OWNER,
+    Part, Relay,
+};
 pub use park::{MAX_PARKED, MAX_PARKED_BYTES, MAX_PARKED_PER_OWNER};
 
 pub use crate::caller::{CallerExchange, DESCRIBE};
@@ -457,6 +462,8 @@ pub struct Node<S: LogSink, C: Clock> {
     state_key: crate::limits::StateKey,
     clock: C,
     state: Mutex<State<S>>,
+    /// The connections open now (WebSockets, streamed responses).
+    live: live::Slots,
 }
 
 impl<S: LogSink, C: Clock> Node<S, C> {
@@ -474,6 +481,7 @@ impl<S: LogSink, C: Clock> Node<S, C> {
                     call.body.payload(),
                     transport,
                     &mut updated,
+                    None,
                 );
                 Outcome {
                     result,
@@ -488,6 +496,7 @@ impl<S: LogSink, C: Clock> Node<S, C> {
                     call.body.payload(),
                     &mut NoTransport,
                     &mut updated,
+                    None,
                 );
                 Outcome {
                     result,
@@ -504,6 +513,44 @@ impl<S: LogSink, C: Clock> Node<S, C> {
                 },
                 record: None,
             },
+            Body::Socket { .. } => Outcome {
+                result: Err(Error::RequestInvalid {
+                    rule: "a WebSocket operation runs on a streaming call",
+                }),
+                record: None,
+            },
+        }
+    }
+
+    /// Runs a [`SignedCall`] whose result goes to the caller as it arrives: a WebSocket
+    /// operation ([`Body::Socket`]) or an HTTPS operation whose `return` streams the body.
+    /// The parts go through `relay`; the result is [`Output::Closed`], or what the operation
+    /// handed back when it did not get to stream (it waits for approval, say).
+    pub fn relay<T: Transport>(
+        &self,
+        call: &SignedCall,
+        transport: &mut T,
+        relay: &mut dyn live::Relay,
+    ) -> Outcome<Output> {
+        let (record, operation, auth) = (&call.record, call.operation.as_str(), &call.auth);
+        let mut updated = None;
+        let result = match &call.body {
+            Body::Http { .. } | Body::Socket { .. } => self.execute(
+                record,
+                operation,
+                auth,
+                call.body.payload(),
+                transport,
+                &mut updated,
+                Some(relay),
+            ),
+            _ => Err(Error::RequestInvalid {
+                rule: "a streaming call runs a WebSocket or a streamed response",
+            }),
+        };
+        Outcome {
+            result,
+            record: updated,
         }
     }
 
@@ -532,6 +579,7 @@ impl<S: LogSink, C: Clock> Node<S, C> {
             seal: seal.0,
             state_key,
             clock,
+            live: live::Slots::default(),
             state: Mutex::new(State {
                 log,
                 sink,
@@ -639,7 +687,7 @@ impl<S: LogSink, C: Clock> Node<S, C> {
                             &carried.limits,
                         )?;
                     }
-                    Event::Done { .. } => {}
+                    Event::Done { .. } | Event::Closed { .. } => {}
                 }
             }
         }
@@ -940,6 +988,7 @@ impl<S: LogSink, C: Clock> Node<S, C> {
                     (operation.connection(), payload),
                     (Some(Connection::Https), Payload::Http(_))
                         | (Some(Connection::Tls), Payload::Stream { .. })
+                        | (Some(Connection::Websocket), Payload::Socket(_))
                         | (None, Payload::Derive(_))
                         | (_, Payload::Resume(_))
                 );
@@ -1074,6 +1123,7 @@ impl<S: LogSink, C: Clock> Node<S, C> {
                 Payload::Http(request),
                 transport,
                 &mut updated,
+                None,
             )
             .and_then(|output| match output {
                 Output::Http(response) => Ok(response),
@@ -1107,7 +1157,15 @@ impl<S: LogSink, C: Clock> Node<S, C> {
             exchanges,
         };
         let result = self
-            .execute(record, operation, auth, payload, transport, &mut updated)
+            .execute(
+                record,
+                operation,
+                auth,
+                payload,
+                transport,
+                &mut updated,
+                None,
+            )
             .and_then(|output| match output {
                 Output::Stream(output) => Ok(output),
                 Output::Pending(_) => Err(Error::Pending),
@@ -1139,6 +1197,7 @@ impl<S: LogSink, C: Clock> Node<S, C> {
             Payload::Derive(input),
             &mut NoTransport,
             &mut updated,
+            None,
         )?;
         match output {
             Output::Derive(bytes) => Ok(bytes),
@@ -1151,6 +1210,7 @@ impl<S: LogSink, C: Clock> Node<S, C> {
 
     /// Checks the call and what the caller sends against the operation, then runs its steps
     /// over its connection.
+    #[allow(clippy::too_many_arguments)]
     fn execute<T: Transport>(
         &self,
         record: &Record,
@@ -1159,6 +1219,7 @@ impl<S: LogSink, C: Clock> Node<S, C> {
         payload: Payload<'_>,
         transport: &mut T,
         updated: &mut Option<Record>,
+        relay: Option<&mut dyn live::Relay>,
     ) -> Result<Output> {
         if let Payload::Resume(id) = payload {
             return self.resume(record, name, auth, id, transport, updated);
@@ -1175,22 +1236,40 @@ impl<S: LogSink, C: Clock> Node<S, C> {
         // What the caller sends is checked in full before the record is opened, so a refused
         // request leaves no entry and reaches no server.
         let mut input = Vec::new();
+        // A streaming call is for an operation that streams, and takes one of the bounded
+        // number of open connections; a WebSocket operation needs one.
+        let _slot = match (&relay, live::streams(operation)) {
+            (Some(_), true) => Some(self.live.take(&record.owner, &auth.caller, policy)?),
+            (Some(_), false) => {
+                return Err(Error::RequestInvalid {
+                    rule: "the operation does not stream",
+                });
+            }
+            (None, _) if operation.connection() == Some(Connection::Websocket) => {
+                return Err(Error::RequestInvalid {
+                    rule: "a WebSocket operation runs on a streaming call",
+                });
+            }
+            (None, _) => None,
+        };
         match payload {
             Payload::Describe | Payload::Resume(_) => return Err(operation.unknown()),
-            Payload::Http(request) => match (request, operation.takes_request()) {
-                (Some(request), true) => request.validate(operation)?,
-                (None, false) => {}
-                (Some(_), false) => {
-                    return Err(Error::RequestInvalid {
-                        rule: "the operation takes no request",
-                    });
+            Payload::Http(request) | Payload::Socket(request) => {
+                match (request, operation.takes_request()) {
+                    (Some(request), true) => request.validate(operation)?,
+                    (None, false) => {}
+                    (Some(_), false) => {
+                        return Err(Error::RequestInvalid {
+                            rule: "the operation takes no request",
+                        });
+                    }
+                    (None, true) => {
+                        return Err(Error::RequestInvalid {
+                            rule: "the operation needs a request",
+                        });
+                    }
                 }
-                (None, true) => {
-                    return Err(Error::RequestInvalid {
-                        rule: "the operation needs a request",
-                    });
-                }
-            },
+            }
             Payload::Stream {
                 destination,
                 exchanges,
@@ -1238,7 +1317,15 @@ impl<S: LogSink, C: Clock> Node<S, C> {
         if let Some(pending) = self.gate(&mut run, payload, &input)? {
             return Ok(Output::Pending(pending));
         }
-        self.proceed(&mut run, payload, &input, transport, updated)
+        match (relay, payload) {
+            (Some(relay), Payload::Http(request) | Payload::Socket(request)) => {
+                self.renew_sessions(&mut run, transport, updated)?;
+                let live = live::Live { auth, relay };
+                self.run_live(&mut run, request, transport, live, updated)
+                    .map(Output::Closed)
+            }
+            _ => self.proceed(&mut run, payload, &input, transport, updated),
+        }
     }
 
     /// Runs the steps of `run` from `run.start` over the connection of the operation, and parks
@@ -1273,7 +1360,9 @@ impl<S: LogSink, C: Clock> Node<S, C> {
                     .park_challenge(run, at, payload, input, updated)
                     .map(Output::Pending),
             },
-            Payload::Describe | Payload::Resume(_) => Err(run.operation.unknown()),
+            Payload::Describe | Payload::Resume(_) | Payload::Socket(_) => {
+                Err(run.operation.unknown())
+            }
         }
     }
 
@@ -1467,17 +1556,18 @@ impl<S: LogSink, C: Clock> Node<S, C> {
         checked
     }
 
-    /// Builds, logs and sends one HTTPS request, and parses its response.
-    fn https_send<T: Transport>(
+    /// Builds and logs one HTTPS request: what [`Node::https_send`] and the streamed sends
+    /// of [`live`] share. The request goes out with the confirmation it returns.
+    fn prepare<'o>(
         &self,
-        run: &mut Run<'_>,
-        open: &Open,
-        send: &Send,
-        request: Option<&Request>,
-        transport: &mut T,
+        run: &Run<'_>,
+        open: &'o Open,
+        send: &'o Send,
+        request: Option<&'o Request>,
         updated: &Option<Record>,
-    ) -> Result<(u64, Http)> {
-        let (now, who) = (run.now, run.who);
+        kind: request::Wire<'_>,
+    ) -> Result<live::Prepared<'o>> {
+        let now = run.now;
         let outbound = Outbound::of(send, &open.destinations, request)?;
         if !run.operation.allows_destination(outbound.destination) {
             return Err(outbound.destination.denied());
@@ -1492,6 +1582,7 @@ impl<S: LogSink, C: Clock> Node<S, C> {
                 unix_ms: now,
                 budget: &run.budget,
             },
+            kind,
         )?;
         let client = render_identity(
             open.identity.as_ref(),
@@ -1513,13 +1604,47 @@ impl<S: LogSink, C: Clock> Node<S, C> {
             generation: updated.as_ref().unwrap_or(run.record).generation,
             detail: detail.seal(&run.user_key, &run.record.owner, &run.record.id)?,
         };
-        let (seq, confirmed) = self.lock().commit(now, who, event)?;
-        let sent = dispatch(
+        let (seq, confirmed) = self.lock().commit(now, run.who, event)?;
+        Ok(live::Prepared {
+            seq,
             confirmed,
+            wire: built.wire,
+            tainted: built.tainted,
+            client,
+            destination: outbound.destination,
+        })
+    }
+
+    /// Builds, logs and sends one HTTPS request, and parses its response.
+    fn https_send<T: Transport>(
+        &self,
+        run: &mut Run<'_>,
+        open: &Open,
+        send: &Send,
+        request: Option<&Request>,
+        transport: &mut T,
+        updated: &Option<Record>,
+    ) -> Result<(u64, Http)> {
+        let (now, who) = (run.now, run.who);
+        let kind = if send.grpc {
+            request::Wire::Grpc
+        } else {
+            request::Wire::Plain
+        };
+        let prepared = self.prepare(run, open, send, request, updated, kind)?;
+        let seq = prepared.seq;
+        let built = request::Built {
+            wire: prepared.wire,
+            tainted: prepared.tainted,
+        };
+        let client = prepared.client;
+        let sent = dispatch(
+            prepared.confirmed,
             transport,
-            outbound.destination,
+            prepared.destination,
             client.as_ref(),
             &built.wire,
+            open.protocol.unwrap_or_default(),
         );
         drop(client);
         let (_, mut bytes) = match sent {
@@ -1530,7 +1655,13 @@ impl<S: LogSink, C: Clock> Node<S, C> {
             }
         };
         run.tainted.extend(built.tainted);
-        let parsed = Http::parse(&bytes);
+        let parsed = Http::parse(&bytes).and_then(|http| {
+            if send.grpc {
+                live::grpc_answer(http)
+            } else {
+                Ok(http)
+            }
+        });
         bytes.zeroize();
         match parsed {
             Ok(http) => Ok((seq, http)),

@@ -229,6 +229,8 @@ fn convert(operation: Operation, notes: &mut Vec<String>) -> NewOperation {
                 connection: Connection::Https,
                 destinations,
                 identity,
+                protocol: None,
+                limits: None,
             })];
             let mut templates: Vec<String> = Vec::new();
             for path in &paths {
@@ -267,6 +269,8 @@ fn convert(operation: Operation, notes: &mut Vec<String>) -> NewOperation {
                     request: Some(request),
                     inject: step.inject,
                     template: None,
+                    grpc: false,
+                    frame: None,
                 }));
                 if !step.capture.is_empty() {
                     out.push(NewStep::Receive(Receive {
@@ -307,6 +311,8 @@ fn convert(operation: Operation, notes: &mut Vec<String>) -> NewOperation {
                 connection: Connection::Tls,
                 destinations,
                 identity,
+                protocol: None,
+                limits: None,
             })];
             for exchange in script {
                 out.push(match exchange {

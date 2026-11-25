@@ -65,11 +65,27 @@ pub enum Payload<'a> {
     Describe,
     /// Goes on with the waiting operation of this id.
     Resume(&'a [u8; 16]),
+    /// A WebSocket operation, with the caller's handshake request when its first send takes
+    /// one.
+    Socket(Option<&'a Request>),
 }
 
 fn part(hasher: &mut Sha256, bytes: &[u8]) {
     hasher.update((bytes.len() as u64).to_be_bytes());
     hasher.update(bytes);
+}
+
+fn request_parts(h: &mut Sha256, r: &Request) {
+    part(h, r.method.as_str().as_bytes());
+    part(h, r.destination.host.as_bytes());
+    part(h, &r.destination.port.to_be_bytes());
+    part(h, r.path.as_bytes());
+    part(h, &(r.headers.len() as u64).to_be_bytes());
+    for (name, value) in &r.headers {
+        part(h, name.as_bytes());
+        part(h, value.as_bytes());
+    }
+    part(h, &r.body);
 }
 
 impl Payload<'_> {
@@ -80,16 +96,12 @@ impl Payload<'_> {
             Payload::Http(None) => part(&mut h, b"http"),
             Payload::Http(Some(r)) => {
                 part(&mut h, b"http-request");
-                part(&mut h, r.method.as_str().as_bytes());
-                part(&mut h, r.destination.host.as_bytes());
-                part(&mut h, &r.destination.port.to_be_bytes());
-                part(&mut h, r.path.as_bytes());
-                part(&mut h, &(r.headers.len() as u64).to_be_bytes());
-                for (name, value) in &r.headers {
-                    part(&mut h, name.as_bytes());
-                    part(&mut h, value.as_bytes());
-                }
-                part(&mut h, &r.body);
+                request_parts(&mut h, r);
+            }
+            Payload::Socket(None) => part(&mut h, b"socket"),
+            Payload::Socket(Some(r)) => {
+                part(&mut h, b"socket-request");
+                request_parts(&mut h, r);
             }
             Payload::Stream {
                 destination,
@@ -214,5 +226,54 @@ impl CallerKey {
         };
         auth.signature = self.sign(&auth.message(&call)?);
         Ok(auth)
+    }
+}
+
+const FRAME_DOMAIN: &[u8] = b"frame/v1\0";
+
+/// The message a caller signs for one frame it sends on a WebSocket call: the signature of
+/// the call (which binds the node, record, operation and handshake), the frame's sequence
+/// number (from 0, one more each frame), its kind and the hash of its bytes. The operator
+/// between caller and node can neither inject a frame, nor reorder, replay or move one to
+/// another call.
+fn frame_message(call: &[u8; 64], seq: u64, binary: bool, data: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(FRAME_DOMAIN.len() + 64 + 8 + 1 + 32);
+    out.extend_from_slice(FRAME_DOMAIN);
+    out.extend_from_slice(call);
+    out.extend_from_slice(&seq.to_be_bytes());
+    out.push(u8::from(binary));
+    out.extend_from_slice(&Sha256::digest(data));
+    out
+}
+
+impl CallerKey {
+    /// Signs frame `seq` of the WebSocket call whose authorization is `auth`.
+    pub fn sign_frame(
+        &self,
+        auth: &Authorization,
+        seq: u64,
+        binary: bool,
+        data: &[u8],
+    ) -> [u8; 64] {
+        self.sign(&frame_message(&auth.signature, seq, binary, data))
+    }
+}
+
+impl Authorization {
+    pub(crate) fn verify_frame(
+        &self,
+        key: &CallerPublicKey,
+        seq: u64,
+        binary: bool,
+        data: &[u8],
+        signature: &[u8; 64],
+    ) -> Result<()> {
+        key.verify(
+            &frame_message(&self.signature, seq, binary, data),
+            signature,
+        )
+        .map_err(|_| Error::FrameRefused {
+            rule: "frame signature does not verify",
+        })
     }
 }

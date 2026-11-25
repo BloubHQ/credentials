@@ -266,6 +266,10 @@ pub enum FlagCode {
     Wider,
     /// A destination the previous version did not have.
     NewDestination,
+    /// A WebSocket relays the caller's frames of a kind with no pinned shape.
+    FramesUnpinned,
+    /// A WebSocket hands the server's messages back to the caller.
+    ServerFrames,
 }
 
 /// A risk flag.
@@ -307,6 +311,7 @@ fn place(connection: Connection, d: &Destination) -> Place {
         scheme: match connection {
             Connection::Https => "https",
             Connection::Tls => "tls",
+            Connection::Websocket => "wss",
         }
         .into(),
         host: d.host.clone(),
@@ -318,6 +323,7 @@ fn connection_name(connection: Option<Connection>) -> &'static str {
     match connection {
         Some(Connection::Https) => "https",
         Some(Connection::Tls) => "tls",
+        Some(Connection::Websocket) => "websocket",
         None => "none",
     }
 }
@@ -480,6 +486,7 @@ fn return_summary(ret: &Return, connection: Option<Connection>) -> ReturnSummary
         match &p.body {
             None => {}
             Some(BodyProjection::All) => out.body = "all".into(),
+            Some(BodyProjection::Stream) => out.body = "stream".into(),
             Some(BodyProjection::Json(pointers)) => {
                 out.body = "json".into();
                 out.json = pointers.clone();
@@ -778,26 +785,64 @@ fn risk_flags(policy: &Policy, origin: Option<&Origin>, flags: &mut Vec<Flag>) {
             }
         }
         if let Some(ret) = operation.returns() {
-            if let Some(p) = &ret.response
-                && p.body == Some(BodyProjection::All)
-            {
-                flag(
-                    flags,
-                    FlagCode::ResponseAll,
-                    &at,
-                    "the whole response body goes back to the caller",
-                );
+            if let Some(p) = &ret.response {
+                if p.body == Some(BodyProjection::All) {
+                    flag(
+                        flags,
+                        FlagCode::ResponseAll,
+                        &at,
+                        "the whole response body goes back to the caller",
+                    );
+                }
+                if p.body == Some(BodyProjection::Stream) {
+                    flag(
+                        flags,
+                        FlagCode::ResponseAll,
+                        &at,
+                        "the whole response body goes back to the caller, as it arrives",
+                    );
+                }
             }
             if let Some(relay) = &ret.relay {
-                flag(
-                    flags,
-                    FlagCode::Relay,
-                    &at,
-                    format!(
-                        "the caller's sends matching {:?} run under the policy's login",
-                        relay.sends
-                    ),
-                );
+                if relay.frames.is_empty() {
+                    flag(
+                        flags,
+                        FlagCode::Relay,
+                        &at,
+                        format!(
+                            "the caller's sends matching {:?} run under the policy's login",
+                            relay.sends
+                        ),
+                    );
+                } else {
+                    flag(
+                        flags,
+                        FlagCode::Relay,
+                        &at,
+                        format!(
+                            "the caller's {} kind(s) of WebSocket frames go to the server under the policy's login",
+                            relay.frames.len()
+                        ),
+                    );
+                }
+                for (i, rule) in relay.frames.iter().enumerate() {
+                    if rule.unpinned() {
+                        flag(
+                            flags,
+                            FlagCode::FramesUnpinned,
+                            format!("{at}.frames[{i}]"),
+                            "the caller's frames of this kind are relayed with no pinned shape (no JSON schema or pattern)",
+                        );
+                    }
+                }
+                if relay.server {
+                    flag(
+                        flags,
+                        FlagCode::ServerFrames,
+                        &at,
+                        "the server's WebSocket messages go back to the caller (after the stream search)",
+                    );
+                }
                 for p in relay.sends.iter().filter(|p| broad(p)) {
                     flag(
                         flags,
@@ -994,7 +1039,7 @@ fn body_rank(p: Option<&super::Projection>) -> u8 {
     match p.and_then(|p| p.body.as_ref()) {
         None => 0,
         Some(BodyProjection::Json(_)) => 1,
-        Some(BodyProjection::All) => 2,
+        Some(BodyProjection::All | BodyProjection::Stream) => 2,
     }
 }
 
@@ -1028,6 +1073,32 @@ fn diff_return(at: &str, a: &Return, b: &Return, wider: &mut Vec<String>) {
     let before = relays(a);
     for p in relays(b).into_iter().filter(|p| !before.contains(p)) {
         wider.push(format!("{at}: the stream now relays sends matching {p:?}"));
+    }
+    let frames = |r: &Return| {
+        r.relay
+            .as_ref()
+            .map(|r| r.frames.clone())
+            .unwrap_or_default()
+    };
+    let before = frames(a);
+    for (i, rule) in frames(b).iter().enumerate() {
+        if !before.contains(rule) {
+            wider.push(format!("{at}: the frame rule {i} is new or changed"));
+        }
+    }
+    let server = |r: &Return| r.relay.as_ref().is_some_and(|r| r.server);
+    if server(b) && !server(a) {
+        wider.push(format!(
+            "{at}: the server's messages now go back to the caller"
+        ));
+    }
+    let trailers = |p: Option<&super::Projection>| -> Vec<String> {
+        p.map(|p| p.trailers.iter().map(|h| h.to_ascii_lowercase()).collect())
+            .unwrap_or_default()
+    };
+    let before = trailers(pa);
+    for h in trailers(pb).into_iter().filter(|h| !before.contains(h)) {
+        wider.push(format!("{at}: the response trailer {h} now goes back"));
     }
     if a.template != b.template {
         wider.push(format!("{at}: the output changed"));

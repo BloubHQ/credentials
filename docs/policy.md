@@ -102,8 +102,9 @@ The kind of connection decides what `send`, `receive` and `return` mean:
 
 | Connection | `send` | `receive` | `return` | What the caller sends |
 | --- | --- | --- | --- | --- |
-| `https` | One HTTP/1.1 request on its own TLS connection: `request` and `inject`. | Reads the response of the `send` just before it, for its captures. | `response`: the projection of the last response. | A request within the contract of each `send` that takes it. |
+| `https` | One request on its own TLS connection (HTTP/2 or HTTP/1.1, chosen by ALPN; see [HTTP versions and gRPC](#http-versions-and-grpc)): `request` and `inject`. | Reads the response of the `send` just before it, for its captures. | `response`: the projection of the last response, which may be streamed. | A request within the contract of each `send` that takes it. |
 | `tls` | Writes a rendered `template`. | Reads up to and including the first of `until` (1 to 8 delimiters of 1 to 256 bytes). | `relay`: which of the caller's exchanges run after the steps. | Exchanges, each matched against `relay`. |
+| `websocket` | The first is the handshake (an HTTPS `send` with a GET); each later one writes a message: `frame` and `template`. | After the handshake, reads its answer's headers; later, the next message. | `relay`: which of the caller's frames go to the server, and whether the server's go back. | Signed frames, each matched against `relay.frames`. |
 | none (no `open`) | — | — | `template`: the output. | Its `input`, checked by the `input` schema. |
 
 Rules for every operation:
@@ -115,20 +116,23 @@ Rules for every operation:
 - `compute` may appear anywhere after `open`.
 - `run` needs an HTTPS connection and may appear anywhere after `open`.
 - `await` may appear in an HTTPS operation or one with no connection, at most 4 times; not
-  on TLS, whose connection would stay open while it waits.
+  on TLS or a WebSocket, whose connection would stay open while it waits.
+- `run` and `await` are refused on a WebSocket.
 - `repeat` and `if` are refused for now (see [Loops and branches](#loops-and-branches)).
 
-New kinds of connection (WebSocket, SSH, database handshakes, a browser over CDP) fit the
-same steps: each kind says what its `send`, `receive` and `return` carry, and the template
-analysis stays the same. None is implemented yet.
+Other kinds of connection (SSH, database handshakes, a browser over CDP) fit the same steps:
+each kind says what its `send`, `receive` and `return` carry, and the template analysis
+stays the same. They are not implemented yet.
 
 ### `open`
 
 | Member | Meaning |
 | --- | --- |
-| `connection` | `https` or `tls`. |
+| `connection` | `https`, `tls` or `websocket` (always `wss`). |
 | `destinations` | 1–32 hosts and ports. `*.example.com` matches exactly one label (`eu.example.com`, not `example.com` or `a.b.example.com`); `*.` must be followed by at least two labels, so `*.com` is refused. Hosts are lowercase labels of `a–z 0–9 -` (at most 253 bytes), and the port is not 0. The caller's request or stream names one of them. |
 | `identity` | Optional client certificate for mutual TLS: two templates, handed to the transport only. |
+| `protocol` | HTTPS only, optional: `h2` or `http1` pins the HTTP version. Without it the node offers both by ALPN and takes what the server picks. A pinned version the server does not agree to fails the call before the request is written (no downgrade). |
+| `limits` | For a WebSocket or an operation whose response is streamed, optional: `idle_ms` (default 30 s, at most 120 s), `duration_ms` (default 10 min, at most 1 h) and `bytes` (both ways together; default 64 MiB, at most 1 GiB). Reaching one ends the connection. |
 
 ### `send` on HTTPS
 
@@ -214,6 +218,77 @@ headers; the engine sends `Accept-Encoding: identity` and `Connection: close`.
 
 `{"do": "send", "template": "a1 LOGIN {{user}} {{password}}\r\n"}` writes the rendered
 template.
+
+### HTTP versions and gRPC
+
+The engine builds every request in HTTP/1.1 form; the transport sends it over HTTP/2 when
+the server picks `h2` by ALPN, and hands the answer back in HTTP/1.1 form (a chunked body, and
+the HTTP/2 trailers after it). Its HTTP/2 client is synchronous and minimal: one stream per
+connection, no server push, HPACK with Huffman, strict frame and field checks (a field name
+must be a lowercase token, a value holds no control byte, connection-specific fields and
+unknown pseudo-headers are refused, `content-length` must agree with the body).
+
+```json
+{"do": "send", "grpc": true,
+ "request": {"from": "fixed", "method": "POST", "path": "/pkg.Service/Get"},
+ "inject": [{"target": {"kind": "header", "name": "authorization"},
+             "template": "Bearer {{access_token}}"},
+            {"target": {"kind": "body"}, "template": "{{ hexdecode(message) }}"}]}
+```
+
+`grpc: true` makes the send a unary gRPC call: the body is one message, sent
+length-prefixed (uncompressed) with `content-type: application/grpc` and `te: trailers`, and
+the answer must be one uncompressed message, which becomes the body the projection and the
+captures read. It needs `protocol: "h2"` on the `open`, a POST, and no `content-type` in the
+request (the node sets it). `grpc-status` and `grpc-message` come in the trailers: project them
+with `trailers` or capture them with `{"from": "trailer", "name": "grpc-status"}` (a trailer
+capture falls back to the header of the same name, as a trailers-only gRPC answer carries it).
+
+### WebSocket
+
+```json
+{"name": "live",
+ "steps": [
+   {"do": "open", "connection": "websocket",
+    "destinations": [{"host": "stream.example.com", "port": 443}],
+    "limits": {"idle_ms": 60000, "duration_ms": 1800000}},
+   {"do": "send", "request": {"from": "fixed", "method": "GET", "path": "/v1/socket"}},
+   {"do": "send", "frame": "text", "template": "{\"op\":\"auth\",\"token\":\"{{access_token}}\"}"},
+   {"do": "receive", "capture": [{"source": {"from": "regex", "pattern": "\"session\":\"([a-z0-9]{1,64})\""},
+                                  "into": {"kind": "temp", "name": "session", "secret": false}}]},
+   {"do": "return", "relay": {
+     "frames": [{"kind": "text",
+                 "shape": {"json": {"members": [
+                   {"pointer": "/op", "equals": "subscribe"},
+                   {"pointer": "/channel", "type": "string", "pattern": "[a-z]{1,32}"}]}}}],
+     "server": true}}
+ ]}
+```
+
+- The first `send` is the handshake: an HTTPS `send` with a GET, no body and no gRPC, over
+  HTTP/1.1. The node adds `Upgrade`, `Connection`, `Sec-WebSocket-Version` and a fresh
+  `Sec-WebSocket-Key`; the policy and the caller cannot set those or
+  `Sec-WebSocket-Extensions`. The answer must be `101` with `Upgrade: websocket`, the right
+  `Sec-WebSocket-Accept`, no extension, and a subprotocol only if the request offered one.
+- A later `send` writes one message: `frame` (`text` or `binary`) and a `template` (the
+  first-message authentication of many APIs). A `receive` right after the handshake reads the
+  headers of its answer; a later one reads the next message (`between`, `regex` or
+  `all`).
+- `return` takes `relay` only: `frames` (at most 16 rules; each has a `kind`, an optional
+  `shape` and an optional `template`) and `server`. A caller's frame goes to the server only
+  when it is signed for this call, in sequence, and matches the first rule of its kind: its
+  data must hold against `shape` (an [input schema](#input-schemas): a closed JSON schema, or
+  `raw` with a `pattern`); the node writes the checked data, or the rendered `template`, which
+  may read it as `$input` and the fields (a template that reads `$input` needs a shape). A frame
+  that matches no rule, has a bad signature or is out of sequence ends the connection. A rule
+  with no shape, or a `raw` shape with no pattern, is flagged `frames_unpinned`.
+- The server's messages go back to the caller only with `server: true` (flagged
+  `server_frames`), after the stream search for secrets; pings are answered by the node.
+- `run` and `await` are refused; at most one WebSocket is open per call.
+
+A WebSocket and a streamed response are open connections: a caller holds at most 4 at once,
+an owner 16, a node 256. The node logs one entry when one opens (the `use`) and one when it
+closes, with why it closed, the status, and the messages and bytes each way.
 
 ### `receive` and captures
 
@@ -382,9 +457,20 @@ not matter), and the body only as `body` says:
 | absent | nothing |
 | `"all"` | the whole body (the summary flags it) |
 | `{"json": [pointers]}` | a JSON object from each pointer to the JSON text of its value, numbers as written; a `*` token stands for every element of an array (`/items/*/id` gives an array of ids). A pointer that reaches nothing is left out. A body that is not JSON fails the call. At most 32 pointers. |
+| `"stream"` | the whole body, handed on as it arrives when the caller asks for a stream (server-sent events, chunked bodies); a plain call gets it whole, as with `"all"` (the summary flags it the same way). The `send` must be the step just before `return`, and not gRPC. |
 
-`{"do": "return"}` alone returns the status only. Whatever goes back is still redacted and
-searched for secrets.
+`trailers` lists the trailer fields that go back (at most 32, case does not matter), such as
+`grpc-status`. `{"do": "return"}` alone returns the status only. Whatever goes back is still
+redacted and searched for secrets.
+
+A streamed body is searched as it passes: the node holds back the last bytes of what it
+has read (one less than the longest form of a secret it searches for, times six for JSON
+escapes), so a secret split across chunks, in any form the search knows (raw, Base64 in both
+alphabets, JSON-escaped, percent-encoded, hex in both cases, and `\u00XX` escapes), is found
+before any byte of it leaves. A secret found mid-stream ends the stream; what was already
+handed on held none of it. A captured secret in a streamed body ends it too, since it cannot be
+redacted in place. The status and the listed headers go first, the body in parts, then the
+listed trailers.
 
 #### TLS: the relay
 
@@ -398,6 +484,17 @@ until) run on the connection when **every** send matches one of 1 to 16 patterns
 sends are checked before anything is logged or the connection opens. Without `relay`, a
 call with exchanges is refused. Every read is redacted and searched before it is returned;
 an error stops the exchanges and is returned next to the reads that completed.
+
+#### WebSocket: the relay
+
+```json
+{"do": "return", "relay": {"frames": [{"kind": "binary", "shape": {"raw": {"max_len": 256, "pattern": "[0-9a-f]{2,256}"}},
+                                       "template": "{{ hexdecode($input) }}"}],
+                           "server": false}}
+```
+
+See [WebSocket](#websocket). A server message is searched as a whole, with the end of the
+one before it, so a secret split across two messages is found too.
 
 #### No connection: the output
 
@@ -625,14 +722,16 @@ crate, which checks the policy first) gives the owner, in JSON:
 | `plain_signoff` | The owner signs off another plain-text connection. |
 | `raw_input` | An operation takes any bytes (`{"raw": {}}`). |
 | `derive_reversible` | An output is not one-way: it holds an encryption, a key agreement or an XOR of a secret. |
-| `relay` | A stream relays the caller's sends. |
+| `relay` | A stream relays the caller's sends, or a WebSocket the caller's frames. |
 | `relay_broad` | A relay pattern matches broadly (`.*`, `.+`, a negated class). |
-| `response_all` | The whole response body goes back. |
+| `response_all` | The whole response body goes back (`"all"` or `"stream"`). |
 | `query_any` | A caller's query parameter takes any value. |
 | `encoded_percent` | The caller's path may hold `%25`. |
 | `override_params` | The caller may send method-override parameters. |
 | `client_certificate` | A client certificate goes to a destination. |
 | `run_unpinned` | A `run` step fetches its module without a `sha256` pin: the site can change the code that reads the secrets. |
+| `frames_unpinned` | A WebSocket relays the caller's frames of a kind with no shape (or a `raw` shape with no pattern). |
+| `server_frames` | A WebSocket hands the server's messages back to the caller. |
 | `wider` | Against `previous`: a new destination, method, path, header, query rule, injection, operation, caller or caller key; more of the response; a looser limit; a field made public or not guessable; a payment changed or an approval dropped; a session rule changed; the item unbound or its pins and sign-offs changed. |
 | `new_destination` | Against `previous`: a destination it did not have. |
 

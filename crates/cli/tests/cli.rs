@@ -444,6 +444,24 @@ fn owner_node_and_caller_end_to_end() {
     // A refused act appends nothing, so the checkpoint is not signed and written again.
     assert_eq!(std::fs::read(&head_file).unwrap(), head_before);
 
+    // The streaming endpoint runs only operations that stream: a derivation is refused there
+    // with a JSON error, before anything is logged.
+    let mut args = call_args("streamed");
+    args.extend([
+        "--out".to_string(),
+        s(&path("stream-call.json")).to_string(),
+    ]);
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    ok(&args);
+    let (status, reply) = post(
+        port,
+        "/stream",
+        &std::fs::read(path("stream-call.json")).unwrap(),
+    );
+    assert_eq!(status, 400, "{reply}");
+    assert!(reply.get("ok").is_none(), "{reply}");
+    assert_eq!(std::fs::read(&head_file).unwrap(), head_before);
+
     // Restart, anchored to the checkpoint the server wrote next to its log.
     drop(server);
     let head = PathBuf::from(format!("{}.head.json", s(&log)));

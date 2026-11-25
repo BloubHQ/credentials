@@ -198,6 +198,25 @@ pub enum Event {
         /// True when the result went back to the caller.
         ok: bool,
     },
+    /// How a connection that stayed open (a WebSocket, a streamed response) ended, with what
+    /// went each way: the one entry after the one that opened it.
+    Closed {
+        /// The sequence number of the entry that opened it.
+        of: u64,
+        /// The HTTP status of the handshake or the response.
+        status: Option<u16>,
+        /// True when it ended normally (either side closed, the response ended).
+        ok: bool,
+        /// Why it ended, as a fixed word (`server`, `caller`, `idle`, `duration`, `bytes`,
+        /// `refused`, `reflection`, `error`).
+        reason: String,
+        /// Messages (or body parts) and bytes sent to the server after the opening request.
+        to_server: (u64, u64),
+        /// Messages (or body parts) and bytes handed to the caller.
+        to_caller: (u64, u64),
+        /// How long it was open, in milliseconds.
+        duration_ms: u64,
+    },
 }
 
 /// What a successor took over for one owner: the content of [`Event::Carry`].

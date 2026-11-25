@@ -510,7 +510,7 @@ As built (part 10):
 | 3 | Typed items, disclosure levels, `describe`, custom kinds (done: `docs/policy.md`, Typed items) | 2 |
 | 4 | Policy JSON Schema, `client::summarize` with risk flags, approval format (done: `docs/policy.md`; the approval runtime is part 5) | 2, 3 |
 | 5 | Sessions, challenges, approvals, spending limits (done: `docs/policy.md`, Operations that wait; codes read from a `mail` item, `await` on TLS and amounts from body contracts are next) | 2 |
-| 6 | Connection kinds in layer 1: HTTP/2, WebSocket, streamed responses, then SSH, databases, FTP, mail, queues; tunnels as an IR relay step | 2 |
+| 6 | Connection kinds in layer 1: HTTP/2, WebSocket, streamed responses (first half done: `docs/policy.md`, HTTP versions and gRPC, WebSocket; own synchronous HTTP/2 client and HPACK, one thread per open connection, the Nitro host relay unchanged), then SSH, databases, FTP, mail, queues; tunnels as an IR relay step (next) | 2 |
 | 7 | Trusted code sandbox (layer 3): WebAssembly runtime, JavaScript module, origin-pinned site code (done: `run` step, `crates/sandbox`, wasmi 1.1.0 chosen by measurement; JavaScript measured with boa in the sandbox, its shipping plan in `docs/sandbox.md`) | 2 |
 | 8 | Browser fills over CDP | 4, 5 |
 | 9 | Remaining primitive families (Appendices A, B), UDP relay and its protocols | 1 |

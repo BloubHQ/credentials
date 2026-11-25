@@ -108,6 +108,12 @@ impl Var {
         matches!(self, Var::Host | Var::Unix | Var::UnixMs | Var::Nonce)
     }
 
+    /// True when the template of a WebSocket frame rule may read the variable: what a stream
+    /// may, and the caller's frame as its shape checked it.
+    pub fn in_frame(self) -> bool {
+        self.in_stream() || self == Var::Input
+    }
+
     /// True when a derivation (a `compute` or the `return` template of an operation with no
     /// connection) may read the variable.
     pub fn in_derive(self) -> bool {

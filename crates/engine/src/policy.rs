@@ -87,12 +87,16 @@ pub const MAX_DELIMITERS: usize = 8;
 pub const MAX_DELIMITER: usize = 256;
 /// Most headers or JSON members of a response projection.
 pub const MAX_PROJECTION: usize = 32;
-/// Most caller send patterns of a relay.
+/// Most caller send patterns of a relay; also the most frame rules.
 pub const MAX_RELAY_PATTERNS: usize = 16;
 
 /// Headers the engine sets itself, or that change how a server reads or answers a request;
 /// neither an injection nor a caller may name them.
-pub(crate) const RESERVED_HEADERS: [&str; 15] = [
+pub(crate) const RESERVED_HEADERS: [&str; 19] = [
+    "sec-websocket-key",
+    "sec-websocket-version",
+    "sec-websocket-extensions",
+    "sec-websocket-accept",
     "host",
     "content-length",
     "transfer-encoding",
@@ -462,6 +466,13 @@ pub enum Source {
     },
     /// The whole body.
     All,
+    /// The value of the first trailer with this name (after a chunked or HTTP/2 body), or of
+    /// the header when the answer has no trailers of that name (a gRPC answer without a
+    /// message carries its status in its head).
+    Trailer {
+        /// Trailer name.
+        name: String,
+    },
 }
 
 /// The forms the tagged enums are read in. Serde ignores unknown members next to the tag of a
@@ -524,6 +535,9 @@ mod wire {
             group: Option<u8>,
         },
         All {},
+        Trailer {
+            name: String,
+        },
     }
 
     impl From<Source> for super::Source {
@@ -552,6 +566,7 @@ mod wire {
                 },
                 Source::Regex { pattern, group } => Self::Regex { pattern, group },
                 Source::All {} => Self::All,
+                Source::Trailer { name } => Self::Trailer { name },
             }
         }
     }
@@ -569,11 +584,12 @@ impl Source {
             | Source::HeaderParam { .. }
             | Source::Json { .. }
             | Source::Html { .. }
+            | Source::Trailer { .. }
                 if stream =>
             {
                 Some(http_only)
             }
-            Source::Header { name } | Source::Cookie { name } => {
+            Source::Header { name } | Source::Cookie { name } | Source::Trailer { name } => {
                 (!is_token(name)).then_some("name is not a token")
             }
             Source::HeaderParam {
@@ -635,18 +651,22 @@ pub struct Capture {
     pub optional: bool,
 }
 
-/// The kind of connection an operation opens. New kinds (WebSocket, SSH, database
-/// handshakes, a browser over CDP) are added here, each with what its `send`, `receive` and
-/// `return` mean; the steps and the analysis stay the same.
+/// The kind of connection an operation opens. New kinds (SSH, database handshakes, a browser
+/// over CDP) are added here, each with what its `send`, `receive` and `return` mean; the
+/// steps and the analysis stay the same.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Connection {
-    /// HTTPS: each `send` is one HTTP/1.1 request on its own TLS connection, and `receive`
-    /// reads its response.
+    /// HTTPS: each `send` is one request on its own TLS connection (HTTP/2 or HTTP/1.1, as
+    /// ALPN agrees and `protocol` allows), and `receive` reads its response.
     Https,
     /// A TLS byte stream (IMAP, SMTP, line protocols): `send` writes, `receive` reads up to a
     /// delimiter.
     Tls,
+    /// A WebSocket (RFC 6455) over TLS: the first `send` is the opening handshake, an HTTPS
+    /// request under the same contracts; later sends write messages from templates, and the
+    /// `return` relays the caller's frames within declared shapes.
+    Websocket,
 }
 
 /// The `open` step: the connection and where it may go.
@@ -660,6 +680,95 @@ pub struct Open {
     /// Client certificate.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub identity: Option<Identity>,
+    /// The HTTP version an HTTPS connection must use (`h2` or `http1`); without it, the one
+    /// ALPN agrees on, HTTP/2 first. A pinned version the server does not agree to fails the
+    /// request before anything is sent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protocol: Option<crate::egress::Versions>,
+    /// Bounds of a connection that stays open (a WebSocket, a streamed response); the
+    /// defaults when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limits: Option<StreamLimits>,
+}
+
+/// Bounds of a connection that stays open: it is closed when one is reached.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StreamLimits {
+    /// Longest time without a byte either way, in milliseconds (default 30 s, at most 120 s).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idle_ms: Option<u64>,
+    /// Longest time open, in milliseconds (default 10 minutes, at most 1 hour).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
+    /// Most bytes both ways together (default 64 MiB, at most 1 GiB).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bytes: Option<u64>,
+}
+
+/// Default and largest idle time of an open connection.
+pub const STREAM_IDLE_MS: (u64, u64) = (30_000, 120_000);
+/// Default and longest duration of an open connection.
+pub const STREAM_DURATION_MS: (u64, u64) = (600_000, 3_600_000);
+/// Default and largest byte count of an open connection.
+pub const STREAM_BYTES: (u64, u64) = (64 << 20, 1 << 30);
+
+impl StreamLimits {
+    /// The limits in force: given ones, else the defaults.
+    pub fn effective(&self) -> (u64, u64, u64) {
+        (
+            self.idle_ms.unwrap_or(STREAM_IDLE_MS.0),
+            self.duration_ms.unwrap_or(STREAM_DURATION_MS.0),
+            self.bytes.unwrap_or(STREAM_BYTES.0),
+        )
+    }
+
+    fn fault(&self) -> Option<&'static str> {
+        let within = |v: Option<u64>, max: u64| v.is_none_or(|v| v > 0 && v <= max);
+        (!(within(self.idle_ms, STREAM_IDLE_MS.1)
+            && within(self.duration_ms, STREAM_DURATION_MS.1)
+            && within(self.bytes, STREAM_BYTES.1)))
+        .then_some("limits: idle 1 ms to 120 s, duration 1 ms to 1 h, bytes 1 to 1 GiB")
+    }
+}
+
+/// The kind of a WebSocket data message.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FrameKind {
+    /// A text message (UTF-8).
+    Text,
+    /// A binary message.
+    Binary,
+}
+
+/// A frame of the caller a WebSocket relays: its kind, the shape it must have, and the
+/// template the node sends in its place.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FrameRule {
+    /// The kind of message.
+    pub kind: FrameKind,
+    /// The shape the caller's frame must have: a closed JSON schema, or bytes under a pattern
+    /// (the schema language of an input). Without it, any frame of the kind is relayed; a
+    /// summary flags that.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shape: Option<Input>,
+    /// What is sent for the frame, `$input` being the frame as checked (and normalized) by the
+    /// shape; without it, the frame as it came.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub template: Option<String>,
+}
+
+impl FrameRule {
+    /// True when the shape leaves the frame open: no shape, or bytes with no pattern.
+    pub fn unpinned(&self) -> bool {
+        match &self.shape {
+            None => true,
+            Some(Input::Raw(raw)) => raw.pattern.is_none(),
+            Some(_) => false,
+        }
+    }
 }
 
 /// What request an HTTPS `send` sends.
@@ -691,9 +800,17 @@ pub struct Send {
     /// What the request carries (HTTPS).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub inject: Vec<Injection>,
-    /// What is written (TLS).
+    /// What is written (TLS), or the message sent (WebSocket, with `frame`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub template: Option<String>,
+    /// The request is a unary gRPC call (HTTPS pinned to `h2`, `POST`): its body is framed as
+    /// one message, with `content-type: application/grpc` and `te: trailers`; the answer's
+    /// message is unframed and its `grpc-status` read from the trailers.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub grpc: bool,
+    /// The kind of message a WebSocket send writes (after the handshake).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frame: Option<FrameKind>,
 }
 
 /// The `receive` step. On HTTPS it reads the response of the `send` just before it; on a TLS
@@ -731,6 +848,9 @@ pub struct Projection {
     /// What of the body goes back; nothing when absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub body: Option<BodyProjection>,
+    /// Response trailers that go back (gRPC's `grpc-status`, say).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub trailers: Vec<String>,
 }
 
 /// What of a response body goes back.
@@ -742,15 +862,29 @@ pub enum BodyProjection {
     /// These JSON members, as an object from each pointer to its value. A `*` token stands
     /// for every element of an array.
     Json(Vec<String>),
+    /// The whole body, forwarded as it arrives (server-sent events, chunked answers) on a
+    /// streaming call, after the stream search; a plain call gets it whole, as `all`. A
+    /// summary flags it like `all`.
+    Stream,
 }
 
-/// The caller's exchanges a TLS operation relays after its steps.
+/// The caller's exchanges a TLS operation relays after its steps, or the frames a WebSocket
+/// relays.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Relay {
     /// Regular expressions (linear time, ASCII, `.` does not match a line end); each caller
-    /// send must match one of them whole.
+    /// send must match one of them whole (TLS).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub sends: Vec<String>,
+    /// The frames of the caller that are relayed (WebSocket): each must match a rule of its
+    /// kind; any other is refused and ends the connection.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub frames: Vec<FrameRule>,
+    /// True when the server's messages go back to the caller (WebSocket), after the stream
+    /// search. A summary flags it: whatever the server sends reaches the caller.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub server: bool,
 }
 
 /// The `return` step: what goes back to the caller. HTTPS takes `response`, TLS `relay`, an
@@ -1138,6 +1272,12 @@ fn check_projection(at: &str, projection: &Projection) -> Checked {
         || format!("{at}.response.headers"),
         "at most 32 header names, each a token",
     )?;
+    ensure(
+        projection.trailers.len() <= MAX_PROJECTION
+            && projection.trailers.iter().all(|h| is_token(h)),
+        || format!("{at}.response.trailers"),
+        "at most 32 trailer names, each a token",
+    )?;
     if let Some(BodyProjection::Json(pointers)) = &projection.body {
         ensure(
             !pointers.is_empty()
@@ -1428,6 +1568,40 @@ impl Policy {
             || format!("{at}.inject"),
             "at most 16 injections",
         )?;
+        ensure(
+            send.frame.is_none(),
+            || format!("{at}.frame"),
+            "frame is for the messages of a WebSocket, after its handshake",
+        )?;
+        let methods: Vec<Method> = match request {
+            StepRequest::Fixed { method, .. } => vec![*method],
+            StepRequest::Caller(contract) => contract.methods.clone(),
+        };
+        let names_header = |name: &str| {
+            send.inject.iter().any(
+                |i| matches!(&i.target, Target::Header { name: n } if n.eq_ignore_ascii_case(name)),
+            ) || matches!(request, StepRequest::Caller(c)
+                if c.headers.iter().any(|h| h.eq_ignore_ascii_case(name)))
+        };
+        if open.connection == Connection::Websocket {
+            // The opening handshake: a GET with no body.
+            ensure(
+                !send.grpc
+                    && methods.iter().all(|m| *m == Method::Get)
+                    && !send.inject.iter().any(|i| i.target == Target::Body),
+                || at.to_string(),
+                "a WebSocket handshake is a GET with no body and no gRPC",
+            )?;
+        }
+        if send.grpc {
+            ensure(
+                open.protocol == Some(crate::egress::Versions::Http2)
+                    && methods.iter().all(|m| *m == Method::Post)
+                    && !names_header("content-type"),
+                || format!("{at}.grpc"),
+                "a gRPC send needs protocol h2, POST, and sets content-type itself",
+            )?;
+        }
         match request {
             StepRequest::Fixed {
                 path, destination, ..
@@ -1538,6 +1712,11 @@ impl Policy {
                 )?;
                 if let Some(relay) = &ret.relay {
                     ensure(
+                        relay.frames.is_empty() && !relay.server,
+                        || format!("{at}.relay"),
+                        "frames and server are for a WebSocket",
+                    )?;
+                    ensure(
                         !relay.sends.is_empty()
                             && relay.sends.len() <= MAX_RELAY_PATTERNS
                             && relay
@@ -1547,6 +1726,42 @@ impl Policy {
                         || format!("{at}.relay.sends"),
                         "1 to 16 regular expressions of at most 256 bytes within the size limits",
                     )?;
+                }
+            }
+            Some(Connection::Websocket) => {
+                ensure(
+                    ret.response.is_none() && ret.template.is_none(),
+                    || at.to_string(),
+                    "a WebSocket return takes relay only",
+                )?;
+                ensure(
+                    sent,
+                    || at.to_string(),
+                    "return needs the handshake before it",
+                )?;
+                let Some(relay) = &ret.relay else {
+                    return Ok(());
+                };
+                ensure(
+                    relay.sends.is_empty() && relay.frames.len() <= MAX_RELAY_PATTERNS,
+                    || format!("{at}.relay"),
+                    "a WebSocket relays frames (at most 16 rules), not sends",
+                )?;
+                for (i, rule) in relay.frames.iter().enumerate() {
+                    let at = format!("{at}.relay.frames[{i}]");
+                    if let Some(rule) = rule.shape.as_ref().and_then(Input::fault) {
+                        return fail(format!("{at}.shape"), rule);
+                    }
+                    if let Some(text) = &rule.template {
+                        let at = format!("{at}.template");
+                        let (template, _) =
+                            self.check_template(&at, kinds, text, known, Var::in_frame)?;
+                        ensure(
+                            !template.vars().contains(&Var::Input) || rule.shape.is_some(),
+                            || at,
+                            "a frame template that reads $input needs a shape",
+                        )?;
+                    }
                 }
             }
             None => {
@@ -1617,6 +1832,25 @@ impl Policy {
                     )?;
                     check_destinations(&at, &open.destinations)?;
                     self.check_identity(&at, &kinds, open.identity.as_ref())?;
+                    ensure(
+                        open.protocol.is_none() || open.connection == Connection::Https,
+                        || format!("{at}.protocol"),
+                        "protocol is for an HTTPS connection (a WebSocket handshake is HTTP/1.1)",
+                    )?;
+                    let streams = open.connection == Connection::Websocket
+                        || operation.returns().is_some_and(|r| {
+                            r.response
+                                .as_ref()
+                                .is_some_and(|p| p.body == Some(BodyProjection::Stream))
+                        });
+                    ensure(
+                        open.limits.is_none() || streams,
+                        || format!("{at}.limits"),
+                        "limits are for a WebSocket or a streamed response",
+                    )?;
+                    if let Some(rule) = open.limits.as_ref().and_then(StreamLimits::fault) {
+                        return fail(format!("{at}.limits"), rule);
+                    }
                 }
                 (Step::Send(_) | Step::Receive(_), None) => {
                     return fail(at, "send and receive need an open connection");
@@ -1631,9 +1865,36 @@ impl Policy {
                         )?;
                         self.check_https_send(&at, &kinds, open, send, &known)?;
                     }
+                    Connection::Websocket if sends == 0 => {
+                        sends += 1;
+                        self.check_https_send(&at, &kinds, open, send, &known)?;
+                    }
+                    Connection::Websocket => {
+                        ensure(
+                            send.request.is_none()
+                                && send.inject.is_empty()
+                                && !send.grpc
+                                && send.frame.is_some(),
+                            || at.clone(),
+                            "a WebSocket send after the handshake takes frame and template",
+                        )?;
+                        let Some(template) = &send.template else {
+                            return fail(at, "a WebSocket send needs a template");
+                        };
+                        self.check_template(
+                            &format!("{at}.template"),
+                            &kinds,
+                            template,
+                            &known,
+                            Var::in_stream,
+                        )?;
+                    }
                     Connection::Tls => {
                         ensure(
-                            send.request.is_none() && send.inject.is_empty(),
+                            send.request.is_none()
+                                && send.inject.is_empty()
+                                && !send.grpc
+                                && send.frame.is_none(),
                             || at.clone(),
                             "a TLS send takes template only",
                         )?;
@@ -1677,6 +1938,38 @@ impl Policy {
                         )?;
                         self.check_captures(&at, &receive.capture, true, true, &mut known)?;
                     }
+                    Connection::Websocket => {
+                        ensure(
+                            receive.until.is_empty(),
+                            || format!("{at}.until"),
+                            "a WebSocket receive reads one message; until is for TLS streams",
+                        )?;
+                        // Right after the handshake, a receive reads its answer; later, the
+                        // next message.
+                        let handshake = match previous {
+                            Some(Step::Send(send)) if send.request.is_some() => {
+                                Some(matches!(send.request, Some(StepRequest::Fixed { .. })))
+                            }
+                            _ => None,
+                        };
+                        match handshake {
+                            Some(fixed) => self.check_captures(
+                                &at,
+                                &receive.capture,
+                                false,
+                                fixed,
+                                &mut known,
+                            )?,
+                            None => {
+                                ensure(
+                                    sends > 0,
+                                    || at.clone(),
+                                    "a WebSocket receive follows the handshake",
+                                )?;
+                                self.check_captures(&at, &receive.capture, true, true, &mut known)?
+                            }
+                        }
+                    }
                 },
                 (Step::Compute(compute), _) => {
                     ensure(
@@ -1701,12 +1994,29 @@ impl Policy {
                     known.push(&compute.into);
                 }
                 (Step::Run(run), _) => {
+                    ensure(
+                        connection != Some(Connection::Websocket),
+                        || at.clone(),
+                        "run is not available on a WebSocket",
+                    )?;
                     self.check_run(&at, &kinds, open, run, &known)?;
                     known.push(&run.into);
                 }
                 (Step::Return(ret), _) => {
                     ensure(i + 1 == count, || at.clone(), "return is the last step")?;
                     self.check_return(&at, &kinds, connection, ret, &known, sends > 0)?;
+                    let streamed = ret
+                        .response
+                        .as_ref()
+                        .is_some_and(|p| p.body == Some(BodyProjection::Stream));
+                    if streamed {
+                        // The response streamed is the one of the send just before.
+                        ensure(
+                            matches!(previous, Some(Step::Send(send)) if !send.grpc),
+                            || at.clone(),
+                            "a streamed body comes from the send just before return (not gRPC)",
+                        )?;
+                    }
                 }
                 (Step::Repeat(_) | Step::If(_), _) => {
                     return fail(
@@ -1717,6 +2027,11 @@ impl Policy {
                 (Step::Await(wait), _) => {
                     awaits += 1;
                     ensure(awaits <= MAX_AWAITS, || at.clone(), "at most 4 await steps")?;
+                    ensure(
+                        connection != Some(Connection::Websocket),
+                        || at.clone(),
+                        "a WebSocket does not wait; await is for HTTPS and derivations",
+                    )?;
                     if wait.challenge.poll.is_some() {
                         polls += 1;
                         ensure(
@@ -2129,9 +2444,17 @@ fn summarize_send(send: &Send, out: &mut Vec<String>) {
             }
         }
         None => out.push(format!(
-            "  send {:?}",
+            "  send {}{:?}",
+            match send.frame {
+                Some(FrameKind::Text) => "a text message ",
+                Some(FrameKind::Binary) => "a binary message ",
+                None => "",
+            },
             send.template.as_deref().unwrap_or_default()
         )),
+    }
+    if send.grpc {
+        out.push("  (a unary gRPC call over HTTP/2)".into());
     }
 }
 
@@ -2143,6 +2466,7 @@ fn summarize_operation(operation: &Operation, out: &mut Vec<String>) {
             match open.connection {
                 Connection::Https => "HTTPS",
                 Connection::Tls => "TLS stream",
+                Connection::Websocket => "WebSocket",
             },
             destination_names(&open.destinations),
             if open.identity.is_some() {
@@ -2230,11 +2554,38 @@ fn summarize_operation(operation: &Operation, out: &mut Vec<String>) {
             Step::Run(run) => out.extend(run::summary_line(run, operation.open())),
             Step::Return(ret) => match (&ret.response, &ret.relay, &ret.template) {
                 (_, _, Some(template)) => out.push(format!("  return {template}")),
-                (_, Some(relay), _) => {
+                (_, Some(relay), _) if relay.frames.is_empty() && !relay.server => {
                     out.push(format!(
                         "  return: relays caller sends matching {:?}",
                         relay.sends
                     ));
+                }
+                (_, Some(relay), _) => {
+                    for rule in &relay.frames {
+                        out.push(format!(
+                            "  return: relays the caller's {} frames{}{}",
+                            match rule.kind {
+                                FrameKind::Text => "text",
+                                FrameKind::Binary => "binary",
+                            },
+                            rule.shape
+                                .as_ref()
+                                .map(|s| format!(" shaped {}", s.describe()))
+                                .unwrap_or_else(|| " of any shape".into()),
+                            rule.template
+                                .as_ref()
+                                .map(|t| format!(", sent as {t:?}"))
+                                .unwrap_or_default()
+                        ));
+                        if rule.unpinned() {
+                            out.push(
+                                "  ! frames of this kind are relayed with no pinned shape".into(),
+                            );
+                        }
+                    }
+                    if relay.server {
+                        out.push("  ! the server's messages go back to the caller".into());
+                    }
                 }
                 (Some(p), _, _) => {
                     out.push(format!(
@@ -2247,11 +2598,12 @@ fn summarize_operation(operation: &Operation, out: &mut Vec<String>) {
                         match &p.body {
                             None => String::new(),
                             Some(BodyProjection::All) => ", the whole body".into(),
+                            Some(BodyProjection::Stream) => ", the whole body as it arrives".into(),
                             Some(BodyProjection::Json(pointers)) =>
                                 format!(", body members [{}]", pointers.join(", ")),
                         }
                     ));
-                    if p.body == Some(BodyProjection::All) {
+                    if matches!(p.body, Some(BodyProjection::All | BodyProjection::Stream)) {
                         out.push("  ! the whole response body goes back to the caller".into());
                     }
                 }
