@@ -346,6 +346,33 @@ primitive waits for the release that adds it.
 onto `engine::template`), operation kind `module`; a fuzz target for module inputs; a module
 SDK in Rust that compiles to `wasm32-unknown-unknown`.
 
+## 8e. Running the site's own code
+
+Some logins encrypt or package the password in the site's JavaScript or WebAssembly before the
+API call (an RSA key and session key fetched first, a fingerprint blob, a custom cipher). Three
+ways, in order of preference:
+
+1. **Express it**: when the steps map onto node functions (fetch the key, `rsa_encrypt_*` over
+   a length-prefixed concatenation, captures), it is an ordinary policy.
+2. **Values without secrets stay outside**: a part that does not depend on a secret (a device
+   fingerprint, a proof-of-work) can be computed by the caller or the browser and passed in as
+   an input; it gives the caller nothing it did not have.
+3. **Site code in the node**: the node fetches the script or module **from the site's own
+   origin** (the URL and, optionally, a hash pinned in the signed policy), runs it in a sandbox
+   (a JavaScript engine compiled into the node, or the WASM runtime of section 8c, with no I/O,
+   fuel and memory limits, and only the browser APIs the policy lists, emulated), passes it the
+   secret, and treats its whole output as **tainted**: it can only go into the request to that
+   same site, never back to the caller. The site already receives the secret, so running its
+   own code on it gives it nothing new; the caller still sees nothing.
+
+Limits: code that needs a real browser environment (DOM, canvas, timing, the owner's network)
+cannot be emulated faithfully and goes through a browser fill (section 6); a site whose code
+changes on every load needs the hash left unpinned, which the approval screen flags.
+
+**Implementation.** operation step `run {script, entry, inputs}` in `engine`; the engine choice
+(an embeddable JavaScript interpreter in pure Rust versus QuickJS) is decided by measured size,
+speed and audit surface in its pull request.
+
 ## 8d. Primitives shipped up front
 
 Primitives are the one part that needs a release, so the first release that adds a group
