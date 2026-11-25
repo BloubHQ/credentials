@@ -85,6 +85,7 @@ pub mod caller;
 pub mod egress;
 pub mod encoding;
 pub mod error;
+pub mod extract;
 pub mod fields;
 pub mod grant;
 pub mod keys;
@@ -99,5 +100,7 @@ pub mod response;
 pub mod secret;
 pub mod template;
 mod totp;
+#[cfg(test)]
+mod vectors;
 
 pub use error::{Error, Result};

@@ -3178,3 +3178,402 @@ fn a_clock_stepped_back_after_a_restart_opens_nothing_old() {
     ));
     assert!(node.derive(&record, "derive", &auth, b"x").is_err());
 }
+
+fn fixed(method: Method, path: &str, inject: Vec<Injection>, capture: Vec<Capture>) -> Step {
+    Step {
+        request: StepRequest::Fixed {
+            method,
+            path: path.into(),
+            destination: None,
+        },
+        inject,
+        capture,
+    }
+}
+
+fn unhex(text: &[u8]) -> Vec<u8> {
+    text.chunks(2)
+        .map(|p| u8::from_str_radix(std::str::from_utf8(p).unwrap(), 16).unwrap())
+        .collect()
+}
+
+fn lower_hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// A password envelope built from generic primitives: the server hands out a session key and
+/// a P-256 public key; the node makes an ephemeral key pair, derives an AES-256 key as
+/// SHA-256 of the hex of the shared secret, encrypts length-prefixed fields under a fresh IV,
+/// and sends `b64(ciphertext),b64(iv),hex(ephemeral public key),session`. The test plays the
+/// server and decrypts.
+#[test]
+fn ephemeral_ecdh_password_envelope() {
+    use base64::Engine as _;
+    use cbc::cipher::{BlockModeDecrypt, KeyIvInit, block_padding::Pkcs7};
+    use sha2::Digest as _;
+
+    let clock = TestClock::at(NOW);
+    let server = p256::SecretKey::from_slice(&[0x11; 32]).unwrap();
+    let server_public = {
+        use p256::elliptic_curve::sec1::ToSec1Point as _;
+        lower_hex(
+            server
+                .public_key()
+                .as_affine()
+                .to_sec1_point(false)
+                .as_bytes(),
+        )
+    };
+    let keys = fixed(
+        Method::Get,
+        "/keys/current",
+        vec![],
+        vec![
+            capture(Source::All, temp("keys", false)),
+            capture(
+                Source::Regex {
+                    pattern: "^([^,]+),".into(),
+                    group: None,
+                },
+                temp("session", false),
+            ),
+        ],
+    );
+    let envelope = concat!(
+        "{{ b64(aes_cbc_encrypt(",
+        "sha256(hex(ecdh(\"p256\", hexdecode(between(keys, \",\", \"\"))))), ",
+        "hexdecode($nonce), ",
+        "u8(len(session)) + session + u8(len(user)) + user + u8(len(password)) + password",
+        ")) + \",\" + b64(hexdecode($nonce)) + \",\" + hex(ecdh_public(\"p256\")) + \",\" + session }}",
+    );
+    let login = fixed(
+        Method::Post,
+        "/login",
+        vec![
+            header("Content-Type", "text/plain"),
+            inject(Target::Body, envelope),
+        ],
+        vec![],
+    );
+    let policy = Policy {
+        fields: vec![public("user"), FieldSpec::guessable("password")],
+        callers: vec![],
+        operations: vec![http("login", host(), vec![keys, login])],
+    };
+    let password = b"hunter2-correct-horse";
+    let s = setup(&clock, policy, &[("user", b"kim"), ("password", password)]);
+    let mut transport = FakeTransport::default();
+    let session = "sk_5f2a9c";
+    transport
+        .replies
+        .push_back(reply("200 OK", &format!("{session},{server_public}")));
+    transport
+        .replies
+        .push_back(reply("200 OK", r#"{"ok":true}"#));
+    let outcome = call_http(&s.node, &s.record, "login", None, &mut transport);
+    assert_eq!(outcome.result.unwrap().body(), br#"{"ok":true}"#);
+
+    let body = body_of(&transport.sent[1]).to_vec();
+    let parts: Vec<&[u8]> = body.split(|b| *b == b',').collect();
+    assert_eq!(parts.len(), 4);
+    let b64 = base64::engine::general_purpose::STANDARD;
+    let ciphertext = b64.decode(parts[0]).unwrap();
+    let iv = b64.decode(parts[1]).unwrap();
+    assert_eq!(iv.len(), 16);
+    assert_eq!(parts[2].len(), 130, "uncompressed P-256 point in hex");
+    assert_eq!(parts[3], session.as_bytes());
+    let ephemeral = p256::PublicKey::from_sec1_bytes(&unhex(parts[2])).unwrap();
+    let shared = server.diffie_hellman(&ephemeral);
+    let key = sha2::Sha256::digest(lower_hex(shared.raw_secret_bytes()).as_bytes());
+    let plain = cbc::Decryptor::<aes::Aes256>::new_from_slices(&key, &iv)
+        .unwrap()
+        .decrypt_padded_vec::<Pkcs7>(&ciphertext)
+        .unwrap();
+    let mut expected = vec![u8::try_from(session.len()).unwrap()];
+    expected.extend_from_slice(session.as_bytes());
+    expected.extend_from_slice(&[3]);
+    expected.extend_from_slice(b"kim");
+    expected.push(u8::try_from(password.len()).unwrap());
+    expected.extend_from_slice(password);
+    assert_eq!(plain, expected);
+    // The password itself never went out.
+    assert!(
+        !transport
+            .sent
+            .iter()
+            .any(|w| w.windows(password.len()).any(|x| x == password))
+    );
+    // A second login uses a new ephemeral key.
+    transport
+        .replies
+        .push_back(reply("200 OK", &format!("{session},{server_public}")));
+    transport.replies.push_back(reply("200 OK", "{}"));
+    call_http(&s.node, &s.record, "login", None, &mut transport)
+        .result
+        .unwrap();
+    let again = body_of(&transport.sent[3]).to_vec();
+    let again: Vec<&[u8]> = again.split(|b| *b == b',').collect();
+    assert_ne!(again[2], parts[2]);
+}
+
+/// A JWT whose `iat` and `exp` the node sets itself (`$unix`, `add`, `json_set_number`),
+/// signed with RS512: the caller passes only the audience, so the policy bounds the lifetime.
+#[test]
+fn jwt_claims_get_their_times_from_the_node() {
+    use base64::Engine as _;
+    use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
+    use ring::signature::{
+        KeyPair as _, RSA_PKCS1_2048_8192_SHA512, RsaKeyPair, UnparsedPublicKey,
+    };
+
+    let pem = include_str!("fixtures/rsa2048.pem");
+    let der: String = pem.lines().filter(|l| !l.starts_with("-----")).collect();
+    let der = STANDARD.decode(der).unwrap();
+    let verifying = RsaKeyPair::from_pkcs8(&der)
+        .unwrap()
+        .public_key()
+        .as_ref()
+        .to_vec();
+    let claims = concat!(
+        "json_set_number(json_set_number(json_set(json_set(\"{}\", \"iss\", client_id), ",
+        "\"aud\", $input), \"iat\", $unix), \"exp\", add($unix, \"300\"))",
+    );
+    let head = format!(r#"b64urlraw("{{\"alg\":\"RS512\"}}") + "." + b64urlraw({claims})"#);
+    let jwt = format!(
+        "{{{{ {head} + \".\" + b64urlraw(rsa_sign_pkcs1(\"sha512\", pem(key), {head})) }}}}"
+    );
+    let clock = TestClock::at(NOW);
+    let s = setup(
+        &clock,
+        derive_policy(vec![secret("key"), public("client_id")], &jwt),
+        &[("key", pem.as_bytes()), ("client_id", b"svc-1")],
+    );
+    let token = call_derive(&s.node, &s.record, "derive", b"https://auth.example.com").unwrap();
+    let token = String::from_utf8(token).unwrap();
+    let (signed, signature) = token.rsplit_once('.').unwrap();
+    let payload = URL_SAFE_NO_PAD
+        .decode(signed.split('.').nth(1).unwrap())
+        .unwrap();
+    let iat = NOW / 1000;
+    assert_eq!(
+        String::from_utf8(payload).unwrap(),
+        format!(
+            r#"{{"iss":"svc-1","aud":"https://auth.example.com","iat":{iat},"exp":{}}}"#,
+            iat + 300
+        )
+    );
+    UnparsedPublicKey::new(&RSA_PKCS1_2048_8192_SHA512, &verifying)
+        .verify(
+            signed.as_bytes(),
+            &URL_SAFE_NO_PAD.decode(signature).unwrap(),
+        )
+        .unwrap();
+}
+
+/// A CSRF token read from an HTML form (`html` capture) and a value cut from a captured
+/// text (`slice`) feed the next request.
+#[test]
+fn html_and_regex_captures_feed_later_steps() {
+    let clock = TestClock::at(NOW);
+    let page = fixed(
+        Method::Get,
+        "/login",
+        vec![],
+        vec![
+            capture(
+                Source::Html {
+                    selector: "input[name=_csrf]".into(),
+                    attribute: Some("value".into()),
+                },
+                temp("csrf", false),
+            ),
+            capture(
+                Source::Regex {
+                    pattern: r"build-([0-9a-f]{12})".into(),
+                    group: None,
+                },
+                temp("build", false),
+            ),
+        ],
+    );
+    let login = fixed(
+        Method::Post,
+        "/login",
+        vec![
+            header("X-Build", "{{ slice(build, \"0\", \"6\") }}"),
+            inject(
+                Target::Body,
+                "_csrf={{pct(csrf)}}&user={{pct(user)}}&password={{pct(password)}}",
+            ),
+        ],
+        vec![],
+    );
+    let policy = Policy {
+        fields: vec![public("user"), secret("password")],
+        callers: vec![],
+        operations: vec![http("login", host(), vec![page, login])],
+    };
+    let s = setup(&clock, policy, &[("user", b"kim"), ("password", TOKEN)]);
+    let mut transport = FakeTransport::default();
+    transport.replies.push_back(reply(
+        "200 OK",
+        r#"<html><!-- build-0123456789ab --><form><input type="hidden" name="_csrf" value="a+b&amp;c"></form></html>"#,
+    ));
+    transport.replies.push_back(reply("200 OK", "ok"));
+    call_http(&s.node, &s.record, "login", None, &mut transport)
+        .result
+        .unwrap();
+    let sent = text(&transport.sent[1]);
+    assert!(sent.contains("X-Build: 012345\r\n"), "{sent}");
+    assert!(sent.ends_with(&format!(
+        "_csrf=a%2Bb%26c&user=kim&password={}",
+        text(TOKEN)
+    )));
+}
+
+/// Every new function, used to hand a secret back from a derivation or to let the caller
+/// steer which part of it comes out, is refused when the policy is signed.
+#[test]
+fn new_functions_cannot_exfiltrate_a_secret() {
+    let device = DeviceKey::generate();
+    let fields = || vec![secret("key"), public("pub")];
+    let refused = [
+        // Cutting: the output is the secret, or the caller picks the part.
+        r#"{{ slice(key, "0", "4") }}"#,
+        r#"{{ slice(key, $input, "1") }}"#,
+        r#"{{ hex(slice(key, len($input), "1")) }}"#,
+        r#"{{ between(key, "", "-") }}"#,
+        r#"{{ between(key, $input, "") }}"#,
+        r#"{{ between($input, key, "") }}"#,
+        // Arithmetic and fixed-width encodings keep the secret readable.
+        r#"{{ add(key, "0") }}"#,
+        r#"{{ add(key, $input) }}"#,
+        r#"{{ u8(key) }}"#,
+        r#"{{ be64(key) }}"#,
+        r#"{{ le16(key) }}"#,
+        r#"{{ json_set_number("{}", "n", key) }}"#,
+        r#"{{ json_set_number("{}", $input, key) }}"#,
+        // A hash of the secret alone is as good as the secret.
+        r#"{{ hex(sha384(key)) }}"#,
+        r#"{{ hex(sha512_256(key)) }}"#,
+        r#"{{ hex(md4(key)) }}"#,
+        // Algorithm names are fixed by the policy.
+        r#"{{ hex(pbkdf2($input, key, "salt", "1")) }}"#,
+        r#"{{ b64(rsa_sign_pkcs1($input, key, "m")) }}"#,
+        r#"{{ b64(rsa_sign_pss($input, key, "m")) }}"#,
+        r#"{{ hex(ecdh_public($input)) }}"#,
+        r#"{{ pbkdf2("sha256", "p", "s", key + $input) }}"#,
+        // Public-key encryption: the key may not come from the caller, and a secret in the
+        // message stays tainted.
+        r#"{{ b64(rsa_encrypt_pkcs1($input, "x")) }}"#,
+        r#"{{ b64(rsa_encrypt_oaep("sha256", $input, "x")) }}"#,
+        r#"{{ b64(rsa_encrypt_oaep("sha256", pub, key)) }}"#,
+        r#"{{ b64(rsa_encrypt_pkcs1(pub, key)) }}"#,
+        // A shared secret is a secret, and so is a plain hash of it.
+        r#"{{ hex(ecdh("p256", $input)) }}"#,
+        r#"{{ hex(sha256(hex(ecdh("x25519", $input)))) }}"#,
+        r#"{{ hex(ecdh("p256", pub, key)) }}"#,
+        r#"{{ hex(ecdh("p256", key + $input)) }}"#,
+        // Symmetric encryption under a known key.
+        r#"{{ chacha20_poly1305_encrypt("0123456789abcdef0123456789abcdef", "000000000000", key) }}"#,
+        r#"{{ aes_gcm_encrypt("0123456789abcdef01234567", "000000000000", key) }}"#,
+        // A random length steered by the secret and the caller.
+        r#"{{ random(key + $input) }}"#,
+    ];
+    for template in refused {
+        let policy = with_caller(derive_policy(fields(), template));
+        assert!(
+            matches!(device.sign_policy(policy), Err(Error::PolicyInvalid { at, .. }) if at.starts_with("operations[0].template")),
+            "{template}"
+        );
+    }
+    let allowed = [
+        r#"{{ hex(ecdh_public("p256")) }}"#,
+        r#"{{ hex(random("16")) }}"#,
+        r#"{{ add($unix, "300") }}"#,
+        r#"{{ hex(u8(len(key))) + hex(be64($unix)) }}"#,
+        r#"{{ hex(hmac_sha384(key, $input)) + hex(hmac_md5(key, $input)) }}"#,
+        r#"{{ hex(pbkdf2("sha512", key, $input, "1000")) }}"#,
+        r#"{{ hex(sha384(key + $input)) }}"#,
+        r#"{{ slice($input, "0", "4") + between($input, "a", "") }}"#,
+        r#"{{ json_set_number("{}", "n", add($unix, $input)) }}"#,
+        r#"{{ b64(rsa_encrypt_oaep("sha256", pub, $input)) }}"#,
+    ];
+    for template in allowed {
+        let policy = with_caller(derive_policy(fields(), template));
+        let signed = device.sign_policy(policy);
+        assert!(signed.is_ok(), "{template} {:?}", signed.err());
+    }
+}
+
+/// The new captures and functions in a request: a secret temp captured by `html` or `regex`
+/// is redacted in the response, and a tainted header value cut by `slice` is searched for.
+#[test]
+fn new_captures_are_redacted_and_cut_secrets_are_searched() {
+    let clock = TestClock::at(NOW);
+    let page = fixed(
+        Method::Get,
+        "/session",
+        vec![],
+        vec![
+            capture(
+                Source::Html {
+                    selector: "meta[name=token]".into(),
+                    attribute: Some("content".into()),
+                },
+                temp("token", true),
+            ),
+            capture(
+                Source::Regex {
+                    pattern: "sid=([a-z0-9]+)".into(),
+                    group: Some(1),
+                },
+                temp("sid", true),
+            ),
+        ],
+    );
+    let use_it = fixed(
+        Method::Get,
+        "/me",
+        vec![
+            header("Authorization", "Bearer {{token}}"),
+            header("X-Key-Part", "{{ slice(key, \"0\", \"12\") }}"),
+            header("X-Sid", "{{sid}}"),
+        ],
+        vec![],
+    );
+    let policy = Policy {
+        fields: vec![secret("key")],
+        callers: vec![],
+        operations: vec![http("op", host(), vec![page, use_it])],
+    };
+    let key = b"key_0123456789abcdef";
+    let s = setup(&clock, policy, &[("key", key)]);
+    let session = r#"<meta name="token" content="tok_abcdefgh12345678"> sid=s0s1s2s3s4"#;
+    // The response echoes both captured secrets: they are redacted.
+    let mut transport = FakeTransport::default();
+    transport.replies.push_back(reply("200 OK", session));
+    transport.replies.push_back(reply(
+        "200 OK",
+        r#"{"t":"tok_abcdefgh12345678","s":"s0s1s2s3s4"}"#,
+    ));
+    let response = call_http(&s.node, &s.record, "op", None, &mut transport)
+        .result
+        .unwrap();
+    assert_eq!(
+        text(response.body()),
+        r#"{"t":"[redacted]","s":"[redacted]"}"#
+    );
+    // The response echoes the part of the key the policy cut: dropped.
+    let mut transport = FakeTransport::default();
+    transport.replies.push_back(reply("200 OK", session));
+    transport
+        .replies
+        .push_back(reply("200 OK", r#"{"echo":"key_01234567"}"#));
+    assert_eq!(
+        call_http(&s.node, &s.record, "op", None, &mut transport)
+            .result
+            .map(|_| ()),
+        Err(Error::Reflection)
+    );
+}

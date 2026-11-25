@@ -7,6 +7,38 @@ before 1.0, minor versions may break formats and APIs.
 
 ### Added
 
+- Template functions, the first group of the primitives of `docs/design.md` section 8d, each
+  with its taint rule (`docs/policy.md`) and threat-model rows:
+  - structure: `slice(value, start, length)`, `between(value, start, end)` (empty delimiters
+    mean the ends), `add(a, b)` on signed 64-bit decimals, `json_set_number(object, key,
+    integer)`, and the fixed-width integer encoders `u8`, `be64`, `le16`, `le32`, `le64` next
+    to `be16` and `be32`; `random(n)`;
+  - hashes and MACs: `md4`, `sha384`, `sha512_256`, `hmac_md5`, `hmac_sha384`, and
+    `pbkdf2(hash, password, salt, rounds[, length])` for SHA-1, -256, -384 and -512
+    (`pbkdf2_sha256` stays);
+  - signatures: `rsa_sign_pkcs1(hash, key, msg)` (SHA-1, -256, -384, -512),
+    `rsa_sign_pss(hash, key, msg)` (SHA-256, -384, -512), `p521_sign` (`rsa_sign_*_sha256`
+    stay);
+  - key agreement: `ecdh(curve, peer[, private])` and `ecdh_public(curve)` on P-256, P-384,
+    P-521 and X25519, with one ephemeral key pair per curve and operation that never leaves
+    the node, or a static private key from a field;
+  - encryption: `chacha20_poly1305_encrypt`, AES-192 keys in `aes_gcm_encrypt`, and
+    `rsa_encrypt_oaep(hash, public_key, msg)` / `rsa_encrypt_pkcs1(public_key, msg)`, whose
+    public key may not be chosen by the caller.
+- New analysis rules: a secret and a chosen value may not meet in `slice`, `between`, `add`
+  or `json_set_number`; hash and curve names must be fixed by the policy; an RSA encryption
+  key may not come from request variables or `$input`; every `ecdh` result is a secret that
+  a plain hash does not clean.
+- Capture sources `html` (one compound selector over the `html5gum` tokenizer; an attribute
+  or the element's text) and `regex` (the `regex` crate, linear time, a chosen group), at most
+  2 MiB read, 256-byte selectors and patterns; `regex` also reads stream bytes. Fuzz targets
+  `html_capture` and `regex_capture`.
+- Known-answer tests from RFC 1320, 2202, 4231, 6070, 6979, 7748, 7914, 8439, FIPS 180, the
+  GCM specification, NIST CAVP (ECC CDH) and the PKCS #1 v2.1 vectors (`engine/src/vectors.rs`).
+- Dependencies: `rsa` 0.10, `p521` 0.14, `md4` 0.11, `x25519-dalek` 3 (already in the tree
+  through `hpke`), `regex` 1 (no Unicode tables), `html5gum` 0.9; the `ecdh` features of
+  `p256` and `p384`.
+
 - `client` crate: the app side for iOS, Android and the web, one Rust implementation over
   `engine` and `attest` with a string and bytes API: device, user and caller keys as base64url
   (`generate_key`, `import_key`, `public_key`); `nonce` and `verify_node` /
@@ -106,6 +138,9 @@ before 1.0, minor versions may break formats and APIs.
   `--attestation`, `grant` warns.
 
 ### Changed
+
+- The render budget of 32 signatures per operation also counts key agreements.
+- `crates/engine/src/primitives.rs` is stored with LF line endings, like every other file.
 
 - `CHANGELOG.md` moved to `docs/`, `deny.toml` to `.github/` (`cargo deny --config .github/deny.toml check`).
 - Fuzz targets moved from `fuzz/` to `crates/fuzz/`.

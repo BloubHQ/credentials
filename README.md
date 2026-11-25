@@ -180,13 +180,15 @@ policy is signed, every template is analysed:
   key: a secret in its message, nonce or data stays tainted, because another operation could
   encrypt chosen bytes under the same key. A derivation whose output is tainted is refused.
 - **Oracles.** A secret and a value the caller or server chooses may not meet where the result
-  reveals the secret piece by piece: in `replace`, `xor`, the key of `json_set`, a decoder,
-  a number or a key argument. `len(replace(key, $input, ""))` is refused.
+  reveals the secret piece by piece: in `replace`, `xor`, `slice`, `between`, `add`, the key
+  of `json_set`, a decoder, a number or a key argument. `len(replace(key, $input, ""))` and
+  `slice(key, $input, "1")` are refused. Hash and curve names are fixed by the policy, and an
+  RSA encryption key never comes from the caller.
 - **Guessable fields.** A derivation may depend on a field marked `guessable` (PIN, password)
   only through `len`: a hash, signature, MAC or encryption of it would let the caller check
   guesses.
 - **Budgets.** One operation may render at most 128 MiB, 1,000,000 PBKDF2 rounds and 32
-  signatures.
+  signatures and key agreements.
 
 | Credential | Policy |
 | --- | --- |
@@ -197,7 +199,10 @@ policy is signed, every template is analysed:
 | HTTP Digest | step 1 captures `realm`/`nonce` with `header_param`; step 2 answers with `md5`; RFC 2617 vector |
 | OAuth refresh | `fixed` POST, `json` capture into a field: the node returns a new record |
 | Session login | `fixed` POST /login, `cookie` capture into a temp, `Cookie` on the caller's request |
+| Login form with a CSRF token | `html` capture `input[name=_csrf]` (`value`) into a temp, then `fixed` POST /login |
+| Password encrypted in the browser | `ecdh("p256", server_key)` + `sha256` + `aes_cbc_encrypt` with `u8(len(…))` prefixes and `ecdh_public("p256")`; or `rsa_encrypt_oaep("sha256", key, password)` with the key captured from the server |
 | JWT RS256 | derive `b64urlraw(header) + "." + b64urlraw($input) + "." + b64urlraw(rsa_sign_pkcs1_sha256(pem(key), …))` |
+| JWT with a lifetime the policy bounds | derive with `json_set_number(..., "exp", add($unix, "300"))` and `rsa_sign_pkcs1("sha512", pem(key), …)`: the node sets `iat`/`exp` |
 | Ethereum | derive `{{ k256_sign_recoverable(key, keccak256($input)) }}` |
 | IMAP | stream: expect greeting, send `a1 LOGIN {{user}} {{password}}`, expect, relay |
 | TOTP | derive `{{ totp(b32decode(seed)) }}` |
@@ -447,7 +452,9 @@ instrumented allocator.
 
 RustCrypto `rsa` 0.10 was also measured as a replacement for ring: it left 11 freed blocks
 holding the prime `p` per signature (temporaries while it parses and checks the key), so ring
-stays.
+stays. ring cannot sign PKCS#1 v1.5 with SHA-1, so `rsa_sign_pkcs1("sha1", …)` alone goes
+through RustCrypto `rsa` and has that cost (not measured again); RSA encryption uses only
+public keys.
 
 ## What it does not do
 
@@ -466,6 +473,8 @@ explains each.
 - **A value the server sends for capture is the server's.** If a server hands back a key and
   the policy uses it as a key, the server knows that key.
 - **Low-entropy secrets** not marked `guessable` are treated as strong keys.
+- **Cuts shorter than 4 bytes** (`slice`, `u8` of a secret) are below what the reflection
+  search looks for; the policy fixes where they come from, never the caller.
 - **First use is trusted**: the first grant for an owner on a node decides its devices. An
   owner who loses every device starts a new owner name.
 - **Stream sessions** end with the call. SSH, database wire protocols, gRPC and WebSocket

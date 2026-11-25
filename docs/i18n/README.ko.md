@@ -180,13 +180,14 @@ let outcome = node.run(&call, &mut TlsTransport::new());
   가립니다. 메시지, nonce, 데이터에 든 비밀 값은 오염된 채로 남습니다. 다른 operation이 같은 키로
   고른 바이트를 암호화할 수 있기 때문입니다. 출력이 오염된 derivation은 거부합니다.
 - **오라클.** 비밀 값과, 호출자나 서버가 고르는 값은 결과가 비밀 값을 조금씩 드러내는 곳에서 만날 수
-  없습니다: `replace`, `xor`, `json_set`의 키, 디코더, 숫자나 키 인자. `len(replace(key, $input, ""))`는
-  거부합니다.
+  없습니다: `replace`, `xor`, `slice`, `between`, `add`, `json_set`의 키, 디코더, 숫자나 키 인자.
+  `len(replace(key, $input, ""))`와 `slice(key, $input, "1")`는 거부합니다. 해시와 곡선 이름은 정책이
+  정하고, RSA 암호화 키는 호출자에게서 오지 않습니다.
 - **추측 가능한 필드.** derivation은 `guessable`로 표시한 필드(PIN, 비밀번호)에 `len`을 통해서만
   의존할 수 있습니다. 그 필드의 해시, 서명, MAC, 암호문은 모두 호출자가 추측을 대조하는 데 쓸 수
   있습니다.
 - **예산(budget).** operation 하나가 렌더링할 수 있는 양은 최대 128 MiB, PBKDF2 1,000,000 라운드,
-  서명 32개입니다.
+  서명과 키 합의 합쳐 32개입니다.
 
 | 자격 증명 | 정책 |
 | --- | --- |
@@ -197,7 +198,10 @@ let outcome = node.run(&call, &mut TlsTransport::new());
 | HTTP Digest | step 1에서 `header_param`으로 `realm`/`nonce`를 캡처, step 2에서 `md5`로 응답. RFC 2617 벡터 |
 | OAuth 갱신 | `fixed` POST, `json` 캡처를 필드로: 노드가 새 레코드를 돌려줌 |
 | 세션 로그인 | `fixed` POST /login, `cookie` 캡처를 임시 값으로, 호출자 요청에 `Cookie` |
+| CSRF 토큰이 있는 로그인 폼 | `html` 캡처 `input[name=_csrf]`(`value`)를 임시 값으로, 이어서 `fixed` POST /login |
+| 브라우저에서 암호화하는 비밀번호 | `ecdh("p256", server_key)` + `sha256` + `aes_cbc_encrypt`, `u8(len(…))` 길이 접두사와 `ecdh_public("p256")`; 또는 서버에서 캡처한 키로 `rsa_encrypt_oaep("sha256", key, password)` |
 | JWT RS256 | derive `b64urlraw(header) + "." + b64urlraw($input) + "." + b64urlraw(rsa_sign_pkcs1_sha256(pem(key), …))` |
+| 정책이 수명을 정하는 JWT | derive에서 `json_set_number(..., "exp", add($unix, "300"))`와 `rsa_sign_pkcs1("sha512", pem(key), …)`: `iat`/`exp`는 노드가 넣습니다 |
 | Ethereum | derive `{{ k256_sign_recoverable(key, keccak256($input)) }}` |
 | IMAP | stream: 인사말 expect, `a1 LOGIN {{user}} {{password}}` send, expect, 중계 |
 | TOTP | derive `{{ totp(b32decode(seed)) }}` |
@@ -439,7 +443,9 @@ curl -s "http://127.0.0.1:8700/attestation?nonce=$(head -c 32 /dev/urandom | bas
 | 64 KiB 응답의 HTTP 호출 1,000회 | 0.329 s | 0.338–0.369 s |
 
 ring의 대안으로 RustCrypto `rsa` 0.10도 측정했습니다. 서명 하나당 소수 `p`를 담은 해제된 블록이
-11개 남았으므로(키를 파싱하고 검사하는 동안 생기는 임시 값), ring을 유지합니다.
+11개 남았으므로(키를 파싱하고 검사하는 동안 생기는 임시 값), ring을 유지합니다. ring은 SHA-1
+PKCS#1 v1.5 서명을 하지 못하므로 `rsa_sign_pkcs1("sha1", …)`만 RustCrypto `rsa`를 거치고 그 비용을
+치릅니다(다시 측정하지 않음). RSA 암호화는 공개 키만 씁니다.
 
 ## 하지 않는 것
 
@@ -460,6 +466,8 @@ ring의 대안으로 RustCrypto `rsa` 0.10도 측정했습니다. 서명 하나�
 - **엔트로피가 낮은 비밀 값**이라도 `guessable`로 표시하지 않으면 강한 키로 취급합니다.
 - **첫 사용은 신뢰합니다**: 노드에서 어떤 소유자에 대한 첫 grant가 그 소유자의 기기를 결정합니다.
   모든 기기를 잃은 소유자는 새 소유자 이름으로 시작해야 합니다.
+- **4바이트보다 짧은 조각**(`slice`, 비밀 값의 `u8`)은 반사 검색이 찾는 길이보다 짧습니다. 어디서
+  잘라 오는지는 정책이 정하고 호출자는 정하지 못합니다.
 - **Stream 세션**은 호출과 함께 끝납니다. SSH, 데이터베이스 와이어 프로토콜, gRPC, WebSocket
   프레이밍은 send/expect 스크립트로 가능한 범위까지만 동작합니다.
 - **브라우저 로그인, 푸시 2FA, 하드웨어 키**는 사람이나 기기가 필요하므로 위임할 수 없습니다.

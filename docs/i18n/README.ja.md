@@ -182,12 +182,14 @@ let outcome = node.run(&call, &mut TlsTransport::new());
   tainted のままです。別のオペレーションが同じ鍵で選んだバイトを暗号化できるからです。出力が tainted な
   導出は拒否されます。
 - **オラクル (oracle)。** シークレットと、呼び出し元またはサーバーが選ぶ値とは、結果からシークレットが
-  少しずつ明らかになる場所で出会ってはなりません: `replace`、`xor`、`json_set` のキー、デコーダー、
-  数値引数や鍵引数などです。`len(replace(key, $input, ""))` は拒否されます。
+  少しずつ明らかになる場所で出会ってはなりません: `replace`、`xor`、`slice`、`between`、`add`、
+  `json_set` のキー、デコーダー、数値引数や鍵引数などです。`len(replace(key, $input, ""))` と
+  `slice(key, $input, "1")` は拒否されます。ハッシュ名と曲線名はポリシーが決め、RSA 暗号化の鍵は
+  呼び出し元から来ません。
 - **推測可能なフィールド。** 導出が `guessable` と指定されたフィールド (PIN、パスワード) に依存できるのは
   `len` を通してだけです。そのハッシュ、署名、MAC、暗号文はどれも呼び出し元に推測を照合させてしまいます。
 - **予算 (budget)。** 1 つのオペレーションでレンダリングできるのは最大 128 MiB、PBKDF2 1,000,000
-  ラウンド、32 署名までです。
+  ラウンド、署名と鍵合意あわせて 32 回までです。
 
 | 認証情報 | ポリシー |
 | --- | --- |
@@ -198,7 +200,10 @@ let outcome = node.run(&call, &mut TlsTransport::new());
 | HTTP Digest | ステップ 1 で `header_param` により `realm`/`nonce` をキャプチャし、ステップ 2 で `md5` により応答する。RFC 2617 のベクター |
 | OAuth リフレッシュ | `fixed` POST、`json` キャプチャでフィールドへ: ノードは新しいレコードを返す |
 | セッションログイン | `fixed` POST /login、`cookie` キャプチャで一時値へ、呼び出し元のリクエストに `Cookie` |
+| CSRF トークン付きのログインフォーム | `html` キャプチャ `input[name=_csrf]` (`value`) を一時値へ、続けて `fixed` POST /login |
+| ブラウザーで暗号化するパスワード | `ecdh("p256", server_key)` + `sha256` + `aes_cbc_encrypt`、`u8(len(…))` の長さ接頭辞と `ecdh_public("p256")`。またはサーバーからキャプチャした鍵で `rsa_encrypt_oaep("sha256", key, password)` |
 | JWT RS256 | derive `b64urlraw(header) + "." + b64urlraw($input) + "." + b64urlraw(rsa_sign_pkcs1_sha256(pem(key), …))` |
+| ポリシーが有効期間を決める JWT | derive で `json_set_number(..., "exp", add($unix, "300"))` と `rsa_sign_pkcs1("sha512", pem(key), …)`: `iat`/`exp` はノードが入れます |
 | Ethereum | derive `{{ k256_sign_recoverable(key, keccak256($input)) }}` |
 | IMAP | stream: グリーティングを expect、`a1 LOGIN {{user}} {{password}}` を send、expect、中継 |
 | TOTP | derive `{{ totp(b32decode(seed)) }}` |
@@ -444,7 +449,9 @@ curl -s "http://127.0.0.1:8700/attestation?nonce=$(head -c 32 /dev/urandom | bas
 | 64 KiB レスポンスの HTTP 呼び出し 1,000 回 | 0.329 s | 0.338–0.369 s |
 
 ring の代替として RustCrypto `rsa` 0.10 も計測しました。署名 1 回あたり素数 `p` を保持した解放済み
-ブロックが 11 個残った (鍵の解析と検査の間の一時値) ため、ring を使い続けます。
+ブロックが 11 個残った (鍵の解析と検査の間の一時値) ため、ring を使い続けます。ring は SHA-1 の
+PKCS#1 v1.5 署名ができないので、`rsa_sign_pkcs1("sha1", …)` だけが RustCrypto `rsa` を通り、その
+コストを負います (再計測していません)。RSA 暗号化は公開鍵しか使いません。
 
 ## しないこと
 
@@ -464,6 +471,8 @@ ring の代替として RustCrypto `rsa` 0.10 も計測しました。署名 1 �
 - **サーバーがキャプチャ用に送ってくる値はサーバーのものです。** サーバーが鍵を返し、ポリシーがそれを
   鍵として使う場合、サーバーはその鍵を知っています。
 - **低エントロピーのシークレット**で `guessable` と指定されていないものは、強い鍵として扱われます。
+- **4 バイトより短い切り出し** (`slice`、シークレットの `u8`) は反射検索が探す長さに届きません。
+  どこから切り出すかはポリシーが決め、呼び出し元は決められません。
 - **初回使用は信頼されます**: ノード上での所有者に対する最初のグラントが、その所有者のデバイスを
   決めます。すべてのデバイスを失った所有者は、新しい所有者名から始めることになります。
 - **ストリームセッション**は呼び出しとともに終了します。SSH、データベースのワイヤプロトコル、gRPC、
