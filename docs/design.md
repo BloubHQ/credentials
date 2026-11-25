@@ -1,0 +1,258 @@
+# Design: from a credential engine to the vault of an agent service
+
+Status: proposal. This document says what this repository must implement so that an AI agent
+can act for its owner on any site or service without ever holding the owner's secrets, and how.
+It is the plan of record; each part lands as its own pull request, with its tests, threat-model
+rows and measurements.
+
+## 1. Scope
+
+This repository is the **vault**: the node that runs in an AWS Nitro Enclave, the formats it
+accepts, the libraries owners and callers use to talk to it, and the build that makes its
+measurements public. The agent, its conversations, its model provider and the service's own
+servers live elsewhere; they are callers, and the vault treats them as untrusted.
+
+| In this repository | Outside (agent and service) |
+| --- | --- |
+| Node in the enclave, attestation, reproducible EIF, signed log | The agent, its memory, its prompts |
+| Typed items and their policies | Drafting a policy for a new site |
+| Sessions, one-time-code challenges, owner approvals: formats and checks | Approval cards, push notifications, app screens |
+| The fill step of a browser task: the node drives the browser for the moment secrets enter it | The browser controller the agent uses (click, read, navigate), the Kernel account |
+| Protocol tunnels on the node, `credentials tunnel` on the caller's machine | Agent tools that use a tunnel |
+| Reflection filtering, default deny, hand-over between nodes | Deployment infrastructure |
+| `client` crate: verify a node, grant, summarize and sign policies, approve, back up keys | Keychain / Block Store glue, UI |
+
+### What is protected, from whom
+
+Secrets (passwords, card numbers and CVCs, OAuth tokens, private keys, TOTP seeds, session
+cookies, one-time codes) must stay out of reach of:
+
+- the agent and the model provider, including when the agent is prompt-injected;
+- the service's own servers and staff, and the operator of the parent instance;
+- the browser controller, except for the fields a fill puts into the page of the site the owner
+  approved.
+
+They are visible, by necessity, to: the owner's device; the node; the destination itself; and,
+for browser fills, the cloud browser (Kernel) and the site's own page. Section 9 lists every
+value against every place.
+
+## 2. Layers
+
+```
+typed items     card · login · oauth · identity · totp · ssh · database · ftp · mail · api
+sessions        login sessions · protocol sessions · challenges · approvals
+engine          fields · signed policies · templates · captures · log          (exists)
+transports      HTTP/1.1 · HTTP/2 · TLS/mTLS · text streams · protocol modules · CDP fill
+```
+
+Everything below *typed items* exists in some form today; the work adds to each layer without
+replacing the engine. A typed item is a record whose fields and policy follow a schema the node
+knows, so an agent asks for "the card item, at this merchant" instead of writing a policy.
+
+## 3. Typed items
+
+Each kind fixes its field names, their **disclosure level**, validation and default policies.
+
+| Disclosure | The caller sees | Examples |
+| --- | --- | --- |
+| `secret` | nothing; the value only goes where the signed policy sends it | password, card number, CVC, token, key |
+| `masked` | a fixed projection | card brand and last four, `j***@gmail.com` |
+| `public` | the value | name on card, shipping address, when the owner allows it |
+
+| Kind | Fields (disclosure) | Node checks |
+| --- | --- | --- |
+| `card` | number (secret, masked: brand+last4), expiry (masked), cvc (secret), holder (public), billing (public) | Luhn, expiry in the future, CVC length per brand |
+| `login` | origin (public), username (masked), password (secret), totp seed (secret, optional), session (secret, optional) | origin is an exact scheme+host |
+| `oauth` | provider, client id (public), client secret, refresh/access token (secret), scopes (public) | refresh captures re-seal the new token |
+| `identity` | name, birth date, phone, email, address (each public or masked as the owner sets); national id (secret) | per-field release to listed origins only |
+| `totp` | seed (secret), digits, period | derive only |
+| `ssh` | host, port, host key (public, pinned), user (public), password or private key (secret) | host key must be pinned |
+| `database` | engine, host, port, database, user (public), password (secret), TLS mode and CA pin | TLS required unless the owner signs it off |
+| `ftp` | host, mode (FTPS explicit/implicit, SFTP goes to `ssh`), user, password | plain FTP only when signed off |
+| `mail` | IMAP/SMTP/POP3 host, user, app password or OAuth | |
+| `api` | free-form fields with a hand-written policy (today's records) | as today |
+
+**Implementation.** `engine::item` holds the schemas as data (`items.json` compiled in, so it
+is in PCR2). A typed record is an ordinary record whose policy is generated from the schema and
+the owner's choices, then signed by the owner like any policy. The node re-derives the policy
+from the schema and refuses a typed record whose signed policy differs, so a typed item cannot
+smuggle extra destinations. Masked projections are computed by the node and returned by a new
+`describe` call that never returns `secret` fields.
+
+## 4. Policies written by an agent
+
+Agents meet sites no one listed. They draft policies; the owner decides.
+
+1. The agent drafts a policy (JSON Schema published from `engine::policy`, so drafts validate
+   before they reach the owner).
+2. `client::summarize(policy)` produces what the approval screen shows: for each secret, where it
+   can go (scheme, host, port, method, path), in what form (header, body, query, TLS identity,
+   derived output), and **risk flags**: a destination not under the item's origin, a wildcard,
+   plain HTTP, a destination first seen, a derive output that is not one-way, a policy wider
+   than the previous one for the same item.
+3. The owner's device signs. Nothing else can make a policy valid. A changed policy shows only
+   the difference.
+4. Default deny stays: a destination, method, path or caller header not in the policy is refused.
+
+Known sites ship as **reviewed templates** in `items.json` (Pickle's fixed providers, but as
+data the owner still signs); unknown sites use agent drafts with the flags above.
+
+## 5. Sessions, challenges, approvals
+
+### Sessions
+
+A session is a secret the node obtained (cookies, a bearer token from a login, an authenticated
+protocol connection). It is stored as a field of the item, sealed like any other, with an
+expiry and a **renewal rule**: re-login with the stored password (the node does it), or ask
+the owner (sites behind JavaScript or CAPTCHA: the owner logs in once on the device, the app
+seals the resulting cookies into the item).
+
+### Challenges (one-time codes)
+
+When a step needs a code the node cannot compute:
+
+1. The node parks the operation: its temps stay in enclave memory under a challenge id, for at
+   most 5 minutes; the caller gets `challenge {id, kind: sms|email|app|3ds, hint}`.
+2. The code arrives in one of two ways: the owner's app sends it signed by a device key
+   (`client::answer_challenge`), or the node reads it itself from a `mail` item of the owner
+   under a policy that allows exactly that (sender and pattern pinned).
+3. The node resumes. The code never passes through the agent.
+
+**Implementation.** `engine::session` (parked operations, bounded count per owner and in
+total, expiry) and a new step kind `await {challenge}` in `Operation::Http` and `Stream`.
+
+### Approvals
+
+An item or policy can require the owner's approval per use: payments always, plus whatever
+the owner marks. The node returns `approval_required {id, summary}`; the summary is built by
+the node (merchant origin, amount, currency, item masked view), and the owner's device signs
+`approve(id, summary hash)`. The log records the approval.
+
+## 6. Browser fills (card and login on JavaScript pages)
+
+The agent works in a cloud browser (Kernel). Secrets enter that browser only through the node,
+only on the approved origin, and only while the agent is detached.
+
+1. The agent's controller brings the page to the form and calls the node:
+   `fill {item, field map, expected origin}` with the CDP endpoint and its token.
+2. The node connects to the browser over TLS from inside the enclave, and:
+   - detaches the agent: the controller hands over the session (Kernel live view off, the
+     controller's CDP client paused); the node refuses to fill if another client is attached;
+   - checks the top-level origin and the form's `action` / the fetch target the page will use,
+     against the item's origin;
+   - removes listeners the agent could have planted: the fill runs in a fresh isolated world,
+     and the node refuses when the page has scripts injected through CDP since the last
+     navigation (it tracks `Page.addScriptToEvaluateOnNewDocument` and `Runtime.evaluate`
+     calls of the session it took over);
+   - types the values with `Input.insertText`, submits, waits for navigation;
+   - blanks the fields it filled if the page is still there, and returns only
+     `{outcome, final origin}`.
+3. Approval (payments) happens before step 2; 3-D Secure becomes a challenge (section 5).
+4. The controller must mask: screenshots and DOM reads it hands to the model never contain the
+   filled values. That is outside this repository; the node helps by returning the selectors
+   it filled.
+
+What this cannot stop: the site's own page sees the values (as it would for a person), and
+Kernel, which runs the browser, can read its memory. Section 9 states both; Kernel's PCI DSS
+status must be confirmed before cards go live.
+
+**Implementation.** `transport::cdp` (a minimal CDP client over the existing TLS
+`Connector`), `engine` operation kind `fill`, item kinds `card` and `login`.
+
+## 7. Protocol tunnels
+
+The node authenticates to the server with the secret, then relays bytes. Callers keep their
+tools: `credentials tunnel --item prod-db --listen 127.0.0.1:5432` opens a local port; `psql`,
+`ssh`, `mysql`, FileZilla connect to it unchanged.
+
+```
+client tool -> credentials tunnel -> (signed call, TLS) -> node: authenticate, then relay -> server
+```
+
+| Protocol | Node-side work |
+| --- | --- |
+| SSH, SFTP, SCP | SSH client (`russh`); host key pinned in the item; caller gets exec / shell / sftp channels |
+| PostgreSQL | startup + SCRAM-SHA-256 / MD5 / cleartext over TLS, then relay |
+| MySQL, MariaDB | handshake + `caching_sha2_password` / `mysql_native_password`, then relay |
+| MongoDB | SCRAM-SHA-256 in OP_MSG, then relay |
+| Redis | `AUTH` / `HELLO`, then relay |
+| MSSQL | TDS login7 (SQL auth; NTLM later in the same module) |
+| FTP, FTPS | control channel `USER`/`PASS`, `AUTH TLS`, PASV data connections relayed |
+| SMTP, IMAP, POP3 | text auth (`stream`, exists) + STARTTLS |
+| LDAP | simple bind over LDAPS / StartTLS |
+| SMB | NTLMv2 session setup |
+| RDP, VNC | last: RDP NLA (CredSSP) and VNC auth |
+
+Every module: TLS (or SSH) ends inside the enclave; a fuzz target for its parser; the
+credential never written into the relayed stream after authentication; a log entry per
+session with start, end and byte counts (contents only if the policy asks for it).
+
+**Implementation.** crate `tunnel` (protocol modules, behind one `Authenticator` trait),
+`engine` operation kind `session`, the caller side in `cli` (`credentials tunnel`), the
+relay over the existing vsock egress.
+
+## 8. Transport and engine gaps
+
+| Gap | Change |
+| --- | --- |
+| Values in HTML (CSRF tokens, hidden inputs) | capture source `html {selector}` and `regex {pattern}` (linear-time `regex` crate, size limits) |
+| Sites that encrypt the password in JavaScript | `rsa_encrypt_pkcs1`, `rsa_encrypt_oaep`; the public key must come from the policy or from the destination's response, never from the caller |
+| Missing algorithms | `sha384`, `hmac_sha384`, `md4`, `hmac_md5`, `aes_ecb`, `des` (for VNC), `ed25519` already |
+| HTTP/2, gRPC | `h2` in `transport`, ALPN; gRPC framing for injected metadata |
+| Reflection | every response path (HTTP bodies, headers, errors, stream bytes, CDP results) scrubbed of every secret value and its common encodings before it leaves |
+| Tokens obtained by the node | always re-sealed into the item, never returned (exists for OAuth capture; extended to sessions) |
+
+## 9. Who sees what
+
+| Value | Owner device | Node | Destination | Kernel / site page | Service servers | Agent / model |
+| --- | --- | --- | --- | --- | --- | --- |
+| Password, token, key | yes | yes | yes | only for a fill | no | no |
+| Card number, CVC | yes | yes | PSP / merchant | yes (fill) | no | masked only |
+| One-time code | yes | yes | yes | if typed into a page | no | no |
+| Session cookie | after device login | yes | yes | yes (browser task) | no | no |
+| Identity fields | yes | yes | listed origins | when filled | per disclosure | per disclosure |
+| Results of calls (mail text, pages) | | yes | | | yes | yes |
+
+## 10. Node continuity
+
+A Nitro node has no sealed storage; a new release is a new node. Releases hand over:
+
+1. The release workflow signs a **successor statement** (from release X to the measurements of
+   release Y) with Sigstore keyless signing tied to this repository's workflow, logged in
+   Rekor. The signer identity is compiled into the EIF.
+2. The old node checks the new node's attestation (the `attest` crate, inside the enclave),
+   that its PCRs match a successor statement, and that it is not older; then re-seals grants,
+   devices, floors and items to the new node's key and writes a hand-over entry. The new node's
+   log starts with that entry's hash, so `credentials verify` checks one chain across nodes.
+3. Owners opt in per grant (`allow_successor`), on by default for releases signed as above.
+4. If the old node is gone (crash), owners' apps re-grant after verifying the new node:
+   `client` does it on the next app start, with the owner's approval policy.
+
+The design admits several nodes; one runs at first (cost). With several, an owner grants to
+each, or a node hands its grants to a peer of the same release.
+
+## 11. Order
+
+| # | Part | Depends on |
+| --- | --- | --- |
+| 1 | Reflection scrubbing everywhere; algorithm gaps; `rsa_encrypt_*`; `html`/`regex` capture | |
+| 2 | Typed items, disclosure levels, `describe`, reviewed templates | 1 |
+| 3 | Policy JSON Schema, `client::summarize` with risk flags, approval format | 2 |
+| 4 | Sessions and challenges (`await` step, mail-read codes, app answers) | 2 |
+| 5 | Browser fills over CDP (Kernel), card and login items | 3, 4 |
+| 6 | Protocol tunnels: SSH, PostgreSQL, MySQL, Redis, FTP/FTPS first; then MongoDB, MSSQL, LDAP, SMB; RDP/VNC last | 2 |
+| 7 | HTTP/2 and gRPC | 1 |
+| 8 | Node hand-over and successor statements | 2 |
+| 9 | Key backup and device transfer in `client` (Keychain, Block Store, 6-digit transfer) | |
+
+Each part adds its rows to `docs/threat-model.md`, fuzz targets for any new parser, and
+measured results in its pull request.
+
+## 12. Open questions
+
+- PCI DSS scope of storing card numbers in the node, and Kernel's PCI status.
+- Korean card issuers: none was found with a public one-time virtual card API; cards stay real
+  numbers until one is.
+- Legal limits on processing national ID numbers (주민등록번호) for identity items.
+- Which sites bind sessions to the client IP, so that a session made on the owner's device
+  fails from the node.
