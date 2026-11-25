@@ -290,6 +290,33 @@ The enclave reaches the network only through TCP connections the host relays (vs
 | Delegation | family members, a colleague's agent | an owner grants another owner's callers a narrower policy on an item; revocable, logged on both sides |
 | Emergency access | when the owner is gone | a delegate whose access opens after a waiting period the owner can cancel from a device |
 
+## 8c. Extension modules: schemes no list names
+
+Lists end; sites invent their own schemes. An **auth module** is a WebAssembly module that
+describes one scheme, run by the node in a sandbox (`wasmtime`-style, fuel and memory limits,
+no clock, no randomness and no I/O of its own).
+
+- **Secrets are handles.** A module never reads a secret's bytes. It gets opaque handles and
+  calls the node's functions with them: the template functions (hashes, MACs, signatures,
+  ciphers, encodings), `send`/`expect` on the connection the policy allows, `capture` into
+  fields or temps. A handle can flow into an output only through a function the template
+  analysis already admits (one-way, encryption under a pinned key, a signature); the same
+  taint rules as section 4 of the policy document apply to every call.
+- **The owner signs the module.** Its hash is part of the policy the owner signs, so a module
+  is as trusted as a policy and no more; the approval screen shows the module's declared
+  destinations and outputs. Reviewed modules ship with the release (in PCR2); others come
+  with a policy like an agent draft, with the risk flags of section 4.
+- **What a module cannot do** is decided by the node, not by the module: destinations, methods,
+  reflection scrubbing, limits and the log stay with the node.
+
+This closes the gap between "every scheme in a list" and "any scheme": a new scheme needs a
+module and the owner's signature, not a node release, unless it needs a primitive the node
+does not have, which then goes into the next release.
+
+**Implementation.** crate `module` (WASM runtime, the handle table, the host functions mapped
+onto `engine::template`), operation kind `module`; a fuzz target for module inputs; a module
+SDK in Rust that compiles to `wasm32-unknown-unknown`.
+
 ## 9. Who sees what
 
 | Value | Owner device | Node | Destination | Kernel / site page | Service servers | Agent / model |
@@ -336,6 +363,7 @@ each, or a node hands its grants to a peer of the same release.
 | 9 | Key backup and device transfer in `client` (Keychain, Block Store, 6-digit transfer) | |
 | 10 | Section 8a: payload ciphers and Korean certificates; OAuth 1.0a, DPoP, SigV4A, NTLM, SAML, SRP; software passkeys; generated and rotated secrets; `verify` and `decrypt`; proxies; ssh-agent; OpenPGP | 2 |
 | 11 | Section 8b: spending limits, `vend`, SASL XOAUTH2, delegation, emergency access | 2, 5 |
+| 12 | Section 8c: auth modules (WASM, secrets as handles, signed by the owner) | 1, 3 |
 
 Each part adds its rows to `docs/threat-model.md`, fuzz targets for any new parser, and
 measured results in its pull request.
