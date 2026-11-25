@@ -273,7 +273,7 @@ The enclave reaches the network only through TCP connections the host relays (vs
 | --- | --- |
 | Values in HTML (CSRF tokens, hidden inputs) | capture source `html {selector}` and `regex {pattern}` (linear-time `regex` crate, size limits) |
 | Sites that encrypt the password in JavaScript | `rsa_encrypt_pkcs1`, `rsa_encrypt_oaep`; the public key must come from the policy or from the destination's response, never from the caller |
-| Missing algorithms | `sha384`, `hmac_sha384`, `md4`, `hmac_md5`, `aes_ecb`, `des` (for VNC), `ed25519` already |
+| Missing algorithms | `sha384`, `hmac_sha384`, `pbkdf2_sha1`, `md4`, `hmac_md5`, `aes_ecb`, `des` (for VNC), `ed25519` already |
 | HTTP/2, gRPC | `h2` in `transport`, ALPN; gRPC framing for injected metadata |
 | Reflection | every response path (HTTP bodies, headers, errors, stream bytes, WebSocket frames, datagrams, CDP results) scrubbed of every secret value and its common encodings before it leaves |
 | Tokens obtained by the node | always re-sealed into the item, never returned (exists for OAuth capture; extended to sessions) |
@@ -353,7 +353,7 @@ adds all of it, taken from the registries (IANA JOSE, COSE, SASL, SSH, TLS signa
 HTTP authentication schemes) rather than from site-by-site demand: every hash, MAC, KDF,
 signature, key agreement, key wrap and cipher those registries list and that is not
 deprecated, plus the national ciphers (SEED, ARIA) and big-integer arithmetic for SRP. The
-audit of the registries against this document goes into an appendix, entry by entry.
+audit of the registries against this document is Appendix A, entry by entry.
 
 ## 9. Who sees what
 
@@ -423,3 +423,97 @@ approvals inside another company's app (KakaoTalk, a bank's app push).
 - Legal limits on processing national ID numbers (주민등록번호) for identity items.
 - Which sites bind sessions to the client IP, so that a session made on the owner's device
   fails from the node.
+
+## Appendix A. Gaps found against the IANA registries (2026-11)
+
+Checked entry by entry against IANA: HTTP authentication schemes, SASL, JOSE, COSE, SSH, TLS
+SignatureScheme and ClientCertificateType, RADIUS, OAuth parameters, WebAuthn. Entries the
+registry marks deprecated, obsolete or prohibited (37) are left out.
+
+| Of 617 entries | Count |
+| --- | --- |
+| Work today | 76 |
+| Planned in sections 3-8c | 85 |
+| Missing, possible in principle (rows below) | 215 |
+| Not a vault's concern (server side, no secret) | 235 |
+| Impossible in principle (hardware attestation formats, device-bound extension) | 6 |
+
+Not yet checked: IANA EAP method types, Kerberos encryption types, GSS-API mechanisms, SSH key
+exchange, cipher and MAC names, OpenSSH certificate formats.
+
+### Template language (structure, not cryptography)
+
+| Change | Needed by |
+| --- | --- |
+| `slice(v, start, len)` and `between(v, start, end)` on values, captures from temps | COSE HMAC 256/64; GCM tag split (A*GCMKW, compact JWE); A*CBC-HS* key split; SCRAM over HTTP, IMAP and SMTP |
+| Decimal arithmetic `add(a, b)` and numeric members in `json_set` | `exp`/`nbf` set by the node: JWT bearer grant, `client_secret_jwt`, `private_key_jwt`, VAPID, SAML `NotOnOrAfter` (today the caller passes claims and the policy cannot bound `exp`) |
+| CBOR encoding | every COSE structure, WebAuthn attestation objects, COSE key thumbprints, OpenID4VP mdoc |
+| TLS channel binding variables: `tls_exporter(label, len)`, `tls_server_end_point` | SCRAM-*-PLUS, GS2-KRB5-PLUS, EAP-AES128-PLUS, SXOVER-PLUS, HTTP `Concealed` |
+| Bounded iteration `hash_chain(alg, seed, n)` | SASL `OTP` and its six-word encoding |
+| Length-framed `expect` in `stream` | RadSec, EAP inside RADIUS, binary SASL carriers |
+| Retry on a server nonce (one conditional step) | DPoP `use_dpop_nonce` |
+
+### Signatures
+
+| Function | Needed by |
+| --- | --- |
+| `rsa_sign_pkcs1(hash, key, msg)` for SHA-1/256/384/512 | JOSE and COSE RS384/RS512, ssh-agent `rsa-sha2-512` and `ssh-rsa`, TLS legacy schemes |
+| `rsa_sign_pss(hash, …)` for SHA-384/512 | JOSE and COSE PS384/PS512 |
+| `p521_sign` | ES512, ESP512, `ecdsa-sha2-nistp521`, TLS `ecdsa_secp521r1_sha512` |
+| `ed448_sign` | JOSE, COSE, `ssh-ed448`, TLS `ed448` |
+| `brainpool_sign` (P256r1, P320r1, P384r1, P512r1) | COSE ESB*, TLS brainpool schemes |
+| `mldsa_sign` (44, 65, 87) | JOSE, COSE, key type `AKP`, TLS, SSH ML-DSA and composites |
+| `slhdsa_sign` | TLS SLH-DSA |
+| `hss_lms_sign`, its counter re-sealed into the item on each use | COSE HSS-LMS |
+| `dsa_sign`; ECDSA with SHA-1 | `ssh-dss`, TLS `dss_sign`, `ecdsa_sha1`, SASL ISO 9798 |
+| Prehashed ECDSA | SASL ECDSA-NIST256P-CHALLENGE |
+| National: SM2/SM3, GOST R 34.10-2012, BIGN | TLS schemes and client certificate types |
+| Identity-based: ECCSI, ISO IBS1/IBS2, Chinese IBS; WalnutDSA | TLS, COSE |
+
+mTLS reaches these only through a custom `rustls::sign::SigningKey` in `transport` backed by
+`engine` primitives, since ring has no P-521, Ed448, brainpool or post-quantum keys.
+
+### Key agreement, KDFs, key wrapping, ciphers
+
+| Function | Needed by |
+| --- | --- |
+| `ecdh(curve, priv, peer)` for P-256, P-384, P-521, X25519, X448 | JOSE ECDH-ES*, COSE ECDH-ES/SS, HPKE, SASL ECDH-X25519-CHALLENGE |
+| `concat_kdf` (SP 800-56A) | JOSE and COSE ECDH-ES |
+| `hkdf(hash, …)` for SHA-256/384/512, and the AES-CBC-MAC variant | COSE direct+HKDF, ECDH+HKDF, HPKE |
+| `hpke_seal` (RFC 9180, all DHKEM and AEAD suites) | JOSE HPKE-0..7 and HPKE-*-KE |
+| `aes_kw_wrap` (RFC 3394) | JOSE and COSE A*KW, ECDH-ES+A*KW, PBES2 |
+| `pbkdf2(hash, …)` for SHA-1/256/384/512 | SCRAM-SHA-1, PBES2-HS* |
+| AES-192 keys in `aes_gcm_encrypt` | A192GCM, A192GCMKW |
+| `aes_cbc_hmac_encrypt` (RFC 7518 5.2) | A128CBC-HS256, A192CBC-HS384, A256CBC-HS512 |
+| `aes_ccm_encrypt`, `aes_cbc_mac` | COSE AES-CCM-*, AES-MAC |
+| `chacha20_poly1305_encrypt` (the crate is already in the engine) | COSE, HPKE |
+| `rsa_encrypt_oaep(hash, …)` for SHA-1/256/384/512 | JOSE RSA-OAEP*, COSE RSAES-OAEP |
+
+### Hashes
+
+`sha512_256`, `sha3_*`, `shake128`, `shake256`, `turboshake128/256`, `kt128/256`: COSE hash
+algorithms, HTTP Digest `SHA-512-256`, ML-DSA and SLH-DSA.
+
+### Protocol modules and flows
+
+| Change | Needed by |
+| --- | --- |
+| HTTP `Mutual` (RFC 8120, ISO 11770-4 KAM3 PAKE) | HTTP `Mutual` and its 4 algorithms |
+| Privacy Pass client (blind RSA, VOPRF P-384), tokens sealed into the item | HTTP `PrivateToken` |
+| HTTP `Concealed` (RFC 9729) | needs `tls_exporter` |
+| HTTP SCRAM (RFC 7804) | `SCRAM-SHA-1`, `SCRAM-SHA-256` schemes |
+| SSH `keyboard-interactive` (prompts to fields, OTP to `await`), `hostbased`, `gssapi-with-mic`, `gssapi-keyex`, X.509 keys (RFC 6187) | SSH beyond russh's defaults |
+| GSS-EAP (RFC 7055); EAP-MD5, MSCHAPv2, EAP-TLS, PEAP, TTLS inside RADIUS; ARAP | SASL EAP-AES128, RADIUS EAP-Message |
+| ISO 9798 SASL (RFC 3163); SASL over Diameter; SASL OTP | SASL 9798-*, SXOVER-PLUS, OTP |
+| Novell NMAS | blocked: no public specification found |
+| SD-JWT key binding, mdoc DeviceAuth | OpenID4VP `vp_token` |
+| ACE PoP (CoAP, OSCORE, COSE) | OAuth token type `PoP` |
+| SAML assertions signed by the node (XML-DSig, exclusive c14n) | SAML bearer grant and client assertion |
+| Software passkey extensions: `hmac-secret`, `credBlob`, `largeBlob`, `payment` | WebAuthn extensions |
+
+### Order inside section 8d
+
+1. `slice`/`between`, `add`, `pbkdf2(hash)`: JWE assembly, SCRAM and node-set `exp`.
+2. Hash-parameterized RSA, P-521, HKDF, ECDH, AES key wrap, Concat KDF: most of JOSE and COSE.
+3. CBOR and channel binding.
+4. Post-quantum and national signature schemes last.
