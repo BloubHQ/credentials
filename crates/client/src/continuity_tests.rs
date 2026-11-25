@@ -168,7 +168,7 @@ fn downgrades_unlisted_images_and_forged_statements_are_refused() {
         &[w.nitro.root()],
     );
     assert_eq!(reason(refused), "chain_untrusted");
-    // The compiled trust root of this build is empty: nothing verifies against it.
+    // The compiled trust root (the public Sigstore instance) does not take a test chain.
     let n = Arc::new(nonce());
     let refused = crate::continuity::verify_successor(
         document,
@@ -181,7 +181,7 @@ fn downgrades_unlisted_images_and_forged_statements_are_refused() {
     );
     assert!(matches!(
         refused,
-        Err(ClientError::SuccessorRefused { ref reason, .. }) if reason == "trust_root_empty"
+        Err(ClientError::SuccessorRefused { ref reason, .. }) if reason == "chain_untrusted"
     ));
     // The nonce was spent.
     assert!(n.take(now_ms()).is_err());

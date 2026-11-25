@@ -498,9 +498,10 @@ credentials verify old.jsonl <old node key> --next new.jsonl --head new.jsonl.he
 - **If the old node is gone**, apps re-grant: `client::verify_successor` checks the new node
   against the statement of the release the owner had granted to, and `client::regrant`
   grants under the owner's policy.
-- **Not yet active.** The Sigstore trust root compiled into the nodes
-  (`crates/continuity/trust/trusted_root.json`) is empty until it is committed: until then
-  every statement is refused. The hand-over is tested with test roots only (no Nitro hardware,
+- **Trust root.** The Sigstore trust root compiled into the nodes
+  (`crates/continuity/trust/trusted_root.json`) is the public instance's, as Sigstore's TUF
+  repository served it on 2026-11-26 (the release workflow checks it against TUF again). Only
+  its Rekor v1 log (ECDSA P-256) is read, so releases sign with Rekor v1. The hand-over is tested with test roots only (no Nitro hardware,
   no Sigstore service in the tests).
 
 ## What it guarantees

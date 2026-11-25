@@ -237,8 +237,9 @@ These remain by design; each is listed in the README.
   repository or GitHub Actions) can sign a successor statement for its build; a compromised
   Fulcio could issue a certificate for that identity (the certificate's SCTs are not checked;
   the Rekor inclusion makes such a statement public). Owners who do not accept this grant with
-  `grant_without_successor`. The compiled Sigstore trust root is empty in the source until it
-  is committed: until then every node and client refuses every statement.
+  `grant_without_successor`. The compiled Sigstore trust root is the public instance's (from its
+  TUF repository on 2026-11-26); a change of Sigstore's roots needs a new release, and only its
+  Rekor v1 log is read.
 - **Untested on hardware.** The hand-over, the take-over and the re-grant are tested with a
   test Nitro root and a test Sigstore (roots made at run time), never with the NSM, vsock or the
   real Sigstore root.

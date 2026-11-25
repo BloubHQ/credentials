@@ -283,6 +283,12 @@ mod tests {
 
     #[test]
     fn the_compiled_root_parses() {
-        TrustRoot::production().unwrap();
+        let root = TrustRoot::production().unwrap();
+        // The public instance: Rekor v1 (one ECDSA P-256 log; the Ed25519 Rekor v2 log is not
+        // read) and its two Fulcio roots (the one of 2021-2022 and the current one).
+        assert!(!root.is_empty());
+        assert_eq!(root.logs.len(), 1);
+        assert_eq!(root.authorities.len(), 2);
+        assert!(root.authorities.iter().any(|a| a.valid_until_ms.is_none()));
     }
 }

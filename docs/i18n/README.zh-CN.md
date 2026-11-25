@@ -446,8 +446,9 @@ credentials verify old.jsonl <旧节点密钥> --next new.jsonl --head new.jsonl
   `credentials verify --next` 检查跨两个节点的一条链，旧节点移交后拒绝一切操作。
 - **旧节点已不在时**，应用重新授权：`client::verify_successor` 用所有者曾授权的版本的声明检查
   新节点，`client::regrant` 按所有者的策略授权。
-- **尚未启用。** 编译进节点的 Sigstore 信任根（`crates/continuity/trust/trusted_root.json`）在
-  提交之前为空，在此之前所有声明都会被拒绝。移交只用测试根测试过（测试中没有 Nitro 硬件，
+- **信任根。** 编译进节点的 Sigstore 信任根（`crates/continuity/trust/trusted_root.json`）是公共
+  实例的信任根，取自 2026-11-26 Sigstore TUF 仓库提供的版本（发布工作流会再次与 TUF 比对）。只读取其
+  Rekor v1 日志（ECDSA P-256），因此发布用 Rekor v1 签名。移交只用测试根测试过（测试中没有 Nitro 硬件，
   也不访问 Sigstore 服务）。
 
 ## 它保证什么

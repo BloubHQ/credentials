@@ -7,6 +7,10 @@ before 1.0, minor versions may break formats and APIs.
 
 ### Changed
 
+- The compiled Sigstore trust root (`crates/continuity/trust/trusted_root.json`) is the public
+  instance's, from its TUF repository (`gh attestation trusted-root`, 2026-11-26); release
+  signing pins Fulcio and Rekor v1 (`--use-signing-config=false`) and checks the bundle has a
+  signed entry timestamp and an inclusion proof.
 - Minimum Rust 1.88 (was 1.87): `time` 0.3.47, which fixes RUSTSEC-2026-0009, needs it.
 
 ### Added
