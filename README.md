@@ -267,8 +267,9 @@ credentials verify log.jsonl <node-public-key> --owner alice --user-key key.txt 
   time (table below).
 - **Attestation.** Run the node in a TEE (SGX, TDX, SEV-SNP, Nitro). Put
   `NodeIdentity::report_data()` (SHA-512 over the log key and the seal key) into the quote's
-  report data; owners check the quote and that value before they seal a grant. Quote
-  verification is platform-specific and not in this repository.
+  report data; owners check the quote and that value before they seal a grant. For AWS Nitro
+  Enclaves the [`attest`](crates/attest) crate and `credentials attest` do this check (below);
+  for the other TEEs quote verification is platform-specific and not in this repository.
 - **Keys and restarts.** Keep `NodeKey::to_bytes()` sealed to the enclave. After a restart,
   `Node::restore(key, sink, clock, entries)` continues the chain and brings back record
   floors, known devices and the last grant times; owners grant again, and nothing granted or
@@ -280,6 +281,40 @@ credentials verify log.jsonl <node-public-key> --owner alice --user-key key.txt 
   durable JSONL log.
 - **Concurrency.** Every method takes `&self`; share one node between threads. Transport I/O
   runs outside the node's lock.
+
+### Verifying a Nitro node before a grant
+
+A node in an AWS Nitro Enclave puts `NodeIdentity::report_data()` into the `user_data` of its
+attestation document. Before the owner seals a grant, it sends the node a fresh random nonce
+(32 bytes), gets the document back, and checks it against the `measurements.json` of the
+releases it accepts (`{"release": ..., "git_commit": ..., "pcr0": ..., "pcr1": ..., "pcr2":
+...}`, one object or an array; PCRs in hex):
+
+```sh
+credentials attest --document doc.cbor --nonce <base64url> --measurements measurements.json \
+    --identity identity.json
+credentials grant ... --node identity.json \
+    --attestation doc.cbor --nonce <base64url> --measurements measurements.json
+```
+
+`attest::verify` (and both commands) refuse the document unless:
+
+- it is a COSE_Sign1 signed with ES384 (protected header exactly `{1: -35}`) whose payload is
+  the map of the Nitro Secure Module, with `digest` `SHA384`;
+- its certificate chains through the `cabundle` intermediates to the pinned AWS Nitro Enclaves
+  Root-G1 (SHA-256 `641a0321...79bb5b`), valid at the time the document states; the copy of the
+  root inside the document is not trusted;
+- the signature verifies under the P-384 key of that certificate;
+- its nonce is the one the owner sent, so an old document cannot be replayed;
+- PCR0, PCR1 and PCR2 are not all zero (a debug enclave, whose memory the host can read) and
+  equal one accepted release, so an old or unknown build is refused once its measurements leave
+  the list;
+- with `--identity` (and always with `grant --attestation`), its `user_data` equals
+  `report_data()` of the node identity, so the seal key the grant goes to belongs to the
+  attested enclave.
+
+`credentials grant` without `--attestation` still works and prints a warning: nothing then
+shows what code holds the seal key.
 
 ## What it guarantees
 
@@ -335,7 +370,8 @@ These are limits of the design, not missing code. The [threat model](docs/threat
 explains each.
 
 - **No TEE in this repository.** The node is an ordinary process here; attestation is a
-  platform integration (see [Running a node](#running-a-node)). Without a TEE, whoever runs the
+  platform integration (see [Running a node](#running-a-node)). The owner side of Nitro
+  attestation is here (`attest`); the enclave image and its measurements are not. Without a TEE, whoever runs the
   node can read its memory.
 - **Reflection search finds known encodings only**: raw, base64 (both alphabets), percent,
   JSON and hex, and escaped JSON strings. A server that splits, compresses in its own way or
@@ -359,6 +395,7 @@ explains each.
 | [`engine`](crates/engine) | Secrets, policies, templates, records, grants, callers, the log, responses, the node |
 | [`transport`](crates/transport) | TLS transport (rustls), and an end-to-end example |
 | [`verify`](crates/verify) | Verifier of node logs, run as `credentials verify` |
+| [`attest`](crates/attest) | Verifier of AWS Nitro Enclaves attestation documents, run as `credentials attest` |
 | [`cli`](crates/cli) | The `credentials` tool: keys, policies, records, grants, calls, and a node server |
 
 ## Development
