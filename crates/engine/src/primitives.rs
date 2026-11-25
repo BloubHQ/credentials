@@ -16,6 +16,13 @@ use zeroize::{Zeroize, Zeroizing};
 use crate::template::{Budget, Bytes, Func};
 use crate::{Error, Result, totp};
 
+mod cbor;
+mod kdf;
+mod modes;
+mod sign;
+
+pub(crate) use kdf::MAX_DERIVED;
+
 /// Most PBKDF2 iterations of one call.
 pub const MAX_PBKDF2_ROUNDS: u64 = 1_000_000;
 
@@ -410,7 +417,7 @@ fn number(args: &[Bytes], i: usize, default: u64) -> Result<u64> {
     }
 }
 
-fn mac<M: Mac + hmac::KeyInit>(key: &[u8], message: &[u8]) -> Result<Bytes> {
+pub(super) fn mac<M: Mac + hmac::KeyInit>(key: &[u8], message: &[u8]) -> Result<Bytes> {
     let mut mac = <M as hmac::KeyInit>::new_from_slice(key).map_err(|_| Error::KeyInvalid)?;
     mac.update(message);
     Ok(Zeroizing::new(mac.finalize().into_bytes().to_vec()))
@@ -534,7 +541,7 @@ fn p521_sign(key: &[u8], message: &[u8]) -> Result<Bytes> {
 }
 
 /// The curves of `ecdh`.
-const CURVES: [&str; 4] = ["p256", "p384", "p521", "x25519"];
+const CURVES: [&str; 5] = ["p256", "p384", "p521", "x25519", "x448"];
 
 fn curve(name: &[u8]) -> Result<&'static str> {
     CURVES
@@ -575,7 +582,7 @@ fn generate(curve: &str) -> Result<Bytes> {
                 .to_vec(),
         ),
         _ => {
-            let mut key = Zeroizing::new(vec![0u8; 32]);
+            let mut key = Zeroizing::new(vec![0u8; if curve == "x448" { 56 } else { 32 }]);
             rng.fill_bytes(key.as_mut_slice());
             key
         }
@@ -603,8 +610,8 @@ fn x25519_bytes(bytes: &[u8]) -> Result<Zeroizing<[u8; 32]>> {
 }
 
 /// The shared secret of `private` and `peer` on `curve`: the x-coordinate for NIST curves
-/// (SEC1 peer keys, compressed or not), the 32 bytes of X25519 (an all-zero result, from a
-/// low-order peer key, is refused).
+/// (SEC1 peer keys, compressed or not), the 32 bytes of X25519 or the 56 of X448 (an
+/// all-zero result, from a low-order peer key, is refused).
 fn ecdh(curve: &str, peer: &[u8], private: &[u8]) -> Result<Bytes> {
     macro_rules! nist {
         ($krate:ident) => {{
@@ -617,6 +624,7 @@ fn ecdh(curve: &str, peer: &[u8], private: &[u8]) -> Result<Bytes> {
         "p256" => nist!(p256),
         "p384" => nist!(p384),
         "p521" => nist!(p521),
+        "x448" => sign::x448(private, peer)?,
         _ => {
             let key = x25519_bytes(private)?;
             let peer = x25519_bytes(peer)?;
@@ -629,7 +637,8 @@ fn ecdh(curve: &str, peer: &[u8], private: &[u8]) -> Result<Bytes> {
     })
 }
 
-/// The public key of `private` on `curve`: SEC1 uncompressed, or 32 bytes for X25519.
+/// The public key of `private` on `curve`: SEC1 uncompressed, 32 bytes for X25519, 56 for
+/// X448.
 fn ecdh_public(curve: &str, private: &[u8]) -> Result<Bytes> {
     macro_rules! nist {
         ($krate:ident) => {{
@@ -649,6 +658,7 @@ fn ecdh_public(curve: &str, private: &[u8]) -> Result<Bytes> {
         "p256" => nist!(p256),
         "p384" => nist!(p384),
         "p521" => nist!(p521),
+        "x448" => sign::x448_public(private)?,
         _ => {
             let key = x25519_bytes(private)?;
             Zeroizing::new(
@@ -690,7 +700,7 @@ fn aes_gcm(key: &[u8], nonce: &[u8], message: &[u8], aad: &[u8]) -> Result<Bytes
     out.map(Zeroizing::new).map_err(|_| Error::Encoding)
 }
 
-fn aes_cbc(key: &[u8], iv: &[u8], message: &[u8]) -> Result<Bytes> {
+pub(super) fn aes_cbc(key: &[u8], iv: &[u8], message: &[u8]) -> Result<Bytes> {
     use cbc::cipher::{BlockModeEncrypt, KeyIvInit, block_padding::Pkcs7};
     let out = match key.len() {
         16 => cbc::Encryptor::<aes::Aes128>::new_from_slices(key, iv)
@@ -787,7 +797,7 @@ fn random(count: u64) -> Result<Bytes> {
 
 /// A hash a function takes by name.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Hash {
+pub(super) enum Hash {
     Sha1,
     Sha256,
     Sha384,
@@ -861,11 +871,87 @@ pub(crate) fn output_bound(func: Func, args: &[Bytes]) -> usize {
         | Func::RsaEncryptPkcs1 => 1024,
         Func::Random => 1024,
         Func::EcdhPublic => 160,
+        Func::Hkdf
+        | Func::HkdfExpand
+        | Func::ConcatKdf
+        | Func::KbkdfCounter
+        | Func::Shake128
+        | Func::Shake256 => MAX_DERIVED,
+        Func::Nfold => 1024,
+        Func::AesCbcHmacEncrypt
+        | Func::AesEaxEncrypt
+        | Func::AesCtsEncrypt
+        | Func::AesKwWrap
+        | Func::AesKwpWrap => len(2).max(len(1)) + 96,
+        Func::AesCcmEncrypt => len(3) + 32,
+        Func::DsaSign | Func::DsaSignDer => 512,
+        Func::CborArray | Func::CborMap => args.iter().map(|a| a.len()).sum::<usize>() + 9,
+        Func::CborTag => len(1) + 9,
         _ => len(0) + 128,
     }
 }
 
+/// The functions of the families added with the second group of section 8d.
+fn call_family(func: Func, args: &[Bytes], budget: &Budget) -> Result<Option<Bytes>> {
+    let at = |i: usize| arg(args, i);
+    let opt = |i: usize| args.get(i).map_or(&[][..], |v| v.as_slice());
+    Ok(Some(match func {
+        Func::Sha3_224 => Zeroizing::new(sha3::Sha3_224::digest(at(0)?).to_vec()),
+        Func::Sha3_256 => Zeroizing::new(sha3::Sha3_256::digest(at(0)?).to_vec()),
+        Func::Sha3_384 => Zeroizing::new(sha3::Sha3_384::digest(at(0)?).to_vec()),
+        Func::Sha3_512 => Zeroizing::new(sha3::Sha3_512::digest(at(0)?).to_vec()),
+        Func::Shake128 => kdf::shake(at(0)?, at(1)?, false)?,
+        Func::Shake256 => kdf::shake(at(0)?, at(1)?, true)?,
+        Func::Hkdf => kdf::hkdf(kdf::Sha2::parse(at(0)?)?, at(1)?, at(2)?, at(3)?, at(4)?)?,
+        Func::HkdfExpand => kdf::hkdf_expand(kdf::Sha2::parse(at(0)?)?, at(1)?, at(2)?, at(3)?)?,
+        Func::ConcatKdf => kdf::concat_kdf(kdf::Sha2::parse(at(0)?)?, at(1)?, at(2)?, at(3)?)?,
+        Func::KbkdfCounter => {
+            kdf::kbkdf_counter(kdf::Sha2::parse(at(0)?)?, at(1)?, at(2)?, at(3)?)?
+        }
+        Func::AesCmac => modes::cmac(at(0)?, at(1)?)?,
+        Func::AesCbcMac => modes::cbc_mac(at(0)?, at(1)?)?,
+        Func::AesKwWrap => modes::key_wrap(at(0)?, at(1)?, false)?,
+        Func::AesKwpWrap => modes::key_wrap(at(0)?, at(1)?, true)?,
+        Func::AesCbcHmacEncrypt => modes::cbc_hmac(at(0)?, at(1)?, at(2)?, opt(3))?,
+        Func::AesCcmEncrypt => {
+            let tag = kdf::length(at(2)?, 16)?;
+            modes::ccm(at(0)?, at(1)?, tag, at(3)?, opt(4))?
+        }
+        Func::AesEaxEncrypt => modes::eax(at(0)?, at(1)?, at(2)?, opt(3))?,
+        Func::AesCtsEncrypt => modes::cts(at(0)?, at(1)?, at(2)?)?,
+        Func::Nfold => modes::nfold(at(0)?, kdf::length(at(1)?, 8192)?)?,
+        Func::KerberosDk => modes::kerberos_dk(at(0)?, at(1)?)?,
+        Func::Ed448Sign => {
+            budget.signature()?;
+            sign::ed448(at(0)?, at(1)?, opt(2))?
+        }
+        Func::EcdsaSignPrehash => {
+            budget.signature()?;
+            sign::ecdsa_prehash(at(0)?, at(1)?, at(2)?)?
+        }
+        Func::DsaSign | Func::DsaSignDer => {
+            budget.signature()?;
+            sign::dsa(
+                Hash::parse(at(0)?)?,
+                at(1)?,
+                at(2)?,
+                func == Func::DsaSignDer,
+            )?
+        }
+        Func::CborInt => cbor::int(at(0)?)?,
+        Func::CborBytes => cbor::bytes(at(0)?)?,
+        Func::CborText => cbor::text(at(0)?)?,
+        Func::CborArray => cbor::array(args)?,
+        Func::CborMap => cbor::map(args)?,
+        Func::CborTag => cbor::tag(at(0)?, at(1)?)?,
+        _ => return Ok(None),
+    }))
+}
+
 pub(crate) fn call(func: Func, args: &[Bytes], unix: u64, budget: &Budget) -> Result<Bytes> {
+    if let Some(out) = call_family(func, args, budget)? {
+        return Ok(out);
+    }
     let a = arg(args, 0)?;
     Ok(match func {
         Func::B64 => b64(&STANDARD, a)?,
@@ -1031,5 +1117,7 @@ pub(crate) fn call(func: Func, args: &[Bytes], unix: u64, budget: &Budget) -> Re
             let aad = args.get(3).map_or(&[][..], |v| v.as_slice());
             chacha20_poly1305(a, arg(args, 1)?, arg(args, 2)?, aad)?
         }
+        // The families of `call_family`, handled above.
+        _ => return Err(bad("function not available")),
     })
 }

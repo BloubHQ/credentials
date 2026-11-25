@@ -216,6 +216,36 @@ funcs! {
     AesGcmEncrypt = "aes_gcm_encrypt"(3, 4): "`aes_gcm_encrypt(key, nonce12, message[, aad])`: ciphertext and tag; key 16, 24 or 32 bytes.",
     AesCbcEncrypt = "aes_cbc_encrypt"(3, 3): "`aes_cbc_encrypt(key, iv16, message)` with PKCS#7 padding; key 16, 24 or 32 bytes.",
     ChaCha20Poly1305Encrypt = "chacha20_poly1305_encrypt"(3, 4): "`chacha20_poly1305_encrypt(key32, nonce12, message[, aad])`: ciphertext and tag (RFC 8439).",
+    Sha3_224 = "sha3_224"(1, 1): "SHA3-224 digest (FIPS 202; one-way).",
+    Sha3_256 = "sha3_256"(1, 1): "SHA3-256 digest (FIPS 202; one-way).",
+    Sha3_384 = "sha3_384"(1, 1): "SHA3-384 digest (FIPS 202; one-way).",
+    Sha3_512 = "sha3_512"(1, 1): "SHA3-512 digest (FIPS 202; one-way).",
+    Shake128 = "shake128"(2, 2): "`shake128(message, length)`: `length` bytes of SHAKE128 (FIPS 202), 1 to 8192 (one-way).",
+    Shake256 = "shake256"(2, 2): "`shake256(message, length)`: `length` bytes of SHAKE256 (FIPS 202), 1 to 8192 (one-way).",
+    Hkdf = "hkdf"(5, 5): "`hkdf(hash, ikm, salt, info, length)`: HKDF (RFC 5869) with `sha256`, `sha384` or `sha512`; a secret when the input is.",
+    HkdfExpand = "hkdf_expand"(4, 4): "`hkdf_expand(hash, prk, info, length)`: the expand step of HKDF alone; a secret when the input is.",
+    ConcatKdf = "concat_kdf"(4, 4): "`concat_kdf(hash, z, other_info, length)`: the single-step KDF of NIST SP 800-56A with a SHA-2 hash; a secret when the input is.",
+    KbkdfCounter = "kbkdf_counter"(4, 4): "`kbkdf_counter(hash, key, fixed_input, length)`: the counter-mode KDF of NIST SP 800-108 with HMAC-SHA-2 and a 32-bit counter before the fixed input; a secret when the input is.",
+    AesCmac = "aes_cmac"(2, 2): "`aes_cmac(key, message)`: AES-CMAC (RFC 4493), 16 bytes; key 16, 24 or 32 bytes.",
+    AesCbcMac = "aes_cbc_mac"(2, 2): "`aes_cbc_mac(key, message)`: AES CBC-MAC, zero IV, zero padding, 16 bytes; key 16, 24 or 32 bytes.",
+    AesKwWrap = "aes_kw_wrap"(2, 2): "`aes_kw_wrap(kek, key)`: AES key wrap (RFC 3394); kek 16, 24 or 32 bytes, key a multiple of 8 bytes, at least 16.",
+    AesKwpWrap = "aes_kwp_wrap"(2, 2): "`aes_kwp_wrap(kek, key)`: AES key wrap with padding (RFC 5649); kek 16, 24 or 32 bytes.",
+    AesCbcHmacEncrypt = "aes_cbc_hmac_encrypt"(3, 4): "`aes_cbc_hmac_encrypt(key, iv16, message[, aad])`: AES-CBC with HMAC-SHA-2 (RFC 7518 section 5.2), ciphertext and tag; key 32, 48 or 64 bytes.",
+    AesCcmEncrypt = "aes_ccm_encrypt"(4, 5): "`aes_ccm_encrypt(key, nonce, tag_length, message[, aad])`: AES-CCM (NIST SP 800-38C), ciphertext and tag; nonce 7 to 13 bytes, tag 4 to 16, even.",
+    AesEaxEncrypt = "aes_eax_encrypt"(3, 4): "`aes_eax_encrypt(key, nonce16, message[, aad])`: AES-EAX, ciphertext and 16-byte tag.",
+    AesCtsEncrypt = "aes_cts_encrypt"(3, 3): "`aes_cts_encrypt(key, iv16, message)`: AES-CBC with ciphertext stealing, CBC-CS3 as Kerberos uses it (RFC 3962); message at least 16 bytes.",
+    Nfold = "nfold"(2, 2): "`nfold(value, bits)`: the n-fold of RFC 3961, to a multiple of 8 bits up to 8192.",
+    KerberosDk = "kerberos_dk"(2, 2): "`kerberos_dk(key, constant)`: DK of RFC 3961 for the AES encryption types of RFC 3962; key 16 or 32 bytes; a secret when the input is.",
+    Ed448Sign = "ed448_sign"(2, 3): "`ed448_sign(key, message[, context])`: Ed448 (RFC 8032); key raw 57 bytes or PKCS#8 DER (one-way).",
+    EcdsaSignPrehash = "ecdsa_sign_prehash"(3, 3): "`ecdsa_sign_prehash(curve, key, digest)`: ECDSA of a given digest on `p256`, `p384`, `p521` or `k256`, `r || s` (one-way).",
+    DsaSign = "dsa_sign"(3, 3): "`dsa_sign(hash, key, message)`: DSA (FIPS 186-4, RFC 6979 nonce) with `sha1`, `sha256`, `sha384` or `sha512`, `r || s`; key PKCS#8 DER (one-way).",
+    DsaSignDer = "dsa_sign_der"(3, 3): "`dsa_sign_der(hash, key, message)`: DSA as `dsa_sign`, DER (one-way).",
+    CborInt = "cbor_int"(1, 1): "`cbor_int(n)`: a CBOR integer from -2^64 to 2^64-1 (RFC 8949, deterministic).",
+    CborBytes = "cbor_bytes"(1, 1): "`cbor_bytes(value)`: a CBOR byte string.",
+    CborText = "cbor_text"(1, 1): "`cbor_text(value)`: a CBOR text string of UTF-8 bytes.",
+    CborArray = "cbor_array"(0, 32): "`cbor_array(item, ...)`: a CBOR array of up to 32 encoded items.",
+    CborMap = "cbor_map"(0, 32): "`cbor_map(key, value, ...)`: a CBOR map of up to 16 pairs of encoded items, keys sorted (RFC 8949 section 4.2.1).",
+    CborTag = "cbor_tag"(2, 2): "`cbor_tag(number, item)`: a CBOR tag around one encoded item.",
 }
 
 impl Func {
@@ -235,6 +265,12 @@ impl Func {
                 | Func::Sha512
                 | Func::Sha512_256
                 | Func::Keccak256
+                | Func::Sha3_224
+                | Func::Sha3_256
+                | Func::Sha3_384
+                | Func::Sha3_512
+                | Func::Shake128
+                | Func::Shake256
                 | Func::HmacSha1
                 | Func::HmacSha256
                 | Func::HmacSha384
@@ -258,7 +294,53 @@ impl Func {
                 | Func::Sha512
                 | Func::Sha512_256
                 | Func::Keccak256
+                | Func::Sha3_224
+                | Func::Sha3_256
+                | Func::Sha3_384
+                | Func::Sha3_512
+                | Func::Shake128
+                | Func::Shake256
         )
+    }
+
+    /// A key derivation: its output is a key, a secret whenever an input is (rule 8).
+    fn derives_key(self) -> bool {
+        matches!(
+            self,
+            Func::Hkdf | Func::HkdfExpand | Func::ConcatKdf | Func::KbkdfCounter | Func::KerberosDk
+        )
+    }
+
+    /// A MAC built on a block cipher: one-way only under a secret key. Under a known key
+    /// it is reversible (a one-block CBC-MAC is the block encrypted).
+    fn block_mac(self) -> bool {
+        matches!(self, Func::AesCmac | Func::AesCbcMac)
+    }
+
+    /// The indices of the key, nonce, message and AAD of a symmetric encryption.
+    fn cipher_args(self) -> Option<(usize, Option<usize>, usize, Option<usize>)> {
+        match self {
+            Func::AesGcmEncrypt
+            | Func::ChaCha20Poly1305Encrypt
+            | Func::AesCbcHmacEncrypt
+            | Func::AesEaxEncrypt => Some((0, Some(1), 2, Some(3))),
+            Func::AesCbcEncrypt | Func::AesCtsEncrypt => Some((0, Some(1), 2, None)),
+            Func::AesCcmEncrypt => Some((0, Some(1), 3, Some(4))),
+            Func::AesKwWrap | Func::AesKwpWrap => Some((0, None, 1, None)),
+            _ => None,
+        }
+    }
+
+    /// The index of a length argument, which may not depend on a secret: the length of the
+    /// output would give it back.
+    fn length_arg(self) -> Option<usize> {
+        match self {
+            Func::Shake128 | Func::Shake256 | Func::Nfold => Some(1),
+            Func::AesCcmEncrypt => Some(2),
+            Func::HkdfExpand | Func::ConcatKdf | Func::KbkdfCounter => Some(3),
+            Func::Hkdf => Some(4),
+            _ => None,
+        }
     }
 
     fn signs(self) -> bool {
@@ -275,6 +357,10 @@ impl Func {
                 | Func::RsaSignPssSha256
                 | Func::RsaSignPkcs1
                 | Func::RsaSignPss
+                | Func::Ed448Sign
+                | Func::EcdsaSignPrehash
+                | Func::DsaSign
+                | Func::DsaSignDer
         )
     }
 
@@ -286,7 +372,14 @@ impl Func {
             | Func::RsaSignPss
             | Func::RsaEncryptOaep
             | Func::Ecdh
-            | Func::EcdhPublic => Some(0),
+            | Func::EcdhPublic
+            | Func::Hkdf
+            | Func::HkdfExpand
+            | Func::ConcatKdf
+            | Func::KbkdfCounter
+            | Func::EcdsaSignPrehash
+            | Func::DsaSign
+            | Func::DsaSignDer => Some(0),
             _ => None,
         }
     }
@@ -331,7 +424,24 @@ impl Func {
             | Func::Le32
             | Func::Le64
             | Func::U8
-            | Func::Random => 0..1,
+            | Func::Random
+            | Func::CborInt
+            | Func::CborText
+            | Func::AesCmac
+            | Func::AesCbcMac
+            | Func::AesKwWrap
+            | Func::AesKwpWrap
+            | Func::KerberosDk => 0..1,
+            Func::Shake128 | Func::Shake256 | Func::Nfold => 1..2,
+            Func::HkdfExpand | Func::ConcatKdf | Func::KbkdfCounter => 3..4,
+            Func::Hkdf => 4..5,
+            Func::AesCbcHmacEncrypt | Func::AesEaxEncrypt | Func::AesCtsEncrypt => 0..2,
+            Func::AesCcmEncrypt => 0..3,
+            // The key; the curve or hash name is fixed (rule 6).
+            Func::EcdsaSignPrehash | Func::DsaSign | Func::DsaSignDer => 1..2,
+            // Every item is checked for well-formedness.
+            Func::CborArray | Func::CborMap => 0..32,
+            Func::CborTag => 0..2,
             Func::Time => 0..2,
             Func::Totp => 1..3,
             Func::Pbkdf2Sha256 => 2..4,
@@ -651,6 +761,17 @@ fn call_info(func: Func, args: &[Info]) -> core::result::Result<Info, Rule> {
     if func.sensitive_args().any(|i| at(i).mixed()) {
         return Err("a secret mixed with a chosen value reaches a decoder, number or key");
     }
+    if func.length_arg().is_some_and(|i| at(i).tainted) {
+        return Err("a length must not depend on a secret");
+    }
+    // The order of a map's pairs, and whether two keys are equal, compare the keys: a secret
+    // key and a chosen key may not meet.
+    if func == Func::CborMap
+        && args.iter().step_by(2).any(|k| k.tainted)
+        && args.iter().step_by(2).any(|k| k.controlled)
+    {
+        return Err("a secret and a chosen value meet in a function that compares or cuts them");
+    }
     // A secret in one number argument and a chosen value in another is the same oracle as
     // both in one: `time(secret, $input)` picks which digits of the secret come out.
     if matches!(
@@ -672,11 +793,16 @@ fn call_info(func: Func, args: &[Info]) -> core::result::Result<Info, Rule> {
         // A shared secret is known to the node and the peer only: a secret, whatever the
         // arguments.
         true
-    } else if matches!(
-        func,
-        Func::AesGcmEncrypt | Func::AesCbcEncrypt | Func::ChaCha20Poly1305Encrypt
-    ) {
-        let (key, nonce, message, aad) = (at(0), at(1), at(2), at(3));
+    } else if func.derives_key() {
+        // A key derived from a secret is a secret (rule 8), whatever else went in.
+        any_tainted
+    } else if func.block_mac() {
+        // One-way under a key nobody else knows; under a known key, a short message can be
+        // decrypted back out of the tag.
+        !at(0).secret_key && any_tainted
+    } else if let Some((key, nonce, message, aad)) = func.cipher_args() {
+        let opt = |i: Option<usize>| i.map(at).unwrap_or_default();
+        let (key, nonce, message, aad) = (at(key), opt(nonce), at(message), opt(aad));
         if key.secret_key {
             // A secret key hides only itself. A secret in the message stays readable: another
             // operation of the policy may encrypt chosen bytes under the same key and a chosen
@@ -694,7 +820,10 @@ fn call_info(func: Func, args: &[Info]) -> core::result::Result<Info, Rule> {
     // chose its public key, learns it, but nothing the caller chooses reaches it. Treating it
     // as not controlled keeps a hash of it tainted (rule 3), so a key derived from it is never
     // handed back.
-    let controlled = func != Func::Ecdh && any_controlled;
+    // A key derived from a secret is in the same position: the caller may choose its other
+    // inputs, but not one byte of the output. A key derived from nothing secret is as
+    // controlled as its inputs.
+    let controlled = func != Func::Ecdh && !(func.derives_key() && any_tainted) && any_controlled;
     // Only a secret field itself, or a decoding or a fixed part of it, is a key nobody else
     // knows. A hash or MAC of it is a new value that some operation may hand back, after
     // which it hides nothing.
@@ -1349,5 +1478,101 @@ mod tests {
         assert!(tainted(
             r#"{{ chacha20_poly1305_encrypt(key, hexdecode($nonce + $nonce), key) }}"#
         ));
+    }
+
+    #[test]
+    fn taint_of_the_families() {
+        let analyze = |t: &str| Template::parse(t).unwrap().analyze(&kind);
+        const LENGTH: Rule = "a length must not depend on a secret";
+        const ALGORITHM: Rule = "a hash or curve name must be fixed by the policy";
+        const MIXED: Rule = "a secret mixed with a chosen value reaches a decoder, number or key";
+        const MEET: Rule =
+            "a secret and a chosen value meet in a function that compares or cuts them";
+        for (template, expected) in [
+            // A key derived from a secret is a secret; the caller's salt does not make it
+            // controlled, so a plain hash of it stays a secret too.
+            (r#"{{ hkdf("sha256", key, $input, "", "32") }}"#, Ok(true)),
+            (
+                r#"{{ sha256(hkdf("sha256", key, $input, "", "32")) }}"#,
+                Ok(true),
+            ),
+            (
+                r#"{{ hmac_sha256(kbkdf_counter("sha384", key, "x", "16"), $input) }}"#,
+                Ok(false),
+            ),
+            (r#"{{ concat_kdf("sha512", $input, "", "16") }}"#, Ok(false)),
+            (r#"{{ kerberos_dk(key, "kerberos") }}"#, Ok(true)),
+            // ...so it may key an encryption, whose output then stays a secret.
+            (
+                r#"{{ aes_gcm_encrypt(hkdf("sha256", key, $input, "", "16"), "000000000000", $input) }}"#,
+                Ok(true),
+            ),
+            (r#"{{ hkdf("sha256", $input, "", "", key) }}"#, Err(LENGTH)),
+            (r#"{{ shake128($input, key) }}"#, Err(LENGTH)),
+            (r#"{{ nfold($input, key) }}"#, Err(LENGTH)),
+            (
+                r#"{{ aes_ccm_encrypt(key, "0123456", msg, $input) }}"#,
+                Err(LENGTH),
+            ),
+            (r#"{{ hkdf(nonce_t, key, "", "", "16") }}"#, Err(ALGORITHM)),
+            (r#"{{ dsa_sign($input, key, "m") }}"#, Err(ALGORITHM)),
+            (
+                r#"{{ ecdsa_sign_prehash(nonce_t, key, "0123456789abcdef") }}"#,
+                Err(ALGORITHM),
+            ),
+            (r#"{{ shake256(key, "64") }}"#, Ok(true)),
+            (r#"{{ shake256(key + $input, "64") }}"#, Ok(false)),
+            (r#"{{ sha3_384(session) }}"#, Ok(false)),
+            // Block-cipher MACs: one-way under a secret key only.
+            (r#"{{ aes_cmac(key, msg) }}"#, Ok(false)),
+            (r#"{{ aes_cbc_mac("0123456789abcdef", msg) }}"#, Ok(true)),
+            (r#"{{ aes_cmac(key + $input, "m") }}"#, Err(MIXED)),
+            // Encryption: the rule of the first group, with each function's arguments.
+            (r#"{{ aes_kw_wrap(key, random("16")) }}"#, Ok(false)),
+            (r#"{{ aes_kw_wrap(key, msg) }}"#, Ok(true)),
+            (r#"{{ aes_kwp_wrap(nonce_t, msg) }}"#, Ok(true)),
+            (
+                r#"{{ aes_ccm_encrypt(key, "0123456", "8", $input, msg) }}"#,
+                Ok(true),
+            ),
+            (
+                r#"{{ aes_ccm_encrypt(key, "0123456", "8", $input, "aad") }}"#,
+                Ok(false),
+            ),
+            (
+                r#"{{ aes_cbc_hmac_encrypt(key, "0123456789abcdef", msg) }}"#,
+                Ok(true),
+            ),
+            (
+                r#"{{ aes_eax_encrypt(key, session + $input, "m") }}"#,
+                Err(MIXED),
+            ),
+            (r#"{{ aes_cts_encrypt(key, $nonce, $input) }}"#, Ok(false)),
+            // Signatures drop the taint; their keys may not mix.
+            (r#"{{ ed448_sign(key, msg, "ctx") }}"#, Ok(false)),
+            (
+                r#"{{ dsa_sign_der("sha1", key + $input, "m") }}"#,
+                Err(MIXED),
+            ),
+            (r#"{{ ecdh("x448", nonce_t) }}"#, Ok(true)),
+            // CBOR keeps the taint; its checks and its key order are oracles.
+            (
+                r#"{{ cbor_array(cbor_bytes(key), cbor_int("1")) }}"#,
+                Ok(true),
+            ),
+            (r#"{{ cbor_array(key + $input) }}"#, Err(MIXED)),
+            (r#"{{ cbor_tag("18", session) }}"#, Err(MIXED)),
+            (
+                r#"{{ cbor_map(cbor_bytes(key), cbor_int("1"), cbor_bytes($input), cbor_int("2")) }}"#,
+                Err(MEET),
+            ),
+            (
+                r#"{{ cbor_map(cbor_int("1"), cbor_bytes(key), cbor_int("2"), cbor_bytes($input)) }}"#,
+                Ok(true),
+            ),
+            (r#"{{ cbor_array() + cbor_map() }}"#, Ok(false)),
+        ] {
+            assert_eq!(analyze(template), expected, "{template}");
+        }
     }
 }

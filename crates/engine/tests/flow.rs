@@ -3644,3 +3644,167 @@ fn new_captures_are_redacted_and_cut_secrets_are_searched() {
         Err(Error::Reflection)
     );
 }
+
+/// Every function of the second group of families (KDFs, key wrapping, AES modes and MACs,
+/// Ed448, prehashed ECDSA, DSA, X448, SHA-3 and SHAKE, CBOR, Kerberos n-fold and DK), used
+/// to hand a secret back from a derivation or to let the caller steer how it comes out, is
+/// refused when the policy is signed; the same functions used as intended are accepted.
+#[test]
+fn families_cannot_exfiltrate_a_secret() {
+    let device = DeviceKey::generate();
+    let fields = || vec![secret("key"), public("pub")];
+    let refused = [
+        // A key derived from a secret is a secret, and so is a plain hash of it.
+        r#"{{ hex(hkdf("sha256", key, "", "", "32")) }}"#,
+        r#"{{ hex(hkdf("sha256", key, $input, "info", "32")) }}"#,
+        r#"{{ hex(sha256(hkdf("sha256", key, $input, "", "32"))) }}"#,
+        r#"{{ hex(hkdf_expand("sha384", key, "info", "48")) }}"#,
+        r#"{{ hex(concat_kdf("sha256", ecdh("p256", pub), $input, "16")) }}"#,
+        r#"{{ hex(kbkdf_counter("sha512", key, $input, "64")) }}"#,
+        r#"{{ hex(kerberos_dk(key, "kerberos")) }}"#,
+        // Hash names are fixed by the policy, and no length depends on a secret.
+        r#"{{ hex(hkdf($input, key, "", "", "32")) }}"#,
+        r#"{{ hex(concat_kdf($input, key, "", "16")) }}"#,
+        r#"{{ hex(kbkdf_counter($input, key, "", "16")) }}"#,
+        r#"{{ hex(hkdf_expand($input, key, "", "32")) }}"#,
+        r#"{{ len(hkdf("sha256", $input, "", "", key)) }}"#,
+        r#"{{ len(shake256($input, key)) }}"#,
+        r#"{{ len(nfold($input, key)) }}"#,
+        r#"{{ len(aes_ccm_encrypt("0123456789abcdef", "0123456", key, $input)) }}"#,
+        // A plain hash of the secret alone.
+        r#"{{ hex(sha3_224(key)) }}"#,
+        r#"{{ hex(sha3_256(key)) }}"#,
+        r#"{{ hex(sha3_384(key)) }}"#,
+        r#"{{ hex(sha3_512(key)) }}"#,
+        r#"{{ hex(shake128(key, "32")) }}"#,
+        r#"{{ hex(shake256(key, "64")) }}"#,
+        // A block-cipher MAC under a known key can be decrypted; a chosen key is an oracle.
+        r#"{{ hex(aes_cmac("0123456789abcdef", key)) }}"#,
+        r#"{{ hex(aes_cbc_mac(pub, key)) }}"#,
+        r#"{{ hex(aes_cmac(key + $input, "m")) }}"#,
+        r#"{{ hex(aes_cbc_mac(key + $input, "m")) }}"#,
+        // Encryption and wrapping under a known key, or of a secret under any key.
+        r#"{{ b64(aes_kw_wrap("0123456789abcdef", key)) }}"#,
+        r#"{{ b64(aes_kwp_wrap(pub, key)) }}"#,
+        r#"{{ b64(aes_kw_wrap(key, key)) }}"#,
+        r#"{{ b64(aes_cbc_hmac_encrypt("0123456789abcdef0123456789abcdef", "0123456789abcdef", key)) }}"#,
+        r#"{{ b64(aes_ccm_encrypt("0123456789abcdef", "0123456", "8", key)) }}"#,
+        r#"{{ b64(aes_eax_encrypt(pub, $input, key)) }}"#,
+        r#"{{ b64(aes_cts_encrypt("0123456789abcdef", "0123456789abcdef", key)) }}"#,
+        r#"{{ b64(aes_ccm_encrypt(key, "0123456", "8", "m", key)) }}"#,
+        r#"{{ b64(aes_eax_encrypt(key, key + $input, "m")) }}"#,
+        r#"{{ b64(aes_kw_wrap(key + $input, "0123456789abcdef")) }}"#,
+        // n-fold keeps the secret readable; DK under a chosen key is an oracle.
+        r#"{{ hex(nfold(key, "128")) }}"#,
+        r#"{{ hex(kerberos_dk(key + $input, "kerberos")) }}"#,
+        // Signatures: the algorithm is fixed, the key is not mixed with chosen bytes.
+        r#"{{ hex(ecdsa_sign_prehash($input, key, "0123456789abcdef0123456789abcdef")) }}"#,
+        r#"{{ hex(dsa_sign($input, key, "m")) }}"#,
+        r#"{{ hex(dsa_sign_der(pub + $input, key, "m")) }}"#,
+        r#"{{ hex(ed448_sign(key + $input, "m")) }}"#,
+        r#"{{ hex(ecdsa_sign_prehash("p256", key + $input, "0123456789abcdef")) }}"#,
+        r#"{{ hex(dsa_sign("sha256", key + $input, "m")) }}"#,
+        // X448 shared secrets are secrets.
+        r#"{{ hex(ecdh("x448", $input)) }}"#,
+        r#"{{ hex(sha3_256(hex(ecdh("x448", pub)))) }}"#,
+        // CBOR keeps the secret readable, and its checks and key order are oracles.
+        r#"{{ hex(cbor_bytes(key)) }}"#,
+        r#"{{ hex(cbor_array(cbor_text("a"), cbor_bytes(key))) }}"#,
+        r#"{{ len(cbor_array(key + $input)) }}"#,
+        r#"{{ len(cbor_int(key + $input)) }}"#,
+        r#"{{ len(cbor_text(key + $input)) }}"#,
+        r#"{{ len(cbor_tag(key + $input, "\0")) }}"#,
+        r#"{{ len(cbor_map(cbor_bytes(key), cbor_int("1"), cbor_bytes($input), cbor_int("2"))) }}"#,
+    ];
+    for template in refused {
+        // Refused by the analysis, not by the parser.
+        assert!(
+            engine::template::Template::parse(template).is_ok(),
+            "{template}"
+        );
+        let policy = with_caller(derive_policy(fields(), template));
+        assert!(
+            matches!(device.sign_policy(policy), Err(Error::PolicyInvalid { at, .. }) if at.starts_with("operations[0].steps[0].template")),
+            "{template}"
+        );
+    }
+    let allowed = [
+        // One-way functions of a derived key, and derivations from nothing secret.
+        r#"{{ hex(hmac_sha256(hkdf("sha256", key, $input, "", "32"), $input)) }}"#,
+        r#"{{ hex(hkdf("sha256", $input, "", "", "32")) + hex(nfold($input, "128")) }}"#,
+        r#"{{ hex(sha3_512(key + $input)) + hex(shake256(key + $input, "64")) }}"#,
+        // Under a secret key: MACs, and a fresh content key wrapped.
+        r#"{{ hex(aes_cmac(key, $input)) + hex(aes_cbc_mac(key, $input)) }}"#,
+        r#"{{ b64(aes_kw_wrap(key, random("16"))) + b64(aes_kwp_wrap(key, random("20"))) }}"#,
+        // Under a secret key, with the node's nonce, a chosen message.
+        r#"{{ b64(aes_ccm_encrypt(key, slice(hexdecode($nonce), "0", "13"), "16", $input, "aad")) }}"#,
+        r#"{{ b64(aes_eax_encrypt(key, hexdecode($nonce), $input)) }}"#,
+        r#"{{ b64(aes_cts_encrypt(key, hexdecode($nonce), $input)) }}"#,
+        r#"{{ b64(aes_cbc_hmac_encrypt(key, hexdecode($nonce), $input, "aad")) }}"#,
+        // Signatures and the public half of a key agreement.
+        r#"{{ hex(ed448_sign(key, $input, "ctx")) + hex(ecdsa_sign_prehash("p384", key, sha384($input))) }}"#,
+        r#"{{ hex(dsa_sign("sha256", key, $input)) + hex(dsa_sign_der("sha1", key, $input)) }}"#,
+        r#"{{ hex(ecdh_public("x448")) }}"#,
+        // A COSE_Sign1 (EdDSA) over the caller's payload.
+        concat!(
+            r#"{{ b64urlraw(cbor_tag("18", cbor_array(cbor_bytes(cbor_map(cbor_int("1"), cbor_int("-8"))), "#,
+            r#"cbor_map(), cbor_bytes($input), cbor_bytes(ed448_sign(key, cbor_array(cbor_text("Signature1"), "#,
+            r#"cbor_bytes(cbor_map(cbor_int("1"), cbor_int("-8"))), cbor_bytes(""), cbor_bytes($input))))))) }}"#,
+        ),
+        r#"{{ hex(cbor_map(cbor_text("k"), cbor_bytes($input), cbor_int("1"), cbor_bytes(hex(sha3_256(key + $input))))) }}"#,
+    ];
+    for template in allowed {
+        let policy = with_caller(derive_policy(fields(), template));
+        let signed = device.sign_policy(policy);
+        assert!(signed.is_ok(), "{template} {:?}", signed.err());
+    }
+}
+
+/// A `COSE_Sign1` (RFC 9052) with Ed448, built by a derivation over the caller's payload,
+/// verifies with the public key: the structure, the `Sig_structure` signed, the signature.
+#[test]
+fn a_derivation_builds_a_cose_sign1_with_ed448() {
+    use base64::Engine as _;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use ed448_goldilocks::signature::Verifier as _;
+
+    // RFC 8032 section 7.4, the blank-message key.
+    let secret_key = [
+        0x6c, 0x82, 0xa5, 0x62, 0xcb, 0x80, 0x8d, 0x10, 0xd6, 0x32, 0xbe, 0x89, 0xc8, 0x51, 0x3e,
+        0xbf, 0x6c, 0x92, 0x9f, 0x34, 0xdd, 0xfa, 0x8c, 0x9f, 0x63, 0xc9, 0x96, 0x0e, 0xf6, 0xe3,
+        0x48, 0xa3, 0x52, 0x8c, 0x8a, 0x3f, 0xcc, 0x2f, 0x04, 0x4e, 0x39, 0xa3, 0xfc, 0x5b, 0x94,
+        0x49, 0x2f, 0x8f, 0x03, 0x2e, 0x75, 0x49, 0xa2, 0x00, 0x98, 0xf9, 0x5b,
+    ];
+    let protected = r#"cbor_map(cbor_int("1"), cbor_int("-8"))"#;
+    let template = format!(
+        concat!(
+            "{{{{ b64urlraw(cbor_tag(\"18\", cbor_array(cbor_bytes({p}), cbor_map(), ",
+            "cbor_bytes($input), cbor_bytes(ed448_sign(key, cbor_array(cbor_text(\"Signature1\"), ",
+            "cbor_bytes({p}), cbor_bytes(\"\"), cbor_bytes($input))))))) }}}}"
+        ),
+        p = protected
+    );
+    let clock = TestClock::at(NOW);
+    let s = setup(
+        &clock,
+        derive_policy(vec![secret("key")], &template),
+        &[("key", &secret_key)],
+    );
+    let payload = b"This is the content.";
+    let out = call_derive(&s.node, &s.record, "derive", payload).unwrap();
+    let cose = URL_SAFE_NO_PAD.decode(out).unwrap();
+    // Tag 18, array of 4: bstr(3) {1: -8}, {}, bstr payload, bstr(114) signature.
+    let mut head = vec![0xd2, 0x84, 0x43, 0xa1, 0x01, 0x27, 0xa0, 0x54];
+    head.extend_from_slice(payload);
+    head.extend_from_slice(&[0x58, 0x72]);
+    assert_eq!(&cose[..head.len()], head.as_slice());
+    let signature = &cose[head.len()..];
+    assert_eq!(signature.len(), 114);
+    let mut to_be_signed = b"\x84\x6aSignature1\x43\xa1\x01\x27\x40\x54".to_vec();
+    to_be_signed.extend_from_slice(payload);
+    let key = ed448_goldilocks::SigningKey::try_from(&secret_key[..]).unwrap();
+    let signature = ed448_goldilocks::Signature::try_from(signature).unwrap();
+    key.verifying_key()
+        .verify(&to_be_signed, &signature)
+        .unwrap();
+}

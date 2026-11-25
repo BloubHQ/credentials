@@ -10,7 +10,7 @@ use zeroize::Zeroizing;
 use crate::primitives;
 use crate::template::{Budget, Bytes, Func};
 
-fn unhex(text: &str) -> Vec<u8> {
+pub(crate) fn unhex(text: &str) -> Vec<u8> {
     let clean: Vec<u8> = text.bytes().filter(|b| !b.is_ascii_whitespace()).collect();
     clean
         .chunks(2)
@@ -22,16 +22,16 @@ fn func(name: &str) -> Func {
     Func::ALL.iter().find(|(n, _)| *n == name).unwrap().1
 }
 
-fn call_in(budget: &Budget, name: &str, args: &[&[u8]]) -> crate::Result<Vec<u8>> {
+pub(crate) fn call_in(budget: &Budget, name: &str, args: &[&[u8]]) -> crate::Result<Vec<u8>> {
     let args: Vec<Bytes> = args.iter().map(|a| Zeroizing::new(a.to_vec())).collect();
     primitives::call(func(name), &args, 0, budget).map(|v| v.to_vec())
 }
 
-fn call(name: &str, args: &[&[u8]]) -> Vec<u8> {
+pub(crate) fn call(name: &str, args: &[&[u8]]) -> Vec<u8> {
     call_in(&Budget::default(), name, args).unwrap()
 }
 
-fn hex_call(name: &str, args: &[&[u8]]) -> String {
+pub(crate) fn hex_call(name: &str, args: &[&[u8]]) -> String {
     call(name, args)
         .iter()
         .map(|b| format!("{b:02x}"))

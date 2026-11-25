@@ -192,7 +192,7 @@ has names, variables, string literals, function calls and `+`; no branches or lo
 policy is signed, every template is analysed:
 
 - **Taint.** A value that holds a secret in reversible form is *tainted*. Encodings keep taint;
-  hashes, MACs, signatures and `len` remove it, except a hash of the secret alone, which is as good as the key where the key is hashed before use (a long HMAC key, an Ed25519 seed). Encryption under a secret field hides only the
+  hashes, MACs, signatures and `len` remove it, except a hash of the secret alone, which is as good as the key where the key is hashed before use (a long HMAC key, an Ed25519 seed). A key derived from a secret (HKDF, Concat KDF, SP 800-108, Kerberos DK) is a secret too, and no output length may depend on one. Encryption under a secret field hides only the
   key: a secret in its message, nonce or data stays tainted, because another operation could
   encrypt chosen bytes under the same key. A derivation whose output is tainted is refused.
 - **Oracles.** A secret and a value the caller or server chooses may not meet where the result
