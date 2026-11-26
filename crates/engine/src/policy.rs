@@ -67,7 +67,7 @@ pub use input::{Input, JsonInput, JsonType, Member, NodeTime, RawInput, RlpInput
 pub use proto::{
     Answer, Command, CommandRule, DEFAULT_MESSAGES, Login, MAX_COMMANDS, MAX_HOST_KEYS, MAX_MAIL,
     MAX_MESSAGE_WAIT_MS, MAX_MESSAGES, MAX_PARAM, MAX_PARAMS, MAX_RECIPIENTS, MailRule, Mechanism,
-    MqttVersion, ParamRule, SshChannel, TlsMode, forward_target,
+    MqttVersion, ParamRule, SshChannel, TlsMode, VerbShape, forward_target, path_ok, verb_shape,
 };
 pub use run::{ModuleRef, ModuleSource, RunModule};
 pub use summary::diff;
@@ -703,6 +703,13 @@ pub enum Connection {
     /// AMQP 0-9-1 over TLS: `PLAIN`, publications to fixed exchanges and routing keys,
     /// messages got from fixed queues.
     Amqp,
+    /// FTP over TLS (RFC 959, RFC 4217; implicit, or explicit with `AUTH TLS`): typed file
+    /// operations over passive-mode data connections to the same server, each protected
+    /// by TLS.
+    Ftp,
+    /// POP3 over TLS (RFC 1939; implicit, or `STLS` of RFC 2595): `USER`/`PASS`, `APOP` or
+    /// SASL, then commands whose parameters are message numbers.
+    Pop3,
     /// UDP datagrams to one destination, for request and response protocols that protect
     /// their messages with a MAC (RADIUS, DNS with TSIG, STUN): `send` writes one datagram,
     /// `receive` reads one. There is no TLS, so a send may not hold a secret in reversible
@@ -1867,7 +1874,9 @@ impl Policy {
                 | Connection::Redis
                 | Connection::Mysql
                 | Connection::Mqtt
-                | Connection::Amqp),
+                | Connection::Amqp
+                | Connection::Ftp
+                | Connection::Pop3),
             ) => {
                 ensure(
                     ret.response.is_none() && ret.template.is_none(),
@@ -2163,7 +2172,9 @@ impl Policy {
                     | Connection::Redis
                     | Connection::Mysql
                     | Connection::Mqtt
-                    | Connection::Amqp => {
+                    | Connection::Amqp
+                    | Connection::Ftp
+                    | Connection::Pop3 => {
                         return fail(at, "a send on a protocol connection takes command only");
                     }
                     Connection::Tls => {
@@ -2231,7 +2242,9 @@ impl Policy {
                     | Connection::Redis
                     | Connection::Mysql
                     | Connection::Mqtt
-                    | Connection::Amqp => {
+                    | Connection::Amqp
+                    | Connection::Ftp
+                    | Connection::Pop3 => {
                         return fail(at, "a protocol receive follows its send");
                     }
                     Connection::Https => {
@@ -2910,6 +2923,8 @@ fn summarize_operation(operation: &Operation, out: &mut Vec<String>) {
                 Connection::Mysql => "MySQL",
                 Connection::Mqtt => "MQTT",
                 Connection::Amqp => "AMQP",
+                Connection::Ftp => "FTP over TLS",
+                Connection::Pop3 => "POP3",
                 Connection::Udp => "UDP datagrams (no TLS)",
             },
             destination_names(&open.destinations),

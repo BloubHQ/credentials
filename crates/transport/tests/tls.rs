@@ -438,3 +438,98 @@ fn no_exporter_over_tls12() {
         Some(Error::transport(TransportKind::Unsupported, true))
     );
 }
+
+/// Serves a data connection on its own port: reads one line, sends `content`, and ends with
+/// close_notify (or with a bare TCP close, a cut). Gives back how the handshake went.
+fn serve_data(
+    config: Arc<ServerConfig>,
+    content: &'static [u8],
+    close_notify: bool,
+) -> (u16, mpsc::Receiver<Option<rustls::HandshakeKind>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let (tcp, _) = listener.accept().unwrap();
+        let mut stream = StreamOwned::new(ServerConnection::new(config).unwrap(), tcp);
+        let mut byte = [0u8; 1];
+        let mut line = Vec::new();
+        while !line.ends_with(b"\n") {
+            if stream.read(&mut byte).unwrap_or(0) == 0 {
+                break;
+            }
+            line.push(byte[0]);
+        }
+        let _ = tx.send(stream.conn.handshake_kind());
+        stream.write_all(content).unwrap();
+        if close_notify {
+            stream.conn.send_close_notify();
+        }
+        stream.flush().unwrap();
+        let _ = stream.sock.shutdown(std::net::Shutdown::Both);
+    });
+    (port, rx)
+}
+
+fn read_to_end(stream: &mut dyn engine::egress::Stream) -> Result<Vec<u8>> {
+    let mut out = Vec::new();
+    let started = Instant::now();
+    loop {
+        match stream.read_some(4096, Duration::from_millis(200))? {
+            engine::egress::Arrived::Bytes(bytes) => out.extend(bytes),
+            engine::egress::Arrived::End => return Ok(out),
+            engine::egress::Arrived::Nothing => {
+                assert!(started.elapsed() < Duration::from_secs(5), "never ended");
+            }
+        }
+    }
+}
+
+#[test]
+fn a_data_connection_goes_to_the_same_server_and_resumes_its_tls_session() {
+    let server = load("imap");
+    let config = Arc::new(server_config(&server, None));
+    let control_config = (*config).clone();
+    let (address, _got) = serve(control_config, |stream| {
+        stream.write_all(b"220 ready\r\n").unwrap();
+        stream.flush().unwrap();
+        thread::sleep(Duration::from_millis(1500));
+    });
+    let (port, kind) = serve_data(config.clone(), b"file bytes", true);
+    let mut transport = transport(address);
+    let mut control = transport
+        .open(&Destination::new("imap.test", 990), None)
+        .unwrap();
+    assert_eq!(
+        control.read_until(&[b"\r\n"], 1024).unwrap(),
+        b"220 ready\r\n"
+    );
+    assert_eq!(control.peer_ip(), Some(address.ip()));
+    let mut data = control.open_data(port).unwrap();
+    data.write(b"go\n").unwrap();
+    assert_eq!(read_to_end(data.as_mut()).unwrap(), b"file bytes");
+    assert_eq!(kind.recv().unwrap(), Some(rustls::HandshakeKind::Resumed));
+}
+
+#[test]
+fn a_data_connection_cut_without_close_notify_is_not_an_end() {
+    let server = load("imap");
+    let config = Arc::new(server_config(&server, None));
+    let (address, _got) = serve((*config).clone(), |stream| {
+        stream.write_all(b"220 ready\r\n").unwrap();
+        stream.flush().unwrap();
+        thread::sleep(Duration::from_millis(1500));
+    });
+    let (port, _kind) = serve_data(config.clone(), b"half a fi", false);
+    let mut transport = transport(address);
+    let mut control = transport
+        .open(&Destination::new("imap.test", 990), None)
+        .unwrap();
+    control.read_until(&[b"\r\n"], 1024).unwrap();
+    let mut data = control.open_data(port).unwrap();
+    data.write(b"go\n").unwrap();
+    assert_eq!(
+        read_to_end(data.as_mut()).err(),
+        Some(Error::transport(TransportKind::Closed, true))
+    );
+}

@@ -10,15 +10,20 @@
 )]
 
 mod amqp;
+mod fake_ftp;
 mod fake_mail;
 mod fake_pg;
+mod fake_pop3;
 mod fake_ssh;
+mod ftp;
 mod hostile;
 mod mail;
 mod mqtt;
 mod mysql;
 mod policy;
+mod pop3;
 mod postgres;
+
 mod redis;
 mod ssh;
 mod ssh_paths;
@@ -167,6 +172,15 @@ pub trait Peer {
     fn take(&mut self) -> Vec<u8>;
     /// True once the server closed the connection.
     fn closed(&self) -> bool;
+    /// The address of the server, as a direct TCP connection would know it.
+    fn peer_ip(&self) -> Option<std::net::IpAddr> {
+        None
+    }
+    /// A data connection to `port` of this server (FTP).
+    fn data(&mut self, port: u16) -> engine::Result<Box<dyn Stream>> {
+        let _ = port;
+        Err(engine::Error::transport(TransportKind::Unsupported, true))
+    }
 }
 
 /// A transport whose every connection goes to one in-process server.
@@ -217,6 +231,14 @@ impl<P: Peer> Stream for PeerStream<'_, P> {
         }
         let _ = max;
         Ok(Arrived::Bytes(bytes))
+    }
+
+    fn peer_ip(&self) -> Option<std::net::IpAddr> {
+        self.0.peer_ip()
+    }
+
+    fn open_data(&mut self, port: u16) -> engine::Result<Box<dyn Stream>> {
+        self.0.data(port)
     }
 }
 

@@ -30,7 +30,7 @@ pub mod hpack;
 pub mod udp;
 
 use std::io::{self, Read, Write};
-use std::net::{Shutdown, SocketAddr, TcpStream, ToSocketAddrs};
+use std::net::{IpAddr, Shutdown, SocketAddr, TcpStream, ToSocketAddrs};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -55,6 +55,12 @@ pub trait Socket: Read + Write + Send {
 
     /// Closes both directions.
     fn shutdown(&self) -> io::Result<()>;
+
+    /// The address of the peer, when the socket is connected to it directly (TCP); `None`
+    /// for a stream a relay carries.
+    fn peer_addr(&self) -> Option<SocketAddr> {
+        None
+    }
 }
 
 impl Socket for TcpStream {
@@ -65,6 +71,10 @@ impl Socket for TcpStream {
 
     fn shutdown(&self) -> io::Result<()> {
         TcpStream::shutdown(self, Shutdown::Both)
+    }
+
+    fn peer_addr(&self) -> Option<SocketAddr> {
+        TcpStream::peer_addr(self).ok()
     }
 }
 
@@ -79,6 +89,22 @@ pub trait Connector: Send + Sync {
         attempt: Duration,
         deadline: Instant,
     ) -> io::Result<Box<dyn Socket>>;
+
+    /// Connects to `port` on the server an earlier connection to `host` reached at `peer`
+    /// (the data connection of FTP). With `peer` known it goes to exactly that address, so a
+    /// second resolution of `host` cannot send it elsewhere; the default connects to `host`
+    /// again, as a relay that resolves names itself must.
+    fn connect_again(
+        &self,
+        host: &str,
+        peer: Option<IpAddr>,
+        port: u16,
+        attempt: Duration,
+        deadline: Instant,
+    ) -> io::Result<Box<dyn Socket>> {
+        let _ = peer;
+        self.connect(host, port, attempt, deadline)
+    }
 }
 
 /// Connects over TCP to the addresses a resolver gives, in order.
@@ -131,6 +157,26 @@ impl Connector for TcpConnector {
             }
         }
         Err(last)
+    }
+
+    fn connect_again(
+        &self,
+        host: &str,
+        peer: Option<IpAddr>,
+        port: u16,
+        attempt: Duration,
+        deadline: Instant,
+    ) -> io::Result<Box<dyn Socket>> {
+        let Some(ip) = peer else {
+            return self.connect(host, port, attempt, deadline);
+        };
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(io::Error::new(io::ErrorKind::TimedOut, "connect deadline"));
+        }
+        let stream = TcpStream::connect_timeout(&SocketAddr::new(ip, port), attempt.min(left))?;
+        stream.set_nodelay(true)?;
+        Ok(Box::new(stream))
     }
 }
 
@@ -205,7 +251,7 @@ pub struct TlsTransport {
     io_timeout: Duration,
     total_timeout: Duration,
     stream_timeout: Duration,
-    connector: Box<dyn Connector>,
+    connector: Arc<dyn Connector>,
     datagrams: Box<dyn udp::DatagramConnector>,
 }
 
@@ -235,7 +281,7 @@ impl TlsTransport {
             io_timeout: Duration::from_secs(30),
             total_timeout: Duration::from_secs(120),
             stream_timeout: Duration::from_secs(3600),
-            connector: Box::new(TcpConnector::new()),
+            connector: Arc::new(TcpConnector::new()),
             datagrams: Box::new(udp::UdpConnector::new()),
         }
     }
@@ -271,7 +317,7 @@ impl TlsTransport {
 
     /// Replaces what opens the byte streams TLS runs over ([`TcpConnector`] by default).
     pub fn connector(mut self, connector: impl Connector + 'static) -> Self {
-        self.connector = Box::new(connector);
+        self.connector = Arc::new(connector);
         self
     }
 
@@ -315,7 +361,8 @@ impl TlsTransport {
         ServerName::try_from(destination.host.clone())
             .map_err(|_| fault(TransportKind::Connect, false))?;
         let tcp = self.tcp(destination, deadline)?;
-        self.handshake(tcp, destination, identity, alpn, deadline)
+        let config = self.config(identity, alpn)?;
+        self.handshake(tcp, destination, config, deadline)
     }
 
     /// Opens the byte stream to `destination`.
@@ -344,13 +391,11 @@ impl TlsTransport {
         &self,
         mut tcp: Box<dyn Socket>,
         destination: &Destination,
-        identity: Option<&ClientIdentity>,
-        alpn: &[&[u8]],
+        config: Arc<ClientConfig>,
         deadline: Instant,
     ) -> Result<Tls> {
         let name = ServerName::try_from(destination.host.clone())
             .map_err(|_| fault(TransportKind::Connect, false))?;
-        let config = self.config(identity, alpn)?;
         let mut tls =
             ClientConnection::new(config, name).map_err(|_| fault(TransportKind::Tls, false))?;
         while tls.is_handshaking() {
@@ -386,6 +431,79 @@ impl TlsTransport {
             return Err(fault(TransportKind::Downgrade, false));
         }
         Ok((stream, version))
+    }
+}
+
+impl TlsTransport {
+    /// What a data connection of `stream` needs to reach the same server the same way.
+    fn origin(
+        &self,
+        destination: &Destination,
+        config: Arc<ClientConfig>,
+        stream: &Tls,
+        deadline: Instant,
+    ) -> Origin {
+        Origin {
+            host: destination.host.clone(),
+            peer: stream.sock.peer_addr().map(|a| a.ip()),
+            config,
+            connector: self.connector.clone(),
+            connect_timeout: self.connect_timeout,
+            io_timeout: self.io_timeout,
+            deadline,
+        }
+    }
+}
+
+/// Where a TLS connection went and how, so a second connection (an FTP data connection) goes
+/// to the same server the same way and resumes its TLS session (rustls keeps the session
+/// cache in `config`, keyed by the server name).
+struct Origin {
+    host: String,
+    peer: Option<IpAddr>,
+    config: Arc<ClientConfig>,
+    connector: Arc<dyn Connector>,
+    connect_timeout: Duration,
+    io_timeout: Duration,
+    deadline: Instant,
+}
+
+impl Origin {
+    /// Connects to `port` on the same server and sets up TLS to the same name. The handshake
+    /// runs on the first read or write: rustls completes it before any application data.
+    fn open_data(&self, port: u16) -> Result<TlsStream> {
+        if port == 0 {
+            return Err(fault(TransportKind::Connect, false));
+        }
+        if self
+            .deadline
+            .saturating_duration_since(Instant::now())
+            .is_zero()
+        {
+            return Err(fault(TransportKind::Timeout, false));
+        }
+        let name = ServerName::try_from(self.host.clone())
+            .map_err(|_| fault(TransportKind::Connect, false))?;
+        let sock = self
+            .connector
+            .connect_again(
+                &self.host,
+                self.peer,
+                port,
+                self.connect_timeout,
+                self.deadline,
+            )
+            .map_err(|_| fault(TransportKind::Connect, false))?;
+        let tls = ClientConnection::new(self.config.clone(), name)
+            .map_err(|_| fault(TransportKind::Tls, false))?;
+        Ok(TlsStream {
+            inner: StreamOwned::new(tls, sock),
+            pending: Vec::new(),
+            io_timeout: self.io_timeout,
+            deadline: self.deadline,
+            origin: None,
+            strict_end: true,
+        })
     }
 }
 
@@ -496,6 +614,8 @@ impl Transport for TlsTransport {
                     pending: Vec::new(),
                     io_timeout: self.io_timeout,
                     deadline,
+                    origin: None,
+                    strict_end: false,
                 })
             }
             Version::Http2 => Box::new(H2Stream {
@@ -513,12 +633,19 @@ impl Transport for TlsTransport {
         identity: Option<&ClientIdentity>,
     ) -> Result<Box<dyn Stream + '_>> {
         let deadline = Instant::now() + self.total_timeout;
-        let stream = self.connect(destination, identity, &[], deadline)?;
+        ServerName::try_from(destination.host.clone())
+            .map_err(|_| fault(TransportKind::Connect, false))?;
+        let tcp = self.tcp(destination, deadline)?;
+        let config = self.config(identity, &[])?;
+        let stream = self.handshake(tcp, destination, config.clone(), deadline)?;
+        let origin = self.origin(destination, config, &stream, deadline);
         Ok(Box::new(TlsStream {
             inner: stream,
             pending: Vec::new(),
             io_timeout: self.io_timeout,
             deadline,
+            origin: Some(origin),
+            strict_end: false,
         }))
     }
 
@@ -547,12 +674,16 @@ impl Transport for TlsTransport {
         // The prelude reads with `read_some`, which hands over every byte it takes from the
         // socket; whatever the server sent after its go-ahead is still in the socket and goes
         // into the handshake, where it fails as a TLS record would.
-        let stream = self.handshake(plain.sock, destination, identity, &[], deadline)?;
+        let config = self.config(identity, &[])?;
+        let stream = self.handshake(plain.sock, destination, config.clone(), deadline)?;
+        let origin = self.origin(destination, config, &stream, deadline);
         Ok(Box::new(TlsStream {
             inner: stream,
             pending: Vec::new(),
             io_timeout: self.io_timeout,
             deadline,
+            origin: Some(origin),
+            strict_end: false,
         }))
     }
 
@@ -732,6 +863,11 @@ struct TlsStream {
     pending: Vec<u8>,
     io_timeout: Duration,
     deadline: Instant,
+    /// For a protocol connection: how to open its data connections.
+    origin: Option<Origin>,
+    /// The end must be a TLS close_notify: an FTP data connection, where the end of the
+    /// connection is the end of the file and a cut must not pass for it.
+    strict_end: bool,
 }
 
 impl Stream for TlsStream {
@@ -796,8 +932,10 @@ impl Stream for TlsStream {
             Ok(0) => Ok(Arrived::End),
             Ok(n) => Ok(Arrived::Bytes(chunk.get(..n).unwrap_or_default().to_vec())),
             // A server that closes without close_notify ends what it sent; the engine checks
-            // the framing.
-            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => Ok(Arrived::End),
+            // the framing. Where the end is the framing, it is a cut.
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof && !self.strict_end => {
+                Ok(Arrived::End)
+            }
             Err(e) => match io_kind(&e) {
                 TransportKind::Timeout => Ok(Arrived::Nothing),
                 kind => Err(fault(kind, true)),
@@ -827,6 +965,18 @@ impl Stream for TlsStream {
             .export_keying_material(out.as_mut_slice(), label, Some(context))
             .map_err(|_| fault(TransportKind::Tls, true))?;
         Ok(out)
+    }
+
+    fn peer_ip(&self) -> Option<IpAddr> {
+        self.origin.as_ref().and_then(|o| o.peer)
+    }
+
+    fn open_data(&mut self, port: u16) -> Result<Box<dyn Stream>> {
+        let origin = self
+            .origin
+            .as_ref()
+            .ok_or_else(|| fault(TransportKind::Unsupported, true))?;
+        Ok(Box::new(origin.open_data(port)?))
     }
 }
 

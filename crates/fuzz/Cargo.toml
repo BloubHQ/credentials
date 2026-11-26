@@ -197,3 +197,10 @@ path = "fuzz_targets/owner_controls.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "ftp_pop3_replies"
+path = "fuzz_targets/ftp_pop3_replies.rs"
+test = false
+doc = false
+bench = false

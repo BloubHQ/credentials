@@ -1,5 +1,5 @@
 //! Operations on protocol connections: SSH (with SFTP and port forwarding), PostgreSQL,
-//! MySQL, SMTP, IMAP, Redis, MQTT and AMQP.
+//! MySQL, SMTP, IMAP, POP3, Redis, MQTT, AMQP and FTP over TLS.
 //!
 //! Order, as for every act: the caller's commands and messages are checked against the
 //! policy before anything is logged ([`check_session`]); the node logs the use, opens the
@@ -24,8 +24,9 @@ use crate::policy::{
     CommandRule, Connection, Destination, FrameKind, Login, MAX_PARAM, Mechanism, MqttVersion,
     Open, Operation, Relay, SshChannel, Step, TlsMode,
 };
+use crate::policy::{path_ok, verb_shape};
 use crate::proto::io::{Bounds, Io};
-use crate::proto::{amqp, imap, mqtt, mysql, postgres, redis, sftp, smtp, ssh};
+use crate::proto::{amqp, ftp, imap, mqtt, mysql, pop3, postgres, redis, sftp, smtp, ssh};
 use crate::record::Record;
 use crate::reflection::{self, Secrets};
 use crate::response::MAX_RESPONSE;
@@ -83,6 +84,8 @@ fn param_ok(connection: Connection, rule: &crate::policy::ParamRule, value: &str
         // Quoted strings of IMAP and words of a shell cannot hold these.
         Connection::Imap => !bytes.iter().any(|b| matches!(b, b'\r' | b'\n' | 0)),
         Connection::Ssh => !bytes.contains(&0),
+        // A message number as given; one in a template is checked once rendered.
+        Connection::Pop3 => !rule.raw_caller() || pop3::number_ok(bytes),
         _ => true,
     };
     bytes.len() <= max
@@ -94,16 +97,29 @@ fn param_ok(connection: Connection, rule: &crate::policy::ParamRule, value: &str
 }
 
 /// True when the caller's `value` for parameter `at` of `rule` keeps the command in its shape:
-/// an MQTT topic or filter of the caller holds no wildcard (only the policy's may), and an
-/// SFTP path of the caller is absolute with no `.` or `..` segment.
+/// an MQTT topic or filter of the caller holds no wildcard (only the policy's may), and a
+/// path of the caller (SFTP, FTP) is absolute with no `.` or `..` segment, and for FTP holds
+/// no control byte that could end the command line.
 fn shape_ok(connection: Connection, rule: &CommandRule, at: usize, value: &str) -> bool {
     match connection {
         Connection::Mqtt if at == 0 => !value.contains(['+', '#']),
-        Connection::Ssh if at == 0 && rule.ssh_channel() == SshChannel::Sftp => {
-            // The value goes in a template, or is the path; either way it may not climb.
+        Connection::Ssh | Connection::Ftp => {
+            let channel = rule.ssh_channel();
+            if connection == Connection::Ssh && channel != SshChannel::Sftp {
+                return true;
+            }
+            let Some(shape) = verb_shape(connection, channel, &rule.text) else {
+                return true;
+            };
+            if !shape.paths.contains(&at) {
+                return true;
+            }
+            let raw = rule.params.get(at).is_some_and(|p| p.raw_caller());
+            // The value goes in a template, or is the path; either way it may not climb, and
+            // it may not end an FTP command line.
             !value.split('/').any(|s| s == "..")
-                && (!rule.params.first().is_some_and(|p| p.raw_caller())
-                    || sftp::normalize(value.as_bytes()).is_ok())
+                && (connection != Connection::Ftp || !value.bytes().any(|b| b < 0x20 || b == 0x7f))
+                && (!raw || path_ok(connection, value.as_bytes(), shape.root))
         }
         _ => true,
     }
@@ -403,6 +419,8 @@ enum Session<'s> {
     Mysql(mysql::Client<'s>),
     Mqtt(mqtt::Client<'s>),
     Amqp(amqp::Client<'s>),
+    Ftp(ftp::Client<'s>),
+    Pop3(pop3::Client<'s>),
 }
 
 /// The result of one command, and every byte the server sent for it in the form it came, for
@@ -423,6 +441,8 @@ impl<'s> Session<'s> {
             Session::Mysql(c) => c.io(),
             Session::Mqtt(c) => c.io(),
             Session::Amqp(c) => c.io(),
+            Session::Ftp(c) => c.io(),
+            Session::Pop3(c) => c.io(),
         }
     }
 
@@ -451,16 +471,49 @@ impl<'s> Session<'s> {
             Session::Ssh(client) if shape.channel == SshChannel::Sftp => {
                 let mut files = sftp::Sftp::start(client)?;
                 let path = param(rendered, 0)?;
+                let mut raw = Zeroizing::new(Vec::new());
                 let data = match rendered.text.as_slice() {
                     b"read" => files.read_file(path, MAX_RESPONSE)?,
                     b"write" => {
                         files.write_file(path, param(rendered, 1)?)?;
                         Zeroizing::new(Vec::new())
                     }
-                    _ => return Err(refused("an SFTP command is read or write")),
+                    b"list" => {
+                        let entries = files.list(path)?;
+                        for e in &entries {
+                            raw.extend_from_slice(&e.name);
+                            raw.push(0);
+                        }
+                        let json = serde_json::Value::Array(
+                            entries.iter().map(sftp::Entry::json).collect(),
+                        );
+                        Zeroizing::new(json_bytes(&json)?)
+                    }
+                    b"stat" => {
+                        let mut out = serde_json::Map::new();
+                        files.stat(path)?.json(&mut out);
+                        Zeroizing::new(json_bytes(&serde_json::Value::Object(out))?)
+                    }
+                    b"rename" => {
+                        files.rename(path, param(rendered, 1)?)?;
+                        Zeroizing::new(Vec::new())
+                    }
+                    b"delete" => {
+                        files.delete(path)?;
+                        Zeroizing::new(Vec::new())
+                    }
+                    b"mkdir" => {
+                        files.mkdir(path)?;
+                        Zeroizing::new(Vec::new())
+                    }
+                    b"rmdir" => {
+                        files.rmdir(path)?;
+                        Zeroizing::new(Vec::new())
+                    }
+                    _ => return Err(refused("an SFTP command the policy cannot name")),
                 };
                 files.finish()?;
-                Ok(ran(data.to_vec(), false, Zeroizing::new(Vec::new())))
+                Ok(ran(data.to_vec(), false, raw))
             }
             Session::Ssh(_) if shape.channel == SshChannel::DirectTcpip => {
                 Err(refused("a forward runs on a streaming call"))
@@ -582,6 +635,55 @@ impl<'s> Session<'s> {
                     raw: Zeroizing::new(Vec::new()),
                 })
             }
+            Session::Ftp(client) => {
+                let path = param(rendered, 0)?;
+                let verb = rendered.text.as_slice();
+                let outcome = match verb {
+                    b"list" => client.list(path, MAX_RESPONSE)?,
+                    b"retrieve" => client.retrieve(path, MAX_RESPONSE)?,
+                    b"store" => client.store(path, param(rendered, 1)?)?,
+                    b"delete" => client.delete(path)?,
+                    b"rename" => client.rename(path, param(rendered, 1)?)?,
+                    b"mkdir" => client.mkdir(path)?,
+                    _ => return Err(refused("an FTP command the policy cannot name")),
+                };
+                match (verb, outcome.ok) {
+                    (b"retrieve", true) => {
+                        let data = outcome
+                            .data
+                            .as_ref()
+                            .map(|d| d.to_vec())
+                            .unwrap_or_default();
+                        Ok(ran(data, false, Zeroizing::new(Vec::new())))
+                    }
+                    (b"list", true) => {
+                        let json = serde_json::Value::Array(
+                            outcome.entries.iter().map(ftp::Entry::json).collect(),
+                        );
+                        let raw = outcome.data.unwrap_or_default();
+                        Ok(ran(json_bytes(&json)?, false, raw))
+                    }
+                    (_, ok) => {
+                        let json = serde_json::json!({
+                            "code": outcome.code,
+                            "text": String::from_utf8_lossy(&outcome.text),
+                        });
+                        Ok(ran(json_bytes(&json)?, !ok, Zeroizing::new(Vec::new())))
+                    }
+                }
+            }
+            Session::Pop3(client) => {
+                let response = client.command(&rendered.text, &rendered.params, MAX_RESPONSE)?;
+                Ok(Ran {
+                    result: CommandResult {
+                        name: String::new(),
+                        status: Some(response.status),
+                        data: response.bytes.to_vec(),
+                        stderr: Vec::new(),
+                    },
+                    raw: Zeroizing::new(Vec::new()),
+                })
+            }
             Session::Smtp(_) => Err(refused("SMTP runs no commands, only messages")),
         }
     }
@@ -615,6 +717,8 @@ impl<'s> Session<'s> {
             Session::Mysql(client) => client.close(),
             Session::Mqtt(client) => client.close(),
             Session::Amqp(client) => client.close(),
+            Session::Ftp(client) => client.close(),
+            Session::Pop3(client) => client.close(),
         }
     }
 }
@@ -638,7 +742,7 @@ fn sign_in<'s>(
     open: &Open,
     credentials: &Credentials,
     bounds: Bounds,
-    greeting: Option<&mysql::Greeting>,
+    greeting: Option<&Prelude>,
 ) -> Result<Session<'s>> {
     let io = Io::new(stream, bounds);
     let login = open.login.as_ref();
@@ -685,9 +789,11 @@ fn sign_in<'s>(
         Connection::Redis => Session::Redis(redis::Client::connect(io, user, secret)?),
         Connection::Mysql => {
             // The prelude read the greeting and asked for TLS before anything else.
-            let greeting = greeting.ok_or(Error::ServerUntrusted {
-                rule: "a MySQL connection signs in after its greeting and TLS",
-            })?;
+            let Some(Prelude::Mysql(greeting)) = greeting else {
+                return Err(Error::ServerUntrusted {
+                    rule: "a MySQL connection signs in after its greeting and TLS",
+                });
+            };
             let database = login.and_then(|l| l.database.as_deref());
             Session::Mysql(mysql::Client::connect(
                 io, greeting, user, database, secret,
@@ -710,6 +816,20 @@ fn sign_in<'s>(
             let vhost = login.and_then(|l| l.vhost.as_deref()).unwrap_or("/");
             Session::Amqp(amqp::Client::connect(io, vhost.as_bytes(), user, secret)?)
         }
+        Connection::Ftp => Session::Ftp(ftp::Client::connect(io, after_starttls, user, secret)?),
+        Connection::Pop3 => {
+            let greeting = match greeting {
+                Some(Prelude::Pop3(g)) => Some(g),
+                _ => None,
+            };
+            Session::Pop3(pop3::Client::connect(
+                io,
+                greeting,
+                credentials.mechanism,
+                user,
+                secret,
+            )?)
+        }
         Connection::Https
         | Connection::Tls
         | Connection::Websocket
@@ -725,7 +845,10 @@ fn opening_of(open: &Open) -> OpeningKind {
     match (open.connection, open.tls) {
         (Connection::Ssh, _) => OpeningKind::Plain,
         (Connection::Postgres | Connection::Mysql, _) => OpeningKind::Starttls,
-        (Connection::Smtp | Connection::Imap, Some(TlsMode::Starttls)) => OpeningKind::Starttls,
+        (
+            Connection::Smtp | Connection::Imap | Connection::Pop3 | Connection::Ftp,
+            Some(TlsMode::Starttls),
+        ) => OpeningKind::Starttls,
         _ => OpeningKind::Tls,
     }
 }
@@ -736,8 +859,15 @@ struct Opened<'t> {
     seq: u64,
     stream: Box<dyn Stream + 't>,
     meter: Meter,
-    /// What the MySQL prelude read.
-    greeting: Option<mysql::Greeting>,
+    /// What the MySQL or POP3 prelude read.
+    greeting: Option<Prelude>,
+}
+
+/// What a plain prelude read that the sign-in needs: MySQL's greeting, or the POP3 greeting
+/// with its `APOP` timestamp.
+enum Prelude {
+    Mysql(mysql::Greeting),
+    Pop3(pop3::Greeting),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -749,19 +879,17 @@ enum OpeningKind {
 
 /// The plain prelude before TLS of a protocol that upgrades its connection. Nothing secret is
 /// written in it. MySQL's greeting comes before TLS: it is kept for the sign-in.
-fn prelude(
-    open: &Open,
-    stream: &mut dyn Stream,
-    bounds: Bounds,
-) -> Result<Option<mysql::Greeting>> {
+fn prelude(open: &Open, stream: &mut dyn Stream, bounds: Bounds) -> Result<Option<Prelude>> {
     let mut io = Io::new(stream, bounds);
     match open.connection {
         Connection::Postgres => postgres::prelude(&mut io).map(|()| None),
         Connection::Smtp => smtp::prelude(&mut io).map(|()| None),
         Connection::Imap => imap::prelude(&mut io).map(|()| None),
+        Connection::Ftp => ftp::prelude(&mut io).map(|()| None),
+        Connection::Pop3 => pop3::prelude(&mut io).map(|g| Some(Prelude::Pop3(g))),
         Connection::Mysql => {
             let database = open.login.as_ref().is_some_and(|l| l.database.is_some());
-            mysql::prelude(&mut io, database).map(Some)
+            mysql::prelude(&mut io, database).map(|g| Some(Prelude::Mysql(g)))
         }
         _ => Err(Error::transport(TransportKind::Unsupported, false)),
     }

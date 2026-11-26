@@ -211,6 +211,10 @@ pub struct SshServer {
     /// The SFTP files, by path, and its symbolic links, by path to target.
     pub files: BTreeMap<String, Vec<u8>>,
     pub links: BTreeMap<String, String>,
+    /// SFTP directories made explicitly (a directory also exists under any file).
+    pub dirs: std::collections::BTreeSet<String>,
+    /// Directories whose listing was handed out (the next READDIR is the end).
+    listed: std::collections::BTreeSet<String>,
     /// SFTP requests it got, by type and path.
     pub sftp_seen: Vec<(u8, String)>,
     /// `host:port` it forwards to; what it saw asked, and what came through.
@@ -262,6 +266,8 @@ impl SshServer {
             agreed_host: String::new(),
             files: BTreeMap::new(),
             links: BTreeMap::new(),
+            dirs: std::collections::BTreeSet::new(),
+            listed: std::collections::BTreeSet::new(),
             sftp_seen: Vec::new(),
             reachable: Vec::new(),
             forwards: Vec::new(),
@@ -729,12 +735,7 @@ impl SshServer {
                         real = format!("{target}/{rest}");
                     }
                 }
-                let known = self.files.contains_key(&real)
-                    || self
-                        .files
-                        .keys()
-                        .any(|f| f.starts_with(&format!("{real}/")))
-                    || real == "/";
+                let known = self.files.contains_key(&real) || self.is_dir(&real);
                 if !known {
                     return status(2);
                 }
@@ -754,14 +755,129 @@ impl SshServer {
                     0o120_777
                 } else if self.files.contains_key(&path) {
                     0o100_644
+                } else if self.is_dir(&path) {
+                    0o040_755
                 } else {
                     return status(2);
                 };
+                let size = self.files.get(&path).map_or(0, |f| f.len() as u64);
                 let mut out = vec![105];
                 out.extend(id.to_be_bytes());
-                out.extend(4u32.to_be_bytes());
+                out.extend(0x0du32.to_be_bytes());
+                out.extend(size.to_be_bytes());
                 out.extend(mode.to_be_bytes());
+                out.extend(1_700_000_000u32.to_be_bytes());
+                out.extend(1_700_000_000u32.to_be_bytes());
                 out
+            }
+            // OPENDIR: the handle is the path.
+            11 => {
+                let path = path_of(r.string());
+                self.sftp_seen.push((11, path.clone()));
+                if !self.is_dir(&path) {
+                    return status(2);
+                }
+                self.listed.remove(&path);
+                let mut out = vec![102];
+                out.extend(id.to_be_bytes());
+                out.extend(string(path.as_bytes()));
+                out
+            }
+            // READDIR: every name once, with . and .., then the end.
+            12 => {
+                let path = path_of(r.string());
+                if !self.listed.insert(path.clone()) {
+                    return status(1);
+                }
+                let prefix = if path == "/" {
+                    "/".to_string()
+                } else {
+                    format!("{path}/")
+                };
+                let mut names: Vec<(String, u32, u64)> =
+                    vec![(".".into(), 0o040_755, 0), ("..".into(), 0o040_755, 0)];
+                let mut seen = std::collections::BTreeSet::new();
+                for (file, content) in &self.files {
+                    if let Some(rest) = file.strip_prefix(&prefix) {
+                        match rest.split_once('/') {
+                            None => names.push((rest.into(), 0o100_644, content.len() as u64)),
+                            Some((dir, _)) if seen.insert(dir.to_string()) => {
+                                names.push((dir.into(), 0o040_755, 0));
+                            }
+                            Some(_) => {}
+                        }
+                    }
+                }
+                for dir in &self.dirs {
+                    if let Some(rest) = dir.strip_prefix(&prefix)
+                        && !rest.contains('/')
+                        && seen.insert(rest.to_string())
+                    {
+                        names.push((rest.into(), 0o040_755, 0));
+                    }
+                }
+                for link in self.links.keys() {
+                    if let Some(rest) = link.strip_prefix(&prefix)
+                        && !rest.contains('/')
+                    {
+                        names.push((rest.into(), 0o120_777, 0));
+                    }
+                }
+                let mut out = vec![104];
+                out.extend(id.to_be_bytes());
+                out.extend((names.len() as u32).to_be_bytes());
+                for (name, mode, size) in names {
+                    out.extend(string(name.as_bytes()));
+                    out.extend(string(format!("-rw-r--r-- 1 u g {size} {name}").as_bytes()));
+                    out.extend(0x05u32.to_be_bytes());
+                    out.extend(size.to_be_bytes());
+                    out.extend(mode.to_be_bytes());
+                }
+                out
+            }
+            // REMOVE.
+            13 => {
+                let path = path_of(r.string());
+                self.sftp_seen.push((13, path.clone()));
+                if self.files.remove(&path).is_some() || self.links.remove(&path).is_some() {
+                    status(0)
+                } else {
+                    status(2)
+                }
+            }
+            // MKDIR.
+            14 => {
+                let path = path_of(r.string());
+                self.sftp_seen.push((14, path.clone()));
+                self.dirs.insert(path);
+                status(0)
+            }
+            // RMDIR.
+            15 => {
+                let path = path_of(r.string());
+                self.sftp_seen.push((15, path.clone()));
+                let busy = self
+                    .files
+                    .keys()
+                    .any(|f| f.starts_with(&format!("{path}/")));
+                if busy || !self.dirs.remove(&path) {
+                    status(4)
+                } else {
+                    status(0)
+                }
+            }
+            // RENAME.
+            18 => {
+                let from = path_of(r.string());
+                let to = path_of(r.string());
+                self.sftp_seen.push((18, format!("{from} -> {to}")));
+                match self.files.remove(&from) {
+                    Some(content) => {
+                        self.files.insert(to, content);
+                        status(0)
+                    }
+                    None => status(2),
+                }
             }
             // OPEN: the handle is the path.
             3 => {
@@ -809,6 +925,15 @@ impl SshServer {
             4 => status(0),
             _ => status(8),
         }
+    }
+
+    fn is_dir(&self, path: &str) -> bool {
+        path == "/"
+            || self.dirs.contains(path)
+            || self
+                .files
+                .keys()
+                .any(|f| f.starts_with(&format!("{path}/")))
     }
 
     fn data(&mut self, bytes: &[u8], stderr: bool) {

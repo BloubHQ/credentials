@@ -7,6 +7,9 @@ before 1.0, minor versions may break formats and APIs.
 
 ### Changed
 
+- A protocol line that arrives whole is held to the line bound too (`proto::io::Io::line`):
+  before, a line longer than the bound passed when its end was already buffered.
+
 - Policy IR `repeat` and `if` run (`engine::policy::flow`; `docs/policy.md`, Loops and
   branches). A loop has `times` (1 to 8, fixed by the signed policy), `steps` and an optional
   `until`; a branch has `when`, `then` and `else`. A test is `{"name", "one_of" | "none_of"}`
@@ -36,6 +39,27 @@ before 1.0, minor versions may break formats and APIs.
 
 ### Added
 
+- Protocol connections `pop3` and `ftp` (`engine::proto::pop3`, `engine::proto::ftp`;
+  `docs/policy.md`, Protocol connections), and typed SFTP operations:
+  - POP3 (RFC 1939) over implicit TLS or `STLS` (RFC 2595): `CAPA`, then the mechanism the
+    policy names and no other: `user` (`USER`/`PASS`), `apop` (MD5, flagged
+    `weak_mechanism`), or SASL (RFC 5034) `plain`, `login`, `xoauth2`. `STAT`, `LIST`,
+    `UIDL`, `RETR`, `TOP`, `DELE`, `NOOP`, `RSET` with message numbers only.
+  - FTP over TLS only (RFC 959, 4217): implicit or `AUTH TLS`, `PROT P` required, typed
+    `list` (MLSD or NLST), `retrieve`, `store`, `delete`, `mkdir`, `rename`. Passive data
+    connections only (EPSV, then PASV), each to the control connection's own address (a
+    `PASV` reply naming another host is refused: FTP bounce), to a port of at least 1024,
+    over TLS resuming the control session, and ending in `close_notify`.
+  - SFTP `list`, `stat`, `rename`, `delete`, `mkdir`, `rmdir`, each path checked as for
+    `read`, never through a link; `rename` never overwrites.
+  - Replies of both kinds come back with the sign-in's user name and password replaced by
+    `[redacted]` (`engine::proto::io::Scrub`); paths cannot hold a control byte; replies,
+    lines, listings and files are bounded. The `ftp` kind is typed (`tls` pins the mode;
+    `plain` allows no operation), and the `mail` kind takes optional `pop3_host` and
+    `pop3_port`. Kind shapes take `pop3`, `ftp` and `tls`; the schema takes the new
+    connections and mechanisms. Fuzz target `ftp_pop3_replies`.
+  - The transport's `Stream` gives the peer address and opens a data connection to the
+    same server (`peer_ip`, `open_data`).
 - Template capabilities for the gaps the scheme tests found, each a family (`docs/policy.md`,
   Request components, AEAD parts and public keys; `docs/design.md` section 11):
   - Request components: `$header("name")` reads a header of the caller's request (only one
