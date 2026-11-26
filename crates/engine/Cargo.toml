@@ -40,6 +40,7 @@ p384.workspace = true
 p521.workspace = true
 x25519-dalek.workspace = true
 rsa.workspace = true
+crypto-bigint.workspace = true
 regex.workspace = true
 sandbox.workspace = true
 html5gum.workspace = true
@@ -78,3 +79,7 @@ hmac.workspace = true
 p256.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
+# The SRP tests: a server and a verifier on another big-integer library, and a safe-prime
+# check of the groups.
+num-bigint.workspace = true
+crypto-primes.workspace = true

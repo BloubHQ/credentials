@@ -123,6 +123,9 @@ fn the_policy_reference_parses() {
                     "sp_entity_id",
                     "relay_state",
                     "certificate",
+                    "ed_key",
+                    "rsa_key",
+                    "key_created",
                 ];
                 let policy = Policy {
                     item: None,
@@ -130,9 +133,8 @@ fn the_policy_reference_parses() {
                         .iter()
                         .map(|n| match *n {
                             "cert" | "user" | "repo_id" | "client_id" | "server_key"
-                            | "recipient" | "sp_entity_id" | "relay_state" | "certificate" => {
-                                FieldSpec::public(n)
-                            }
+                            | "recipient" | "sp_entity_id" | "relay_state" | "certificate"
+                            | "key_created" => FieldSpec::public(n),
                             _ => FieldSpec::secret(n),
                         })
                         .collect(),
