@@ -140,6 +140,30 @@ pub enum Error {
         /// Which rule.
         rule: &'static str,
     },
+    /// A delegation, or a change of one, is malformed, not for this node, not signed by a
+    /// known device of the owner, stale, or carries a policy wider than the record's.
+    #[error("delegation invalid: {rule}")]
+    DelegationInvalid {
+        /// Which rule.
+        rule: &'static str,
+    },
+    /// No delegation of this id is in force for the record: it was never given, ended,
+    /// lapsed, was revoked, its device was withdrawn, or the record's policy changed since.
+    #[error("no delegation of this id is in force for the record")]
+    DelegationUnknown,
+    /// Emergency access waits: the owner may still cancel it. `opens_ms` is when it opens.
+    #[error("emergency access waits until {opens_ms} (Unix ms); the owner may cancel it")]
+    DelegationWaiting {
+        /// When the waiting period ends, Unix milliseconds.
+        opens_ms: u64,
+    },
+    /// A vending operation was refused: the credential it minted would outlive the policy's
+    /// lifetime, or its expiry could not be read. Nothing of it went back.
+    #[error("vend refused: {rule}")]
+    VendRefused {
+        /// Which rule.
+        rule: &'static str,
+    },
     /// The record has no kind, so there is nothing a caller may be told of it.
     #[error("the record is not a typed item")]
     NotAnItem,
@@ -399,6 +423,7 @@ impl Error {
                 | Error::RequestInvalid { .. }
                 | Error::InputInvalid { .. }
                 | Error::ParkedUnknown
+                | Error::DelegationUnknown
                 | Error::FrameRefused { .. }
         )
     }

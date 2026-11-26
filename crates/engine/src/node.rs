@@ -27,6 +27,7 @@ use zeroize::{Zeroize, Zeroizing};
 
 use crate::call::{Body, Output, SignedCall};
 use crate::caller::{Authorization, Call, MAX_SKEW_MS, Payload};
+use crate::delegation::RecordKeys;
 use crate::egress::Stream;
 use crate::egress::{ClientIdentity, Transport, dispatch, open_stream};
 use crate::fields::Fields;
@@ -46,6 +47,7 @@ use crate::template::{Budget, Context, Template, Temps, Var};
 use crate::{Error, Result};
 
 mod browser;
+mod delegate;
 mod handover;
 mod live;
 mod park;
@@ -341,6 +343,8 @@ struct State<S> {
     parked: park::Registry,
     /// Spending limits and the payments counted against them, per record.
     limits: HashMap<RecordKey, crate::limits::Ledger>,
+    /// Delegations of records to other owners' callers, by owner and id.
+    delegations: HashMap<(String, [u8; 16]), delegate::Slot>,
     /// Set once this node handed over to a successor: the node takes no act after it.
     handed_over: Option<handover::Done>,
 }
@@ -456,7 +460,10 @@ impl<S: LogSink> State<S> {
 
 /// What a checked call carries into the operation.
 struct Checked {
-    policy_owner: Arc<UserKey>,
+    /// The keys of the record: from the owner's grant, or carried by a delegation.
+    keys: Arc<RecordKeys>,
+    /// The caller as the log names it: its name in the policy, or `delegate/name` for a
+    /// caller of a delegated policy.
     caller: String,
 }
 
@@ -600,6 +607,7 @@ impl<S: LogSink, C: Clock> Node<S, C> {
                 calls: HashMap::new(),
                 parked: park::Registry::default(),
                 limits: HashMap::new(),
+                delegations: HashMap::new(),
                 handed_over: None,
             }),
         }
@@ -680,7 +688,41 @@ impl<S: LogSink, C: Clock> Node<S, C> {
                         state.forget_device(&e.owner, device);
                         state.issued(&e.owner, *issued_ms);
                     }
-                    Event::Revoke { issued_ms, .. } => state.issued(&e.owner, *issued_ms),
+                    Event::Revoke { issued_ms, .. } => {
+                        state.issued(&e.owner, *issued_ms);
+                        state.delegations.retain(|(o, _), _| *o != e.owner);
+                    }
+                    Event::Delegate {
+                        issued_ms, sealed, ..
+                    } => {
+                        state.issued(&e.owner, *issued_ms);
+                        delegate::restore(&mut state, &node.seal, &node.state_key, e, sealed)?;
+                    }
+                    Event::AccessRequest { id, opens_ms } => {
+                        // The entry under the delegate (no record) repeats the owner's.
+                        if !e.record_id.is_empty()
+                            && let Some(slot) = state.delegations.get_mut(&(e.owner.clone(), *id))
+                        {
+                            slot.opens_ms = Some(*opens_ms);
+                        }
+                    }
+                    Event::Undelegate {
+                        id,
+                        revoke,
+                        issued_ms,
+                        ..
+                    } => {
+                        if !e.record_id.is_empty() {
+                            state.issued(&e.owner, *issued_ms);
+                            let key = (e.owner.clone(), *id);
+                            if *revoke {
+                                state.delegations.remove(&key);
+                            } else if let Some(slot) = state.delegations.get_mut(&key) {
+                                slot.opens_ms = None;
+                            }
+                        }
+                    }
+                    Event::Delegated { .. } | Event::Vend { .. } => {}
                     Event::HandOver { .. } => {
                         // The chain of this node ended there: it stays stopped.
                         state.handed_over = Some(handover::Done::restored(signed.hash()?));
@@ -922,6 +964,8 @@ impl<S: LogSink, C: Clock> Node<S, C> {
             },
         )?;
         state.grants.remove(owner);
+        // Delegations end with it: a revocation takes back every key of the owner.
+        state.delegations.retain(|(o, _), _| o != owner);
         // Operations that wait hold values opened under the key just taken back.
         state.parked.drop_owner(owner);
         state.issued(owner, revocation.issued_ms);
@@ -950,12 +994,14 @@ impl<S: LogSink, C: Clock> Node<S, C> {
     fn check_call<'r>(
         &self,
         record: &'r Record,
+        delegated: Option<&'r delegate::Delegated>,
         name: &str,
         auth: &Authorization,
         payload: &Payload<'_>,
         now: u64,
     ) -> Result<(&'r Policy, &'r Operation, Checked)> {
-        let (policy, operation, checked) = self.check_auth(record, name, auth, payload, now)?;
+        let (policy, operation, checked) =
+            self.check_auth(record, delegated, name, auth, payload, now)?;
         let operation = operation.ok_or_else(|| Error::OperationUnknown {
             name: name.to_string(),
         })?;
@@ -967,6 +1013,7 @@ impl<S: LogSink, C: Clock> Node<S, C> {
     fn check_auth<'r>(
         &self,
         record: &'r Record,
+        delegated: Option<&'r delegate::Delegated>,
         name: &str,
         auth: &Authorization,
         payload: &Payload<'_>,
@@ -981,7 +1028,21 @@ impl<S: LogSink, C: Clock> Node<S, C> {
                 .map(|g| g.user_key.clone());
             (grant, state.floor(record), state.devices(&record.owner))
         };
-        let policy = record.policy.verify_any(&devices)?;
+        // A delegated call runs under the delegated policy, signed by a device the owner
+        // still has; the record's own policy is never used for it.
+        let policy = match delegated {
+            Some(d) => {
+                if !devices.contains(&d.device) {
+                    return Err(Error::DelegationUnknown);
+                }
+                d.policy.verify_any(&devices)?
+            }
+            None => record.policy.verify_any(&devices)?,
+        };
+        let label = match delegated {
+            Some(d) => format!("{}/{}", d.delegate, auth.caller),
+            None => auth.caller.clone(),
+        };
         let operation = match payload {
             Payload::Describe if name == DESCRIBE => None,
             Payload::Describe => {
@@ -1045,7 +1106,17 @@ impl<S: LogSink, C: Clock> Node<S, C> {
             payload: payload.sha256(),
         };
         auth.verify(&caller.key, &call)?;
-        let user_key = grant?;
+        let keys = match delegated {
+            // The delegation was checked against the record's policy as it was: once the
+            // owner changes it, the delegation no longer holds.
+            Some(d) => {
+                if crate::delegation::policy_sha256(&record.policy)? != d.base_sha256 {
+                    return Err(Error::DelegationUnknown);
+                }
+                d.keys.clone()
+            }
+            None => Arc::new(RecordKeys::of(grant?.as_ref(), &record.id)?),
+        };
         let need = floor.ok_or(Error::RecordUnpinned)?;
         if record.generation < need {
             return Err(Error::RecordStale {
@@ -1072,8 +1143,12 @@ impl<S: LogSink, C: Clock> Node<S, C> {
         state
             .nonces
             .insert(tag, who, auth.time_ms.saturating_add(MAX_SKEW_MS), now)?;
+        if let (Some(_), Some(id)) = (delegated, auth.delegation) {
+            // In force, not lapsed; with a waiting period, requested and past it.
+            delegate::admit(&mut state, record, id, &label, now)?;
+        }
         if let Some(limit) = caller.limit {
-            let key = (record.owner.clone(), record.id.clone(), caller.name.clone());
+            let key = (record.owner.clone(), record.id.clone(), label.clone());
             let calls = state.calls.entry(key).or_default();
             while calls
                 .front()
@@ -1090,14 +1165,14 @@ impl<S: LogSink, C: Clock> Node<S, C> {
             policy,
             operation,
             Checked {
-                policy_owner: user_key,
-                caller: auth.caller.clone(),
+                keys,
+                caller: label,
             },
         ))
     }
 
-    fn open(&self, record: &Record, user_key: &UserKey) -> Result<Fields> {
-        let fields = record.open(user_key)?;
+    fn open(&self, record: &Record, keys: &RecordKeys) -> Result<Fields> {
+        let fields = record.open(&keys.record)?;
         self.lock()
             .raise(&record.owner, &record.id, record.generation);
         // A typed item is checked against its kind each time, with the clock: an expired card
@@ -1112,12 +1187,19 @@ impl<S: LogSink, C: Clock> Node<S, C> {
     /// [`DESCRIBE`] with the payload [`Payload::Describe`]. The node logs it like a use.
     pub fn describe(&self, record: &Record, auth: &Authorization) -> Result<Description> {
         let now = self.clock.now_ms();
-        let (policy, _, checked) =
-            self.check_auth(record, DESCRIBE, auth, &Payload::Describe, now)?;
+        let delegated = self.delegation_of(record, auth)?;
+        let (policy, _, checked) = self.check_auth(
+            record,
+            delegated.as_deref(),
+            DESCRIBE,
+            auth,
+            &Payload::Describe,
+            now,
+        )?;
         if policy.item.is_none() {
             return Err(Error::NotAnItem);
         }
-        let fields = self.open(record, &checked.policy_owner)?;
+        let fields = self.open(record, &checked.keys)?;
         let description = crate::item::describe(policy, &fields)?;
         self.lock().commit(
             now,
@@ -1258,14 +1340,16 @@ impl<S: LogSink, C: Clock> Node<S, C> {
             });
         }
         let now = self.clock.now_ms();
-        let (policy, operation, checked) = self.check_call(record, name, auth, &payload, now)?;
+        let delegated = self.delegation_of(record, auth)?;
+        let (policy, operation, checked) =
+            self.check_call(record, delegated.as_deref(), name, auth, &payload, now)?;
         // What the caller sends is checked in full before the record is opened, so a refused
         // request leaves no entry and reaches no server.
         let mut input = Vec::new();
         // A streaming call is for an operation that streams, and takes one of the bounded
         // number of open connections; a WebSocket operation needs one.
         let _slot = match (&relay, live::streams(operation)) {
-            (Some(_), true) => Some(self.live.take(&record.owner, &auth.caller, policy)?),
+            (Some(_), true) => Some(self.live.take(&record.owner, &checked.caller, policy)?),
             (Some(_), false) => {
                 return Err(Error::RequestInvalid {
                     rule: "the operation does not stream",
@@ -1283,7 +1367,7 @@ impl<S: LogSink, C: Clock> Node<S, C> {
             }
             // A protocol connection is open for the whole call: it takes a slot too.
             (None, _) if operation.connection().is_some_and(Connection::is_protocol) => {
-                Some(self.live.take(&record.owner, &auth.caller, policy)?)
+                Some(self.live.take(&record.owner, &checked.caller, policy)?)
             }
             // A browser fill holds its CDP connection for the call: it takes a slot too.
             (None, _) if operation.connection() == Some(Connection::Browser) => {
@@ -1292,7 +1376,7 @@ impl<S: LogSink, C: Clock> Node<S, C> {
                         rule: "a browser operation runs on an HTTP call",
                     });
                 }
-                Some(self.live.take(&record.owner, &auth.caller, policy)?)
+                Some(self.live.take(&record.owner, &checked.caller, policy)?)
             }
             (None, _) => None,
         };
@@ -1335,7 +1419,7 @@ impl<S: LogSink, C: Clock> Node<S, C> {
                 };
             }
         }
-        let user_key = checked.policy_owner;
+        let user_key = checked.keys;
         let fields = self.open(record, &user_key)?;
         let mut run = Run {
             record,
@@ -1504,15 +1588,26 @@ impl<S: LogSink, C: Clock> Node<S, C> {
                         .last
                         .take()
                         .ok_or_else(|| operation.unknown())
-                        .and_then(|http| http.project(ret.response.as_ref(), log_seqs))
-                        .and_then(|response| {
+                        .and_then(|http| {
+                            // What a vending operation mints is checked before anything of
+                            // the response goes back.
+                            let expires = vend_expiry(operation, &http, now)?;
+                            Ok((http.project(ret.response.as_ref(), log_seqs)?, expires))
+                        })
+                        .and_then(|(response, expires)| {
                             let secrets = Secrets {
                                 policy: run.policy,
                                 fields: &run.fields,
                                 captured: &run.captured.secrets,
                                 rendered: &run.tainted,
                             };
-                            release_http(response, &secrets)
+                            Ok((release_http(response, &secrets)?, expires))
+                        })
+                        .and_then(|(response, expires)| {
+                            if let Some(expires_ms) = expires {
+                                self.log_vend(run, expires_ms)?;
+                            }
+                            Ok(response)
                         });
                     if let Some((seq, status)) = pending.take() {
                         self.done(now, who, seq, Some(status), response.is_ok());
@@ -1884,6 +1979,13 @@ impl<S: LogSink, C: Clock> Node<S, C> {
                         budget: &run.budget,
                     };
                     let output = template.render(&ctx)?;
+                    // The expiry is the input member the node set: its clock plus the offset
+                    // the policy check bounded by the lifetime.
+                    let vended = operation
+                        .vend
+                        .as_ref()
+                        .map(|vend| local_vend_expiry(operation, vend, input, run.now))
+                        .transpose()?;
                     let detail = Detail::Derive {
                         input_sha256: Sha256::digest(given).into(),
                         input_len: given.len() as u64,
@@ -1894,6 +1996,9 @@ impl<S: LogSink, C: Clock> Node<S, C> {
                         detail: detail.seal(&run.user_key, &run.record.owner, &run.record.id)?,
                     };
                     self.lock().commit(run.now, run.who, event)?;
+                    if let Some(expires_ms) = vended {
+                        self.log_vend(run, expires_ms)?;
+                    }
                     return Ok(Flow::Done(output.to_vec()));
                 }
                 Step::Open(_)
@@ -1905,6 +2010,16 @@ impl<S: LogSink, C: Clock> Node<S, C> {
             }
         }
         Err(operation.unknown())
+    }
+
+    /// Logs that a vended credential, valid until `expires_ms`, goes back to the caller.
+    fn log_vend(&self, run: &Run<'_>, expires_ms: u64) -> Result<()> {
+        let event = Event::Vend {
+            operation: run.name.to_string(),
+            generation: run.record.generation,
+            expires_ms,
+        };
+        self.lock().commit(run.now, run.who, event).map(|_| ())
     }
 
     /// Records how an act ended. A failure halts the log, so the next act fails; the result of
@@ -1924,7 +2039,7 @@ impl<S: LogSink, C: Clock> Node<S, C> {
             .generation
             .checked_add(1)
             .ok_or(Error::RecordInvalid)?;
-        let next = current.reseal(&run.user_key, &run.fields)?;
+        let next = current.reseal(&run.user_key.record, &run.fields)?;
         let event = Event::Update {
             operation: run.name.to_string(),
             generation,
@@ -1936,6 +2051,66 @@ impl<S: LogSink, C: Clock> Node<S, C> {
         *updated = Some(next);
         Ok(())
     }
+}
+
+/// The expiry of what a vending HTTPS operation hands back, read from its last response and
+/// checked against the lifetime the policy gives; `None` for an operation that vends nothing.
+fn vend_expiry(operation: &Operation, http: &Http, now: u64) -> Result<Option<u64>> {
+    let Some(vend) = &operation.vend else {
+        return Ok(None);
+    };
+    let refused = |rule| Error::VendRefused { rule };
+    let source = vend
+        .expires
+        .source
+        .as_ref()
+        .ok_or_else(|| operation.unknown())?;
+    let value = http
+        .capture(source)
+        .map_err(|_| refused("the expiry cannot be read from the response"))?
+        .ok_or(refused("the response holds no expiry"))?;
+    let expires = crate::policy::vend::parse_time(&value, vend.expires.format, now)
+        .ok_or(refused("the expiry is not a time of the policy's format"))?;
+    let latest = now
+        .saturating_add(vend.lifetime_ms)
+        .saturating_add(crate::policy::VEND_SKEW_MS);
+    if expires > latest {
+        return Err(refused(
+            "the credential would stay valid longer than the policy's lifetime",
+        ));
+    }
+    Ok(Some(expires))
+}
+
+/// The expiry of what a vending derivation hands back: the clock the node wrote into the
+/// checked input member, plus its offset, which the policy check bounded by the lifetime.
+fn local_vend_expiry(
+    operation: &Operation,
+    vend: &crate::policy::Vend,
+    input: &[u8],
+    now: u64,
+) -> Result<u64> {
+    let refused = |rule| Error::VendRefused { rule };
+    let pointer = vend
+        .expires
+        .input
+        .as_deref()
+        .ok_or_else(|| operation.unknown())?;
+    let value: serde_json::Value =
+        serde_json::from_slice(input).map_err(|_| refused("the input holds no expiry"))?;
+    let text = value
+        .pointer(pointer)
+        .and_then(serde_json::Value::as_u64)
+        .ok_or(refused("the input holds no expiry"))?
+        .to_string();
+    let expires = crate::policy::vend::parse_time(text.as_bytes(), vend.expires.format, now)
+        .ok_or(refused("the expiry is not a time of the policy's format"))?;
+    if expires > now.saturating_add(vend.lifetime_ms) {
+        return Err(refused(
+            "the credential would stay valid longer than the policy's lifetime",
+        ));
+    }
+    Ok(expires)
 }
 
 /// A transport for operations with no connection: they send nothing.
@@ -2023,7 +2198,9 @@ struct Run<'a> {
     operation: &'a Operation,
     kinds: Kinds<'a>,
     fields: Fields,
-    user_key: Arc<UserKey>,
+    /// The keys of the record and of its log details (from the user key of the grant, or
+    /// carried by a delegation).
+    user_key: Arc<RecordKeys>,
     budget: Budget,
     captured: Captured,
     /// Rendered values that hold a secret in reversible form.

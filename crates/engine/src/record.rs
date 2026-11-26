@@ -15,8 +15,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::encoding::{b64_array, b64_vec, canonical};
 use crate::fields::Fields;
-use crate::keys::{DeviceKey, DevicePublicKey, UserKey};
+use crate::keys::{DeviceKey, DevicePublicKey, KEY_LEN, UserKey};
 use crate::policy::{Policy, SignedPolicy};
+use crate::secret::Secret;
 use crate::{Error, Result};
 
 /// The record format version.
@@ -82,8 +83,7 @@ fn check_fields(policy: &Policy, fields: &Fields) -> Result<()> {
     }
 }
 
-fn cipher(user_key: &UserKey, id: &str) -> Result<ChaCha20Poly1305> {
-    let key = user_key.record_key(id)?;
+fn cipher(key: &Secret<[u8; KEY_LEN]>) -> Result<ChaCha20Poly1305> {
     ChaCha20Poly1305::new_from_slice(key.expose()).map_err(|_| Error::KeyInvalid)
 }
 
@@ -102,7 +102,7 @@ impl Record {
     }
 
     fn sealed(
-        user_key: &UserKey,
+        key: &Secret<[u8; KEY_LEN]>,
         id: &str,
         owner: &str,
         generation: u64,
@@ -128,7 +128,7 @@ impl Record {
             ct: Vec::new(),
         };
         let aad = record.aad()?;
-        record.ct = cipher(user_key, id)?
+        record.ct = cipher(key)?
             .encrypt(
                 &Nonce::from(nonce),
                 Payload {
@@ -148,7 +148,7 @@ impl Record {
         policy: SignedPolicy,
         fields: &Fields,
     ) -> Result<Record> {
-        Self::sealed(user_key, id, owner, 1, policy, fields)
+        Self::sealed(&user_key.record_key(id)?, id, owner, 1, policy, fields)
     }
 
     fn next_generation(&self) -> Result<u64> {
@@ -157,9 +157,9 @@ impl Record {
 
     /// The same record (id, owner, policy) with new field values, one generation later. Runs
     /// on the node after an operation captured a value into a field.
-    pub(crate) fn reseal(&self, user_key: &UserKey, fields: &Fields) -> Result<Record> {
+    pub(crate) fn reseal(&self, key: &Secret<[u8; KEY_LEN]>, fields: &Fields) -> Result<Record> {
         Self::sealed(
-            user_key,
+            key,
             &self.id,
             &self.owner,
             self.next_generation()?,
@@ -172,7 +172,8 @@ impl Record {
     /// Fields the new policy does not list are dropped; fields it requires must be present.
     /// Runs on the device: the values never leave the engine.
     pub fn rewrap(&self, user_key: &UserKey, policy: SignedPolicy) -> Result<Record> {
-        let old = self.open(user_key)?;
+        let key = user_key.record_key(&self.id)?;
+        let old = self.open(&key)?;
         let mut fields = Fields::new();
         for (name, value) in old.values() {
             if policy.policy.fields.iter().any(|f| f.name == name) {
@@ -180,7 +181,7 @@ impl Record {
             }
         }
         Self::sealed(
-            user_key,
+            &key,
             &self.id,
             &self.owner,
             self.next_generation()?,
@@ -196,7 +197,8 @@ impl Record {
     /// device: the values never leave the engine.
     pub fn update(&self, user_key: &UserKey, values: &Fields, now_ms: u64) -> Result<Record> {
         let policy = &self.policy.policy;
-        let mut fields = self.open(user_key)?;
+        let key = user_key.record_key(&self.id)?;
+        let mut fields = self.open(&key)?;
         for (name, value) in values.values() {
             let spec = policy
                 .fields
@@ -210,7 +212,7 @@ impl Record {
             }
         }
         Self::sealed(
-            user_key,
+            &key,
             &self.id,
             &self.owner,
             self.next_generation()?,
@@ -220,7 +222,7 @@ impl Record {
     }
 
     /// Decrypts the fields. Only the engine can call this.
-    pub(crate) fn open(&self, user_key: &UserKey) -> Result<Fields> {
+    pub(crate) fn open(&self, key: &Secret<[u8; KEY_LEN]>) -> Result<Fields> {
         if self.v != VERSION {
             return Err(Error::RecordInvalid);
         }
@@ -228,7 +230,7 @@ impl Record {
         check_name(&self.owner)?;
         let aad = self.aad()?;
         let plain = zeroize::Zeroizing::new(
-            cipher(user_key, &self.id)?
+            cipher(key)?
                 .decrypt(
                     &Nonce::from(self.nonce),
                     Payload {

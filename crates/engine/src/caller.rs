@@ -209,6 +209,14 @@ pub struct Authorization {
     /// Ed25519 signature of the caller.
     #[serde(with = "b64_array")]
     pub signature: [u8; 64],
+    /// The delegation the call runs under, for a caller of another owner's delegated policy
+    /// ([`crate::delegation`]); absent for the owner's own callers.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "crate::encoding::b64_option_array"
+    )]
+    pub delegation: Option<[u8; 16]>,
 }
 
 #[derive(Serialize)]
@@ -224,6 +232,11 @@ struct Body<'a> {
     time_ms: u64,
     #[serde(with = "b64_array")]
     nonce: [u8; 16],
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        with = "crate::encoding::b64_option_array"
+    )]
+    delegation: Option<[u8; 16]>,
 }
 
 /// What an authorization is about.
@@ -248,6 +261,7 @@ impl Authorization {
                 caller: &self.caller,
                 time_ms: self.time_ms,
                 nonce: self.nonce,
+                delegation: self.delegation,
             },
         )
     }
@@ -272,6 +286,22 @@ impl CallerKey {
         payload: &Payload<'_>,
         time_ms: u64,
     ) -> Result<Authorization> {
+        self.authorize_as(caller, node, record, operation, payload, time_ms, None)
+    }
+
+    /// [`CallerKey::authorize`] for a caller of a delegated policy: the call runs under the
+    /// delegation `delegation` of the record's owner, and the signature covers its id.
+    #[allow(clippy::too_many_arguments)]
+    pub fn authorize_as(
+        &self,
+        caller: &str,
+        node: &NodePublicKey,
+        record: &Record,
+        operation: &str,
+        payload: &Payload<'_>,
+        time_ms: u64,
+        delegation: Option<[u8; 16]>,
+    ) -> Result<Authorization> {
         let mut nonce = [0u8; 16];
         UnwrapErr(SysRng).fill_bytes(&mut nonce);
         let mut auth = Authorization {
@@ -279,6 +309,7 @@ impl CallerKey {
             time_ms,
             nonce,
             signature: [0; 64],
+            delegation,
         };
         let call = Call {
             node,

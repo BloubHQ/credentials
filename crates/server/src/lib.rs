@@ -15,8 +15,11 @@
 //!
 //! The endpoints: `GET /identity`, `GET /checkpoint`, and `POST /grant`, `/revoke`, `/pin`,
 //! `/device/add`, `/device/retire`, `/call`, `/answer` (a code for a challenge, sealed by a
-//! device of the owner), `/approve` (the owner's approval of a waiting operation) and
-//! `/limits` (spending limits a device of the owner signed). Bodies and answers are JSON.
+//! device of the owner), `/approve` (the owner's approval of a waiting operation),
+//! `/limits` (spending limits a device of the owner signed), `/delegate` (a delegation of a
+//! record to another owner's callers, with the record) and `/delegation/change` (a device
+//! cancels a request of emergency access or revokes a delegation). Bodies and answers are
+//! JSON.
 
 pub mod http;
 pub mod logfile;
@@ -30,6 +33,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use engine::Error;
 use engine::approval::Approval;
 use engine::call::{Output, SignedCall};
+use engine::delegation::{DelegationChange, DelegationRequest};
 use engine::egress::Transport;
 use engine::encoding::to_b64;
 use engine::grant::{NodeIdentity, Revocation, SealedGrant};
@@ -448,7 +452,7 @@ impl<S: Sink, T: Transport> Shared<S, T> {
             (
                 "POST",
                 "/grant" | "/revoke" | "/pin" | "/device/add" | "/device/retire" | "/call"
-                | "/answer" | "/approve" | "/limits",
+                | "/answer" | "/approve" | "/limits" | "/delegate" | "/delegation/change",
             ) => {
                 // Acts run on at most `threads` transports at once; reads of the identity and
                 // the checkpoint above never wait for them.
@@ -467,13 +471,20 @@ impl<S: Sink, T: Transport> Shared<S, T> {
                     "/answer" => self.act(body, |n, a: &SealedAnswer| n.answer(a)),
                     "/approve" => self.act(body, |n, a: &Approval| n.approve(a)),
                     "/limits" => self.act(body, |n, l: &SpendingLimits| n.set_limits(l)),
+                    "/delegate" => self.act(body, |n, d: &DelegationRequest| {
+                        n.delegate(&d.delegation, &d.record)
+                    }),
+                    "/delegation/change" => {
+                        self.act(body, |n, c: &DelegationChange| n.change_delegation(c))
+                    }
                     _ => self.call(transport, body),
                 }
             }
             (
                 method,
                 "/identity" | "/checkpoint" | "/grant" | "/revoke" | "/pin" | "/device/add"
-                | "/device/retire" | "/call" | "/answer" | "/approve" | "/limits" | "/stream",
+                | "/device/retire" | "/call" | "/answer" | "/approve" | "/limits" | "/delegate"
+                | "/delegation/change" | "/stream",
             ) => error_reply(405, format!("method {method} not allowed here")),
             _ => self
                 .hooks

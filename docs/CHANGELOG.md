@@ -15,6 +15,37 @@ before 1.0, minor versions may break formats and APIs.
 
 ### Added
 
+- Owner controls (`docs/design.md` section 11, part 11): delegation, emergency access and
+  credential vending.
+  - New module `engine::delegation`: `DeviceKey::delegate` signs a `Delegation` of one record
+    to another owner's callers under a narrower policy signed by the same device (same fields
+    and item binding, no capture into a field, nothing wider in the summary diff), bound to
+    the SHA-256 of the record's signed policy, with the record and log-detail keys HPKE-sealed
+    to the node, a lifetime of at most 366 days and a waiting period (0, or 1 hour to 90 days
+    for emergency access). `DeviceKey::change_delegation` cancels a request (`cancel`) or ends
+    a delegation (`revoke`). `Node::delegate` and `Node::change_delegation`; server endpoints
+    `POST /delegate` (`{"delegation", "record"}`) and `POST /delegation/change`. At most 16
+    per record and 64 per owner. Delegations survive a restart (sealed under the state key in
+    the log), end on the owner's grant revocation, and are not carried in a hand-over.
+  - Delegated calls: `Authorization.delegation` (signed, omitted when absent so earlier
+    signatures still verify), `CallerKey::sign_delegated_call_at` and
+    `call::sign_delegated_call`; log entries name the caller `delegate/caller`, under the
+    owner. The first call of an emergency delegation starts the wait and is refused with
+    `Error::DelegationWaiting`.
+  - Log events `delegate`, `delegated` (under the delegate), `access_request`, `undelegate`
+    and `vend`.
+  - `Operation.vend` (`policy::vend`): `lifetime_ms` (1 s to 12 h) and `expires` (a capture
+    source over HTTPS, or a node-set JSON input member with no connection; format `unix`,
+    `unix_ms`, `rfc3339` or `seconds`). HTTPS vending needs fixed requests and a JSON-member
+    projection; the node refuses a credential expiring after the lifetime plus 60 s with
+    `Error::VendRefused` and returns nothing. Risk flag `vend`; JSON Schema `Vend`.
+  - The summary diff counts a longer vend lifetime, a changed vend expiry, and changed open
+    `limits` or `protocol` as wider.
+  - `client`: `delegate` (to a `VerifiedNode` only), `change_delegation`,
+    `sign_delegated_call` (UniFFI and wasm: `delegate`, `changeDelegation`,
+    `signDelegatedCall`).
+  - Errors `DelegationInvalid`, `DelegationUnknown`, `DelegationWaiting`, `VendRefused`.
+  - Fuzz target `owner_controls`; tests in `crates/engine/tests/owner_controls.rs`.
 - Protocol connections, rest of part 6 (`docs/design.md` section 7c): `mysql` (TLS before
   anything else, `caching_sha2_password` only, full auth over TLS only, no LOCAL INFILE,
   prepared statements with string parameters), `mqtt` 3.1.1 and 5 over TLS (QoS 0 and 1, no

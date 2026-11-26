@@ -43,6 +43,34 @@ pub mod b64_array {
     }
 }
 
+/// Serde form of an optional fixed-size byte array as base64 (as [`b64_array`]); use with
+/// `skip_serializing_if = "Option::is_none"` and `default`.
+pub mod b64_option_array {
+    use serde::{Deserialize, Deserializer, Serializer, de};
+
+    /// Serializes the array, or null.
+    #[allow(clippy::ref_option)]
+    pub fn serialize<S: Serializer, const N: usize>(
+        value: &Option<[u8; N]>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        match value {
+            Some(bytes) => serializer.serialize_str(&super::to_b64(bytes)),
+            None => serializer.serialize_none(),
+        }
+    }
+
+    /// Deserializes the array; any other length is an error.
+    pub fn deserialize<'de, D: Deserializer<'de>, const N: usize>(
+        deserializer: D,
+    ) -> Result<Option<[u8; N]>, D::Error> {
+        let text = String::deserialize(deserializer)?;
+        super::array_from_b64(&text)
+            .map(Some)
+            .map_err(|_| de::Error::custom("invalid base64 array"))
+    }
+}
+
 /// Serde form of a boxed fixed-size byte array as base64 (as [`b64_array`]; boxed to keep a
 /// rare variant of a large enum small).
 pub mod b64_box_array {

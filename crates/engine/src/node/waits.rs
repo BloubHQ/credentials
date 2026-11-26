@@ -370,8 +370,15 @@ impl<S: LogSink, C: Clock> Node<S, C> {
         updated: &mut Option<Record>,
     ) -> Result<Output> {
         let now = self.clock.now_ms();
-        let (policy, operation, checked) =
-            self.check_call(record, name, auth, &Payload::Resume(id), now)?;
+        let delegated = self.delegation_of(record, auth)?;
+        let (policy, operation, checked) = self.check_call(
+            record,
+            delegated.as_deref(),
+            name,
+            auth,
+            &Payload::Resume(id),
+            now,
+        )?;
         let parked = {
             let mut state = self.lock();
             let Some(parked) = state.parked.get_mut(id, now) else {
@@ -407,7 +414,7 @@ impl<S: LogSink, C: Clock> Node<S, C> {
             expires_ms,
             ..
         } = parked;
-        let user_key = checked.policy_owner;
+        let user_key = checked.keys;
         let who = (
             record.owner.as_str(),
             record.id.as_str(),

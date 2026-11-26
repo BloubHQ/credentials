@@ -186,7 +186,54 @@ impl CallerKey {
         body: Body,
         time_ms: u64,
     ) -> Result<SignedCall> {
-        let auth = self.authorize(caller, node, &record, operation, &body.payload(), time_ms)?;
+        self.sign_delegated_call_at(caller, node, record, operation, body, time_ms, None)
+    }
+
+    /// Signs a call of the caller named `caller` in the policy of the delegation `delegation`
+    /// of `record`'s owner ([`crate::delegation`]), now. The node runs it under the
+    /// delegated policy.
+    pub fn sign_delegated_call(
+        &self,
+        caller: &str,
+        node: &NodePublicKey,
+        record: Record,
+        operation: &str,
+        body: Body,
+        delegation: [u8; 16],
+    ) -> Result<SignedCall> {
+        self.sign_delegated_call_at(
+            caller,
+            node,
+            record,
+            operation,
+            body,
+            SystemClock.now_ms(),
+            Some(delegation),
+        )
+    }
+
+    /// [`CallerKey::sign_delegated_call`] at `time_ms`; with no delegation, the same as
+    /// [`CallerKey::sign_call_at`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn sign_delegated_call_at(
+        &self,
+        caller: &str,
+        node: &NodePublicKey,
+        record: Record,
+        operation: &str,
+        body: Body,
+        time_ms: u64,
+        delegation: Option<[u8; 16]>,
+    ) -> Result<SignedCall> {
+        let auth = self.authorize_as(
+            caller,
+            node,
+            &record,
+            operation,
+            &body.payload(),
+            time_ms,
+            delegation,
+        )?;
         Ok(SignedCall {
             record,
             operation: operation.to_string(),

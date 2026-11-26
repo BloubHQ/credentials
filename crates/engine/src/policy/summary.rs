@@ -213,6 +213,9 @@ pub struct OperationSummary {
     /// What it pays, and where the amount is read.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub payment: Option<super::Payment>,
+    /// What it vends, and for how long.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vend: Option<super::Vend>,
     /// True when every use waits for the owner's approval.
     #[serde(default, skip_serializing_if = "core::ops::Not::not")]
     pub approval: bool,
@@ -309,6 +312,9 @@ pub enum FlagCode {
     BrowserFill,
     /// A fill puts values into a frame of another origin than the page's.
     FrameOrigin,
+    /// An operation hands the caller a credential minted from the secret (bounded in time
+    /// and scope by the policy).
+    Vend,
 }
 
 /// A risk flag.
@@ -615,6 +621,7 @@ fn operation_summary(operation: &Operation) -> OperationSummary {
         input: operation.input.clone(),
         challenges: Vec::new(),
         payment: operation.payment.clone(),
+        vend: operation.vend.clone(),
         approval: operation.approval,
     };
     for (i, step) in operation.steps.iter().enumerate() {
@@ -865,6 +872,17 @@ fn risk_flags(policy: &Policy, origin: Option<&Origin>, flags: &mut Vec<Flag>) {
     }
     for operation in &policy.operations {
         let at = format!("operation {}", operation.name);
+        if let Some(vend) = &operation.vend {
+            flag(
+                flags,
+                FlagCode::Vend,
+                &at,
+                format!(
+                    "the caller gets a credential minted from the secret, valid at most {} s",
+                    vend.lifetime_ms / 1000
+                ),
+            );
+        }
         if let Some(open) = operation.open() {
             for d in &open.destinations {
                 let name = format!("{}:{}", d.host, d.port);
@@ -1185,12 +1203,25 @@ fn diff_operation(
         if prev_open.and_then(|o| o.tls) != open.tls {
             wider.push(format!("operation {name}: how TLS starts changed"));
         }
+        if prev_open.and_then(|o| o.limits.as_ref()) != open.limits.as_ref() {
+            wider.push(format!("operation {name}: the connection limits changed"));
+        }
+        if prev_open.and_then(|o| o.protocol) != open.protocol {
+            wider.push(format!("operation {name}: the HTTP version changed"));
+        }
     }
     if prev.input != cur.input {
         wider.push(format!("operation {name}: the input schema changed"));
     }
     if prev.payment != cur.payment {
         wider.push(format!("operation {name}: what it pays changed"));
+    }
+    match (&prev.vend, &cur.vend) {
+        (Some(p), Some(c)) if p.covers(c) => {}
+        (None, None) => {}
+        _ => wider.push(format!(
+            "operation {name}: what it vends, or for how long, changed"
+        )),
     }
     if prev.approval && !cur.approval {
         wider.push(format!(
