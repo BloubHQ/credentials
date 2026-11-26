@@ -739,10 +739,12 @@ decryption and CMS signatures); software passkeys; HOTP and the Steam alphabet; 
 without the owner (reading a code from another record, like the `mail` item of part 5);
 OpenPGP; ssh-agent (`credentials tunnel --agent`); BIP-340 Schnorr; incoming webhook
 `verify`; `decrypt`; `generate` and rotation; egress through a proxy; SNMPv3 (RFC 3414 key
-localization and AES-CFB over the UDP relay); OAUTHBEARER; executing IR `repeat` and `if`
-(parsed and refused, section 8c); found by the table above: a template variable for the
-caller's request headers, a detached AEAD output, an Ed25519 public key from its private key,
-DEFLATE and Exclusive XML Canonicalization.
+localization and AES-CFB over the UDP relay); OAUTHBEARER; found by the table above: a template
+variable for the caller's request headers, a detached AEAD output, an Ed25519 public key from its
+private key, DEFLATE and Exclusive XML Canonicalization. IR `repeat` and `if` run on HTTPS and
+derivations, with tests on values no secret influences, static request bounds and the other
+limits of `docs/policy.md` (Loops and branches; `engine::policy::flow`), so the nonce retries
+the table marks as unconditional can now be conditional.
 
 Each part adds its rows to `docs/threat-model.md`, fuzz targets for any new parser, and
 measured results in its pull request.

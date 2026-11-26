@@ -616,19 +616,28 @@
         "do": {"const": "repeat"},
         "times": {"type": "integer", "minimum": 0},
         "steps": {"type": "array", "items": {"$ref": "#/$defs/Step"}},
-        "until": {"type": "string"}
+        "until": {"$ref": "#/$defs/Test"}
       }
     },
     "If": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["do", "name", "equals"],
+      "required": ["do", "when"],
       "properties": {
         "do": {"const": "if"},
-        "name": {"type": "string"},
-        "equals": {"type": "string"},
+        "when": {"$ref": "#/$defs/Test"},
         "then": {"type": "array", "items": {"$ref": "#/$defs/Step"}},
         "else": {"type": "array", "items": {"$ref": "#/$defs/Step"}}
+      }
+    },
+    "Test": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name"],
+      "properties": {
+        "name": {"type": "string"},
+        "one_of": {"type": "array", "items": {"type": "string"}},
+        "none_of": {"type": "array", "items": {"type": "string"}}
       }
     },
     "ItemBinding": {

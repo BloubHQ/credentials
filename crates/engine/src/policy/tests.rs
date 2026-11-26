@@ -122,23 +122,33 @@ fn the_shape_of_an_operation_is_checked() {
 }
 
 #[test]
-fn loops_and_branches_are_syntax_for_now() {
-    let json = r#"{"do": "repeat", "times": 3, "steps": [{"do": "compute", "into": "t", "template": "x"}]}"#;
+fn loops_and_branches_read_their_tests() {
+    let json = r#"{"do": "repeat", "times": 3, "until": {"name": "status", "one_of": ["200"]},
+                   "steps": [{"do": "compute", "into": "t", "template": "x"}]}"#;
     let repeat: Step = serde_json::from_str(json).unwrap();
-    let json = r#"{"do": "if", "name": "status", "equals": "OK", "then": [], "else": []}"#;
+    let json = r#"{"do": "if", "when": {"name": "status", "none_of": ["401"]},
+                   "then": [{"do": "compute", "into": "t", "template": "x"}]}"#;
     let branch: Step = serde_json::from_str(json).unwrap();
     for step in [repeat, branch] {
-        let operation = Operation {
-            name: "op".into(),
-            input: None,
-            steps: vec![step, Step::Return(Return::output("x"))],
-            payment: None,
-            approval: false,
-            vend: None,
-        };
-        let (_, rule) = rule_of(&one(vec![FieldSpec::secret("key")], operation)).expect("refused");
-        assert!(rule.contains("not run yet"), "{rule}");
+        let text = serde_json::to_string(&step).unwrap();
+        assert_eq!(serde_json::from_str::<Step>(&text).unwrap(), step);
     }
+    // The syntax of the first draft, and unknown members, are refused.
+    for bad in [
+        r#"{"do": "if", "name": "status", "equals": "OK", "then": []}"#,
+        r#"{"do": "repeat", "times": 2, "until": "done", "steps": []}"#,
+        r#"{"do": "if", "when": {"name": "s", "one_of": ["1"], "extra": 1}}"#,
+    ] {
+        assert!(serde_json::from_str::<Step>(bad).is_err(), "{bad}");
+    }
+    let test = Test::one_of("s", ["200", "204"]);
+    assert!(test.holds(Some(b"204")));
+    assert!(!test.holds(Some(b"401")));
+    assert!(!test.holds(None));
+    let test = Test::none_of("s", ["401"]);
+    assert!(test.holds(Some(b"200")));
+    assert!(!test.holds(Some(b"401")));
+    assert!(!test.holds(None));
 }
 
 #[test]
