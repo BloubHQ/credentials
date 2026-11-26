@@ -472,13 +472,26 @@
              "properties": {"url": {"type": "string", "pattern": "^https://[a-z0-9.-]{1,253}(:[0-9]{1,5})?/", "maxLength": 2048},
                             "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}}},
             {"type": "object", "additionalProperties": false, "required": ["library"],
-             "properties": {"library": {"$ref": "#/$defs/Token"}}}
+             "properties": {"library": {"$ref": "#/$defs/Token"},
+                            "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}}}
           ]
         },
         "entry": {"$ref": "#/$defs/Token"},
         "inputs": {"type": "array", "maxItems": 16, "items": {"type": "string", "maxLength": 8192}},
         "into": {"$ref": "#/$defs/Token"},
-        "destination": {"$ref": "#/$defs/Destination"}
+        "destination": {"$ref": "#/$defs/Destination"},
+        "script": {
+          "type": "object", "additionalProperties": false, "required": ["url", "sha256"],
+          "properties": {"url": {"type": "string", "pattern": "^https://[a-z0-9.-]{1,253}(:[0-9]{1,5})?/", "maxLength": 2048},
+                         "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}}
+        },
+        "limits": {
+          "type": "object", "additionalProperties": false,
+          "properties": {"fuel": {"type": "integer", "minimum": 1, "maximum": 1000000000},
+                         "memory": {"type": "integer", "minimum": 1, "maximum": 67108864},
+                         "time_ms": {"type": "integer", "minimum": 1, "maximum": 5000},
+                         "source": {"type": "integer", "minimum": 1, "maximum": 262144}}
+        }
       }
     },
     "Receive": {

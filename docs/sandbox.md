@@ -15,11 +15,13 @@ is `run` (`docs/policy.md`, `run`); the crate is `crates/sandbox`.
 | Inputs | At most 16, 1 MiB together: the rendered templates of the step. |
 | Output | At most 64 KiB, in one or more `output` calls. |
 | Fuel | 10⁹ units per run (wasmi's units, plus one per 64 bytes a host function copies). |
+| Time | 5 s of wall clock per run, checked between slices of 10⁷ fuel (the entry runs as a resumable call), so a run may overshoot by one slice. |
 | Memory | 64 MiB of linear memory, one memory, at most 16 tables. |
+| Lower bounds | A signed policy may lower fuel, memory, time and the size of a script (`limits`), never raise them. |
 | Structure | wasmi's strict limits: at most 10,000 functions, 1,000 globals, 100 tables, 1,000 element and data segments, 32 parameters and results, functions of 40 bytes on average once the code exceeds 1,000 bytes. |
 | Proposals | Wasm 2.0 as compilers emit it by default (bulk memory, reference types, multi-value, sign extension, saturating conversions, mutable globals) and floats. Off: SIMD, memory64 (not compiled in), multi-memory, tail calls, extended constants, custom page sizes, wide arithmetic. |
 | State | None: one engine, store and instance per run. The memory is erased before it is freed. |
-| Errors | `ModuleTooLarge`, `ModuleInvalid`, `Import`, `NoMemory`, `Entry`, `Inputs`, `Fuel`, `Memory`, `Output`, `Trap`: fixed messages, no byte of the module, its inputs or its memory. |
+| Errors | `ModuleTooLarge`, `ModuleInvalid`, `Import`, `NoMemory`, `Entry`, `Inputs`, `Fuel`, `Memory`, `Output`, `Time`, `Trap`, `Refused`: fixed messages, no byte of the module, its inputs or its memory. |
 
 Determinism: nothing a module can reach varies between runs, so it gives the same output for
 the same inputs. Float NaNs keep the bits the CPU gives (wasmi 1.x has no NaN
@@ -80,45 +82,84 @@ LLVM-exception OR Apache-2.0 OR MIT`.
 
 ## JavaScript
 
-Measured: [boa](https://github.com/boa-dev/boa) 0.21.1 (`boa_engine`, no default features),
-a JavaScript engine written in Rust, compiles for `wasm32-unknown-unknown` with cargo
-dependencies only (no C toolchain) and runs **inside this sandbox unchanged**: the module
-passes `sandbox::check` (the strict structural limits included) and imports only the host
-functions.
+A site's signing script runs on the reviewed library module `js`: the
+[boa](https://github.com/boa-dev/boa) engine 0.21.1 compiled to `wasm32-unknown-unknown`
+(`crates/sandbox/js`), run by the sandbox like any other module, through the same four host
+functions and under the same limits. The policy names the script (`docs/policy.md`, `run`): a
+URL on the destination's own origin with its SHA-256 (required), fetched by the node, and the
+function to call. `sandbox::run_script` passes the source as input 0, the function name as
+input 1 and the step's inputs as the function's arguments (`Uint8Array`s, at most 14); what the
+function returns (a `Uint8Array`, an `ArrayBuffer`, a string as UTF-8, or a promise of one)
+is the output. An exception, a missing function or a value of another type is `Trap`.
 
-The experiment (not in the repository, since a module's glue calls its imports through
-`unsafe extern` blocks): a `cdylib` whose `run` reads input 0 as a script and inputs 1.. into
-a global array `inputs`, evaluates the script and writes the completion value as a string.
-`getrandom` 0.3 (used by boa for `Math.random` and hash seeds) was built with
-`--cfg getrandom_backend="custom"` and a function that writes zeros, so the module has no
-randomness of its own. Release, `opt-level = "s"`, LTO:
+What a script finds:
 
 | | |
 | --- | --- |
-| Module | 3,983,657 bytes (under the 8 MiB limit) |
-| `inputs[0] + ':' + inputs[1]` | 37.5 ms, 4,924,619 fuel (most of it creating the engine) |
-| XOR of a 4-byte string, char by char | 43.5 ms, 6,068,311 fuel |
-| A loop of 100,000 integer steps | 905 ms, 743,260,775 fuel |
+| Language | ECMAScript as boa 0.21 implements it: classes, closures, generators, `async`/`await` (pending jobs run until the returned promise settles), typed arrays, `DataView`, `BigInt`, `JSON`, `RegExp`, `Map`/`Set`, `Proxy`, `eval` (inside the same sandbox). No `Intl`. |
+| Added by the prelude (`crates/sandbox/js/src/prelude.js`) | `TextEncoder`, `TextDecoder` (UTF-8, one U+FFFD per maximal invalid subpart), `atob`, `btoa`. |
+| Taken away | `Date` and `Math.random` (deleted before the script runs; the engine's clock is fixed at 0 and the time zone offset is 0). A script gets the time and random bytes from its inputs (`{{ $unix }}`, `{{ $nonce }}`). |
+| Not there | Any I/O: `fetch`, `XMLHttpRequest`, `WebSocket`, `require`, `import` (no module loader), timers, `console`, `WebAssembly`, `crypto`. The engine module imports nothing but the four host functions; `sandbox::check` refuses anything else. |
 
-So a site's login script of a few thousand operations fits the fuel limit; a script with
-heavy loops does not and needs `run` of a WebAssembly build, a browser fill (section 6), or
-case 1 of section 8e (expressing the steps as an IR policy).
+The engine module is checked in (`crates/sandbox/libraries/js.wasm`) and compiled into the
+node (PCR2); the node hands it out only when its SHA-256 equals `sandbox::JS_SHA256`, and a
+policy may pin it too (`{"library": "js", "sha256": ...}`). It is built from its locked
+sources by `build/js-module.sh`: cargo dependencies only, no C compiler, paths remapped;
+the CI job `js-module` builds it again on `windows-latest` and compares the bytes (the
+bytes are a Windows host's: the file names compiled into the module keep the host's path
+separator). Built twice here in two directories: the same bytes. The module's glue
+(`crates/sandbox/js/src/abi.rs`) is the only place of the module's crate that needs
+`unsafe` syntax: the `extern` block of the four imports (declared `safe`) and the exported
+`run` (`no_mangle`); it dereferences no pointer.
 
-What is missing before a JavaScript library ships in the node:
+`getrandom` (boa's dependency through `rand`) is built with its `unsupported` backend: it
+fails if called, and its only caller, `Math.random`, is deleted.
 
-1. A reproducible build of the module inside the enclave image build
-   (`build/Dockerfile.enclave`): the `wasm32-unknown-unknown` standard library in the pinned
-   Rust image (today a `rustup target add`, a download the build must pin by digest), and the
-   module's crate with its own `Cargo.lock`; the node then embeds its bytes like
-   `lenprefix8`, so the JavaScript engine is part of PCR2.
-2. The browser APIs the policy lists, emulated in the module (`crypto.subtle` over node
-   primitives as host functions by name, `TextEncoder`, `atob`/`btoa`), and `Math.random` and
-   `crypto.getRandomValues` from an input the node fills with random bytes.
-3. A step form that names the script: a URL on the origin, pinned like a module, passed as
-   input 0, with the same confinement of the output.
-4. Its own fuzz target and review, and a decision on the engine (boa, or QuickJS compiled to
-   WebAssembly, which needs a C toolchain for `wasm32`: clang is not installed on this PC, so
-   QuickJS was not built or measured).
+### Choice of engine (measured)
+
+Measured on 2026-11-27 on the development PC (Windows 11, x86_64), Rust 1.97.1, both modules
+built `opt-level = "s"`, LTO, `panic = "abort"`, run by `crates/sandbox` built in release.
+Each time is the median of 21 whole runs of `sandbox::run_with` (a new engine, compiling and
+instantiating the module, running, erasing the memory), the script parsed in each run; the
+test is `measure` in `crates/sandbox/tests/js.rs` (`cargo test --release -p sandbox --test js
+-- --ignored --nocapture measure`, `JS_CANDIDATE=<path>` for another module). The scripts are
+`crates/sandbox/tests/fixtures/hs256.js` (SHA-256, HMAC-SHA256 and HS256 JWT in plain
+JavaScript) and a JSON parse-and-stringify loop. Both modules ran the same prelude.
+
+| | boa 0.21.1 (chosen) | QuickJS-NG 0.16.2 (rquickjs 0.14.0) |
+| --- | --- | --- |
+| Module | 3,401,557 B | 812,453 B |
+| `sandbox::check` (decode, validate) | 26.2 ms | 8.5 ms |
+| Cold start (empty function) | 66.0 ms, 30.1 M fuel | 30.7 ms, 15.8 M fuel |
+| One HMAC-SHA256 | 128.7 ms, 75.8 M fuel | 45.9 ms, 296.9 M fuel |
+| One HS256 JWT | 163.2 ms, 93.3 M fuel | 53.5 ms, 414.4 M fuel |
+| JSON transform × 1,000 | 783 ms, 441 M fuel | 227 ms, 325 M fuel |
+| HMAC chain × 10 | 575 ms, 285 M fuel | over the fuel limit (10⁹) |
+| HMAC chain × 40 | 2.03 s, 982 M fuel | over the fuel limit |
+| Imports | the four host functions | the four, and `env.__rquickjs_host_now_us` (a clock), which had to be defined inside the module to pass the checks |
+| Build | cargo only, no C compiler | clang for `wasm32`, and a prebuilt `libc.a` (2,670,504 B of wasi-libc) shipped inside `rquickjs-sys`; on Windows the crate's build script passes a `\\?\` include path clang cannot search, worked around by a second copy of the headers |
+| Guest code | Rust | C |
+| Licence | `Unlicense OR MIT` (boa); the module's other dependencies are in the allow list of `.github/deny.toml` but for `foldhash` 0.2.0 (`Zlib`, through hashbrown; `foldhash` 0.1.5, also `Zlib`, is already in the node's Cargo.lock) | MIT (QuickJS-NG, rquickjs); wasi-libc MIT and Apache-2.0 |
+
+An HMAC chain of 1,000 iterations, as the plan asked, does not fit one run on either engine:
+on boa each further HMAC costs about 23 M fuel (from the ×10 and ×40 runs), so 1,000 would
+take about 2.3·10¹⁰ fuel, 23 times the cap (derived, not run). Within the cap boa runs about
+40 HMACs, QuickJS about 3: wasmi charges QuickJS's code about 6.5 M fuel per millisecond
+against boa's 0.6 M, so the fuel cap, which bounds work by WebAssembly instructions, admits
+less of it.
+
+Why boa: it runs as a guest with nothing but the sandbox's imports; it builds from its
+locked sources with cargo alone, so the checked-in module is reproducible without a C
+toolchain or a prebuilt library of unknown provenance; its fuel per unit of work is a
+quarter of QuickJS's on the signing benchmark, so the node's fixed fuel cap admits four
+times the signing work; and the guest is Rust. QuickJS is 2.8–3.5 times faster by the clock,
+starts in half the time and is a quarter of the size; the size costs the node 3.4 MB instead
+of 0.8 MB. Not measured: other engines (none written in Rust besides boa is complete enough
+to run typical scripts), and `x86_64-unknown-linux-musl`, the enclave target.
+
+What a script may not do in one run: about 13 HMAC-SHA256 computations in JavaScript, or a
+few thousand JSON round trips. Heavier code needs `run` of a WebAssembly build, a browser fill
+(`docs/design.md`, section 6) or case 1 of section 8e.
 
 ## Residual risks
 
@@ -138,3 +179,10 @@ What is missing before a JavaScript library ships in the node:
 - **Runtime bugs.** A flaw in wasmi's validator or executor could let a module out of the
   sandbox into the node's process. Pins narrow who can supply a module; the fuzz target
   `sandbox_module` feeds arbitrary modules and inputs to `sandbox::run`.
+- **Engine bugs.** A flaw in boa lets a script corrupt or read the engine module's own
+  memory, which holds only that run's inputs and output; it stays inside the WebAssembly
+  sandbox, and the output stays confined to the script's origin, which wrote the script and
+  receives the secret anyway. The fuzz target `sandbox_script` feeds arbitrary sources and
+  arguments to `sandbox::run_script`.
+- **Time limit.** The wall-clock bound depends on the machine: on a slow or loaded host a
+  script that passes elsewhere may stop with `Time`. Fuel is the bound that does not.

@@ -49,9 +49,9 @@ fn the_engine_is_the_pinned_module() {
 
 #[test]
 fn hmac_matches_the_native_result() {
-    let long_key = vec![0x42u8; 100];
-    let block_key = vec![0x17u8; 64];
-    let long_message = vec![0xa5u8; 300];
+    let long_key = [0x42u8; 100];
+    let block_key = [0x17u8; 64];
+    let long_message = [0xa5u8; 300];
     for (key, message) in [
         (KEY, b"" as &[u8]),
         (KEY, b"abc"),
@@ -89,20 +89,8 @@ fn jwt_matches_the_native_result() {
 
 #[test]
 fn runs_are_deterministic_and_have_no_clock_or_randomness() {
-    let a = run_script(
-        HS256.as_bytes(),
-        "sign",
-        &[KEY, b"same"],
-        Limits::default(),
-    )
-    .unwrap();
-    let b = run_script(
-        HS256.as_bytes(),
-        "sign",
-        &[KEY, b"same"],
-        Limits::default(),
-    )
-    .unwrap();
+    let a = run_script(HS256.as_bytes(), "sign", &[KEY, b"same"], Limits::default()).unwrap();
+    let b = run_script(HS256.as_bytes(), "sign", &[KEY, b"same"], Limits::default()).unwrap();
     assert!(a.output == b.output, "same inputs, same output");
     assert_eq!(a.fuel, b.fuel, "same inputs, same fuel");
     let probe = r#"function probe() {
@@ -218,14 +206,26 @@ fn script_size_entry_and_results() {
         "the entry is a token"
     );
     assert_eq!(js(ok, "missing", &[]).unwrap_err(), Error::Trap);
-    assert_eq!(js("function f() { return 'é'; }", "f", &[]).unwrap(), "é".as_bytes());
     assert_eq!(
-        js("function f() { return new Uint8Array([1, 2, 3]).buffer; }", "f", &[]).unwrap(),
+        js("function f() { return 'é'; }", "f", &[]).unwrap(),
+        "é".as_bytes()
+    );
+    assert_eq!(
+        js(
+            "function f() { return new Uint8Array([1, 2, 3]).buffer; }",
+            "f",
+            &[]
+        )
+        .unwrap(),
         [1, 2, 3]
     );
     assert_eq!(
-        js("function f() { return new Uint8Array([1, 2, 3, 4]).subarray(1, 3); }", "f", &[])
-            .unwrap(),
+        js(
+            "function f() { return new Uint8Array([1, 2, 3, 4]).subarray(1, 3); }",
+            "f",
+            &[]
+        )
+        .unwrap(),
         [2, 3]
     );
     for bad in [
@@ -238,12 +238,16 @@ fn script_size_entry_and_results() {
     ] {
         assert_eq!(js(bad, "f", &[]).unwrap_err(), Error::Trap, "{bad}");
     }
-    let args: Vec<&[u8]> = (0..sandbox::MAX_SCRIPT_ARGS).map(|_| b"x" as &[u8]).collect();
+    let args: Vec<&[u8]> = (0..sandbox::MAX_SCRIPT_ARGS)
+        .map(|_| b"x" as &[u8])
+        .collect();
     assert_eq!(
         js("function f(...a) { return String(a.length); }", "f", &args).unwrap(),
         b"14"
     );
-    let too_many: Vec<&[u8]> = (0..=sandbox::MAX_SCRIPT_ARGS).map(|_| b"x" as &[u8]).collect();
+    let too_many: Vec<&[u8]> = (0..=sandbox::MAX_SCRIPT_ARGS)
+        .map(|_| b"x" as &[u8])
+        .collect();
     assert_eq!(js(ok, "f", &too_many).unwrap_err(), Error::Inputs);
 }
 
@@ -267,7 +271,10 @@ fn the_web_apis_of_the_prelude() {
     );
     let bytes: Vec<u8> = (0..=255).collect();
     let expected = base64::engine::general_purpose::STANDARD.encode(&bytes);
-    assert_eq!(js(script, "roundtrip", &[&bytes]).unwrap(), expected.as_bytes());
+    assert_eq!(
+        js(script, "roundtrip", &[&bytes]).unwrap(),
+        expected.as_bytes()
+    );
     assert_eq!(
         js(script, "big", &[]).unwrap(),
         b"10000000000000000000000000"
@@ -295,9 +302,7 @@ fn measure() {
         runs[runs.len() / 2]
     }
     let candidate = std::env::var_os("JS_CANDIDATE").map(|path| std::fs::read(path).unwrap());
-    let module: &[u8] = candidate
-        .as_deref()
-        .unwrap_or_else(|| library(JS).unwrap());
+    let module: &[u8] = candidate.as_deref().unwrap_or_else(|| library(JS).unwrap());
     let time = |script: &str, entry: &str, args: &[&[u8]]| {
         let mut inputs: Vec<&[u8]> = vec![script.as_bytes(), entry.as_bytes()];
         inputs.extend_from_slice(args);

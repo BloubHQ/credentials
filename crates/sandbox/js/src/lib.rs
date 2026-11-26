@@ -23,10 +23,10 @@
 
 use std::rc::Rc;
 
+use boa_engine::builtins::promise::PromiseState;
 use boa_engine::context::time::FixedClock;
 use boa_engine::context::{ContextBuilder, HostHooks};
 use boa_engine::object::builtins::{JsArrayBuffer, JsUint8Array};
-use boa_engine::builtins::promise::PromiseState;
 use boa_engine::{Context, JsResult, JsString, JsValue, Source};
 
 #[cfg(target_arch = "wasm32")]
@@ -54,9 +54,10 @@ impl From<boa_engine::JsError> for Failed {
     }
 }
 
-/// Runs the script on the inputs and returns the output bytes.
-pub fn execute(inputs: &[Vec<u8>]) -> Result<Vec<u8>, ()> {
-    run_script(inputs).map_err(|_| ())
+/// Runs the script on the inputs and returns the output bytes, or `None` when the script
+/// fails (the module then traps).
+pub fn execute(inputs: &[Vec<u8>]) -> Option<Vec<u8>> {
+    run_script(inputs).ok()
 }
 
 fn run_script(inputs: &[Vec<u8>]) -> Result<Vec<u8>, Failed> {

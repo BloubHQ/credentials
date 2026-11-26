@@ -19,7 +19,7 @@ pub const LIBRARIES: [&str; 2] = ["lenprefix8", JS];
 pub const JS: &str = "js";
 
 /// The SHA-256 of `libraries/js.wasm`, as `build/js-module.sh` prints it.
-pub const JS_SHA256: &str = "047fac9cea607354660b740dca4db755709f274e1655ff32905aca7cbb562b12";
+pub const JS_SHA256: &str = "07caa809a10f2c9a7646455e0760f47b757e3ed8ffe24783502e54958cfb2c64";
 
 const LENPREFIX8: &[u8] = include_bytes!("../libraries/lenprefix8.wasm");
 const JS_MODULE: &[u8] = include_bytes!("../libraries/js.wasm");

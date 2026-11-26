@@ -51,13 +51,13 @@ fn read_inputs() -> Vec<Vec<u8>> {
 pub extern "C" fn run() {
     let inputs = read_inputs();
     match crate::execute(&inputs) {
-        Ok(bytes) => {
+        Some(bytes) => {
             if let Ok(len) = i32::try_from(bytes.len()) {
                 output(offset(&bytes), len);
             } else {
                 core::arch::wasm32::unreachable();
             }
         }
-        Err(()) => core::arch::wasm32::unreachable(),
+        None => core::arch::wasm32::unreachable(),
     }
 }

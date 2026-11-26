@@ -1704,11 +1704,13 @@ impl<S: LogSink, C: Clock> Node<S, C> {
         }
     }
 
-    /// A `run` step: gets the module (a reviewed library, or `GET` on the module's origin
-    /// over the operation's connection, logged like any request, its pin checked), renders
-    /// the inputs, runs the module in the sandbox and keeps the output as a secret temporary
-    /// value. The output is added to what responses are searched for; the policy check made
-    /// sure it goes nowhere but a fixed request to the module's origin.
+    /// A `run` step: gets the module (a reviewed library, its pin checked when the policy
+    /// gives one, or `GET` on the module's origin over the operation's connection, logged
+    /// like any request, its pin checked) or the script the JavaScript engine module runs
+    /// (fetched the same way, always pinned), renders the inputs, runs it in the sandbox
+    /// under the step's limits and keeps the output as a secret temporary value. The output
+    /// is added to what responses are searched for; the policy check made sure it goes
+    /// nowhere but a fixed request to the module's origin.
     fn run_module<T: Transport>(
         &self,
         run: &mut Run<'_>,
@@ -1717,20 +1719,60 @@ impl<S: LogSink, C: Clock> Node<S, C> {
         transport: &mut T,
         updated: &Option<Record>,
     ) -> Result<()> {
+        let limits = step.sandbox_limits();
         let fetched;
-        let module: &[u8] = match step.source() {
+        let (module, script): (&[u8], bool) = match step.source() {
             Some(ModuleRef::Library(name)) => {
-                sandbox::library(name).ok_or(Error::ModuleRefused {
+                let module = sandbox::library(name).ok_or(Error::ModuleRefused {
                     rule: "unknown library module",
-                })?
+                })?;
+                if let Some(pin) = step.library_pin()
+                    && sandbox::library_sha256(name) != Some(pin)
+                {
+                    return Err(Error::ModuleRefused {
+                        rule: "the library does not match its sha256 pin",
+                    });
+                }
+                (module, false)
             }
             Some(ModuleRef::Url {
                 origin,
                 path,
                 sha256,
             }) => {
-                fetched = self.fetch_module(run, open, origin, path, sha256, transport, updated)?;
-                &fetched
+                fetched = self.fetch_module(
+                    run,
+                    open,
+                    (origin, path),
+                    sha256,
+                    sandbox::MAX_MODULE,
+                    transport,
+                    updated,
+                )?;
+                (&fetched, false)
+            }
+            Some(ModuleRef::Script {
+                origin,
+                path,
+                sha256,
+            }) => {
+                if let Some(pin) = step.library_pin()
+                    && sandbox::library_sha256(sandbox::JS) != Some(pin)
+                {
+                    return Err(Error::ModuleRefused {
+                        rule: "the library does not match its sha256 pin",
+                    });
+                }
+                fetched = self.fetch_module(
+                    run,
+                    open,
+                    (origin, path),
+                    Some(sha256),
+                    limits.script.min(sandbox::MAX_SCRIPT),
+                    transport,
+                    updated,
+                )?;
+                (&fetched, true)
             }
             None => return Err(run.operation.unknown()),
         };
@@ -1748,7 +1790,12 @@ impl<S: LogSink, C: Clock> Node<S, C> {
             .map(|text| Template::parse(text).and_then(|t| t.render(&ctx)))
             .collect::<Result<Vec<_>>>()?;
         let slices: Vec<&[u8]> = inputs.iter().map(|i| i.as_slice()).collect();
-        let ran = sandbox::run(module, &step.entry, &slices).map_err(Error::Sandbox)?;
+        let ran = if script {
+            sandbox::run_script(module, &step.entry, &slices, limits)
+        } else {
+            sandbox::run_with(module, &step.entry, &slices, limits)
+        }
+        .map_err(Error::Sandbox)?;
         drop(inputs);
         let output = ran.output;
         run.captured.temps_len = run.captured.temps_len.saturating_add(output.len());
@@ -1762,16 +1809,16 @@ impl<S: LogSink, C: Clock> Node<S, C> {
         Ok(())
     }
 
-    /// Fetches a module with `GET` from its origin, as a logged request of the operation,
-    /// and checks the status, the size and the pin.
+    /// Fetches a module or a script with `GET` from its origin, as a logged request of the
+    /// operation, and checks the status, the size (at most `max` bytes) and the pin.
     #[allow(clippy::too_many_arguments)]
     fn fetch_module<T: Transport>(
         &self,
         run: &mut Run<'_>,
         open: &Open,
-        origin: Destination,
-        path: &str,
+        (origin, path): (Destination, &str),
         sha256: Option<[u8; 32]>,
+        max: usize,
         transport: &mut T,
         updated: &Option<Record>,
     ) -> Result<Vec<u8>> {
@@ -1788,9 +1835,9 @@ impl<S: LogSink, C: Clock> Node<S, C> {
             Err(Error::ModuleRefused {
                 rule: "the module's origin did not answer 200",
             })
-        } else if http.body.len() > sandbox::MAX_MODULE {
+        } else if http.body.len() > max {
             Err(Error::ModuleRefused {
-                rule: "module larger than the limit",
+                rule: "module or script larger than its limit",
             })
         } else if sha256.is_some_and(|pin| <[u8; 32]>::from(Sha256::digest(&*http.body)) != pin) {
             Err(Error::ModuleRefused {

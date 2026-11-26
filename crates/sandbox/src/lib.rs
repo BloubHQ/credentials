@@ -414,7 +414,9 @@ fn charge(caller: &mut Caller<'_, Host>, len: usize) -> Result<(), wasmi::Error>
         Some(pool) => {
             let slice = pool.min(FUEL_SLICE);
             caller.data_mut().reserve = pool.saturating_sub(slice);
-            caller.set_fuel(slice).map_err(|_| fail(caller, Error::Fuel))
+            caller
+                .set_fuel(slice)
+                .map_err(|_| fail(caller, Error::Fuel))
         }
         None => {
             let _ = caller.set_fuel(0);
