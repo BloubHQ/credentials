@@ -874,17 +874,56 @@ form are refused at rendering (`hostile_documents_are_refused_in_templates`,
 `malformed_documents_are_refused`). Fuzz targets `inflate_stream` and `xml_c14n` (a canonical
 form must be its own) type-check; libFuzzer was not run on this Windows host (unmeasured).
 
+SRP-6a and OpenPGP were then added as families (tests in
+`crates/engine/tests/schemes_srp_pgp.rs`, which reads its policies from `docs/policy.md`,
+SRP-6a and OpenPGP, and `crates/engine/src/primitives/srp.rs`):
+
+- **SRP-6a**: `srp_public`, `srp_x`, `srp_u`, `srp_premaster`, `srp_m1`, `srp_verify`, one
+  function per client step of RFC 2945 and RFC 5054, over the seven groups of RFC 5054
+  appendix A named by the policy. Chosen over generic modular arithmetic in templates: the
+  exponent `a + u * x` mixes a secret with a captured value, which `add` already refuses
+  (rule 2), and a premaster secret built from separate operations would have no single place
+  that keeps it tainted and uncontrolled the way `ecdh` is. The big integers are
+  `crypto-bigint` 0.7.11 (`BoxedUint`, `BoxedMontyForm`), already in the build through `rsa`:
+  constant-time Montgomery multiplication and exponentiation over the whole precision, which
+  the group and the input lengths fix. Rule 11 is new: the private value is the node's (a
+  `random` or a field), `B` and the proofs come from the destination.
+- **OpenPGP framing**: `pgp_packet`, `pgp_subpacket`, `pgp_mpi`, `pgp_armor` (RFC 9580). The
+  signature itself is template text over the existing signature functions, so a version, an
+  algorithm or a subpacket needs no code. `pgp_mpi` refuses a tainted input (rule 10: its
+  length tells the leading zeros).
+
+| Scheme or check | Result | Tests | Checked against |
+| --- | --- | --- | --- |
+| SRP-6a computations | works as-is | `rfc5054_appendix_b`, `groups_are_safe_primes`, `refuses_degenerate_values` | RFC 5054 appendix B byte for byte: `k`, `x`, `v`, `A`, `u` and the premaster secret (SHA-1, 1024-bit group); the seven groups of appendix A are safe primes (`crypto-primes`), the four largest derived from the RFC 3526 primes in another crate's source and checked the same way; degenerate inputs refused (`B` of zero, `N`, `N + 1`, longer than `N`; empty or overlong private value or `x`; unknown group or hash; a wrong or short `M2`) |
+| SRP-6a login in two requests (`srp-login`) | works as-is | `srp_login_against_an_independent_server`, `srp_login_refuses_a_wrong_password_an_impostor_and_bad_server_values` | A server written on `num-bigint` (2048-bit group, SHA-256) that keeps only the verifier: 3 logins, each `M1` equal to the server's and each `A` fresh; the server's `M2` checked by `srp_verify` before the session is returned; a wrong password gets no session; an impostor that accepts any `M1` gets nothing back; 4 bad `B` values fail before `M1` is sent |
+| OpenPGP v4 detached signature, RSA (algorithm 1), SHA-256 | works as-is | `openpgp_detached_signatures_verify` | Parsed from the armor (CRC-24 checked) by a reader written in the test; the v4 fingerprint and key ID against a key packet built in the test; the hashed data rebuilt from RFC 9580 section 5.2.4 and verified by `rsa`; GnuPG 2.4.9 by hand: "Good signature", and "BAD signature" on other data |
+| OpenPGP v4 detached signature, EdDSALegacy (algorithm 22) | works as-is | the same | ring over the digest (RFC 9580 section 5.2.3.4), `r` and `s` read as two MPIs; GnuPG 2.4.9 by hand: "Good signature", and "BAD signature" on other data |
+| OpenPGP v6 detached signature, Ed25519 (algorithm 27) with a salt | works with caveat | the same | The v6 fingerprint, four-octet subpacket lengths, a fresh 16-octet salt per call and the 64-octet signature verified by ring over the salted digest; no other implementation checked it (GnuPG 2.4.9 refuses version 6 packets; no RFC 9580 implementation is installed; unmeasured) |
+| OpenPGP framing | works as-is | `openpgp_framing_follows_rfc9580` | The one-, two- and five-octet lengths at 0, 1, 191, 192, 8383, 8384 and 10,000 bytes, the critical bit, MPIs of zero and with leading zeros, against an encoder written in the test |
+
+Attacks measured with them: rule 11 refuses a caller-chosen private value (3 policies), a
+caller-chosen `B` and a caller-chosen `M2`; rule 6 refuses a chosen group or hash in 4
+functions and a chosen armor label or checksum; rule 1 refuses a mixed value in `srp_u` and
+in a packet type; rule 5 refuses handing back `x`, the premaster secret, the session key and
+an `M1` over values the policy fixes, and a framed or armored secret (3); an `M1` over a
+chosen salt signs with a strong password and is refused with a guessable one; rule 10 refuses
+`pgp_mpi` of a secret, `len` of it included. No new parser, so no new fuzz target; timing of
+the arithmetic was not measured on hardware.
+
 Not done; each needs a primitive or a feature, not a site name: OAuth 1.0a normalization in
 `canonical_query`; SigV4A key derivation; NTLM and Negotiate (connection-bound: each HTTPS
 send opens its own connection today, so the handshake and the request would need one
-connection); SRP-6a big-integer functions; SEED and ARIA; Korean certificates (SEED-CBC key
+connection); SEED and ARIA; Korean certificates (SEED-CBC key
 decryption and CMS signatures); software passkeys; HOTP and the Steam alphabet; SMS codes
 without the owner (reading a code from another record, like the `mail` item of part 5);
-OpenPGP; ssh-agent (`credentials tunnel --agent`); BIP-340 Schnorr; incoming webhook
+ssh-agent (`credentials tunnel --agent`); BIP-340 Schnorr; incoming webhook
 `verify`; `decrypt`; `generate` and rotation; egress through a proxy; SNMPv3 (RFC 3414 key
 localization and AES-CFB over the UDP relay); OAUTHBEARER; checking a signed SAML Response
 (element selection by ID and XML signature verification). Found by the table above and done:
-the request components, the AEAD parts, the public keys, DEFLATE and XML canonicalization. IR `repeat` and `if` run on HTTPS and derivations, with tests on values no
+the request components, the AEAD parts, the public keys, DEFLATE and XML canonicalization,
+SRP-6a and OpenPGP framing (text and cleartext signatures, encrypted messages and key
+generation are not done). IR `repeat` and `if` run on HTTPS and derivations, with tests on values no
 secret influences, static request bounds and the other limits of `docs/policy.md` (Loops and
 branches; `engine::policy::flow`), so the nonce retries the table marks as unconditional can now
 be conditional.
@@ -925,6 +964,14 @@ approvals inside another company's app (KakaoTalk, a bank's app push).
   path that holds one.
 - Nonce retries (DPoP `use_dpop_nonce`, ACME `badNonce`) are written unconditionally until IR
   `if` runs; until then a policy fits only servers that always ask for a nonce first.
+- SRP variants. The functions follow RFC 5054: `u` and `k` over values padded to `N`, `M1`
+  as RFC 2945 writes it, groups by name only. A service that pads differently, or sends its
+  own modulus (a per-user `N`, signed or not), is not served: a modulus from the destination
+  would need a check that it is a safe prime of sufficient size before any secret is raised
+  to it, which is costly and was left out. The server side (computing `B`, checking `M1`)
+  is not offered: the node is a client.
+- OpenPGP version 6 output was checked only by the test's own reader and ring; a second
+  RFC 9580 implementation should verify it before a policy relies on it.
 - Vending checks the expiry the service states. A service that states a shorter expiry than
   it honours is out of the node's reach; the owner's scope in the fixed request is the
   other bound.

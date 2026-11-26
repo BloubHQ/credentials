@@ -625,6 +625,7 @@ dependencies = [
  "cbc",
  "chacha20poly1305",
  "cmac",
+ "crypto-bigint",
  "cts",
  "dsa",
  "eax",

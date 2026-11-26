@@ -39,6 +39,27 @@ before 1.0, minor versions may break formats and APIs.
 
 ### Added
 
+- SRP-6a and OpenPGP framing as template families (`docs/policy.md`, SRP-6a and OpenPGP;
+  `docs/design.md` section 11), two rows of the list of schemes not done:
+  - `srp_public`, `srp_x`, `srp_u`, `srp_premaster`, `srp_m1` and `srp_verify` (RFC 2945,
+    RFC 5054) over the seven groups of RFC 5054 appendix A with SHA-1 or SHA-2, on
+    `crypto-bigint` 0.7.11 (already a dependency of `rsa`): constant-time Montgomery
+    arithmetic at precisions set by the group and the input lengths. RFC 5054 appendix B
+    (`k`, `x`, `v`, `A`, `u`, the premaster secret) byte for byte; the seven groups checked
+    to be safe primes. A `B` of zero or not below `N` and a `u` of zero are refused;
+    `srp_verify` fails the operation when the server's `M2` does not match. A premaster
+    secret counts 3 against the 32 signatures of an operation.
+  - New rule 11: the SRP private value is neither caller-chosen nor captured; `B` and the
+    arguments of `srp_verify` are not caller-chosen. Rule 10 now also refuses a tainted input
+    to `pgp_mpi`.
+  - `pgp_packet`, `pgp_subpacket`, `pgp_mpi` and `pgp_armor` (RFC 9580, CRC-24 on request for
+    RFC 4880 readers). Detached signatures are policies over them and the existing signature
+    functions: version 4 with RSA and with EdDSALegacy, version 6 with Ed25519 and a salt.
+  - A two-request SRP login (`srp-login`) against a server on `num-bigint`, and the three
+    signing policies, verified by ring, `rsa` and GnuPG 2.4.9 (v4 only, by hand).
+  - Dev-dependencies `num-bigint` 0.4.8 and `crypto-primes` 0.7.2, both already in
+    `Cargo.lock`.
+
 - DEFLATE and XML canonicalization as template families (`docs/policy.md`, Compression and
   XML; `docs/design.md` section 11), the two gaps of the scheme table:
   - `deflate`, `inflate`, `zlib_deflate`, `zlib_inflate`, `gzip_deflate` and `gzip_inflate`

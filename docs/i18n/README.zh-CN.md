@@ -203,6 +203,9 @@ let outcome = node.run(&call, &mut TlsTransport::new());
 - **压缩与 XML。** 密钥绝不压缩（`deflate`、`zlib_deflate`、`gzip_deflate`）：压缩后的长度会透露
   输入如何重复（CRIME）。一次解压最多写 1 MiB，且不超过剩余预算；XML 不带 DTD 读取，因此没有
   外部实体，也没有实体扩展。
+- **SRP 与 OpenPGP。** SRP 私有值属于节点（`random` 或字段，调用方选择或从响应捕获的值会被拒绝）；
+  `B` 和服务器证明不能来自调用方；premaster secret 与 `ecdh` 结果一样视为密钥，以常数时间计算。
+  `pgp_mpi` 不接受密钥：其长度会透露前导零的个数。
 - **预算。** 一个操作最多可渲染 128 MiB、1,000,000 轮 PBKDF2，签名与密钥协商合计 32 次。
 
 | 凭据 | 策略 |
@@ -220,6 +223,8 @@ let outcome = node.run(&call, &mut TlsTransport::new());
 | 在浏览器中加密的密码 | `ecdh("p256", server_key)` + `sha256` + `aes_cbc_encrypt`，加 `u8(len(…))` 长度前缀和 `ecdh_public("p256")`；或用从服务器捕获的公钥 `rsa_encrypt_oaep("sha256", key, password)` |
 | JWT RS256 | 无连接：`b64urlraw(header) + "." + b64urlraw($input) + "." + b64urlraw(rsa_sign_pkcs1_sha256(pem(key), …))` |
 | 由策略限定有效期的 JWT | 固定 `iss`/`aud`、由节点 `set` `iat`/`exp` 的 `json` input 模式；或在模板中用 `json_set_number(..., "exp", add($unix, "300"))` |
+| SRP-6a 登录 | 对 `random("32")` 求 `srp_public`，收到 salt 和 `B` 后用 `srp_x`、`srp_premaster`、`sha256`、`srp_m1`，返回任何内容之前用 `srp_verify` 检查服务器的 `M2` |
+| OpenPGP 分离签名 | 无连接：用 `pgp_armor("SIGNATURE", pgp_packet("2", ...))` 包裹 `rsa_sign_pkcs1("sha256", ...)`（MPI）或对摘要的 `ed25519_sign`，`pgp_subpacket` 与 trailer 用 `be16`、`be32`、`len` 写出；v4 经 GnuPG 验证 |
 | SAML 服务提供方、WS-Security | HTTP-Redirect：`b64(deflate(authn))`，并对查询串用 `rsa_sign_pkcs1_sha256` 或 `p256_sign` 签名；HTTP-POST：对 `xml_c14n("http://www.w3.org/2001/10/xml-exc-c14n#", ...)` 的 enveloped 签名；均用 `rsa` 和 ring 验证 |
 | 以太坊 | 无连接：`{{ k256_sign_recoverable(key, keccak256($input)) }}`，配合固定收款地址、链和 data 并限制金额的 `rlp` input 模式 |
 | IMAP | tls：receive 问候，send `a1 LOGIN {{user}} {{password}}`，receive，只转发策略列出的命令 |
