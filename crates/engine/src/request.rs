@@ -1,11 +1,11 @@
 //! Building the request of one step from the caller request (or the one the policy fixes) and
 //! the injections of the step.
 //!
-//! The injections render in the order of [`Plan`] (each template reads the request as it is
-//! sent, but for its own target); every rendered value is placed by its target, in the order
-//! the policy lists them; the wire bytes are built in one buffer of a
-//! length computed up front, so no reallocation leaves a copy of a value behind, and the buffer
-//! is a [`Secret`].
+//! The injections render in dependency order (each template reads the request as it is sent,
+//! but for its own target: `docs/policy.md`, Injection order); every rendered value is placed
+//! by its target, in the order the policy lists them; the wire bytes are built in one buffer
+//! of a length computed up front, so no reallocation leaves a copy of a value behind, and the
+//! buffer is a [`Secret`].
 
 use std::collections::HashMap;
 

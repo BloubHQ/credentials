@@ -692,7 +692,7 @@ pub enum NameKind {
 
 /// A request component a template reads, as the analysis asks about it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Component<'a> {
+pub(crate) enum Component<'a> {
     /// A variable.
     Var(Var),
     /// `$header("name")`, the name in lowercase.
@@ -727,7 +727,7 @@ impl Props {
 
     /// A request component as the caller chooses it, before the policy puts anything in it:
     /// what the analysis takes `var` to be when nothing is injected into it.
-    pub fn chosen(var: Var) -> Self {
+    pub(crate) fn chosen(var: Var) -> Self {
         Props(Info {
             controlled: var.controlled(),
             caller: var.controlled(),
@@ -738,7 +738,7 @@ impl Props {
     /// The properties of `self` followed by `other` in one value, as `+` gives them: either's
     /// taint, control and guessability, and never a secret key.
     #[must_use]
-    pub fn then(self, other: Props) -> Props {
+    pub(crate) fn then(self, other: Props) -> Props {
         let (a, b) = (self.0, other.0);
         Props(Info {
             tainted: a.tainted || b.tainted,
@@ -752,7 +752,7 @@ impl Props {
     /// The value in another form (percent-encoded, normalized): the same properties, never a
     /// secret key.
     #[must_use]
-    pub fn encoded(self) -> Props {
+    pub(crate) fn encoded(self) -> Props {
         Props(Info {
             secret_key: false,
             ..self.0
@@ -1446,7 +1446,7 @@ impl Template {
     /// caller chose: `component` gives the properties of one the policy fills (a header or
     /// query parameter it injects, a path holding a path parameter), and `None` for one it
     /// does not touch.
-    pub fn props_in(
+    pub(crate) fn props_in(
         &self,
         kind: &dyn Fn(&str) -> NameKind,
         component: &dyn Fn(Component<'_>) -> Option<Props>,

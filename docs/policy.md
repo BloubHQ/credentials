@@ -2668,6 +2668,11 @@ Every template is analysed before the policy is signed. Each expression has four
 | *secret key*: a strong secret nobody else knows, usable as a key | a secret field that is not guessable | `b64decode` `b32decode` `hexdecode` `pem` `trim` `slice` of it | everything else, including hashes, MACs and `+`: a hash or MAC of a key is a new value some operation may hand back |
 | *guessable*: a guess can be checked against it | guessable fields | every function except `len`, and `+` | `len` |
 
+A request variable of an injection that holds what another injection of the same `send` put
+there has the properties of the caller's part followed by those of each injected template, as
+`+` joins them; an injected header or query parameter read by name, and an injected body read
+as `$body`, is exactly its template ([Injection order](#injection-order)).
+
 An argument is *mixed* when it is both tainted and controlled (a secret and chosen bytes in one
 value).
 
