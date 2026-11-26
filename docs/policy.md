@@ -120,15 +120,16 @@ Rules for every operation:
 - `run` and `await` are refused on a WebSocket.
 - `repeat` and `if` are refused for now (see [Loops and branches](#loops-and-branches)).
 
-Other kinds of connection (SSH, database handshakes, a browser over CDP) fit the same steps:
-each kind says what its `send`, `receive` and `return` carry, and the template analysis
-stays the same. They are not implemented yet.
+Protocol connections (SSH, PostgreSQL, SMTP, IMAP, Redis) fit the same steps: each kind says
+what its `send`, `receive` and `return` carry, and the template analysis stays the same (see
+[Protocol connections](#protocol-connections)). Other kinds (MySQL, MQTT, AMQP, a browser over
+CDP) are not implemented yet.
 
 ### `open`
 
 | Member | Meaning |
 | --- | --- |
-| `connection` | `https`, `tls`, `websocket` (always `wss`) or `udp` (see [UDP](#udp)). |
+| `connection` | `https`, `tls`, `websocket` (always `wss`), or a [protocol connection](#protocol-connections): `ssh`, `postgres`, `smtp`, `imap`, `redis`; or `udp` (see [UDP](#udp)). |
 | `destinations` | 1–32 hosts and ports. `*.example.com` matches exactly one label (`eu.example.com`, not `example.com` or `a.b.example.com`); `*.` must be followed by at least two labels, so `*.com` is refused. Hosts are lowercase labels of `a–z 0–9 -` (at most 253 bytes), and the port is not 0. The caller's request or stream names one of them. |
 | `identity` | Optional client certificate for mutual TLS: two templates, handed to the transport only. |
 | `protocol` | HTTPS only, optional: `h2` or `http1` pins the HTTP version. Without it the node offers both by ALPN and takes what the server picks. A pinned version the server does not agree to fails the call before the request is written (no downgrade). |
@@ -317,6 +318,157 @@ capture falls back to the header of the same name, as a trailers-only gRPC answe
 A WebSocket and a streamed response are open connections: a caller holds at most 4 at once,
 an owner 16, a node 256. The node logs one entry when one opens (the `use`) and one when it
 closes, with why it closed, the status, and the messages and bytes each way.
+
+### Protocol connections
+
+`ssh`, `postgres`, `smtp`, `imap` and `redis` are standard protocol families, never a site's:
+the node signs in with the item's secret, runs the commands the policy fixes or shapes, and
+hands back results after the reflection search. Each is its own client in the engine
+(`engine::proto`), synchronous, with only modern algorithms.
+
+```json
+{"name": "deploy",
+ "steps": [
+   {"do": "open", "connection": "ssh",
+    "destinations": [{"host": "build.example.com", "port": 22}],
+    "host_keys": ["ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIIpE5S3nEfaq9h6S6l5bSkF1H0R1mAEbvYMVg4Ccmi6G"],
+    "login": {"user": "deploy", "key": "{{ssh_key}}"},
+    "limits": {"idle_ms": 30000, "duration_ms": 300000}},
+   {"do": "send", "command": {"text": "uptime"}},
+   {"do": "receive", "capture": [{"source": {"from": "regex", "pattern": "load average: ([0-9.]{1,8})"},
+                                  "into": {"kind": "temp", "name": "load", "secret": false}}]},
+   {"do": "return", "relay": {"commands": [
+     {"name": "restart", "text": "sudo systemctl restart", "params": [{"pattern": "(web|worker)[0-9]{0,2}"}]},
+     {"name": "logs", "text": "journalctl -n 200 -u", "params": [{"pattern": "[a-z0-9-]{1,32}"}]}
+   ]}}
+ ]}
+```
+
+The `open` of a protocol connection:
+
+| Member | Meaning |
+| --- | --- |
+| `login` | Required. `user` and one credential, each a template: `password`; `key` (SSH: an Ed25519 or ECDSA P-256/P-384 key in PKCS#8, or an unencrypted OpenSSH key; RSA in PKCS#8 or PKCS#1); `token` (an OAuth 2.0 bearer token for `xoauth2`); or `answers` (SSH keyboard-interactive: up to 8 `{"prompt": <regular expression the whole prompt must match>, "template"}`). `database` (PostgreSQL, a literal) and `mechanism` are optional. The credential must be the one its mechanism uses. |
+| `mechanism` | SSH `password`, `publickey`, `keyboard-interactive`; PostgreSQL `scram-sha-256`; SMTP `plain`, `login`, `xoauth2`; IMAP `login`, `plain`, `xoauth2`; Redis `auth`. Without it, the kind's default for the credential given. The node uses this mechanism or none: a server that does not offer it is refused, never answered with another. |
+| `host_keys` | SSH only, required: 1 to 16 pinned host keys, `type base64` as in `known_hosts` (`ssh-ed25519`, `ecdsa-sha2-nistp256/384/521`, `ssh-rsa` for an RSA key verified with `rsa-sha2-256/512` only). The node offers only the algorithms of the pinned keys and refuses a key that is not pinned before it sends any credential. |
+| `tls` | SMTP and IMAP: `implicit` (default; ports 465 and 993) or `starttls` (587 and 143). A server that does not offer STARTTLS, or sends anything after its go-ahead before the handshake, is refused. PostgreSQL always asks for TLS (`SSLRequest`) and refuses a server that does not take it; Redis is TLS from the first byte; SSH encrypts itself. |
+| `limits` | As for a WebSocket: idle, duration and bytes (both ways). Reaching one ends the connection. |
+
+`send` takes `command`: `{"text": <template>, "params": [<template>, ...]}`, a command the
+policy fixes (an SSH command line, an SQL statement with `$1`... for the parameters, an IMAP
+command without its tag, a Redis command name). A `receive` after it captures from what came
+back (`between`, `regex` or `all`). `run`, `await` and HTTP requests are refused.
+
+`return` takes `relay`:
+
+- `commands` (at most 32): the commands the caller may run by `name`, each a `text` the caller
+  cannot change and `params`. A parameter is a `template` of the policy, or the caller's value
+  under a `pattern` (matched whole) and `max_len` (default and at most 64 KiB). A parameter of
+  the caller with no pattern is flagged `param_unpinned`. `columns` (PostgreSQL) keeps only
+  those columns of the rows.
+- `mail` (SMTP only, and the only relay of SMTP): `senders` and `recipients`, 1 to 16 patterns
+  each that the whole envelope addresses must match, `max_recipients` (default and at most 100)
+  and `max_bytes` (default and at most 8 MiB).
+- `frames` and `server` (SSH only, with no commands): an interactive shell on a streaming
+  call, as for a WebSocket. The caller's signed frames go to the shell within their rules;
+  what the shell prints goes back with `server: true`, after the stream search.
+
+The caller sends `{"session": {"destination", "commands": [{"name", "params": [...]}],
+"mail": [{"from", "to": [...], "data": <base64>}]}}`. Every command and message is checked
+against its rule **before** anything is logged or the connection opens: an unknown name, a
+parameter outside its pattern or length, the wrong number of parameters, a sender or
+recipient outside the mail rule, or a message with a CR or LF outside a CRLF (SMTP smuggling)
+fails the call. Each result comes back as `{"name", "status", "data", "stderr"}`; an error
+stops the rest and is returned next to the results that completed.
+
+What each kind does with them:
+
+- **SSH** (own client on ring): key exchange `curve25519-sha256`, `ecdh-sha2-nistp256/384/521`
+  with strict key exchange (Terrapin); ciphers `aes256-gcm`, `aes128-gcm` and
+  `chacha20-poly1305` (only under strict key exchange). SHA-1, CBC, CTR with a MAC, `ssh-rsa`
+  signatures, DSA and the finite-field groups are never offered. A rekey is refused (the
+  connection is short). A command line is the rule's text, then each parameter as one POSIX
+  single-quoted word, so `x; rm -rf /` stays an argument. The result is the output, the error
+  output and the exit status.
+- **PostgreSQL**: TLS, then SCRAM-SHA-256 only. A server that asks for cleartext or MD5, says
+  the sign-in succeeded before SCRAM proved it knows the password, sends a server signature
+  that does not verify, or asks for fewer than 4096 (or more than 1,000,000) iterations is
+  refused. Channel binding is not used: TLS already ties the connection to the destination's
+  certificate. Queries go by the extended protocol with every parameter bound as text, never
+  spliced into the SQL. The result is `{"columns", "rows", "tag"}` (values as text, `null` for
+  NULL), or `{"error": {"code", "message"}}` with status 1.
+- **SMTP** (submission): `EHLO`, then `AUTH` with the named mechanism, then `MAIL FROM`,
+  `RCPT TO` and `DATA`, dot-stuffed. The result is the last reply and its code.
+- **IMAP**: `CAPABILITY`, then `LOGIN` (refused if the server says `LOGINDISABLED`) or
+  `AUTHENTICATE`; commands are tagged, each parameter a quoted string (a CR, LF or NUL is
+  refused). The result is the whole response, literals included, and its completion (0 `OK`,
+  1 `NO`, 2 `BAD`). Reading a code from a message is a fixed `send` (`UID FETCH ...
+  BODY[TEXT]`) and a `receive` that captures it into a temp; it never goes back.
+- **Redis**: `AUTH [user] password`, then each command as an array of bulk strings: the rule's
+  text is literal words, each parameter one argument whatever bytes it holds. The reply comes
+  back as JSON (an error as `{"error": ...}` with status 1).
+
+Every result is redacted and searched for secrets before it goes back, in the form the server
+sent it (a value in a row, a bulk string) and as JSON, and across results. A protocol
+connection takes a slot like a WebSocket (a caller holds at most 4 at once, an owner 16, a
+node 256), and the node logs its `use` and its `closed` entry, with the commands and bytes
+each way.
+
+```json
+{"name": "orders",
+ "steps": [
+   {"do": "open", "connection": "postgres",
+    "destinations": [{"host": "db.example.com", "port": 5432}],
+    "login": {"user": "reporting", "password": "{{db_password}}", "database": "shop"}},
+   {"do": "return", "relay": {"commands": [
+     {"name": "order", "text": "SELECT id, status, total FROM orders WHERE id = $1",
+      "params": [{"pattern": "[0-9]{1,12}"}], "columns": ["id", "status", "total"]}
+   ]}}
+ ]}
+```
+
+```json
+{"name": "notify",
+ "steps": [
+   {"do": "open", "connection": "smtp", "tls": "starttls",
+    "destinations": [{"host": "smtp.example.com", "port": 587}],
+    "login": {"user": "alerts@example.com", "password": "{{smtp_password}}"}},
+   {"do": "return", "relay": {"mail": {"senders": ["alerts@example\\.com"],
+                                       "recipients": ["[a-z0-9.]{1,64}@example\\.com"],
+                                       "max_recipients": 5, "max_bytes": 262144}}}
+ ]}
+```
+
+```json
+{"name": "inbox_code",
+ "steps": [
+   {"do": "open", "connection": "imap",
+    "destinations": [{"host": "imap.example.com", "port": 993}],
+    "login": {"user": "me@example.com", "token": "{{access_token}}", "mechanism": "xoauth2"}},
+   {"do": "send", "command": {"text": "SELECT INBOX"}},
+   {"do": "send", "command": {"text": "UID SEARCH UNSEEN FROM", "params": ["no-reply@example.com"]}},
+   {"do": "receive", "capture": [{"source": {"from": "regex", "pattern": "\\* SEARCH ([0-9]{1,10})"},
+                                  "into": {"kind": "temp", "name": "uid", "secret": false}}]},
+   {"do": "send", "command": {"text": "UID FETCH {{uid}} BODY.PEEK[TEXT]"}},
+   {"do": "receive", "capture": [{"source": {"from": "regex", "pattern": "code: ([0-9]{6})"},
+                                  "into": {"kind": "field", "name": "last_code"}}]},
+   {"do": "return", "relay": {"commands": [{"name": "noop", "text": "NOOP"}]}}
+ ]}
+```
+
+```json
+{"name": "cache",
+ "steps": [
+   {"do": "open", "connection": "redis",
+    "destinations": [{"host": "cache.example.com", "port": 6380}],
+    "login": {"user": "reader", "password": "{{redis_password}}"}},
+   {"do": "return", "relay": {"commands": [
+     {"name": "get", "text": "GET", "params": [{"pattern": "session:[0-9a-f]{32}"}]}
+   ]}}
+ ]}
+```
+
+MySQL (`caching_sha2_password`), MQTT and AMQP are not implemented yet; see the design.
 
 ### `receive` and captures
 
@@ -730,8 +882,9 @@ Masks: `card` (brand and last four, from 12 digits), `email` (first character an
 crate, which checks the policy first) gives the owner, in JSON:
 
 - per secret field: each place it goes (scheme, host, port), in what form (a header, a query
-  parameter, a path parameter, the body, a client identity, a stream send, or the output of a
-  derivation and whether that is one-way);
+  parameter, a path parameter, the body, a client identity, a stream send, the sign-in of a
+  protocol connection and its mechanism, a command on one, or the output of a derivation and
+  whether that is one-way);
 - per operation: the connection and destinations, each request (fixed, or the caller's
   methods, path templates, headers and query allow-list), the injections, the response
   projection or relay patterns, the input schema, and each `run` step (`runs`: the module's
@@ -759,9 +912,13 @@ crate, which checks the policy first) gives the owner, in JSON:
 | `client_certificate` | A client certificate goes to a destination. |
 | `run_unpinned` | A `run` step fetches its module without a `sha256` pin: the site can change the code that reads the secrets. |
 | `frames_unpinned` | A WebSocket relays the caller's frames of a kind with no shape (or a `raw` shape with no pattern). |
-| `server_frames` | A WebSocket hands the server's messages back to the caller. |
+| `server_frames` | A WebSocket hands the server's messages back to the caller, or an SSH shell what it prints. |
+| `password_to_server` | A protocol connection signs in with a mechanism that hands the server the password itself: SSH `password`, `plain`, `login`, Redis `auth` (not `scram-sha-256`, `publickey` or `xoauth2`). |
+| `param_unpinned` | A command parameter of the caller has no pattern (only its length bounds it). |
+| `mail_relay` | The caller sends mail over SMTP as the item's account. |
+| `shell_relay` | The caller types into an SSH shell. |
 | `plain_datagram` | An operation sends UDP datagrams, without TLS: what they carry is readable on the path. |
-| `wider` | Against `previous`: a new destination, method, path, header, query rule, injection, operation, caller or caller key; more of the response; a looser limit; a field made public or not guessable; a payment changed or an approval dropped; a session rule changed; the item unbound or its pins and sign-offs changed. |
+| `wider` | Against `previous`: a new destination, method, path, header, query rule, injection, operation, caller or caller key; more of the response; a looser limit; a new sign-in, host key, TLS mode, command or mail rule; a field made public or not guessable; a payment changed or an approval dropped; a session rule changed; the item unbound or its pins and sign-offs changed. |
 | `new_destination` | Against `previous`: a destination it did not have. |
 
 What changed without widening (an operation or a caller removed) is listed in `changes`.

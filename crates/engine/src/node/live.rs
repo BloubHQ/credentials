@@ -206,6 +206,11 @@ fn release(map: &mut HashMap<String, usize>, key: &str) {
 pub(crate) fn streams(operation: &Operation) -> bool {
     match operation.connection() {
         Some(Connection::Websocket) => true,
+        // An SSH shell: the relay takes the caller's frames.
+        Some(Connection::Ssh) => operation
+            .returns()
+            .and_then(|r| r.relay.as_ref())
+            .is_some_and(|r| !r.frames.is_empty() || r.server),
         Some(Connection::Https) => operation.returns().is_some_and(|r| {
             r.response
                 .as_ref()
@@ -244,19 +249,19 @@ pub(crate) struct Live<'a> {
 }
 
 /// Counts and bounds of one open connection.
-struct Meter {
-    started: Instant,
+pub(super) struct Meter {
+    pub(super) started: Instant,
     last: Instant,
     idle: Duration,
     duration: Duration,
     max_bytes: u64,
     bytes: u64,
-    to_server: (u64, u64),
-    to_caller: (u64, u64),
+    pub(super) to_server: (u64, u64),
+    pub(super) to_caller: (u64, u64),
 }
 
 impl Meter {
-    fn new(limits: Option<&StreamLimits>) -> Self {
+    pub(super) fn new(limits: Option<&StreamLimits>) -> Self {
         let (idle, duration, bytes) = limits.copied().unwrap_or_default().effective();
         let now = Instant::now();
         Self {
@@ -318,14 +323,14 @@ impl Meter {
 }
 
 /// How the relay ended.
-struct End {
-    reason: &'static str,
-    ok: bool,
-    trailers: Vec<(String, Vec<u8>)>,
+pub(super) struct End {
+    pub(super) reason: &'static str,
+    pub(super) ok: bool,
+    pub(super) trailers: Vec<(String, Vec<u8>)>,
 }
 
 impl End {
-    fn of(reason: &'static str, ok: bool) -> Self {
+    pub(super) fn of(reason: &'static str, ok: bool) -> Self {
         Self {
             reason,
             ok,
@@ -334,10 +339,12 @@ impl End {
     }
 }
 
-fn reason_of(error: &Error) -> &'static str {
+pub(super) fn reason_of(error: &Error) -> &'static str {
     match error {
         Error::Reflection => "reflection",
         Error::FrameRefused { .. } => "refused",
+        Error::ServerUntrusted { .. } => "untrusted",
+        Error::AuthRefused { .. } => "auth",
         _ => "error",
     }
 }
@@ -403,12 +410,18 @@ impl<S: LogSink, C: Clock> Node<S, C> {
         match open.connection {
             Connection::Websocket => self.socket(run, open, request, transport, &mut live, updated),
             Connection::Https => self.streamed(run, open, request, transport, &mut live, updated),
-            Connection::Tls | Connection::Udp => Err(operation.unknown()),
+            Connection::Tls
+            | Connection::Udp
+            | Connection::Ssh
+            | Connection::Postgres
+            | Connection::Smtp
+            | Connection::Imap
+            | Connection::Redis => Err(operation.unknown()),
         }
     }
 
     /// Logs how an open connection ended and builds what goes back.
-    fn closed(
+    pub(super) fn closed(
         &self,
         run: &Run<'_>,
         of: u64,
@@ -443,7 +456,7 @@ impl<S: LogSink, C: Clock> Node<S, C> {
         })
     }
 
-    fn scrubber(run: &Run<'_>) -> Result<Scrubber> {
+    pub(super) fn scrubber(run: &Run<'_>) -> Result<Scrubber> {
         Scrubber::new(&Secrets {
             policy: run.policy,
             fields: &run.fields,
@@ -1019,7 +1032,7 @@ fn pong(stream: &mut dyn Stream, payload: &[u8], meter: &mut Meter) -> Result<()
 
 /// The bytes the node sends for a frame of the caller: the first rule of its kind whose shape
 /// it matches, and that rule's template. A frame that matches no rule is refused.
-fn frame_bytes(
+pub(super) fn frame_bytes(
     run: &mut Run<'_>,
     rules: &Rules,
     frame: &CallerFrame,

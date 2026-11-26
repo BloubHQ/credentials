@@ -47,6 +47,32 @@ pub struct CallerExchange {
     pub until: Vec<Vec<u8>>,
 }
 
+/// A command of the caller on a protocol connection: the name of a command rule of the
+/// policy and the caller's parameters, in order.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CallerCommand {
+    /// The rule.
+    pub name: String,
+    /// The caller's parameters, one per caller parameter of the rule.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub params: Vec<String>,
+}
+
+/// A message of the caller over SMTP: the envelope and the message (headers and body, lines
+/// ending in CRLF).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CallerMail {
+    /// The envelope sender.
+    pub from: String,
+    /// The envelope recipients.
+    pub to: Vec<String>,
+    /// The message.
+    #[serde(with = "crate::encoding::b64_vec")]
+    pub data: Vec<u8>,
+}
+
 /// What a call asks for.
 #[derive(Clone, Copy, Debug)]
 pub enum Payload<'a> {
@@ -68,6 +94,16 @@ pub enum Payload<'a> {
     /// A WebSocket operation, with the caller's handshake request when its first send takes
     /// one.
     Socket(Option<&'a Request>),
+    /// A protocol connection (SSH, a database, mail, a queue): the destination, the caller's
+    /// commands and messages.
+    Session {
+        /// Where.
+        destination: &'a Destination,
+        /// The commands.
+        commands: &'a [CallerCommand],
+        /// The messages (SMTP).
+        mail: &'a [CallerMail],
+    },
 }
 
 fn part(hasher: &mut Sha256, bytes: &[u8]) {
@@ -122,6 +158,32 @@ impl Payload<'_> {
             Payload::Derive(input) => {
                 part(&mut h, b"derive");
                 part(&mut h, input);
+            }
+            Payload::Session {
+                destination,
+                commands,
+                mail,
+            } => {
+                part(&mut h, b"session");
+                part(&mut h, destination.host.as_bytes());
+                part(&mut h, &destination.port.to_be_bytes());
+                part(&mut h, &(commands.len() as u64).to_be_bytes());
+                for c in *commands {
+                    part(&mut h, c.name.as_bytes());
+                    part(&mut h, &(c.params.len() as u64).to_be_bytes());
+                    for p in &c.params {
+                        part(&mut h, p.as_bytes());
+                    }
+                }
+                part(&mut h, &(mail.len() as u64).to_be_bytes());
+                for m in *mail {
+                    part(&mut h, m.from.as_bytes());
+                    part(&mut h, &(m.to.len() as u64).to_be_bytes());
+                    for t in &m.to {
+                        part(&mut h, t.as_bytes());
+                    }
+                    part(&mut h, &m.data);
+                }
             }
             Payload::Describe => part(&mut h, b"describe"),
             Payload::Resume(id) => {

@@ -21,6 +21,7 @@ transport = { path = "../transport" }
 relay = { path = "../relay" }
 libfuzzer-sys = "0.4"
 serde_json = "1"
+zeroize = "1"
 
 [[bin]]
 name = "template_parse"
@@ -165,6 +166,13 @@ bench = false
 [[bin]]
 name = "stream_scrubber"
 path = "fuzz_targets/stream_scrubber.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "protocol_servers"
+path = "fuzz_targets/protocol_servers.rs"
 test = false
 doc = false
 bench = false

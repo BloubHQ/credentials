@@ -106,6 +106,11 @@ fn the_policy_reference_parses() {
                     "user",
                     "password",
                     "secret",
+                    "ssh_key",
+                    "db_password",
+                    "smtp_password",
+                    "redis_password",
+                    "last_code",
                 ];
                 let policy = Policy {
                     item: None,

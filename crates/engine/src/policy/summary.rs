@@ -53,6 +53,18 @@ pub enum Form {
     Identity,
     /// Bytes written on a TLS stream.
     StreamSend,
+    /// The sign-in of a protocol connection (SSH, PostgreSQL, SMTP, IMAP, Redis).
+    Login {
+        /// The mechanism. `password` (SSH), `plain`, `login` and `auth` hand the server the
+        /// secret itself; `scram-sha-256`, `publickey` and `xoauth2` (a token) do not hand it
+        /// a password.
+        mechanism: String,
+    },
+    /// A command or query the node writes on a protocol connection.
+    Command {
+        /// The command rule, or `step` for a fixed command.
+        name: String,
+    },
     /// An input of code run in the sandbox (a `run` step); the code's output goes only to
     /// the module's origin.
     ModuleInput {
@@ -270,6 +282,15 @@ pub enum FlagCode {
     FramesUnpinned,
     /// A WebSocket hands the server's messages back to the caller.
     ServerFrames,
+    /// A protocol connection signs in with a mechanism that hands the server the password
+    /// itself (SSH `password`, `PLAIN`, `LOGIN`, Redis `AUTH`).
+    PasswordToServer,
+    /// A command parameter of the caller takes any value up to its length (no pattern).
+    ParamUnpinned,
+    /// The caller sends messages over SMTP as the item's account.
+    MailRelay,
+    /// The caller types into an SSH shell.
+    ShellRelay,
     /// An operation sends UDP datagrams, without TLS: what they carry is readable on the
     /// path (and by the host of an enclave).
     PlainDatagram,
@@ -311,13 +332,7 @@ pub struct Summary {
 
 fn place(connection: Connection, d: &Destination) -> Place {
     Place {
-        scheme: match connection {
-            Connection::Https => "https",
-            Connection::Tls => "tls",
-            Connection::Websocket => "wss",
-            Connection::Udp => "udp",
-        }
-        .into(),
+        scheme: connection.scheme().into(),
         host: d.host.clone(),
         port: d.port,
     }
@@ -328,8 +343,61 @@ fn connection_name(connection: Option<Connection>) -> &'static str {
         Some(Connection::Https) => "https",
         Some(Connection::Tls) => "tls",
         Some(Connection::Websocket) => "websocket",
-        Some(Connection::Udp) => "udp",
+        Some(c) => c.scheme(),
         None => "none",
+    }
+}
+
+/// The flags of the relay of a protocol operation.
+fn protocol_flags(flags: &mut Vec<Flag>, at: &str, relay: &super::Relay) {
+    if !relay.frames.is_empty() || relay.server {
+        flag(
+            flags,
+            FlagCode::ShellRelay,
+            at,
+            "the caller types into an SSH shell under the policy's login",
+        );
+        if relay.server {
+            flag(
+                flags,
+                FlagCode::ServerFrames,
+                at,
+                "what the shell prints goes back to the caller (after the stream search)",
+            );
+        }
+        for (i, rule) in relay.frames.iter().enumerate() {
+            if rule.unpinned() {
+                flag(
+                    flags,
+                    FlagCode::FramesUnpinned,
+                    format!("{at}.frames[{i}]"),
+                    "the caller's shell input of this kind has no pinned shape",
+                );
+            }
+        }
+    }
+    for rule in &relay.commands {
+        for (i, p) in rule.params.iter().enumerate() {
+            if p.unpinned() {
+                flag(
+                    flags,
+                    FlagCode::ParamUnpinned,
+                    format!("{at}.commands.{}.params[{i}]", rule.name),
+                    "the caller's value for this parameter has no pattern",
+                );
+            }
+        }
+    }
+    if let Some(mail) = &relay.mail {
+        flag(
+            flags,
+            FlagCode::MailRelay,
+            at,
+            format!(
+                "the caller sends mail as the account, from {:?} to {:?}",
+                mail.senders, mail.recipients
+            ),
+        );
     }
 }
 
@@ -610,6 +678,17 @@ fn uses_in(operation: &Operation) -> Vec<(String, SecretUse)> {
                     add(i, &identity.cert, Form::Identity, &places);
                     add(i, &identity.key, Form::Identity, &places);
                 }
+                if let Some(login) = &open.login {
+                    let mechanism = login
+                        .mechanism_for(open.connection)
+                        .map_or("none", |m| m.as_str());
+                    for template in login.templates() {
+                        let form = Form::Login {
+                            mechanism: mechanism.to_string(),
+                        };
+                        add(i, template, form, &places);
+                    }
+                }
             }
             Step::Send(_) | Step::Await(_) => {
                 let send = match step {
@@ -644,11 +723,29 @@ fn uses_in(operation: &Operation) -> Vec<(String, SecretUse)> {
                 if let Some(template) = &send.template {
                     add(i, template, Form::StreamSend, &to);
                 }
+                if let Some(command) = &send.command {
+                    let form = Form::Command {
+                        name: "step".into(),
+                    };
+                    add(i, &command.text, form.clone(), &to);
+                    for p in &command.params {
+                        add(i, p, form.clone(), &to);
+                    }
+                }
             }
             Step::Return(ret) => {
                 if let Some(template) = &ret.template {
                     let one_way = !reads.reversible_in(template);
                     add(i, template, Form::Output { one_way }, &[]);
+                }
+                for rule in ret.relay.iter().flat_map(|r| &r.commands) {
+                    let form = Form::Command {
+                        name: rule.name.clone(),
+                    };
+                    add(i, &rule.text, form.clone(), &places);
+                    for t in rule.params.iter().filter_map(|p| p.template.as_deref()) {
+                        add(i, t, form.clone(), &places);
+                    }
                 }
             }
             Step::Run(run) => {
@@ -763,6 +860,29 @@ fn risk_flags(policy: &Policy, origin: Option<&Origin>, flags: &mut Vec<Flag>) {
                     "a client certificate is presented",
                 );
             }
+            if let Some(m) = open
+                .login
+                .as_ref()
+                .and_then(|l| l.mechanism_for(open.connection))
+                && matches!(
+                    m,
+                    super::Mechanism::Password
+                        | super::Mechanism::Plain
+                        | super::Mechanism::Login
+                        | super::Mechanism::Auth
+                )
+            {
+                flag(
+                    flags,
+                    FlagCode::PasswordToServer,
+                    &at,
+                    format!(
+                        "the {} sign-in ({}) hands the server the password itself",
+                        open.connection.scheme(),
+                        m.as_str()
+                    ),
+                );
+            }
         }
         if let Some(Input::Raw(raw)) = &operation.input
             && raw.max_len.is_none()
@@ -820,7 +940,11 @@ fn risk_flags(policy: &Policy, origin: Option<&Origin>, flags: &mut Vec<Flag>) {
                     );
                 }
             }
-            if let Some(relay) = &ret.relay {
+            if let Some(relay) = &ret.relay
+                && operation.connection().is_some_and(Connection::is_protocol)
+            {
+                protocol_flags(flags, &at, relay);
+            } else if let Some(relay) = &ret.relay {
                 if relay.frames.is_empty() {
                     flag(
                         flags,
@@ -953,6 +1077,20 @@ fn diff_operation(
         {
             wider.push(format!("operation {name}: the client certificate changed"));
         }
+        let prev_login = prev_open.and_then(|o| o.login.as_ref());
+        if open.login.is_some() && prev_login != open.login.as_ref() {
+            wider.push(format!("operation {name}: the sign-in changed"));
+        }
+        let prev_keys: &[String] = prev_open.map(|o| o.host_keys.as_slice()).unwrap_or(&[]);
+        for k in open.host_keys.iter().filter(|k| !prev_keys.contains(k)) {
+            let kind = k.split(' ').next().unwrap_or_default();
+            wider.push(format!(
+                "operation {name}: a new {kind} host key is trusted"
+            ));
+        }
+        if prev_open.and_then(|o| o.tls) != open.tls {
+            wider.push(format!("operation {name}: how TLS starts changed"));
+        }
     }
     if prev.input != cur.input {
         wider.push(format!("operation {name}: the input schema changed"));
@@ -1022,6 +1160,9 @@ fn diff_send(at: &str, a: &Send, b: &Send, wider: &mut Vec<String>) {
     }
     if a.template != b.template {
         wider.push(format!("{at}: the bytes written changed"));
+    }
+    if a.command != b.command {
+        wider.push(format!("{at}: the command changed"));
     }
     match (&a.request, &b.request) {
         (Some(StepRequest::Caller(x)), Some(StepRequest::Caller(y))) => {
@@ -1102,6 +1243,20 @@ fn diff_return(at: &str, a: &Return, b: &Return, wider: &mut Vec<String>) {
         if !before.contains(rule) {
             wider.push(format!("{at}: the frame rule {i} is new or changed"));
         }
+    }
+    let commands = |r: &Return| {
+        r.relay
+            .as_ref()
+            .map(|r| r.commands.clone())
+            .unwrap_or_default()
+    };
+    let before = commands(a);
+    for rule in commands(b).iter().filter(|c| !before.contains(c)) {
+        wider.push(format!("{at}: the command {} is new or changed", rule.name));
+    }
+    let mail = |r: &Return| r.relay.as_ref().and_then(|r| r.mail.clone());
+    if mail(b).is_some() && mail(a) != mail(b) {
+        wider.push(format!("{at}: the mail rule is new or changed"));
     }
     let server = |r: &Return| r.relay.as_ref().is_some_and(|r| r.server);
     if server(b) && !server(a) {

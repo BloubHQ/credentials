@@ -191,6 +191,29 @@ pub trait Transport {
         Err(Error::transport(TransportKind::Unsupported, false))
     }
 
+    /// Opens a TCP connection with no TLS, for a protocol that encrypts itself (SSH): the
+    /// engine writes nothing secret on it before its own key exchange has authenticated the
+    /// server. The default refuses.
+    fn open_plain(&mut self, destination: &Destination) -> Result<Box<dyn Stream + '_>> {
+        let _ = destination;
+        Err(Error::transport(TransportKind::Unsupported, false))
+    }
+
+    /// Opens a TCP connection, runs `prelude` on it in the clear (the `STARTTLS` exchange of
+    /// a protocol, written by the engine, which carries nothing secret), then makes TLS to
+    /// `destination` on the same connection and returns it. Bytes the server sent in the clear
+    /// that the prelude did not read fail the call: they could be read as if they came over
+    /// TLS. The default refuses.
+    fn open_starttls(
+        &mut self,
+        destination: &Destination,
+        identity: Option<&ClientIdentity>,
+        prelude: &mut dyn FnMut(&mut dyn Stream) -> Result<()>,
+    ) -> Result<Box<dyn Stream + '_>> {
+        let _ = (destination, identity, prelude);
+        Err(Error::transport(TransportKind::Unsupported, false))
+    }
+
     /// Opens an exchange of UDP datagrams with `destination` (a `udp` operation): each
     /// [`Stream::write`] sends one datagram, each [`Stream::read_until`] with no delimiter
     /// reads one, from that destination only. The default refuses.
@@ -198,6 +221,34 @@ pub trait Transport {
         let _ = destination;
         Err(Error::transport(TransportKind::Unsupported, false))
     }
+}
+
+/// How a protocol connection is opened.
+pub(crate) enum Opening<'p> {
+    /// TLS from the first byte.
+    Tls,
+    /// TCP; the protocol encrypts itself.
+    Plain,
+    /// A plain prelude, then TLS.
+    Starttls(&'p mut dyn FnMut(&mut dyn Stream) -> Result<()>),
+}
+
+/// Opens the connection of a protocol operation. Consumes the confirmation: one entry, one
+/// connection.
+pub(crate) fn open_protocol<'t, T: Transport>(
+    confirmed: Confirmed,
+    transport: &'t mut T,
+    destination: &Destination,
+    identity: Option<&ClientIdentity>,
+    opening: Opening<'_>,
+) -> Result<(u64, Box<dyn Stream + 't>)> {
+    let seq = confirmed.seq();
+    let stream = match opening {
+        Opening::Tls => transport.open(destination, identity)?,
+        Opening::Plain => transport.open_plain(destination)?,
+        Opening::Starttls(prelude) => transport.open_starttls(destination, identity, prelude)?,
+    };
+    Ok((seq, stream))
 }
 
 /// Hands the bytes to the transport. Consumes the confirmation: one entry, one request.

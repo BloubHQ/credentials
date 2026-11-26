@@ -671,6 +671,7 @@ dependencies = [
  "sandbox",
  "serde_json",
  "transport",
+ "zeroize",
 ]
 
 [[package]]

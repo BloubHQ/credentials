@@ -342,6 +342,62 @@ RustCrypto generation (`p256` 0.13, `aes-gcm` 0.10, `sha2` 0.10, `hmac` 0.12) ne
 `credentials.exe` was not measured. The HTTP/3, WireGuard, IPsec and SIP rows above stay
 protocol modules of later parts.
 
+## 7c. Protocol connections (part 6, second half)
+
+Done: `ssh`, `postgres`, `smtp`, `imap` and `redis` as connection kinds (`docs/policy.md`,
+Protocol connections), each a protocol family in `engine::proto`, never a site's. Choices the
+design left open, and the more secure option taken:
+
+- **SSH is own code on ring, chosen by measurement.** A minimal client binary with russh 0.54
+  (ring backend; its default aws-lc backend does not build without NASM) was 1,777,664 bytes
+  with 172 crates, needed tokio and an older RustCrypto generation (sha2 0.10, p256 0.13,
+  ed25519-dalek 2, rsa 0.9) next to the engine's, and carries `sha1` and `cbc`. ssh-rs 0.5.0
+  was 1,173,504 bytes with 93 crates and synchronous, but has no AES-GCM and no
+  keyboard-interactive, and offers `ssh-rsa`, `diffie-hellman-group1/14-sha1`, CBC and
+  `hmac-sha1`. The engine's client (`proto/ssh.rs`, 1,679 lines) uses ring for curve25519,
+  ECDH P-256/P-384, AES-GCM, ChaCha20-Poly1305 (`chacha20_poly1305_openssh`), Ed25519, ECDSA
+  and RSA, and the `p521` crate already in the tree for P-521; it adds no crate. All five
+  clients together add 460,800 bytes to the release `credentials.exe` on Windows
+  (11,116,032 before, 11,576,832 after).
+- **Algorithms:** key exchange `curve25519-sha256`, `ecdh-sha2-nistp256/384/521` and strict
+  KEX (Terrapin); ciphers `aes256-gcm`, `aes128-gcm`, and `chacha20-poly1305` only under
+  strict KEX; host keys only of the pinned types, RSA only as `rsa-sha2-256/512`. SHA-1, CBC,
+  CTR with a MAC, DSA and finite-field groups are never offered. A rekey is refused: the node's
+  connections are short and bounded by their limits.
+- **SSH host keys are pinned in the signed policy** and checked before any credential is
+  sent; there is no trust on first use.
+- **PostgreSQL takes SCRAM-SHA-256 only** (no MD5 or cleartext even over TLS) with 4096 to
+  1,000,000 iterations, and verifies the server signature before it accepts
+  `AuthenticationOk`. Channel binding (`SCRAM-SHA-256-PLUS`) is not used: TLS already verifies
+  the certificate of the destination's host, which is what binding adds against a relay. No
+  SASLprep: the password is used as its bytes (equal for ASCII passwords).
+- **SMTP and IMAP use the mechanism the policy names or none.** The policy, not the server,
+  picks; a server that does not offer it is refused before any credential is sent.
+- **STARTTLS before anything else**, and bytes the server sent after its go-ahead fail the
+  call (the CVE-2011-0411 class).
+- **Parameters are never spliced into a command**: bound (PostgreSQL), one bulk string
+  (Redis), one POSIX single-quoted word (SSH), a quoted string with CR, LF and NUL refused
+  (IMAP). Mail with a bare CR or LF is refused (SMTP smuggling), and data is dot-stuffed.
+- **Results are searched twice**: as the server sent the values (raw cells, bulk strings) and
+  as the JSON that goes back, then across results.
+- **A protocol connection counts as an open connection** (caller 4, owner 16, node 256) and
+  logs a `use` and a `closed` entry. The transport's total deadline (120 s by default) also
+  bounds it, as it bounds a WebSocket.
+- **Reading a code from a mail item** (section 5, Challenges): an IMAP operation reads the
+  message with a fixed command and captures the code into a temp or field; it never goes back.
+
+Measured on this host (Windows, release, `cargo test --workspace`): tests 397
+before, 470 after; the protocol tests run against servers in the test process (an
+SSH server on RustCrypto AES-GCM, ed25519-dalek and p256, a SCRAM server on the RustCrypto
+`pbkdf2` and `hmac`), with no network.
+
+Left for later (part 6 is not finished until these are done): MySQL (`caching_sha2_password` over TLS), MQTT 3.1.1
+and 5, AMQP 0-9-1 PLAIN over TLS, FTP, tunnels; SSH agent forwarding, port forwarding and
+SFTP; the `ssh` and `mail` typed kinds (typed items still allow no protocol connection). Not
+exercised by a test: SSH key exchange on P-384 and P-521, RSA host keys, ECDSA client keys,
+OpenSSH-format client keys; the transport's `open_plain` and `open_starttls` over a real
+socket; the fuzz target was checked to build, not run (it needs nightly and libFuzzer).
+
 ## 8. Transport and engine gaps
 
 | Gap | Change |
@@ -538,7 +594,7 @@ As built (part 10):
 | 3 | Typed items, disclosure levels, `describe`, custom kinds (done: `docs/policy.md`, Typed items) | 2 |
 | 4 | Policy JSON Schema, `client::summarize` with risk flags, approval format (done: `docs/policy.md`; the approval runtime is part 5) | 2, 3 |
 | 5 | Sessions, challenges, approvals, spending limits (done: `docs/policy.md`, Operations that wait; codes read from a `mail` item, `await` on TLS and amounts from body contracts are next) | 2 |
-| 6 | Connection kinds in layer 1: HTTP/2, WebSocket, streamed responses (first half done: `docs/policy.md`, HTTP versions and gRPC, WebSocket; own synchronous HTTP/2 client and HPACK, one thread per open connection, the Nitro host relay unchanged), then SSH, databases, FTP, mail, queues; tunnels as an IR relay step (next) | 2 |
+| 6 | Connection kinds in layer 1: HTTP/2, WebSocket, streamed responses (first half done: `docs/policy.md`, HTTP versions and gRPC, WebSocket; own synchronous HTTP/2 client and HPACK, one thread per open connection, the Nitro host relay unchanged), then SSH, databases, FTP, mail, queues (second half started: SSH, PostgreSQL, SMTP, IMAP and Redis done, section 7c; MySQL, MQTT, AMQP, FTP and tunnels as an IR relay step next) | 2 |
 | 7 | Trusted code sandbox (layer 3): WebAssembly runtime, JavaScript module, origin-pinned site code (done: `run` step, `crates/sandbox`, wasmi 1.1.0 chosen by measurement; JavaScript measured with boa in the sandbox, its shipping plan in `docs/sandbox.md`) | 2 |
 | 8 | Browser fills over CDP | 4, 5 |
 | 9 | Remaining primitive families (Appendices A, B), UDP relay and its protocols (done: HPKE, TurboSHAKE, KangarooTwelve, ML-DSA, SM2, brainpool ECDSA, `tls_exporter` in TLS sends, the `udp` connection and the datagram relay; `docs/policy.md` and section 7b; the rows still open and why are listed under Appendix A, Part 9) | 1 |

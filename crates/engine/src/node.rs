@@ -48,6 +48,7 @@ use crate::{Error, Result};
 mod handover;
 mod live;
 mod park;
+mod proto;
 mod waits;
 
 pub use handover::{HandOver, MAX_PACKAGE, Successor, TakenOver};
@@ -56,6 +57,7 @@ pub use live::{
     Part, Relay,
 };
 pub use park::{MAX_PARKED, MAX_PARKED_BYTES, MAX_PARKED_PER_OWNER};
+pub use proto::{CommandResult, MAX_COMMANDS_PER_CALL, MAX_MAIL_PER_CALL, SessionOutput};
 
 pub use crate::caller::{CallerExchange, DESCRIBE};
 pub use crate::response::Response;
@@ -475,7 +477,10 @@ impl<S: LogSink, C: Clock> Node<S, C> {
         let (record, operation, auth) = (&call.record, call.operation.as_str(), &call.auth);
         let mut updated = None;
         match &call.body {
-            Body::Http { .. } | Body::Stream { .. } | Body::Resume { .. } => {
+            Body::Http { .. }
+            | Body::Stream { .. }
+            | Body::Resume { .. }
+            | Body::Session { .. } => {
                 let result = self.execute(
                     record,
                     operation,
@@ -537,7 +542,7 @@ impl<S: LogSink, C: Clock> Node<S, C> {
         let (record, operation, auth) = (&call.record, call.operation.as_str(), &call.auth);
         let mut updated = None;
         let result = match &call.body {
-            Body::Http { .. } | Body::Socket { .. } => self.execute(
+            Body::Http { .. } | Body::Socket { .. } | Body::Session { .. } => self.execute(
                 record,
                 operation,
                 auth,
@@ -994,6 +999,16 @@ impl<S: LogSink, C: Clock> Node<S, C> {
                             Payload::Stream { .. }
                         )
                         | (Some(Connection::Websocket), Payload::Socket(_))
+                        | (
+                            Some(
+                                Connection::Ssh
+                                    | Connection::Postgres
+                                    | Connection::Smtp
+                                    | Connection::Imap
+                                    | Connection::Redis
+                            ),
+                            Payload::Session { .. }
+                        )
                         | (None, Payload::Derive(_))
                         | (_, Payload::Resume(_))
                 );
@@ -1255,6 +1270,15 @@ impl<S: LogSink, C: Clock> Node<S, C> {
                     rule: "a WebSocket operation runs on a streaming call",
                 });
             }
+            (None, true) if operation.connection() == Some(Connection::Ssh) => {
+                return Err(Error::RequestInvalid {
+                    rule: "an SSH shell runs on a streaming call",
+                });
+            }
+            // A protocol connection is open for the whole call: it takes a slot too.
+            (None, _) if operation.connection().is_some_and(Connection::is_protocol) => {
+                Some(self.live.take(&record.owner, &auth.caller, policy)?)
+            }
             (None, _) => None,
         };
         match payload {
@@ -1279,6 +1303,11 @@ impl<S: LogSink, C: Clock> Node<S, C> {
                 destination,
                 exchanges,
             } => check_exchanges(operation, destination, exchanges)?,
+            Payload::Session {
+                destination,
+                commands,
+                mail,
+            } => proto::check_session(operation, destination, commands, mail)?,
             Payload::Derive(given) => {
                 input = match &operation.input {
                     Some(schema) => schema.apply(given, now)?,
@@ -1329,6 +1358,11 @@ impl<S: LogSink, C: Clock> Node<S, C> {
                 self.run_live(&mut run, request, transport, live, updated)
                     .map(Output::Closed)
             }
+            (Some(relay), Payload::Session { destination, .. }) => {
+                let live = live::Live { auth, relay };
+                self.run_shell(&mut run, &payload, destination, transport, live, updated)
+                    .map(Output::Closed)
+            }
             _ => self.proceed(&mut run, payload, &input, transport, updated),
         }
     }
@@ -1365,6 +1399,21 @@ impl<S: LogSink, C: Clock> Node<S, C> {
                     .park_challenge(run, at, payload, input, updated)
                     .map(Output::Pending),
             },
+            Payload::Session {
+                destination,
+                commands,
+                mail,
+            } => self
+                .run_session(
+                    run,
+                    &payload,
+                    destination,
+                    commands,
+                    mail,
+                    transport,
+                    updated,
+                )
+                .map(Output::Session),
             Payload::Describe | Payload::Resume(_) | Payload::Socket(_) => {
                 Err(run.operation.unknown())
             }

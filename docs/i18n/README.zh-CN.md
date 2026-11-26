@@ -170,14 +170,15 @@ let outcome = node.run(&call, &mut TlsTransport::new());
 }
 ```
 
-一个操作是一条连接上的**步骤**列表：`open`（HTTPS、TLS 流、WebSocket、UDP 数据报，或无连接）、`send`、`receive`（含捕获）、
+一个操作是一条连接上的**步骤**列表：`open`（HTTPS、TLS 流、WebSocket、协议连接、UDP 数据报，或无连接）、`send`、`receive`（含捕获）、
 `compute`（把模板的结果放入后续步骤可读的名字），以及决定返回给调用方什么的 `return`。
 
 | 连接 | 作用 |
 | --- | --- |
 | `https` | 1 到 8 个请求。每个 `send` 发送在**契约**（方法、路径模板、请求头、查询参数及其取值）之内的调用方请求，或策略固定的请求，并注入值；`receive` 从其响应中捕获值，放入字段（产生新的记录代数）或临时值。`return` 只返回状态码以及列出的请求头和 JSON 成员（全部返回用 `"body": "all"`）。HTTP/2 由 ALPN 选择（用 `protocol` 固定时绝不降级），支持一元 gRPC，以及按到达顺序转交的响应体（`"body": "stream"`：server-sent events、chunked），并跨分块搜索秘密。 |
 | `websocket` | 一个握手请求、策略写入的消息（首条消息认证），然后是调用方签名的帧；每帧都按封闭的 JSON 模式或正则模式检查。服务器的消息只在 `return` 允许时、经过秘密搜索后返回。有空闲时间、持续时间和字节数上限；打开时和关闭时各记一条日志。 |
-| `tls` | 在一条 TLS 连接上运行 send/receive 脚本（IMAP、SMTP、行协议）；之后只进行其 send 与 `return` 所转发模式相匹配的调用方交互。 |
+| `tls` | 在一条 TLS 连接上运行 send/receive 脚本（行协议）；之后只进行其 send 与 `return` 所转发模式相匹配的调用方交互。 |
+| `ssh`、`postgres`、`smtp`、`imap`、`redis` | 节点用条目的秘密登录（SSH 针对固定的主机密钥使用密码、密钥或 keyboard-interactive；PostgreSQL 在 TLS 上使用 SCRAM-SHA-256；SMTP 和 IMAP 在隐式 TLS 或 STARTTLS 上使用策略指定的机制；Redis 在 TLS 上使用 `AUTH`），运行策略固定的命令，然后运行调用方按名称指定的命令：参数必须匹配其模式，只以绑定、引用或单个参数的形式传入，绝不拼接进命令文本；SMTP 在发件人和收件人规则内发送调用方的邮件。结果经过秘密搜索；SSH shell 在 `/stream` 上运行。只用现代算法，不降级。 |
 | `udp` | 与策略固定的目的地之间，每个 `send` 发送一个数据报、每个 `receive` 读取一个数据报（RADIUS、带 TSIG 的 DNS、STUN），未收到应答时重发；之后只转发与 `return` 所列模式相匹配的调用方数据报。没有 TLS，因此秘密只能经由单向函数（HMAC、签名）进入数据报，其他情况在签名时即被拒绝。 |
 | 无 | `return` 渲染模板并返回给调用方：签名、HMAC、TOTP 码、JWT。调用方的 `$input` 先按操作的 `input` 模式检查（原始字节、JSON 或 RLP：固定成员、允许的值、数值范围、由节点写入的时间）。 |
 
@@ -512,9 +513,9 @@ credentials verify old.jsonl <旧节点密钥> --next new.jsonl --head new.jsonl
   调用方无法决定。
 - **首次使用即信任**：某个所有者在节点上的第一次授权决定了其设备。丢失所有设备的所有者
   需要使用新的所有者名称重新开始。
-- **打开的连接**（WebSocket、流式响应）在达到上限（最长 1 小时）时结束，每条占用一个线程。SSH 和
-  数据库线协议只能在 send/expect 脚本所能达到的范围内工作；gRPC 只支持一元调用（不支持客户端、
-  服务器或双向流）。
+- **打开的连接**（WebSocket、流式响应、协议连接）在达到上限（最长 1 小时）时结束，每条占用一个线程。
+  SSH、PostgreSQL、SMTP、IMAP 和 Redis 有自己的客户端；MySQL、MQTT 和 AMQP 只能在 TLS send/expect
+  脚本所能达到的范围内工作。gRPC 只支持一元调用（不支持客户端、服务器或双向流）。
 - **UDP 数据报不加密。** `udp` 操作收发的内容在路径上以及 enclave 的宿主机上都可读；策略只允许
   秘密经由单向函数进入其中。不提供 DTLS。
 - **浏览器登录和硬件密钥**需要人或设备参与，无法委托。一次性验证码和在其他应用中的批准来自所有者

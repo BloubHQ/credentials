@@ -311,13 +311,19 @@ impl TlsTransport {
         alpn: &[&[u8]],
         deadline: Instant,
     ) -> Result<Tls> {
-        let name = ServerName::try_from(destination.host.clone())
+        // The name is checked before anything is opened.
+        ServerName::try_from(destination.host.clone())
             .map_err(|_| fault(TransportKind::Connect, false))?;
+        let tcp = self.tcp(destination, deadline)?;
+        self.handshake(tcp, destination, identity, alpn, deadline)
+    }
+
+    /// Opens the byte stream to `destination`.
+    fn tcp(&self, destination: &Destination, deadline: Instant) -> Result<Box<dyn Socket>> {
         if deadline.saturating_duration_since(Instant::now()).is_zero() {
             return Err(fault(TransportKind::Timeout, false));
         }
-        let mut tcp = self
-            .connector
+        self.connector
             .connect(
                 &destination.host,
                 destination.port,
@@ -330,7 +336,20 @@ impl TlsTransport {
                 } else {
                     fault(TransportKind::Connect, false)
                 }
-            })?;
+            })
+    }
+
+    /// Makes TLS to `destination` over `tcp`.
+    fn handshake(
+        &self,
+        mut tcp: Box<dyn Socket>,
+        destination: &Destination,
+        identity: Option<&ClientIdentity>,
+        alpn: &[&[u8]],
+        deadline: Instant,
+    ) -> Result<Tls> {
+        let name = ServerName::try_from(destination.host.clone())
+            .map_err(|_| fault(TransportKind::Connect, false))?;
         let config = self.config(identity, alpn)?;
         let mut tls =
             ClientConnection::new(config, name).map_err(|_| fault(TransportKind::Tls, false))?;
@@ -503,6 +522,40 @@ impl Transport for TlsTransport {
         }))
     }
 
+    fn open_plain(&mut self, destination: &Destination) -> Result<Box<dyn Stream + '_>> {
+        let deadline = Instant::now() + self.total_timeout;
+        Ok(Box::new(PlainStream {
+            sock: self.tcp(destination, deadline)?,
+            io_timeout: self.io_timeout,
+            deadline,
+        }))
+    }
+
+    fn open_starttls(
+        &mut self,
+        destination: &Destination,
+        identity: Option<&ClientIdentity>,
+        prelude: &mut dyn FnMut(&mut dyn Stream) -> Result<()>,
+    ) -> Result<Box<dyn Stream + '_>> {
+        let deadline = Instant::now() + self.total_timeout;
+        let mut plain = PlainStream {
+            sock: self.tcp(destination, deadline)?,
+            io_timeout: self.io_timeout,
+            deadline,
+        };
+        prelude(&mut plain)?;
+        // The prelude reads with `read_some`, which hands over every byte it takes from the
+        // socket; whatever the server sent after its go-ahead is still in the socket and goes
+        // into the handshake, where it fails as a TLS record would.
+        let stream = self.handshake(plain.sock, destination, identity, &[], deadline)?;
+        Ok(Box::new(TlsStream {
+            inner: stream,
+            pending: Vec::new(),
+            io_timeout: self.io_timeout,
+            deadline,
+        }))
+    }
+
     fn open_datagrams(&mut self, destination: &Destination) -> Result<Box<dyn Stream + '_>> {
         let deadline = Instant::now() + self.total_timeout;
         let socket = self
@@ -514,6 +567,58 @@ impl Transport for TlsTransport {
             self.io_timeout.min(udp::READ_WAIT),
             deadline,
         )))
+    }
+}
+
+/// A TCP connection with no TLS: an SSH connection (which encrypts itself), or the plain
+/// prelude of a `STARTTLS` connection. It keeps no buffer: what it reads goes straight to the
+/// engine.
+struct PlainStream {
+    sock: Box<dyn Socket>,
+    io_timeout: Duration,
+    deadline: Instant,
+}
+
+impl Stream for PlainStream {
+    fn write(&mut self, bytes: &[u8]) -> Result<()> {
+        set_timeouts(self.sock.as_ref(), self.io_timeout, self.deadline, true)?;
+        self.sock
+            .write_all(bytes)
+            .and_then(|()| self.sock.flush())
+            .map_err(|e| fault(io_kind(&e), true))
+    }
+
+    fn read_until(&mut self, _: &[&[u8]], _: usize) -> Result<Vec<u8>> {
+        // Protocol clients read with `read_some` and frame the bytes themselves.
+        Err(fault(TransportKind::Unsupported, true))
+    }
+
+    fn read_some(&mut self, max: usize, wait: Duration) -> Result<Arrived> {
+        let left = self.deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(fault(TransportKind::Timeout, true));
+        }
+        let wait = wait
+            .min(self.io_timeout)
+            .min(left)
+            .max(Duration::from_millis(1));
+        self.sock
+            .set_timeouts(Some(wait))
+            .map_err(|_| fault(TransportKind::Io, true))?;
+        let mut chunk = Zeroizing::new(vec![0u8; max.clamp(1, CHUNK)]);
+        match self.sock.read(chunk.as_mut_slice()) {
+            Ok(0) => Ok(Arrived::End),
+            Ok(n) => Ok(Arrived::Bytes(chunk.get(..n).unwrap_or_default().to_vec())),
+            Err(e) => match io_kind(&e) {
+                TransportKind::Timeout => Ok(Arrived::Nothing),
+                kind => Err(fault(kind, true)),
+            },
+        }
+    }
+
+    fn close(&mut self) -> Result<()> {
+        let _ = self.sock.shutdown();
+        Ok(())
     }
 }
 
