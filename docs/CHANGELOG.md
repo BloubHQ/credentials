@@ -7,6 +7,14 @@ before 1.0, minor versions may break formats and APIs.
 
 ### Changed
 
+- Every browser fill now ends by clearing the page's history and checking it holds one
+  entry (a browser that keeps it refuses the fill after the values went in), so the
+  back/forward cache cannot bring a filled document back; a fill is refused when any target
+  of the browser (a worker, another page) has a client attached, and the node lists the
+  targets again before each value and the submit; a fill that stops after a value went in
+  blanks what it filled. The approval of a browser operation shows the page's origin, and a
+  payment by one counts at the page, not at the CDP endpoint.
+
 - The request variables of an HTTPS injection read the request **as it is sent**, not the
   caller's request before injection (`docs/policy.md`, Injection order; `engine::request`
   `order`): `$path`, `$pathname`, `$query`, `$target_uri` and `$query_param` with the path
@@ -58,6 +66,30 @@ before 1.0, minor versions may break formats and APIs.
 
 ### Added
 
+- Typed browser fills and the agent's controller kept out of a fill (`docs/policy.md`,
+  Browser fills and Typed browser fills; `docs/design.md` section 6, part 8):
+  - `open.browser` on a `browser` connection: `exclusive` (`header`, `value`) names the
+    answer by which the CDP endpoint says it handed the browser to the node alone; without
+    that exact header in the `101` the node sends no command. Without `exclusive` an
+    operation is flagged `browser_shared`. `leave: reload` loads a page that stayed after
+    the last submit again with a GET at the fill's origin (outcome and close reason
+    `reloaded`); `leave: blank` is the default and today's behaviour.
+  - The kinds `card` and `login` allow `browser` connections: `shape.browser` lists the
+    roles a fill may put into a page (`username`, `password`, `totp` as a 6-digit RFC 6238
+    code; `number`, `expiry`, `expiry_month`, `expiry_year`, `cvc`, `holder`) and the page's
+    origin (a login's pinned origin exactly, top frame only; a card at the merchant the owner
+    names, fields possibly in a direct child frame). `ItemBinding::browser_fill` (with
+    `ItemFill`, `RoleField`) makes the fill from roles and selectors. A typed browser
+    operation must ask for `exclusive` and `leave: reload`, put only role templates (each
+    once) and inject nothing into the handshake. Custom kinds may name roles too.
+  - `engine::cdp`: `Page.resetNavigationHistory`, `Page.getNavigationHistory` and
+    `history_entries`.
+  - Tests against the fake CDP endpoint (`crates/engine/tests/browser.rs`): the grant missing
+    or wrong, a client attached at the start or mid-fill, a second tab mid-fill, values left in
+    the page or its history after `navigated`, `submitted` and `reloaded`, six look-alike
+    origins, frames of another and the same origin, widened templates, TOTP against three
+    RFC 6238 vectors, a card fill before and after the owner's approval, `describe` of both
+    kinds. No real browser or endpoint was measured.
 - SSH remote port forwarding and AMQP 1.0 (`docs/policy.md`, Protocol connections;
   `docs/design.md` section 7c), the two protocol rows left in section 7c:
   - SSH `channel: "tcpip-forward"` (RFC 4254 section 7.1): the server listens on the

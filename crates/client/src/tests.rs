@@ -784,6 +784,23 @@ fn the_schema_kinds_and_custom_kinds() {
 }
 
 #[test]
+fn a_typed_fill_is_made_from_roles() {
+    let binding = r#"{"kind": "login", "pins": {"origin": "https://login.example.com"}}"#;
+    let roles = r##"{"fields": [{"role": "password", "selector": "#pw"},
+                                {"role": "totp", "selector": "#otp"}],
+                    "submit": {"selector": "form"}}"##;
+    let fill: serde_json::Value =
+        serde_json::from_str(&item_fill(binding.into(), roles.into()).unwrap()).unwrap();
+    assert_eq!(fill["origin"], "https://login.example.com");
+    assert_eq!(fill["fields"][0]["template"], "{{password}}");
+    assert_eq!(fill["fields"][1]["template"], "{{ totp(b32decode(totp)) }}");
+    let unknown =
+        r##"{"fields": [{"role": "session", "selector": "#s"}], "submit": {"selector": "form"}}"##;
+    assert_eq!(code(item_fill(binding.into(), unknown.into())), "refused");
+    assert_eq!(code(item_fill(binding.into(), "{".into())), "invalid_input");
+}
+
+#[test]
 fn an_approval_is_of_one_summary_for_one_node() {
     use engine::approval::{Amount, Approval, ApprovalSummary};
     let node = a_node();

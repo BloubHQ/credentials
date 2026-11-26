@@ -464,6 +464,7 @@ impl Operation {
                 host_keys: Vec::new(),
                 tls: None,
                 version: None,
+                browser: None,
             })],
             payment: None,
             approval: false,

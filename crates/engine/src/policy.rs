@@ -51,8 +51,9 @@ pub mod vend;
 mod wait;
 
 pub use browser::{
-    BROWSER_BYTES, BROWSER_DURATION_MS, BROWSER_IDLE_MS, Element, FILL_WAIT_MS, Fill, FillField,
-    MAX_FILL_FIELDS, MAX_FILLS, MAX_NAVIGATE, MAX_SELECTOR, browser_limits,
+    BROWSER_BYTES, BROWSER_DURATION_MS, BROWSER_IDLE_MS, BrowserControl, Element, Exclusive,
+    FILL_WAIT_MS, Fill, FillField, Leave, MAX_FILL_FIELDS, MAX_FILLS, MAX_GRANT_VALUE,
+    MAX_NAVIGATE, MAX_SELECTOR, browser_limits,
 };
 pub use schema::JSON_SCHEMA;
 pub use summary::{Summary, summarize};
@@ -760,6 +761,10 @@ pub struct Open {
     /// The MQTT version (`3.1.1`, the default, or `5`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub version: Option<MqttVersion>,
+    /// How a browser connection keeps the agent's controller out while the node fills, and
+    /// what it leaves in the page ([`BrowserControl`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub browser: Option<BrowserControl>,
 }
 
 /// Bounds of a connection that stays open: it is closed when one is reached.
@@ -2128,6 +2133,7 @@ impl Policy {
                     if let Some(rule) = open.limits.as_ref().and_then(StreamLimits::fault) {
                         return fail(format!("{at}.limits"), rule);
                     }
+                    browser::check_control(&at, open.connection, open.browser.as_ref())?;
                     if open.connection == Connection::Browser
                         && let Some(limits) = &open.limits
                     {

@@ -14,7 +14,8 @@
 //! The reader ([`parse`]) takes one message and tells an answer from an event. An event's
 //! parameters are skipped unread, so nothing a page put there is kept; an answer's `result`
 //! stays a borrowed slice of the message, read by the typed readers ([`targets`],
-//! [`frame_tree`], [`session_id`], [`context_id`], [`remote`], [`navigated`]), each bounded
+//! [`frame_tree`], [`session_id`], [`context_id`], [`remote`], [`navigated`],
+//! [`history_entries`]), each bounded
 //! (ids, URLs, counts and the depth of the frame tree). Duplicate members, a message that is
 //! both an answer and an event, and ids or URLs with control characters are refused.
 
@@ -98,6 +99,11 @@ pub enum Method {
     CallFunctionOn,
     /// `Runtime.releaseObjectGroup`.
     ReleaseObjectGroup,
+    /// `Page.resetNavigationHistory`: the page's history is cleared, so a document the node
+    /// filled cannot come back from the back/forward cache with its values.
+    ResetNavigationHistory,
+    /// `Page.getNavigationHistory`: read after the reset, to check it took.
+    GetNavigationHistory,
 }
 
 impl Method {
@@ -112,6 +118,8 @@ impl Method {
             Method::CreateIsolatedWorld => "Page.createIsolatedWorld",
             Method::CallFunctionOn => "Runtime.callFunctionOn",
             Method::ReleaseObjectGroup => "Runtime.releaseObjectGroup",
+            Method::ResetNavigationHistory => "Page.resetNavigationHistory",
+            Method::GetNavigationHistory => "Page.getNavigationHistory",
         }
     }
 }
@@ -502,6 +510,32 @@ pub fn remote(result: &str) -> Result<Remote, CdpError> {
 }
 
 #[derive(Deserialize)]
+struct HistoryWire {
+    #[serde(rename = "currentIndex")]
+    current_index: u64,
+    entries: Vec<IgnoredAny>,
+}
+
+/// Most entries of a page's history the node reads.
+pub const MAX_HISTORY: usize = 1024;
+
+/// The number of entries of a `Page.getNavigationHistory` result (each entry skipped
+/// unread: its URL and title are the page's), after checking the current index is one of
+/// them.
+pub fn history_entries(result: &str) -> Result<usize, CdpError> {
+    let wire: HistoryWire = serde_json::from_str(result)
+        .map_err(|_| CdpError::Invalid("not a Page.getNavigationHistory result"))?;
+    if wire.entries.len() > MAX_HISTORY {
+        return Err(CdpError::TooLarge);
+    }
+    let current = usize::try_from(wire.current_index).unwrap_or(usize::MAX);
+    if current >= wire.entries.len() {
+        return invalid("the current history index is not an entry");
+    }
+    Ok(wire.entries.len())
+}
+
+#[derive(Deserialize)]
 struct NavigateWire {
     #[serde(rename = "frameId")]
     frame_id: String,
@@ -748,6 +782,19 @@ mod tests {
         }
         assert_eq!(WebOrigin::of_url("about:blank"), None);
         assert_eq!(WebOrigin::of_url("https://a@b.example/"), None);
+    }
+
+    #[test]
+    fn history_counts_entries_only() {
+        let one = r#"{"currentIndex":0,"entries":[{"id":1,"url":"https://a.example/"}]}"#;
+        assert_eq!(history_entries(one).unwrap(), 1);
+        assert!(history_entries(r#"{"currentIndex":1,"entries":[{}]}"#).is_err());
+        assert!(history_entries(r#"{"currentIndex":0,"entries":[]}"#).is_err());
+        let many = format!(
+            r#"{{"currentIndex":0,"entries":[{}]}}"#,
+            vec!["{}"; MAX_HISTORY + 1].join(",")
+        );
+        assert_eq!(history_entries(&many).unwrap_err(), CdpError::TooLarge);
     }
 
     #[test]

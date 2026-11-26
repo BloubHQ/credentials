@@ -198,6 +198,9 @@ pub enum ShapeConnection {
     Pop3,
     /// FTP over TLS: file operations.
     Ftp,
+    /// A browser over CDP: fills of the kind's [`BrowserShape`] roles, the agent's
+    /// controller kept out by the endpoint's exclusive grant.
+    Browser,
     /// No connection: a derivation.
     None,
 }
@@ -212,6 +215,7 @@ impl ShapeConnection {
             ShapeConnection::Imap => "imap",
             ShapeConnection::Pop3 => "pop3",
             ShapeConnection::Ftp => "ftp",
+            ShapeConnection::Browser => "browser",
             ShapeConnection::None => "none",
         }
     }
@@ -258,6 +262,45 @@ pub struct LoginShape {
     /// The OAuth token field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token: Option<String>,
+}
+
+/// A value a browser fill of the kind may put into a page: a name the owner picks fields by,
+/// and the template that makes the value from the item's fields.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BrowserRole {
+    /// The name, a token (`username`, `password`, `totp`, `number`, ...).
+    pub role: String,
+    /// The value: a template over the fields of the kind only (`{{password}}`,
+    /// `{{ totp(b32decode(totp)) }}`).
+    pub template: String,
+}
+
+/// The browser fills of a kind: where the page may be and which values go into it. A fill of
+/// an item puts only these values into a page, each into the element the policy's selector
+/// names, and only through a connection whose endpoint hands the browser to the node alone
+/// and whose page is loaded again when it stays (`docs/policy.md`, Typed browser fills).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BrowserShape {
+    /// The pinned origin field every page of a fill must be at, exactly. Without it the page
+    /// is the owner's choice (a card at a merchant), an `https` origin with no wildcard.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<String>,
+    /// True when a value may go into a direct child frame of another origin (a card form in
+    /// a payment provider's frame; flagged `frame_origin`). Otherwise every element is in the
+    /// top frame.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub frames: bool,
+    /// The values, 1 to 16.
+    pub roles: Vec<BrowserRole>,
+}
+
+impl BrowserShape {
+    /// The role of this name.
+    pub fn role(&self, name: &str) -> Option<&BrowserRole> {
+        self.roles.iter().find(|r| r.role == name)
+    }
 }
 
 /// Where the operations of an item may connect.
@@ -339,6 +382,9 @@ pub struct Shape {
     /// node sends no credential in the clear.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tls: Option<String>,
+    /// The browser fills of the kind; required when the shape allows a browser connection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub browser: Option<BrowserShape>,
 }
 
 /// A kind of item.
@@ -597,6 +643,7 @@ impl KindSchema {
                 "one route per connection of the shape, each to pinned fields with host and port checks",
             )?,
         }
+        self.check_browser_shape()?;
         for (i, name) in shape.captures.iter().enumerate() {
             let ok = if name == "*" {
                 self.free_fields
@@ -615,6 +662,67 @@ impl KindSchema {
             || "shape.captures".into(),
             "each capture once",
         )
+    }
+
+    /// Checks the browser fills of the shape: present exactly when a browser connection is
+    /// allowed; the origin a pinned origin field (the one the kind's HTTPS goes to, when it
+    /// fixes one); 1 to 16 roles of distinct names and templates, each a template over the
+    /// fields of the kind only.
+    fn check_browser_shape(&self) -> Checked {
+        let shape = &self.shape;
+        let allowed = shape.connections.contains(&ShapeConnection::Browser);
+        let Some(browser) = &shape.browser else {
+            return kind_ensure(
+                !allowed,
+                || "shape.browser".into(),
+                "a kind with a browser connection names its browser roles",
+            );
+        };
+        kind_ensure(
+            allowed && !self.free_fields,
+            || "shape.browser".into(),
+            "browser roles are for a kind with named fields and a browser connection",
+        )?;
+        let wanted = match &shape.destinations {
+            DestinationRule::Origin { field } => Some(field),
+            _ => None,
+        };
+        match &browser.origin {
+            Some(name) => kind_ensure(
+                self.field(name)
+                    .is_some_and(|f| f.pinned && f.checks.contains(&Check::Origin {}))
+                    && wanted.is_none_or(|w| w == name),
+                || "shape.browser.origin".into(),
+                "the browser origin is a pinned field with an origin check, the one the kind's destinations name",
+            )?,
+            None => kind_ensure(
+                wanted.is_none(),
+                || "shape.browser.origin".into(),
+                "a kind whose destinations are a pinned origin fills pages at that origin only",
+            )?,
+        }
+        kind_ensure(
+            !browser.roles.is_empty()
+                && browser.roles.len() <= crate::policy::MAX_FILL_FIELDS
+                && unique(browser.roles.iter().map(|r| r.role.as_str()))
+                && unique(browser.roles.iter().map(|r| r.template.as_str())),
+            || "shape.browser.roles".into(),
+            "1 to 16 roles of distinct names and templates",
+        )?;
+        for (i, role) in browser.roles.iter().enumerate() {
+            let at = || format!("shape.browser.roles[{i}]");
+            kind_ensure(is_token(&role.role), at, "a role is a token")?;
+            let names_fields = crate::template::Template::parse(&role.template).is_ok_and(|t| {
+                let names = t.names();
+                !names.is_empty() && names.iter().all(|n| self.field(n).is_some())
+            });
+            kind_ensure(
+                names_fields,
+                at,
+                "a role's template parses and reads fields of the kind only",
+            )?;
+        }
+        Ok(())
     }
 
     /// Checks the rules of the schema.
@@ -1021,7 +1129,7 @@ fn shape_connection(at: &str, operation: &Operation) -> Result<ShapeConnection> 
             | Connection::Amqp1,
         ) => refuse("a typed item has no database or queue connection yet"),
         Some(Connection::Udp) => refuse("a typed item has no UDP operation"),
-        Some(Connection::Browser) => refuse("a typed item has no browser operation yet"),
+        Some(Connection::Browser) => Ok(ShapeConnection::Browser),
         None => Ok(ShapeConnection::None),
     }
 }
@@ -1085,6 +1193,173 @@ fn check_login(
     Ok(())
 }
 
+/// Checks a browser operation of a typed item: the endpoint hands the browser to the node
+/// alone and the page is loaded again when it stays; the handshake carries none of the
+/// item's fields; each fill is at the kind's origin (the pinned one, when the kind names it),
+/// in the top frame unless the kind allows frames, and puts only the kind's role values,
+/// each at most once.
+fn check_browser(
+    at: &str,
+    operation: &Operation,
+    kind: &KindSchema,
+    pins: &BTreeMap<String, String>,
+) -> Checked {
+    let Some(browser) = &kind.shape.browser else {
+        return shape_fail(at, "the kind names no browser roles");
+    };
+    let control = operation.open().and_then(|o| o.browser.as_ref());
+    shape_ensure(
+        control.is_some_and(|c| c.is_exclusive() && c.leave == crate::policy::Leave::Reload),
+        || format!("{at}.steps[0].browser"),
+        "a browser operation of an item needs the endpoint's exclusive grant and leave reload",
+    )?;
+    let origin = match &browser.origin {
+        Some(field) => Some(pins.get(field).ok_or_else(|| {
+            Error::policy(format!("item.pins.{field}"), "a pinned field has no value")
+        })?),
+        None => None,
+    };
+    for (i, step) in crate::policy::flow::walk_indexed(&operation.steps) {
+        let at = format!("{at}.steps[{i}]");
+        let Step::Send(send) = step else {
+            continue;
+        };
+        let Some(fill) = &send.fill else {
+            // The handshake: the caller's own credential for its browser at most.
+            shape_ensure(
+                send.inject.is_empty(),
+                || format!("{at}.inject"),
+                "the browser handshake of an item carries none of its fields",
+            )?;
+            continue;
+        };
+        let at = format!("{at}.fill");
+        if let Some(origin) = origin {
+            shape_ensure(
+                &fill.origin == origin,
+                || format!("{at}.origin"),
+                "a fill of the item is at its pinned origin exactly",
+            )?;
+        }
+        let mut frames = fill
+            .fields
+            .iter()
+            .map(|f| f.frame.as_ref())
+            .chain([fill.submit.frame.as_ref()]);
+        shape_ensure(
+            browser.frames || frames.all(|f| f.is_none()),
+            || at.clone(),
+            "the kind fills the top frame only",
+        )?;
+        for (j, field) in fill.fields.iter().enumerate() {
+            shape_ensure(
+                browser.roles.iter().any(|r| r.template == field.template)
+                    && !fill
+                        .fields
+                        .iter()
+                        .take(j)
+                        .any(|f| f.template == field.template),
+                || format!("{at}.fields[{j}].template"),
+                "a fill of the item puts one of the kind's role values, each at most once",
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// A field of a typed fill as the owner writes it: a role of the kind and the element its
+/// value goes into.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RoleField {
+    /// The role, one of the kind's [`BrowserShape::roles`].
+    pub role: String,
+    /// A CSS selector, as for [`crate::policy::Element::selector`].
+    pub selector: String,
+    /// The frame origin, as for [`crate::policy::Element::frame`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frame: Option<String>,
+}
+
+/// A typed browser fill as the owner writes it: roles and selectors, no templates.
+/// [`ItemBinding::browser_fill`] makes the [`crate::policy::Fill`] the policy carries.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ItemFill {
+    /// The page's origin: only for a kind without a browser origin (a card at a merchant);
+    /// a login fills at its pinned origin.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<String>,
+    /// The fields.
+    pub fields: Vec<RoleField>,
+    /// What submits.
+    pub submit: crate::policy::Element,
+    /// As [`crate::policy::Fill::navigate`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub navigate: Option<String>,
+    /// As [`crate::policy::Fill::wait_ms`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wait_ms: Option<u64>,
+}
+
+impl ItemBinding {
+    /// The fill of `fill` for an item of this binding: the origin from the pin when the kind
+    /// names one, each value the template of its role. The policy that carries it passes
+    /// [`check_policy`] when its `open` asks for the exclusive grant and `leave: reload`.
+    pub fn browser_fill(&self, fill: &ItemFill) -> Result<crate::policy::Fill> {
+        let kind = self.schema()?;
+        let Some(browser) = &kind.shape.browser else {
+            return Err(Error::policy("item", "the kind names no browser roles"));
+        };
+        let origin = match (&browser.origin, &fill.origin) {
+            (Some(field), given) => {
+                let pin = self.pins.get(field).ok_or_else(|| {
+                    Error::policy(format!("item.pins.{field}"), "a pinned field has no value")
+                })?;
+                if given.as_ref().is_some_and(|g| g != pin) {
+                    return Err(Error::policy(
+                        "fill.origin",
+                        "a fill of the item is at its pinned origin exactly",
+                    ));
+                }
+                pin.clone()
+            }
+            (None, Some(given)) => given.clone(),
+            (None, None) => {
+                return Err(Error::policy(
+                    "fill.origin",
+                    "the kind leaves the page's origin to the owner: name it",
+                ));
+            }
+        };
+        let fields = fill
+            .fields
+            .iter()
+            .enumerate()
+            .map(|(i, f)| {
+                let role = browser.role(&f.role).ok_or_else(|| {
+                    Error::policy(
+                        format!("fill.fields[{i}].role"),
+                        "the kind has no such role",
+                    )
+                })?;
+                Ok(crate::policy::FillField {
+                    selector: f.selector.clone(),
+                    frame: f.frame.clone(),
+                    template: role.template.clone(),
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(crate::policy::Fill {
+            origin,
+            navigate: fill.navigate.clone(),
+            fields,
+            submit: fill.submit.clone(),
+            wait_ms: fill.wait_ms,
+        })
+    }
+}
+
 fn check_operation(
     at: &str,
     operation: &Operation,
@@ -1103,6 +1378,9 @@ fn check_operation(
         && let Some(open) = operation.open()
     {
         check_login(&format!("{at}.steps[0]"), open, kind, pins)?;
+    }
+    if connection == ShapeConnection::Browser {
+        check_browser(at, operation, kind, pins)?;
     }
     for (i, step) in crate::policy::flow::walk_indexed(&operation.steps) {
         let at = format!("{at}.steps[{i}]");
@@ -1186,7 +1464,11 @@ pub fn check_policy(policy: &Policy, binding: &ItemBinding) -> Result<()> {
         let at = format!("operations[{i}]");
         let connection = shape_connection(&at, operation)?;
         // A connection the kind does not allow is refused below, whatever it would route to.
-        let fixed = if kind.shape.connections.contains(&connection) {
+        // A browser connection goes to the CDP endpoint the owner signs; its pages are held
+        // to the kind's browser origin by the fills.
+        let fixed = if kind.shape.connections.contains(&connection)
+            && connection != ShapeConnection::Browser
+        {
             binding.destination(kind, connection)?
         } else {
             None

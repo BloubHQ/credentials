@@ -220,7 +220,23 @@
         "login": {"$ref": "#/$defs/Login"},
         "host_keys": {"type": "array", "minItems": 1, "maxItems": 16, "items": {"type": "string", "minLength": 1}},
         "tls": {"enum": ["implicit", "starttls"]},
-        "version": {"enum": ["3.1.1", "5"]}
+        "version": {"enum": ["3.1.1", "5"]},
+        "browser": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "exclusive": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["header", "value"],
+              "properties": {
+                "header": {"$ref": "#/$defs/Token"},
+                "value": {"type": "string", "pattern": "^[!-~]{1,256}$"}
+              }
+            },
+            "leave": {"enum": ["blank", "reload"]}
+          }
+        }
       }
     },
     "Login": {
@@ -718,7 +734,7 @@
       "additionalProperties": false,
       "required": ["connections", "destinations", "returns"],
       "properties": {
-        "connections": {"type": "array", "maxItems": 8, "items": {"enum": ["https", "tls", "ssh", "smtp", "imap", "pop3", "ftp", "none"]}},
+        "connections": {"type": "array", "maxItems": 8, "items": {"enum": ["https", "tls", "ssh", "smtp", "imap", "pop3", "ftp", "browser", "none"]}},
         "destinations": {
           "oneOf": [
             {"type": "object", "additionalProperties": false, "required": ["from"],
@@ -730,7 +746,7 @@
             {"type": "object", "additionalProperties": false, "required": ["from", "hosts"],
              "properties": {"from": {"const": "hosts"}, "hosts": {"type": "array", "minItems": 1, "maxItems": 8, "items": {
                "type": "object", "additionalProperties": false, "required": ["connection", "host", "port"],
-               "properties": {"connection": {"enum": ["https", "tls", "ssh", "smtp", "imap", "pop3", "ftp", "none"]},
+               "properties": {"connection": {"enum": ["https", "tls", "ssh", "smtp", "imap", "pop3", "ftp", "browser", "none"]},
                               "host": {"$ref": "#/$defs/Token"}, "port": {"$ref": "#/$defs/Token"}}}}}}
           ]
         },
@@ -746,7 +762,17 @@
         "relay": {"type": "boolean"},
         "identity": {"type": "boolean"},
         "captures": {"type": "array", "items": {"type": "string", "pattern": "^([A-Za-z0-9_-]{1,64}|\\*)$"}},
-        "approval": {"type": "boolean"}
+        "approval": {"type": "boolean"},
+        "browser": {
+          "type": "object", "additionalProperties": false, "required": ["roles"],
+          "properties": {
+            "origin": {"$ref": "#/$defs/Token"},
+            "frames": {"type": "boolean"},
+            "roles": {"type": "array", "minItems": 1, "maxItems": 16, "items": {
+              "type": "object", "additionalProperties": false, "required": ["role", "template"],
+              "properties": {"role": {"$ref": "#/$defs/Token"}, "template": {"type": "string", "minLength": 1}}}}
+          }
+        }
       }
     }
   }

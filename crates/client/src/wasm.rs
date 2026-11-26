@@ -527,6 +527,12 @@ pub fn item_kinds() -> String {
     crate::item_kinds()
 }
 
+/// See [`crate::item_fill`].
+#[wasm_bindgen(js_name = itemFill)]
+pub fn item_fill(binding_json: String, fill_json: String) -> Result<String> {
+    Ok(crate::item_fill(binding_json, fill_json)?)
+}
+
 /// See [`crate::sign_kind`].
 #[wasm_bindgen(js_name = signKind)]
 pub fn sign_kind(device_key: String, kind_json: String) -> Result<String> {
