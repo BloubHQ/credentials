@@ -90,7 +90,7 @@
     },
     {
       "name": "ssh",
-      "description": "An SSH account with the server's host key pinned. No SSH connection kind exists yet, so no operation can use it.",
+      "description": "An SSH account: commands, a shell, SFTP and forwards within the policy, to the server whose host key is pinned (a whole key, not a fingerprint). The policy signs in with exactly these fields.",
       "fields": [
         {"name": "host", "disclosure": "public", "pinned": true, "checks": [{"check": "host"}]},
         {"name": "port", "disclosure": "public", "pinned": true,
@@ -102,8 +102,9 @@
         {"name": "password", "disclosure": "secret", "optional": true, "guessable": true},
         {"name": "private_key", "disclosure": "secret", "optional": true}
       ],
-      "shape": {"connections": [], "destinations": {"from": "host", "host": "host", "port": "port"},
-                "returns": "status"}
+      "shape": {"connections": ["ssh"], "destinations": {"from": "host", "host": "host", "port": "port"},
+                "returns": "status", "relay": true, "host_key": "host_key",
+                "login": {"user": "user", "password": "password", "key": "private_key"}}
     },
     {
       "name": "database",
@@ -147,20 +148,27 @@
     },
     {
       "name": "mail",
-      "description": "A mailbox over IMAP, SMTP or POP3 with an app password or an OAuth token.",
+      "description": "A mailbox: SMTP to send and IMAP to read, each to its pinned server, with a password or an OAuth token. The policy signs in with exactly these fields.",
       "fields": [
-        {"name": "protocol", "disclosure": "public",
-         "checks": [{"check": "one_of", "values": ["imap", "smtp", "pop3"]}]},
-        {"name": "host", "disclosure": "public", "pinned": true, "checks": [{"check": "host"}]},
-        {"name": "port", "disclosure": "public", "pinned": true,
+        {"name": "smtp_host", "disclosure": "public", "pinned": true,
+         "checks": [{"check": "host"}]},
+        {"name": "smtp_port", "disclosure": "public", "pinned": true,
+         "checks": [{"check": "integer", "min": 1, "max": 65535}]},
+        {"name": "imap_host", "disclosure": "public", "pinned": true,
+         "checks": [{"check": "host"}]},
+        {"name": "imap_port", "disclosure": "public", "pinned": true,
          "checks": [{"check": "integer", "min": 1, "max": 65535}]},
         {"name": "user", "disclosure": "masked", "mask": "email",
          "checks": [{"check": "length", "min": 1, "max": 256}]},
         {"name": "password", "disclosure": "secret", "optional": true, "guessable": true},
         {"name": "token", "disclosure": "secret", "optional": true}
       ],
-      "shape": {"connections": ["tls"], "destinations": {"from": "host", "host": "host", "port": "port"},
-                "returns": "status", "relay": true}
+      "shape": {"connections": ["smtp", "imap"],
+                "destinations": {"from": "hosts", "hosts": [
+                  {"connection": "smtp", "host": "smtp_host", "port": "smtp_port"},
+                  {"connection": "imap", "host": "imap_host", "port": "imap_port"}]},
+                "returns": "status", "relay": true,
+                "login": {"user": "user", "password": "password", "token": "token"}}
     },
     {
       "name": "queue",

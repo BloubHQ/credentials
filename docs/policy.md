@@ -426,7 +426,8 @@ yet.
 
 ### Protocol connections
 
-`ssh`, `postgres`, `smtp`, `imap` and `redis` are standard protocol families, never a site's:
+`ssh` (with SFTP and local port forwarding), `postgres`, `mysql`, `smtp`, `imap`, `redis`,
+`mqtt` and `amqp` are standard protocol families, never a site's:
 the node signs in with the item's secret, runs the commands the policy fixes or shapes, and
 hands back results after the reflection search. Each is its own client in the engine
 (`engine::proto`), synchronous, with only modern algorithms.
@@ -453,30 +454,42 @@ The `open` of a protocol connection:
 
 | Member | Meaning |
 | --- | --- |
-| `login` | Required. `user` and one credential, each a template: `password`; `key` (SSH: an Ed25519 or ECDSA P-256/P-384 key in PKCS#8, or an unencrypted OpenSSH key; RSA in PKCS#8 or PKCS#1); `token` (an OAuth 2.0 bearer token for `xoauth2`); or `answers` (SSH keyboard-interactive: up to 8 `{"prompt": <regular expression the whole prompt must match>, "template"}`). `database` (PostgreSQL, a literal) and `mechanism` are optional. The credential must be the one its mechanism uses. |
-| `mechanism` | SSH `password`, `publickey`, `keyboard-interactive`; PostgreSQL `scram-sha-256`; SMTP `plain`, `login`, `xoauth2`; IMAP `login`, `plain`, `xoauth2`; Redis `auth`. Without it, the kind's default for the credential given. The node uses this mechanism or none: a server that does not offer it is refused, never answered with another. |
+| `login` | Required. `user` and one credential, each a template: `password`; `key` (SSH: an Ed25519 or ECDSA P-256/P-384 key in PKCS#8, or an unencrypted OpenSSH key; RSA in PKCS#8 or PKCS#1); `token` (an OAuth 2.0 bearer token for `xoauth2`, or the MQTT `token` mechanism); or `answers` (SSH keyboard-interactive: up to 8 `{"prompt": <regular expression the whole prompt must match>, "template"}`). Literals: `database` (PostgreSQL, MySQL), `client_id` (MQTT, 1 to 64 visible ASCII bytes; without it a random `credentials-...` one, so two connections never take over each other's session) and `vhost` (AMQP, default `/`). `mechanism` is optional. The credential must be the one its mechanism uses. `user` may be empty for Redis and MQTT. |
+| `mechanism` | SSH `password`, `publickey`, `keyboard-interactive`; PostgreSQL `scram-sha-256`; MySQL `caching-sha2-password`; SMTP `plain`, `login`, `xoauth2`; IMAP `login`, `plain`, `xoauth2`; Redis `auth`; MQTT `password`, `token`; AMQP `plain`. Without it, the kind's default for the credential given. The node uses this mechanism or none: a server that does not offer it is refused, never answered with another. |
 | `host_keys` | SSH only, required: 1 to 16 pinned host keys, `type base64` as in `known_hosts` (`ssh-ed25519`, `ecdsa-sha2-nistp256/384/521`, `ssh-rsa` for an RSA key verified with `rsa-sha2-256/512` only). The node offers only the algorithms of the pinned keys and refuses a key that is not pinned before it sends any credential. |
-| `tls` | SMTP and IMAP: `implicit` (default; ports 465 and 993) or `starttls` (587 and 143). A server that does not offer STARTTLS, or sends anything after its go-ahead before the handshake, is refused. PostgreSQL always asks for TLS (`SSLRequest`) and refuses a server that does not take it; Redis is TLS from the first byte; SSH encrypts itself. |
+| `tls` | SMTP and IMAP: `implicit` (default; ports 465 and 993) or `starttls` (587 and 143). A server that does not offer STARTTLS, or sends anything after its go-ahead before the handshake, is refused. PostgreSQL and MySQL always ask for TLS (`SSLRequest`) before anything else and refuse a server that does not take it; Redis, MQTT and AMQP are TLS from the first byte; SSH encrypts itself. |
+| `version` | MQTT only: `3.1.1` (default) or `5`. |
 | `limits` | As for a WebSocket: idle, duration and bytes (both ways). Reaching one ends the connection. |
 
 `send` takes `command`: `{"text": <template>, "params": [<template>, ...]}`, a command the
-policy fixes (an SSH command line, an SQL statement with `$1`... for the parameters, an IMAP
-command without its tag, a Redis command name). A `receive` after it captures from what came
-back (`between`, `regex` or `all`). `run`, `await` and HTTP requests are refused.
+policy fixes (an SSH command line, an SQL statement with `$1`... (PostgreSQL) or `?` (MySQL)
+for the parameters, an IMAP command without its tag, a Redis command name, or a verb: MQTT
+`publish` (topic, payload) or `subscribe` (filter), AMQP `publish` (exchange, routing key,
+body) or `get` (queue)), and for MQTT `qos` 0 or 1. A `receive` after it captures from what
+came back (`between`, `regex` or `all`). `run`, `await` and HTTP requests are refused. An MQTT
+`subscribe` the policy sends stays subscribed for the rest of the connection.
 
 `return` takes `relay`:
 
 - `commands` (at most 32): the commands the caller may run by `name`, each a `text` the caller
-  cannot change and `params`. A parameter is a `template` of the policy, or the caller's value
-  under a `pattern` (matched whole) and `max_len` (default and at most 64 KiB). A parameter of
-  the caller with no pattern is flagged `param_unpinned`. `columns` (PostgreSQL) keeps only
-  those columns of the rows.
+  cannot change and `params`. A parameter is a `template` of the policy; the caller's value
+  under a `pattern` (matched whole) and `max_len` (default and at most 64 KiB); or both, a
+  `template` that reads the caller's value, checked by the `pattern`, as `$input`
+  (`"level={{ $input }}"`). A parameter of the caller with no pattern is flagged
+  `param_unpinned`. `columns` (PostgreSQL, MySQL) keeps only those columns of the rows.
+  Members of some kinds: `channel` (SSH: `exec` by default, `sftp`, `direct-tcpip`), `qos`
+  (MQTT, 0 or 1), `max_messages` (MQTT `subscribe`, AMQP `get`: 1 to 256, default 16) and
+  `wait_ms` (MQTT `subscribe`: 1 to 60,000, default 5,000).
 - `mail` (SMTP only, and the only relay of SMTP): `senders` and `recipients`, 1 to 16 patterns
   each that the whole envelope addresses must match, `max_recipients` (default and at most 100)
   and `max_bytes` (default and at most 8 MiB).
-- `frames` and `server` (SSH only, with no commands): an interactive shell on a streaming
-  call, as for a WebSocket. The caller's signed frames go to the shell within their rules;
-  what the shell prints goes back with `server: true`, after the stream search.
+- `frames` and `server`: a streaming call, as for a WebSocket. SSH: an interactive shell (no
+  commands), or a forward (every command a `direct-tcpip` rule; the call names one). The
+  caller's signed frames go to the shell or the forwarded connection within their rules; what
+  comes back goes back with `server: true`, after the stream search. MQTT: `server: true` alone
+  hands back the messages of the subscriptions the policy's `send` steps made, each as a text
+  part `{"topic", "payload", "qos", "retain"}` after the reflection search of that message
+  whole; MQTT takes no frames.
 
 The caller sends `{"session": {"destination", "commands": [{"name", "params": [...]}],
 "mail": [{"from", "to": [...], "data": <base64>}]}}`. Every command and message is checked
@@ -512,6 +525,47 @@ What each kind does with them:
 - **Redis**: `AUTH [user] password`, then each command as an array of bulk strings: the rule's
   text is literal words, each parameter one argument whatever bytes it holds. The reply comes
   back as JSON (an error as `{"error": ...}` with status 1).
+- **MySQL**: the server's greeting must offer TLS; the node answers with an `SSLRequest` and
+  nothing else before the handshake, and refuses a server without TLS, or bytes after the
+  greeting before the handshake (injection), before writing anything. Then
+  `caching_sha2_password` only: the scramble, and when the server asks for full
+  authentication, the password over the verified TLS (never the server's RSA key exchange, and
+  never on a plain connection). A switch to `mysql_native_password`, cleartext or any other
+  plugin, a second switch, or a `LOCAL INFILE` request is refused; `CLIENT_LOCAL_FILES`,
+  multi-statements and multi-results are never offered. Each command is a prepared statement
+  (`COM_STMT_PREPARE`, `COM_STMT_EXECUTE` with every parameter bound as a string,
+  `COM_STMT_CLOSE`), so a parameter is never SQL. The result is `{"columns", "rows"}` (values
+  as text, `null` for NULL) or `{"columns": [], "rows": [], "affected", "insert_id"}`; an error
+  is `{"error": {"code", "state", "message"}}` with status 1.
+- **MQTT** (3.1.1 or 5) over TLS: `CONNECT` with a clean session, no will, keep-alive 60 s,
+  the user and the password (or the token as the password); version 5 also states the most the
+  node reads (16 MiB). `publish` and `subscribe` at QoS 0 or 1, never 2, never retained. A
+  topic or filter of the caller never holds `+` or `#` (only the policy's may); a message on a
+  topic no subscription matches, at QoS 2, or with a topic alias is refused. A `subscribe` of
+  the caller subscribes, collects up to `max_messages` within `wait_ms`, unsubscribes, and
+  returns the messages as `[{"topic", "payload", "qos", "retain"}]` (`payload` as text, or
+  `{"base64"}` when it is not UTF-8); a `publish` returns `{"reason"}`.
+- **AMQP 0-9-1** over TLS: `PLAIN` only (a server that does not offer it, or that asks for
+  more with `connection.secure`, is refused before or instead of answering), heartbeats off,
+  frames of at most 128 KiB. Channel 1 in confirm mode: each `publish` is mandatory and waits
+  for its confirmation (`{"confirmed": true}`; a returned message is `{"error": {"code",
+  "message"}}` with status 1). `get` takes up to `max_messages` with `basic.get`,
+  acknowledging each, as `[{"exchange", "routing_key", "redelivered", "payload"}]`. The
+  exchange, routing key and queue of a caller's command are templates of the policy, never the
+  caller's.
+- **SFTP** (SSH, `channel: "sftp"`, version 3): `read` (the path) returns the whole file;
+  `write` (the path, the bytes) creates or truncates it. A path is absolute with no empty, `.`
+  or `..` segment, no trailing `/`, backslash or NUL, checked when the policy is signed (a
+  literal path), before anything is logged (the caller's value) and again before it is sent.
+  The node follows no symbolic link: the server's canonical form of the path (`REALPATH`), or
+  of its directory for a write, must be the path itself, and the file (`LSTAT`, which does not
+  follow links) must be a regular file, or absent for a write. A race on the server between
+  that check and the open remains (see the threat model).
+- **Forwarding** (SSH, `channel: "direct-tcpip"`): the rule's `text` is the `host:port` the
+  server connects to, fixed by the policy, with no parameters; the caller names the rule, never
+  a destination. The node opens one `direct-tcpip` channel on a streaming call and relays the
+  caller's signed frames to it and the bytes back through the stream search. The summary flags
+  each forward rule with its destination.
 
 Every result is redacted and searched for secrets before it goes back, in the form the server
 sent it (a value in a row, a bulk string) and as JSON, and across results. A protocol
@@ -573,7 +627,92 @@ each way.
  ]}
 ```
 
-MySQL (`caching_sha2_password`), MQTT and AMQP are not implemented yet; see the design.
+```json
+{"name": "orders_mysql",
+ "steps": [
+   {"do": "open", "connection": "mysql",
+    "destinations": [{"host": "db.example.com", "port": 3306}],
+    "login": {"user": "reporting", "password": "{{db_password}}", "database": "shop"}},
+   {"do": "return", "relay": {"commands": [
+     {"name": "order", "text": "SELECT id, status FROM orders WHERE id = ?",
+      "params": [{"pattern": "[0-9]{1,12}"}], "columns": ["id", "status"]}
+   ]}}
+ ]}
+```
+
+```json
+{"name": "sensors",
+ "steps": [
+   {"do": "open", "connection": "mqtt", "version": "5",
+    "destinations": [{"host": "broker.example.com", "port": 8883}],
+    "login": {"user": "device-7", "password": "{{mqtt_password}}", "client_id": "node-7"}},
+   {"do": "return", "relay": {"commands": [
+     {"name": "set", "text": "publish", "qos": 1,
+      "params": [{"template": "devices/7/set"},
+                 {"pattern": "[0-9]{1,3}", "template": "level={{ $input }}"}]},
+     {"name": "read", "text": "subscribe", "max_messages": 8, "wait_ms": 2000,
+      "params": [{"pattern": "sensors/[a-z0-9]{1,16}"}]}
+   ]}}
+ ]}
+```
+
+```json
+{"name": "watch",
+ "steps": [
+   {"do": "open", "connection": "mqtt",
+    "destinations": [{"host": "broker.example.com", "port": 8883}],
+    "login": {"user": "device-7", "password": "{{mqtt_password}}"},
+    "limits": {"idle_ms": 60000}},
+   {"do": "send", "command": {"text": "subscribe", "params": ["sensors/+"]}},
+   {"do": "return", "relay": {"server": true}}
+ ]}
+```
+
+```json
+{"name": "queue",
+ "steps": [
+   {"do": "open", "connection": "amqp",
+    "destinations": [{"host": "mq.example.com", "port": 5671}],
+    "login": {"user": "app", "password": "{{amqp_password}}", "vhost": "shop"}},
+   {"do": "return", "relay": {"commands": [
+     {"name": "new", "text": "publish",
+      "params": [{"template": "orders"}, {"template": "new"},
+                 {"pattern": "[0-9]{1,9}", "template": "order:{{ $input }}"}]},
+     {"name": "next", "text": "get", "max_messages": 4, "params": [{"template": "replies"}]}
+   ]}}
+ ]}
+```
+
+```json
+{"name": "reports",
+ "steps": [
+   {"do": "open", "connection": "ssh",
+    "destinations": [{"host": "files.example.com", "port": 22}],
+    "host_keys": ["ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIIpE5S3nEfaq9h6S6l5bSkF1H0R1mAEbvYMVg4Ccmi6G"],
+    "login": {"user": "reports", "key": "{{ssh_key}}"}},
+   {"do": "return", "relay": {"commands": [
+     {"name": "report", "text": "read", "channel": "sftp",
+      "params": [{"pattern": "/srv/reports/[a-z0-9_-]{1,32}\\.csv"}]},
+     {"name": "upload", "text": "write", "channel": "sftp",
+      "params": [{"pattern": "[a-z0-9_-]{1,32}", "template": "/srv/inbox/{{ $input }}.txt"},
+                 {"max_len": 65536}]}
+   ]}}
+ ]}
+```
+
+```json
+{"name": "tunnel",
+ "steps": [
+   {"do": "open", "connection": "ssh",
+    "destinations": [{"host": "bastion.example.com", "port": 22}],
+    "host_keys": ["ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIIpE5S3nEfaq9h6S6l5bSkF1H0R1mAEbvYMVg4Ccmi6G"],
+    "login": {"user": "tunnel", "key": "{{ssh_key}}"},
+    "limits": {"idle_ms": 60000, "duration_ms": 900000}},
+   {"do": "return", "relay": {"server": true,
+     "frames": [{"kind": "binary"}],
+     "commands": [{"name": "db", "text": "db.internal:5432", "channel": "direct-tcpip"}]}}
+ ]}
+```
 
 ### `receive` and captures
 
@@ -875,7 +1014,11 @@ one that gives the caller less:
 | The expiry is masked to its year only. | Month and year together narrow a card down; the year tells an agent whether it is current. |
 | `describe` works on typed records only. | An untyped record has no schema saying which fields are public; describing it would guess. |
 | Any caller the policy lists may `describe`; there is no separate permission. | What `describe` returns is public or masked by the kind and logged; a caller that may use the item already learns that much from its results. Listing it per caller would be a widening knob with no narrowing value. |
-| ssh and vpn kinds allow no connection yet. | Their protocols do not exist in the node; a TLS stream to port 22 would send a key to a server whose host key nobody checked. |
+| The ssh kind allows SSH only, with the item's whole host key pinned; the vpn kind allows no connection. | A TLS stream to port 22 would send a key to a server whose host key nobody checked; a fingerprint pin cannot be compared with the key the server proves; the node speaks no VPN protocol. |
+| A typed protocol login is exactly the kind's fields. | `{{password}}` as the user, or inside other text, would send the secret where the kind did not mean it. |
+| MySQL refuses every plugin but `caching_sha2_password`, and full authentication without TLS. | `mysql_native_password` is SHA-1 based and replayable from a captured exchange; cleartext and the RSA exchange put the password in a form the node did not choose. |
+| SFTP follows no symbolic link. | A link planted under a permitted path would reach a file outside the pattern. |
+| A forward's destination is a literal of the policy. | A caller-chosen destination would make the SSH server a proxy into its network. |
 | Wildcards, client certificates, relays and whole response bodies are refused unless the kind allows them; the reviewed kinds allow them only for `api`. | A kind exists to make a typical credential safe without the owner reading every line. |
 | Plain HTTP and plain database, FTP or broker connections need a named sign-off in the binding, and are flagged in the summary. | A sign-off is an explicit, signed act of the owner, visible in every summary and diff. |
 
@@ -906,10 +1049,10 @@ The reviewed kinds ship in the node (`crates/engine/src/items.json`, or `item_ki
 | `oauth` | client_secret, refresh_token, access_token · — · provider (pinned), client_id, scopes | HTTPS; JSON members back; captures the tokens |
 | `identity` | national_id · name, birth_date, phone, email, address · — | HTTPS; JSON members back |
 | `totp` | seed (≥128 bits) · account · digits, period, issuer | derivations only |
-| `ssh` | password, private_key · — · host, port, host_key (pinned), user | none yet |
+| `ssh` | password, private_key · — · host, port, host_key (pinned), user | SSH to the pinned host and port, pinning exactly the item's host key (a whole key); signs in with exactly `{{user}}` and `{{password}}` or `{{private_key}}`; relay allowed (commands, shell, SFTP, forwards) |
 | `database` | password · — · engine, host, port, tls (pinned), database, user, ca | TLS to the pinned host and port; relay allowed |
 | `ftp` | password · — · host, port, mode (pinned), user | TLS to the pinned host and port; relay allowed |
-| `mail` | password, token · user (email) · protocol, host, port (pinned) | TLS to the pinned host and port; relay allowed |
+| `mail` | password, token · user (email) · smtp_host, smtp_port, imap_host, imap_port (pinned) | SMTP to the pinned SMTP server, IMAP to the pinned IMAP server; signs in with exactly `{{user}}` and `{{password}}` or `{{token}}`; relay allowed |
 | `queue` | password, sasl_secret, nkey_seed, client_key · — · protocol, host, port, tls (pinned), user, client_id | TLS to the pinned host and port; relay allowed |
 | `vpn` | private_key, psk · — · protocol, host, port (pinned), peer_public_key, identity | none yet |
 | `api` | free fields, as an untyped record | anything an untyped policy may do; nothing is described |
@@ -945,9 +1088,17 @@ A policy of a kind must, beyond every rule of an untyped policy:
 - pin every pinned field it declares, with a value that passes the field's checks, and sign
   off only flags the kind's checks name;
 - use only the connections of the shape; send only to the pinned origin (`login`) or the
-  pinned host and port (`database`, `ftp`, `mail`, `queue`), with no wildcard unless the
+  pinned host and port (`ssh`, `database`, `ftp`, `queue`), or the pinned server of its
+  connection (`mail`: SMTP and IMAP each to their own), with no wildcard unless the
   shape allows one; use no client certificate, relay or capture the shape does not allow;
-- return no more than the shape: `status` < `json` (JSON members) < `all` (the whole body).
+- return no more than the shape: `status` < `json` (JSON members) < `all` (the whole body);
+- on a protocol connection (`ssh`, `smtp`, `imap`), sign in with each `login` member exactly
+  `{{field}}` of the field the shape's `login` names for it (`user`, `password`, `key`,
+  `token`), and nothing else (no answers, no literals around the secret); for SSH, pin exactly
+  the item's `host_key`, which must be a whole key: a `SHA256:` fingerprint passes the field's
+  check but not this rule, since the node compares keys, not fingerprints. A shape with a
+  protocol connection must name its `login` (and `host_key` for SSH) and route to pinned
+  hosts only. The database, queue and VPN kinds allow no protocol connection yet.
 
 ### Custom kinds
 

@@ -463,6 +463,7 @@ impl Operation {
                 login: None,
                 host_keys: Vec::new(),
                 tls: None,
+                version: None,
             })],
             payment: None,
             approval: false,

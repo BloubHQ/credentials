@@ -206,8 +206,9 @@ fn release(map: &mut HashMap<String, usize>, key: &str) {
 pub(crate) fn streams(operation: &Operation) -> bool {
     match operation.connection() {
         Some(Connection::Websocket) => true,
-        // An SSH shell: the relay takes the caller's frames.
-        Some(Connection::Ssh) => operation
+        // An SSH shell or forward: the relay takes the caller's frames. MQTT: the relay hands
+        // back the messages of the subscriptions the policy keeps.
+        Some(Connection::Ssh | Connection::Mqtt) => operation
             .returns()
             .and_then(|r| r.relay.as_ref())
             .is_some_and(|r| !r.frames.is_empty() || r.server),
@@ -417,7 +418,10 @@ impl<S: LogSink, C: Clock> Node<S, C> {
             | Connection::Smtp
             | Connection::Imap
             | Connection::Redis
-            | Connection::Browser => Err(operation.unknown()),
+            | Connection::Browser
+            | Connection::Mysql
+            | Connection::Mqtt
+            | Connection::Amqp => Err(operation.unknown()),
         }
     }
 

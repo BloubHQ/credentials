@@ -1224,3 +1224,208 @@ fn every_check_and_mask_takes_any_bytes() {
         }
     }
 }
+
+/// An operation from JSON, for the protocol connections the builders do not cover.
+fn op(value: serde_json::Value) -> Operation {
+    serde_json::from_value(value).unwrap()
+}
+
+fn ssh_host_key() -> String {
+    format!("ssh-ed25519 {}", ed25519_blob("ssh-ed25519"))
+}
+
+fn ssh_item(login: serde_json::Value, host_keys: Vec<String>) -> Policy {
+    Policy::new()
+        .with_item(
+            ItemBinding::reviewed("ssh")
+                .pin("host", "git.example")
+                .pin("port", "22")
+                .pin("host_key", &ssh_host_key()),
+        )
+        .with_field(FieldSpec::public("host"))
+        .with_field(FieldSpec::public("port"))
+        .with_field(FieldSpec::public("host_key"))
+        .with_field(FieldSpec::public("user"))
+        .with_field(FieldSpec::secret("private_key").optional())
+        .with_field(FieldSpec::guessable("password").optional())
+        .with_operation(op(serde_json::json!({"name": "pay", "steps": [
+            {"do": "open", "connection": "ssh",
+             "destinations": [{"host": "git.example", "port": 22}],
+             "host_keys": host_keys, "login": login},
+            {"do": "return", "relay": {"commands": [{"name": "id", "text": "id"}]}}
+        ]})))
+        .with_caller(caller())
+}
+
+#[test]
+fn an_ssh_item_signs_in_with_its_own_fields_to_its_pinned_host_key() {
+    let key_login = serde_json::json!({"user": "{{user}}", "key": "{{private_key}}"});
+    assert_eq!(
+        rule_of(&ssh_item(key_login.clone(), vec![ssh_host_key()])),
+        None
+    );
+    let password_login = serde_json::json!({"user": "{{user}}", "password": "{{password}}"});
+    assert_eq!(
+        rule_of(&ssh_item(password_login, vec![ssh_host_key()])),
+        None
+    );
+    let login_rule = "each login member is exactly {{field}} of the field the kind names for it";
+    // A login member that is not exactly its field: a literal user, the key as a password,
+    // the password wrapped in other text, an answer the kind does not name.
+    for login in [
+        serde_json::json!({"user": "root", "key": "{{private_key}}"}),
+        serde_json::json!({"user": "{{user}}", "password": "{{private_key}}"}),
+        serde_json::json!({"user": "{{user}}", "password": "x{{password}}"}),
+        serde_json::json!({"user": "{{user}}",
+                           "answers": [{"prompt": "P.*", "template": "{{password}}"}]}),
+    ] {
+        assert_eq!(
+            rule_of(&ssh_item(login, vec![ssh_host_key()])).map(|(_, r)| r),
+            Some(login_rule)
+        );
+    }
+    // Another host key, or a second one besides it.
+    let mut blob = 11u32.to_be_bytes().to_vec();
+    blob.extend_from_slice(b"ssh-ed25519");
+    blob.extend_from_slice(&32u32.to_be_bytes());
+    blob.extend_from_slice(&[8u8; 32]);
+    let other = format!("ssh-ed25519 {}", STANDARD.encode(blob));
+    let key_rule = "an SSH operation of an item pins exactly the item's host key, a whole key";
+    for keys in [vec![other.clone()], vec![ssh_host_key(), other]] {
+        assert_eq!(
+            rule_of(&ssh_item(key_login.clone(), keys)).map(|(_, r)| r),
+            Some(key_rule)
+        );
+    }
+    // A fingerprint in the pin: the node could not compare a key to it.
+    let mut fingerprint = ssh_item(key_login.clone(), vec![ssh_host_key()]);
+    fingerprint.item.as_mut().unwrap().pins.insert(
+        "host_key".into(),
+        "SHA256:47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU".into(),
+    );
+    assert_eq!(rule_of(&fingerprint).map(|(_, r)| r), Some(key_rule));
+    // Another destination than the pinned host and port.
+    let mut elsewhere = ssh_item(key_login, vec![ssh_host_key()]);
+    open_of(&mut elsewhere).destinations = vec![Destination::new("evil.example", 22)];
+    assert_eq!(
+        rule_of(&elsewhere).map(|(_, r)| r),
+        Some("a destination outside the item's pinned origin or host")
+    );
+}
+
+fn mail_item(steps: Vec<serde_json::Value>) -> Policy {
+    Policy::new()
+        .with_item(
+            ItemBinding::reviewed("mail")
+                .pin("smtp_host", "smtp.example")
+                .pin("smtp_port", "465")
+                .pin("imap_host", "imap.example")
+                .pin("imap_port", "993"),
+        )
+        .with_field(FieldSpec::public("smtp_host"))
+        .with_field(FieldSpec::public("smtp_port"))
+        .with_field(FieldSpec::public("imap_host"))
+        .with_field(FieldSpec::public("imap_port"))
+        .with_field(FieldSpec::secret("user"))
+        .with_field(FieldSpec::guessable("password").optional())
+        .with_operation(op(serde_json::json!({"name": "pay", "steps": steps})))
+        .with_caller(caller())
+}
+
+fn smtp_steps(host: &str) -> Vec<serde_json::Value> {
+    vec![
+        serde_json::json!({"do": "open", "connection": "smtp",
+            "destinations": [{"host": host, "port": 465}],
+            "login": {"user": "{{user}}", "password": "{{password}}"}}),
+        serde_json::json!({"do": "return", "relay": {"mail": {
+            "senders": ["me@example\\.com"], "recipients": [".*@example\\.com"]}}}),
+    ]
+}
+
+#[test]
+fn a_mailbox_sends_and_reads_only_on_its_pinned_servers() {
+    assert_eq!(rule_of(&mail_item(smtp_steps("smtp.example"))), None);
+    let imap = vec![
+        serde_json::json!({"do": "open", "connection": "imap",
+            "destinations": [{"host": "imap.example", "port": 993}],
+            "login": {"user": "{{user}}", "password": "{{password}}"}}),
+        serde_json::json!({"do": "return", "relay": {"commands": [
+            {"name": "inbox", "text": "SELECT INBOX"}]}}),
+    ];
+    assert_eq!(rule_of(&mail_item(imap)), None);
+    // SMTP to the IMAP server, or anywhere else.
+    for host in ["imap.example", "evil.example"] {
+        assert_eq!(
+            rule_of(&mail_item(smtp_steps(host))).map(|(_, r)| r),
+            Some("a destination outside the item's pinned origin or host")
+        );
+    }
+    // A hand-written exchange over a TLS stream is not a mailbox operation.
+    let tls = vec![
+        serde_json::json!({"do": "open", "connection": "tls",
+            "destinations": [{"host": "smtp.example", "port": 465}]}),
+        serde_json::json!({"do": "send", "template": "AUTH PLAIN {{password}}\r\n"}),
+        serde_json::json!({"do": "return"}),
+    ];
+    assert_eq!(
+        rule_of(&mail_item(tls)).map(|(_, r)| r),
+        Some("the kind does not allow this connection")
+    );
+}
+
+#[test]
+fn ssh_and_mail_items_describe_and_mask_their_public_fields() {
+    let ssh = ssh_item(
+        serde_json::json!({"user": "{{user}}", "key": "{{private_key}}"}),
+        vec![ssh_host_key()],
+    );
+    let host_key = ssh_host_key();
+    let values = fields(&[
+        ("host", "git.example"),
+        ("port", "22"),
+        ("host_key", &host_key),
+        ("user", "deploy"),
+        ("private_key", "-----BEGIN PRIVATE KEY-----"),
+    ]);
+    check_values(&ssh, &values, Some(NOW)).unwrap();
+    let d = describe(&ssh, &values).unwrap();
+    let names: Vec<&str> = d.fields.iter().map(|f| f.name.as_str()).collect();
+    assert_eq!(names, ["host", "port", "host_key", "user"]);
+    assert!(!d.fields.iter().any(|f| f.value.contains("PRIVATE")));
+
+    let mail = mail_item(smtp_steps("smtp.example"));
+    let values = fields(&[
+        ("smtp_host", "smtp.example"),
+        ("smtp_port", "465"),
+        ("user", "jane@example.com"),
+        ("password", "app-password"),
+    ]);
+    check_values(&mail, &values, Some(NOW)).unwrap();
+    let d = describe(&mail, &values).unwrap();
+    let user = d.fields.iter().find(|f| f.name == "user").unwrap();
+    assert_eq!(user.disclosure, Disclosure::Masked);
+    assert_eq!(user.value, "j***@example.com");
+    assert!(!d.fields.iter().any(|f| f.name == "password"));
+    // A record whose server differs from the pin is refused when it is opened.
+    let moved = fields(&[("smtp_host", "evil.example"), ("user", "jane@example.com")]);
+    assert!(check_values(&mail, &moved, Some(NOW)).is_err());
+}
+
+#[test]
+fn a_kind_with_a_protocol_connection_names_its_login_and_host_key() {
+    let ssh = reviewed_kind("ssh").unwrap().clone();
+    let mut no_login = ssh.clone();
+    no_login.shape.login = None;
+    assert!(no_login.validate().is_err());
+    let mut no_host_key = ssh.clone();
+    no_host_key.shape.host_key = None;
+    assert!(no_host_key.validate().is_err());
+    let mut public_secret = ssh.clone();
+    if let Some(login) = public_secret.shape.login.as_mut() {
+        login.password = Some("host".into());
+    }
+    assert!(public_secret.validate().is_err());
+    let mut anywhere = ssh;
+    anywhere.shape.destinations = DestinationRule::Owner {};
+    assert!(anywhere.validate().is_err());
+}

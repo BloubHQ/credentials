@@ -9,15 +9,19 @@
     missing_docs
 )]
 
+mod amqp;
 mod fake_mail;
 mod fake_pg;
 mod fake_ssh;
 mod hostile;
 mod mail;
+mod mqtt;
+mod mysql;
 mod policy;
 mod postgres;
 mod redis;
 mod ssh;
+mod ssh_paths;
 
 use std::collections::VecDeque;
 use std::time::Duration;

@@ -24,6 +24,7 @@ it needs a nightly compiler.
 | `handover_package` | JSON, also as a length-framed message | The frames of the hand-over protocol (`continuity::wire`), `HandOver` deserialization, and `Node::take_over` on a fresh node, which must refuse a package not sealed to it and log nothing. |
 | `key_transfer` | UTF-8 | `client::unwrap_keys` with a fixed backup key, a transfer offer and a sealed transfer with a fixed code, and an answer to a real offer: none opens, nothing panics. |
 | `cdp_message` | Bytes: one CDP message from a browser, also as lossy UTF-8 | `engine::cdp::parse`, then every typed reader of a browser fill on its result (`frame_tree`, `targets`, `session_id`, `context_id`, `remote`, `navigated`), and `WebOrigin::parse` / `of_url`: no panic; a frame tree that reads is bounded and lists each frame after its parent, a target list is bounded, an origin serializes to what reads back the same. |
+| `protocol_servers` | A byte choosing one of 12 cases and the size of the pieces, then a server's bytes | Each protocol client (SSH, PostgreSQL, MySQL, SMTP, IMAP, Redis, MQTT 3.1.1 and 5, AMQP) against those bytes as its server, and the parsers of SSH keys, `KEXINIT`, SCRAM, the MySQL greeting and SFTP paths: no panic; no SSH sign-in without the pinned key, no PostgreSQL sign-in without the SCRAM proof, no MQTT message on a topic not subscribed to, no AMQP bodies past the limit. |
 
 The HTTP response parser in `crates/engine/src/response.rs` is not public, so it has no
 target here.

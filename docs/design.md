@@ -413,12 +413,75 @@ before, 470 after; the protocol tests run against servers in the test process (a
 SSH server on RustCrypto AES-GCM, ed25519-dalek and p256, a SCRAM server on the RustCrypto
 `pbkdf2` and `hmac`), with no network.
 
-Left for later (part 6 is not finished until these are done): MySQL (`caching_sha2_password` over TLS), MQTT 3.1.1
-and 5, AMQP 0-9-1 PLAIN over TLS, FTP, tunnels; SSH agent forwarding, port forwarding and
-SFTP; the `ssh` and `mail` typed kinds (typed items still allow no protocol connection). Not
-exercised by a test: SSH key exchange on P-384 and P-521, RSA host keys, ECDSA client keys,
-OpenSSH-format client keys; the transport's `open_plain` and `open_starttls` over a real
-socket; the fuzz target was checked to build, not run (it needs nightly and libFuzzer).
+Then: `mysql`, `mqtt` (3.1.1 and 5) and `amqp` (0-9-1) as connection kinds, SFTP and local
+port forwarding over SSH, and the `ssh` and `mail` typed kinds. Each is own synchronous code
+over the engine's `Io` and ring (`proto/mysql.rs` 873 lines, `mqtt.rs` 651, `amqp.rs` 569,
+`sftp.rs` 365); no crate was added, so there was no crate size to compare against. Choices
+left open, and the more secure option taken:
+
+- **MySQL: TLS before anything, `caching_sha2_password` only.** A greeting without
+  `CLIENT_SSL`, or bytes after it before the handshake, is refused before the node writes
+  anything. One auth switch, and only to `caching_sha2_password`; `mysql_native_password`
+  (SHA-1, replayable from a captured exchange), cleartext and other plugins are refused. Full
+  authentication sends the password only over the verified TLS, never with the server's RSA
+  key (which the node could not authenticate). `CLIENT_LOCAL_FILES`, multi-statements and
+  multi-results are never offered, and a `LOCAL INFILE` request fails the call. Every command
+  is a prepared statement with each parameter bound as a string, closed after use.
+- **MQTT: TLS from the first byte, QoS 0 and 1 only**, no retain, will or topic alias; clean
+  sessions, and a random client id (`credentials-` and 96 random bits) unless the policy fixes
+  one, so two calls never take over each other's session. A topic or filter of the caller
+  never holds `+` or `#`; only the policy may subscribe with wildcards. A message the broker
+  sends on a topic no subscription matches, at QoS 2 or with an alias, fails the call. A
+  caller's `subscribe` collects within `max_messages` and `wait_ms` and unsubscribes; a
+  policy's stays for a live relay, which hands back each message as a text part after the
+  reflection search of that message whole, and takes no frames from the caller.
+- **AMQP: `PLAIN` only, over TLS**, and `connection.secure` (a challenge the node did not
+  choose) is refused. The node uses one channel, heartbeats off, frames of at most 128 KiB.
+  Publishes are mandatory and confirmed, so a message no queue takes is an error, not a silent
+  loss. The exchange, routing key and queue are always templates of the policy.
+- **SFTP follows no symbolic link.** A path is absolute, with no empty, `.` or `..` segment,
+  backslash or NUL (`sftp::normalize`), checked when signing, before the log and before
+  sending. Before an open the server's `REALPATH` must return the path itself (its directory,
+  for a write) and `LSTAT` a regular file (or nothing, for a write). Following links within the
+  pattern was the other option; refusing them is simpler to reason about.
+- **Forwarding goes only to a literal `host:port` of the policy**, one per streaming call, and
+  that relay holds only forward rules. Its destination is flagged in the summary. What it
+  exposes is in the threat model.
+- **A caller value can go through a policy template** (`pattern` and `template` with
+  `$input`): the pattern checks the value, and the template fixes the rest, so an SFTP path or
+  a payload keeps its fixed prefix.
+- **Typed `ssh` and `mail` sign in only with their own fields.** Each `login` member must be
+  exactly `{{field}}` of the field the kind names; an SSH policy pins exactly the item's host
+  key, as a whole key (a fingerprint passes the field's check, but the node compares keys).
+  Mail routes SMTP and IMAP each to its own pinned server, so `host` and `port` became
+  `smtp_host`, `smtp_port`, `imap_host` and `imap_port` (required).
+
+Measured on this host (Windows, `cargo test --workspace --locked --no-fail-fast`): tests
+498 before, 553 after, 0 failed; the release `credentials.exe` 12,044,288
+bytes before, 12,329,984 after (+285,696). The new tests run against a MySQL, MQTT, AMQP and SFTP server
+written in the test process, and the SSH test server now does P-384 (SHA-384) and P-521
+(SHA-512) key exchange, RSA host keys (`rsa-sha2-256/512`, keys generated with the `rsa`
+crate in the test), and verifies ECDSA P-256/P-384, RSA PKCS#1 and OpenSSH-format client
+keys, all generated in the tests.
+
+Left for later:
+
+- FTP (and FTPS), POP3, tunnels as an IR relay step; SSH agent forwarding, remote forwarding
+  and SFTP directory listing, rename and delete.
+- Typed protocol connections for the `database` and `queue` kinds (they still allow none:
+  their `engine` or `protocol` field would choose the connection, which the kind's shape
+  cannot express yet), and the `vpn` kind.
+- A race on the SFTP server between the `REALPATH`/`LSTAT` check and the open, open to whoever
+  can change the server's files in between; SFTP v3 has no flag that refuses links on open.
+- A live MQTT relay searches each message whole, but not a secret split across two messages;
+  the stream search of SSH spans frames, the message search does not.
+- MQTT 5 properties beyond the maximum packet size (user properties, response topics), MQTT
+  over WebSocket, AMQP 1.0, and AMQP consumers (`basic.consume`) as a live relay.
+- MySQL `COM_QUERY` text results, compression and the server's RSA key exchange (refused on
+  purpose; listed so it stays a decision).
+- The transport's `open_plain` and `open_starttls` over a real socket, and real servers of
+  each kind, are not exercised by a test; the fuzz target was checked to build, not run (it
+  needs nightly and libFuzzer).
 
 ## 8. Transport and engine gaps
 
@@ -616,7 +679,7 @@ As built (part 10):
 | 3 | Typed items, disclosure levels, `describe`, custom kinds (done: `docs/policy.md`, Typed items) | 2 |
 | 4 | Policy JSON Schema, `client::summarize` with risk flags, approval format (done: `docs/policy.md`; the approval runtime is part 5) | 2, 3 |
 | 5 | Sessions, challenges, approvals, spending limits (done: `docs/policy.md`, Operations that wait; codes read from a `mail` item, `await` on TLS and amounts from body contracts are next) | 2 |
-| 6 | Connection kinds in layer 1: HTTP/2, WebSocket, streamed responses (first half done: `docs/policy.md`, HTTP versions and gRPC, WebSocket; own synchronous HTTP/2 client and HPACK, one thread per open connection, the Nitro host relay unchanged), then SSH, databases, FTP, mail, queues (second half started: SSH, PostgreSQL, SMTP, IMAP and Redis done, section 7c; MySQL, MQTT, AMQP, FTP and tunnels as an IR relay step next) | 2 |
+| 6 | Connection kinds in layer 1: HTTP/2, WebSocket, streamed responses (first half done: `docs/policy.md`, HTTP versions and gRPC, WebSocket; own synchronous HTTP/2 client and HPACK, one thread per open connection, the Nitro host relay unchanged), then SSH, databases, FTP, mail, queues (second half done but for the rows left in section 7c: SSH with SFTP and local forwarding, PostgreSQL, MySQL, SMTP, IMAP, Redis, MQTT 3.1.1 and 5, AMQP 0-9-1, and the `ssh` and `mail` typed kinds; FTP, POP3 and tunnels as an IR relay step next) | 2 |
 | 7 | Trusted code sandbox (layer 3): WebAssembly runtime, JavaScript module, origin-pinned site code (done: `run` step, `crates/sandbox`, wasmi 1.1.0 chosen by measurement; JavaScript measured with boa in the sandbox, its shipping plan in `docs/sandbox.md`) | 2 |
 | 8 | Browser fills over CDP (done: the `browser` connection and `fill`, `engine::cdp`, `docs/policy.md` Browser fills; tested against an in-process fake CDP endpoint, never a real browser; typed `card` and `login` items with browser operations, and detaching the agent's controller, are next) | 4, 5 |
 | 9 | Remaining primitive families (Appendices A, B), UDP relay and its protocols (done: HPKE, TurboSHAKE, KangarooTwelve, ML-DSA, SM2, brainpool ECDSA, `tls_exporter` in TLS sends, the `udp` connection and the datagram relay; `docs/policy.md` and section 7b; the rows still open and why are listed under Appendix A, Part 9) | 1 |

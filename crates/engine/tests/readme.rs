@@ -110,6 +110,8 @@ fn the_policy_reference_parses() {
                     "db_password",
                     "smtp_password",
                     "redis_password",
+                    "mqtt_password",
+                    "amqp_password",
                     "last_code",
                 ];
                 let policy = Policy {
