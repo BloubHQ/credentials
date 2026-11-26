@@ -1994,23 +1994,40 @@ impl<S: LogSink, C: Clock> Node<S, C> {
         };
         let mut output = StreamOutput::default();
         let mut history = Zeroizing::new(Vec::new());
-        for exchange in exchanges {
-            let delimiters: Vec<&[u8]> = exchange.until.iter().map(Vec::as_slice).collect();
-            let read = stream
-                .write(&exchange.send)
-                .and_then(|()| stream.read_until(&delimiters, MAX_RESPONSE))
-                .and_then(|read| reflection::release(read, &secrets))
-                .and_then(|read| {
-                    history.extend_from_slice(&read);
-                    reflection::check(&history, &secrets).map(|()| read)
-                });
-            match read {
-                Ok(read) => output.reads.push(read),
-                Err(error) => {
-                    output.error = Some(error);
-                    break;
+        // The caller's delimiters end a read only where they touch no secret, so where a
+        // read ends tells nothing of one the server echoes (reflection::delimit).
+        match reflection::Delimited::new(&secrets) {
+            Err(error) => output.error = Some(error),
+            Ok(mut reader) => {
+                for exchange in exchanges {
+                    let delimiters: Vec<&[u8]> = exchange.until.iter().map(Vec::as_slice).collect();
+                    let read = stream
+                        .write(&exchange.send)
+                        .and_then(|()| reader.read(&mut *stream, &delimiters, MAX_RESPONSE))
+                        .and_then(|mut read| {
+                            reflection::release(core::mem::take(&mut *read), &secrets)
+                        })
+                        .and_then(|read| {
+                            history.extend_from_slice(&read);
+                            reflection::check(&history, &secrets).map(|()| read)
+                        });
+                    match read {
+                        Ok(read) => output.reads.push(read),
+                        Err(error) => {
+                            output.error = Some(error);
+                            break;
+                        }
+                    }
                 }
             }
+        }
+        // A secret found anywhere in the call: no read of it goes back, not even those before
+        // (they could end where the secret starts).
+        if output.error == Some(Error::Reflection) {
+            for read in &mut output.reads {
+                read.zeroize();
+            }
+            output.reads.clear();
         }
         let _ = stream.close();
         self.done(now, who, seq, None, output.error.is_none());

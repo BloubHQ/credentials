@@ -544,8 +544,9 @@ fn a_udp_operation_exchanges_datagrams_and_searches_every_read() {
             .any(|w| w.windows(secret.len()).any(|x| x == secret)),
         "a datagram held the secret"
     );
-    assert_eq!(out.reads, vec![b"pong".to_vec()]);
-    assert!(out.error.is_some(), "the echoed secret ends the exchanges");
+    // The echoed secret ends the exchanges, and no read of the call goes back.
+    assert!(out.reads.is_empty());
+    assert_eq!(out.error, Some(Error::Reflection));
 
     // Delimiters do not apply to datagrams, and a datagram has a size.
     for exchange in [

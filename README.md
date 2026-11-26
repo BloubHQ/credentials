@@ -589,10 +589,14 @@ explains each.
   Enclave](#running-in-a-nitro-enclave)); elsewhere the node is an ordinary process and
   whoever runs it can read its memory. A Nitro node has no sealed storage: a restart is a new
   node, and owners grant again.
-- **Reflection search finds known encodings only**: raw, base64 (both alphabets), percent,
-  JSON and hex, and escaped JSON strings. A server that splits, compresses in its own way or
+- **Reflection search finds known encodings only**: raw, base64 (both alphabets, also inside
+  a longer base64 value), percent (either case, `+` for spaces), JSON, hex (any case), and
+  escaped JSON strings. A server that splits, compresses in its own way or
   encrypts a secret it echoes is not caught. Secret fields of 4 to 7 bytes are searched raw
   only, and their bytes appearing by chance drop the response.
+- **TLS reads take time to decide.** A caller's delimiter never ends a read inside an echoed
+  secret, but deciding takes longer next to one, and the caller sees the time of its call
+  ([threat model](docs/threat-model.md)).
 - **Responses are buffered** (16 MiB at most), because the search needs the whole response.
 - **A value the server sends for capture is the server's.** If a server hands back a key and
   the policy uses it as a key, the server knows that key.

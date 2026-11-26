@@ -944,7 +944,17 @@ until) run on the connection when **every** send matches one of 1 to 16 patterns
 (linear-time regular expressions of at most 256 bytes; `.` does not match a line end). The
 sends are checked before anything is logged or the connection opens. Without `relay`, a
 call with exchanges is refused. Every read is redacted and searched before it is returned;
-an error stops the exchanges and is returned next to the reads that completed.
+an error stops the exchanges and is returned next to the reads that completed, except a
+reflection: when a secret is found in any read of the call (or in the bytes of a read that
+failed), no read goes back.
+
+A caller's delimiter ends a read only where no secret the reply may echo overlaps it, in any
+form the reflection search knows; a match over a secret is skipped and the read goes on, so
+where a read ends tells nothing of the secret. To decide, the node may read past a match while
+the bytes after it could still complete a secret (up to the longest form less one byte, the end
+of the connection or the read timeout); those bytes start the next read. Delimiters that touch
+no secret (`
+`, `a1 OK`) end reads as before.
 
 #### WebSocket: the relay
 

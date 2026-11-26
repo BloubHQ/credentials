@@ -594,6 +594,24 @@ before 1.0, minor versions may break formats and APIs.
 
 ### Security
 
+- The delimiters of a caller's TLS exchanges were an oracle on a secret the server echoes:
+  with `until` set to the bytes before the secret plus a guessed byte, the read ended there
+  only when the guess was right (measured: 3 of 3 bytes learned). A match is now taken only
+  where no occurrence of a secret, in any searched form, overlaps it; the reader looks ahead
+  after a match as far as an overlapping occurrence could reach and keeps the bytes read ahead,
+  in order, for the next read (`reflection::delimit`; measured after: 0 bytes). A reflection in
+  any read of a call (or in a read that fails) now returns no read of the call; before, the
+  reads before it went back with the error. Transports must implement `Stream::read_some` for
+  TLS exchanges with delimiters. The residual timing channel is in `docs/threat-model.md`.
+- The reflection search finds more encoded forms of a secret field: base64 in both alphabets
+  at the three alignments inside a longer value (the characters its own bits decide), the raw
+  value in the percent-decoded response (`%XX` in either case, `+` as a space and as itself,
+  reserved characters left unencoded) and hex in any mix of cases, in whole responses and in
+  the stream search. Before, base64 matched only a value encoded alone, percent only one
+  encoder's uppercase form and hex only all-lower or all-upper. `reflection::forms` lists the
+  lowercase percent and mixed-case hex forms too; `Scrubber::for_secret` searches like for a
+  secret field.
+
 - Rule 10 of the template analysis: the input of `deflate`, `zlib_deflate` and
   `gzip_deflate` may not be tainted (a compressed length tells how the input repeats itself:
   CRIME, BREACH). `inflate`, `zlib_inflate`, `gzip_inflate` and `xml_escape` refuse a secret

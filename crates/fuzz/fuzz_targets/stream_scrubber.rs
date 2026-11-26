@@ -1,6 +1,8 @@
 //! A secret placed in arbitrary bytes, in one of the forms the search knows, split into
 //! arbitrary pieces: the stream search must find it and release no byte of it. Clean bytes
-//! come out whole and in order. A chunked body decoder must not panic on any input.
+//! come out whole and in order. A chunked body decoder must not panic on any input. The search
+//! is the one of a secret field (`Scrubber::for_secret`): its forms are found in any case of
+//! percent and hex escapes, and in a longer base64 value.
 
 #![no_main]
 
@@ -27,7 +29,9 @@ fuzz_target!(|data: &[u8]| {
     stream.extend_from_slice(form);
     stream.extend_from_slice(&rest[at..]);
     let step = usize::from(*step).max(1);
-    let mut scrubber = Scrubber::with_needles(forms(SECRET).unwrap_or_default());
+    let Ok(mut scrubber) = Scrubber::for_secret(SECRET) else {
+        return;
+    };
     let mut out = Vec::new();
     let mut found = false;
     for piece in stream.chunks(step) {
@@ -43,7 +47,9 @@ fuzz_target!(|data: &[u8]| {
     assert!(out.len() <= at, "bytes of the secret were released");
 
     // Clean bytes pass whole (or are refused when they hold the secret in an escaped form).
-    let mut scrubber = Scrubber::with_needles(forms(SECRET).unwrap_or_default());
+    let Ok(mut scrubber) = Scrubber::for_secret(SECRET) else {
+        return;
+    };
     let mut out = Vec::new();
     for piece in rest.chunks(step) {
         match scrubber.push(piece) {

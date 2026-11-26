@@ -159,6 +159,19 @@ impl Stream for FakeStream<'_> {
             .pop_front()
             .ok_or(Error::transport(TransportKind::Closed, false))
     }
+
+    /// The caller's exchanges read with `read_some`: each reply is what one read finds.
+    fn read_some(
+        &mut self,
+        _: usize,
+        _: std::time::Duration,
+    ) -> engine::Result<engine::egress::Arrived> {
+        Ok(self
+            .0
+            .replies
+            .pop_front()
+            .map_or(engine::egress::Arrived::End, engine::egress::Arrived::Bytes))
+    }
 }
 
 fn host() -> Destination {
@@ -1615,7 +1628,8 @@ fn a_stream_logs_in_then_carries_the_caller() {
     assert_eq!(
         outcome.result.unwrap(),
         StreamOutput {
-            reads: vec![b"* 3 EXISTS\r\na2 OK SELECT completed\r\n".to_vec()],
+            // Up to and including the delimiter; the rest would start the next read.
+            reads: vec![b"* 3 EXISTS\r\na2 OK".to_vec()],
             error: None,
         }
     );
@@ -1892,7 +1906,7 @@ fn a_stream_keeps_its_captured_field_when_an_exchange_fails() {
         outcome.result,
         Ok(StreamOutput {
             reads: vec![],
-            error: Some(Error::transport(TransportKind::Closed, false)),
+            error: Some(Error::transport(TransportKind::Closed, true)),
         })
     );
     assert_eq!(outcome.record.unwrap().generation, 2);
