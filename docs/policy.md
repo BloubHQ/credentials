@@ -1897,6 +1897,8 @@ reads.
 | CBOR | `cbor_int(n)` `cbor_bytes(value)` `cbor_text(value)` `cbor_array(item, ...)` `cbor_map(key, value, ...)` `cbor_tag(number, item)` |
 | Compression | `deflate(value)` `inflate(value)` (RFC 1951) `zlib_deflate` `zlib_inflate` (RFC 1950) `gzip_deflate` `gzip_inflate` (RFC 1952) |
 | XML | `xml_c14n(algorithm, document[, inclusive_prefixes])` (Canonical XML 1.0 and 1.1, Exclusive XML Canonicalization 1.0) `xml_escape(text)` |
+| SRP-6a | `srp_public(group, private)` `srp_x(hash, salt, identity, password)` `srp_u(group, hash, A, B)` `srp_premaster(group, hash, x, private, B)` `srp_m1(group, hash, identity, salt, A, B, K)` `srp_verify(hash, A, M1, K, M2)` (RFC 2945, RFC 5054 groups) |
+| OpenPGP | `pgp_packet(type, body)` `pgp_subpacket(type, body)` `pgp_mpi(value)` `pgp_armor(label, data[, "crc24"])` (RFC 9580) |
 
 Keys are raw bytes or PKCS#8 DER (PKCS#1 DER for RSA); use `pem(...)` to read a PEM field.
 Hash names are `sha1`, `sha256`, `sha384` and `sha512`: `pbkdf2` and `rsa_sign_pkcs1` take all
@@ -2302,6 +2304,153 @@ to add a second, or carries a DTD) fails the canonicalization, so nothing is sig
  ]}
 ```
 
+#### SRP-6a and OpenPGP
+
+SRP-6a (RFC 2945, RFC 5054), the client's side, in the groups of RFC 5054 appendix A
+(`rfc5054_1024`, `rfc5054_1536`, `rfc5054_2048`, `rfc5054_3072`, `rfc5054_4096`,
+`rfc5054_6144`, `rfc5054_8192`; the last four are the RFC 3526 primes) with `sha1`, `sha256`,
+`sha384` or `sha512`. The group and the hash are fixed by the policy (rule 6). Each step is a
+function, so a service's variant is a different template, not new code:
+
+- `srp_public(group, private)` is `g^private mod N` padded to the length of `N`: `A` from a
+  private value `a` (`random("32")` in a `compute` step, kept for the second request), or the
+  verifier `v` from `x`. One-way, like `hpke_public`.
+- `srp_x(hash, salt, identity, password)` is `H(salt | H(identity | ":" | password))`
+  (RFC 5054 section 2.4). A service that hashes differently writes the identity it hashes
+  (a prefix before the user name, or nothing) or hashes the password first (`pbkdf2`). A
+  key derived from the password: rule 8.
+- `srp_u(group, hash, A, B)` is `H(PAD(A) | PAD(B))`.
+- `srp_premaster(group, hash, x, private, B)` is `S = (B - k * g^x)^(private + u * x) mod N`
+  with `k = H(N | PAD(g))` and `u` as above, padded to the length of `N`. It refuses a `B`
+  of zero or not below `N` and a `u` of zero (RFC 5054 section 2.6). Always a secret, never
+  controlled, like `ecdh`, so `sha256(S)` (the session key `K` most services use) stays a
+  secret too.
+- `srp_m1(group, hash, identity, salt, A, B, K)` is the client's proof `H(H(N) xor H(g) |
+  H(identity) | salt | A | B | K)` (RFC 2945 section 3), `N` and `g` without leading zeros,
+  `A` and `B` as the policy passes them. A hash: untainted when a captured or chosen value
+  is in it, as the salt and `B` are.
+- `srp_verify(hash, A, M1, K, M2)` is empty when the server's proof `M2` is
+  `H(A | M1 | K)`, compared in constant time, and fails the operation otherwise, so nothing
+  after it runs and nothing is returned to a server that does not know the verifier.
+
+Every value that depends on a secret is computed on `crypto-bigint`'s constant-time big
+integers (Montgomery multiplication, a fixed-window exponentiation over every bit of the
+exponent's precision with constant-time table selection), at precisions fixed by the group and
+by the lengths of the inputs. Public values (`B`, `A`, `u`, `k`) are checked in variable time.
+Timing on real hardware is not measured. A premaster secret counts as 3 signatures against
+the budget of 32 (three exponentiations), `srp_public` as one.
+
+A login in two requests: the node sends the user and `A`, reads the salt and `B`, sends
+`M1`, and checks `M2` before it returns anything (`user` a public field, `password` a secret
+or guessable field):
+
+```json
+{"name": "srp-login",
+ "steps": [
+  {"do": "open", "connection": "https", "destinations": [{"host": "auth.example.com", "port": 443}]},
+  {"do": "compute", "into": "srp_private", "template": "{{ random(\"32\") }}"},
+  {"do": "compute", "into": "srp_a", "template": "{{ srp_public(\"rfc5054_2048\", srp_private) }}"},
+  {"do": "send", "request": {"from": "fixed", "method": "POST", "path": "/srp/init"},
+   "inject": [{"target": {"kind": "body"}, "template": "{\"user\":\"{{ json(user) }}\",\"A\":\"{{ hex(srp_a) }}\"}"}]},
+  {"do": "receive", "capture": [
+    {"source": {"from": "json", "pointer": "/salt"}, "into": {"kind": "temp", "name": "salt", "secret": false}},
+    {"source": {"from": "json", "pointer": "/B"}, "into": {"kind": "temp", "name": "srp_b", "secret": false}}]},
+  {"do": "compute", "into": "srp_secret_x", "template": "{{ srp_x(\"sha256\", hexdecode(salt), user, password) }}"},
+  {"do": "compute", "into": "srp_key", "template": "{{ sha256(srp_premaster(\"rfc5054_2048\", \"sha256\", srp_secret_x, srp_private, hexdecode(srp_b))) }}"},
+  {"do": "compute", "into": "srp_m1", "template": "{{ srp_m1(\"rfc5054_2048\", \"sha256\", user, hexdecode(salt), srp_a, hexdecode(srp_b), srp_key) }}"},
+  {"do": "send", "request": {"from": "fixed", "method": "POST", "path": "/srp/verify"},
+   "inject": [{"target": {"kind": "body"}, "template": "{\"user\":\"{{ json(user) }}\",\"M1\":\"{{ hex(srp_m1) }}\"}"}]},
+  {"do": "receive", "capture": [
+    {"source": {"from": "json", "pointer": "/M2"}, "into": {"kind": "temp", "name": "srp_m2", "secret": false}}]},
+  {"do": "compute", "into": "server_proved", "template": "{{ srp_verify(\"sha256\", srp_a, srp_m1, srp_key, hexdecode(srp_m2)) }}"},
+  {"do": "return", "response": {"body": {"json": ["/session"]}}}
+ ]}
+```
+
+What the analysis holds the SRP functions to, beyond the rules below (rule 11): the private
+value of `srp_public` and `srp_premaster` is neither caller-chosen nor captured (a `random` or
+a field: someone who picked it would know `A`'s discrete logarithm and the premaster secret);
+`B` and every argument of `srp_verify` come from the policy or the destination, never from
+the caller; a mixed value may not reach `srp_u`, `srp_premaster` or `srp_verify`, which fail
+on some inputs (rule 1).
+
+OpenPGP (RFC 9580; version 4 signatures are those of RFC 4880 too): the framing is four
+functions, and a signature is the template's, over the signature functions the engine already
+has, so a version, an algorithm or a subpacket is a different template:
+
+- `pgp_packet(type, body)`: a packet in the OpenPGP format (section 4.2.1), the header
+  `0xC0 | type` (1 to 63) and the shortest body length (one, two or five octets).
+- `pgp_subpacket(type, body)`: a signature subpacket (section 5.2.3.7), its length, the type
+  octet 1 to 255 (bit 7 is the critical flag: `130` is a critical type 2) and the body.
+- `pgp_mpi(value)`: a multiprecision integer (section 3.2), the bit count in two octets and
+  the value without leading zeros, at most 65,535 bits. Its length depends on the value, so
+  its input must not be tainted (rule 10); the public key and the signature never are.
+- `pgp_armor(label, data[, "crc24"])`: ASCII armor (section 6.2) with the label `SIGNATURE`,
+  `MESSAGE`, `PUBLIC KEY BLOCK` or `PRIVATE KEY BLOCK` (fixed by the policy, rule 6), no
+  armor header, base64 lines of 64 characters and LF line ends. The CRC-24 line comes only
+  with `"crc24"`: RFC 9580 section 6.1 says not to emit it, RFC 4880 readers expect it.
+
+A detached version 4 signature of the caller's bytes (type 0x00, binary), RSA (algorithm 1),
+SHA-256: the hashed data is the payload, the signature's hashed part (version, type,
+algorithms, the hashed subpackets with their length) and the trailer `0x04 0xFF` with the
+length of the hashed part. The key's fingerprint is the SHA-1 of `0x99`, a two-octet length
+and the public key packet's body, which the template rebuilds from the key and its creation
+time (`rsa_key` a PKCS#8 PEM, `key_created` a public field in Unix seconds):
+
+```json
+{"name": "openpgp-rsa", "input": {"raw": {"max_len": 65536}},
+ "steps": [
+  {"do": "compute", "into": "key_body", "template": "{{ hexdecode(\"04\") + be32(key_created) + hexdecode(\"01\") + pgp_mpi(rsa_public(\"n\", pem(rsa_key))) + pgp_mpi(rsa_public(\"e\", pem(rsa_key))) }}"},
+  {"do": "compute", "into": "fingerprint", "template": "{{ sha1(hexdecode(\"99\") + be16(len(key_body)) + key_body) }}"},
+  {"do": "compute", "into": "hashed_subpackets", "template": "{{ pgp_subpacket(\"2\", be32($unix)) + pgp_subpacket(\"33\", hexdecode(\"04\") + fingerprint) }}"},
+  {"do": "compute", "into": "hashed_part", "template": "{{ hexdecode(\"04000108\") + be16(len(hashed_subpackets)) + hashed_subpackets }}"},
+  {"do": "compute", "into": "signed", "template": "{{ $input + hashed_part + hexdecode(\"04ff\") + be32(len(hashed_part)) }}"},
+  {"do": "compute", "into": "unhashed", "template": "{{ pgp_subpacket(\"16\", slice(fingerprint, \"12\", \"8\")) }}"},
+  {"do": "return", "template": "{{ pgp_armor(\"SIGNATURE\", pgp_packet(\"2\", hashed_part + be16(len(unhashed)) + unhashed + slice(sha256(signed), \"0\", \"2\") + pgp_mpi(rsa_sign_pkcs1(\"sha256\", pem(rsa_key), signed))), \"crc24\") }}"}
+ ]}
+```
+
+The same with Ed25519 as GnuPG writes it (EdDSALegacy, algorithm 22, RFC 9580 section
+5.5.5.5: the curve OID, the public key as an MPI after `0x40`, and `r` and `s` as two MPIs).
+The EdDSA signature is over the digest (section 5.2.3.4), not the data (`ed_key` the 32-byte
+secret):
+
+```json
+{"name": "openpgp-eddsa-legacy", "input": {"raw": {"max_len": 65536}},
+ "steps": [
+  {"do": "compute", "into": "key_body", "template": "{{ hexdecode(\"04\") + be32(key_created) + hexdecode(\"16092b06010401da470f01\") + pgp_mpi(hexdecode(\"40\") + ed25519_public(ed_key)) }}"},
+  {"do": "compute", "into": "fingerprint", "template": "{{ sha1(hexdecode(\"99\") + be16(len(key_body)) + key_body) }}"},
+  {"do": "compute", "into": "hashed_subpackets", "template": "{{ pgp_subpacket(\"2\", be32($unix)) + pgp_subpacket(\"33\", hexdecode(\"04\") + fingerprint) }}"},
+  {"do": "compute", "into": "hashed_part", "template": "{{ hexdecode(\"04001608\") + be16(len(hashed_subpackets)) + hashed_subpackets }}"},
+  {"do": "compute", "into": "digest", "template": "{{ sha256($input + hashed_part + hexdecode(\"04ff\") + be32(len(hashed_part))) }}"},
+  {"do": "compute", "into": "signature", "template": "{{ ed25519_sign(ed_key, digest) }}"},
+  {"do": "compute", "into": "unhashed", "template": "{{ pgp_subpacket(\"16\", slice(fingerprint, \"12\", \"8\")) }}"},
+  {"do": "return", "template": "{{ pgp_armor(\"SIGNATURE\", pgp_packet(\"2\", hashed_part + be16(len(unhashed)) + unhashed + slice(digest, \"0\", \"2\") + pgp_mpi(slice(signature, \"0\", \"32\")) + pgp_mpi(slice(signature, \"32\", \"32\"))), \"crc24\") }}"}
+ ]}
+```
+
+A version 6 signature (RFC 9580 section 5.2.3) with Ed25519 (algorithm 27): a v6 key packet
+(the key material's length in four octets), a v6 fingerprint (SHA-256 of `0x9B`, a four-octet
+length and the key packet's body), four-octet subpacket lengths, a fresh 16-octet salt hashed
+before the data, the trailer `0x06 0xFF`, and the 64-octet native signature; no issuer key ID
+subpacket, and armor without the CRC-24:
+
+```json
+{"name": "openpgp-v6-ed25519", "input": {"raw": {"max_len": 65536}},
+ "steps": [
+  {"do": "compute", "into": "key_body", "template": "{{ hexdecode(\"06\") + be32(key_created) + hexdecode(\"1b00000020\") + ed25519_public(ed_key) }}"},
+  {"do": "compute", "into": "fingerprint", "template": "{{ sha256(hexdecode(\"9b\") + be32(len(key_body)) + key_body) }}"},
+  {"do": "compute", "into": "salt", "template": "{{ random(\"16\") }}"},
+  {"do": "compute", "into": "hashed_subpackets", "template": "{{ pgp_subpacket(\"2\", be32($unix)) + pgp_subpacket(\"33\", hexdecode(\"06\") + fingerprint) }}"},
+  {"do": "compute", "into": "hashed_part", "template": "{{ hexdecode(\"06001b08\") + be32(len(hashed_subpackets)) + hashed_subpackets }}"},
+  {"do": "compute", "into": "digest", "template": "{{ sha256(salt + $input + hashed_part + hexdecode(\"06ff\") + be32(len(hashed_part))) }}"},
+  {"do": "return", "template": "{{ pgp_armor(\"SIGNATURE\", pgp_packet(\"2\", hashed_part + be32(\"0\") + slice(digest, \"0\", \"2\") + u8(\"16\") + salt + ed25519_sign(ed_key, digest))) }}"}
+ ]}
+```
+
+Not covered: text signatures (type 0x01, which hash the data with its line ends made CR LF),
+cleartext signatures (dash escaping), one-pass signed and encrypted messages (session keys,
+AES-OCB and CFB are not functions), and key generation (certificates are made by the owner).
 #### Parameter lists, derived EC keys and binary messages
 
 Three families for the schemes of `docs/design.md` section 11 that needed them, each
@@ -2518,8 +2667,9 @@ Rules:
    `kbkdf_counter`, `kbkdf_ec_key` (its curve and hash), `ecdsa_sign_prehash`, `dsa_sign`, `dsa_sign_der`, the suite and mode of
    the `hpke_*` functions, the KEM of `hpke_public` and `hpke_derive_key`, the domain byte of
    `turboshake*`, the parameter set of `mldsa_sign` and `mldsa_public`) must be neither tainted nor controlled: the policy fixes the algorithm, so no caller can downgrade it.
-   So must the curve of `ecdsa_public`, the form of `rsa_public` and the algorithm of
-   `xml_c14n`.
+   So must the curve of `ecdsa_public`, the form of `rsa_public`, the algorithm of
+   `xml_c14n`, the group and hash of the `srp_*` functions and the label and checksum of
+   `pgp_armor`.
 7. The public key of `rsa_encrypt_oaep`, `rsa_encrypt_pkcs1`, `hpke_seal` and `hpke_export`,
    and the PSK, PSK id and sender key of every `hpke_*` function, must not be caller-chosen: it
    comes from the policy (a literal or a field) or from a capture of the destination's
@@ -2554,6 +2704,15 @@ Rules:
     tracked. No scheme measured needs it (a SAML request holds no secret; its signature is
     made after compression). Decompression keeps the taint like a decoder (rule 1 covers a
     mixed input), and the output of `xml_c14n` is tainted when the document is.
+    The input of `pgp_mpi` must not be tainted either: it drops leading zeros, so its length
+    tells how many the value has.
+11. The private value of `srp_public` and `srp_premaster` must be neither caller-chosen nor
+    captured: a `random` of the policy or a field. `B` in `srp_premaster` and every argument
+    of `srp_verify` must not be caller-chosen. `srp_x` is a key derived from the password
+    (rule 8); `srp_premaster` is a secret whatever its arguments, of which nobody chooses a
+    byte, like `ecdh`; `srp_u` and `srp_m1` are hashes (rule 3); `srp_public` and
+    `srp_verify` are one-way. A mixed value may not reach `srp_u`, `srp_premaster` (`x`, the
+    private value, `B`) or `srp_verify`, which fail on some inputs (rule 1).
 
 The request components (`$header`, `$query_param`, `$target_uri`) are controlled and
 caller-chosen like `$body`, so every rule above applies to them unchanged: a header value
@@ -2564,7 +2723,7 @@ properties of the encryption they split (never a *secret key*). `ed25519_public`
 `ed448_public`, `ecdsa_public` and `rsa_public` remove the taint, like `hpke_public`, and keep
 *guessable*.
 
-A template that breaks rule 1, 2, 6, 7, 9 or 10 is refused wherever it appears; rule 5 applies to the
+A template that breaks rule 1, 2, 6, 7, 9, 10 or 11 is refused wherever it appears; rule 5 applies to the
 `return` of an operation with no connection. A computed name carries the properties of its
 template, so the rules hold across steps exactly as they do inside one template.
 

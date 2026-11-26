@@ -213,6 +213,10 @@ let outcome = node.run(&call, &mut TlsTransport::new());
 - **圧縮と XML。** 秘密は圧縮しません（`deflate`、`zlib_deflate`、`gzip_deflate`）。圧縮後の
   長さが入力の繰り返し方を明かすためです（CRIME）。1 回の展開で書けるのは最大 1 MiB と残りの
   予算までです。XML は DTD なしで読むので、外部エンティティもエンティティ展開もありません。
+- **SRP と OpenPGP。** SRP の秘密値はノードのものです（`random` かフィールド。呼び出し側が選んだ値や
+  キャプチャした値は拒否）。`B` とサーバーの証明は呼び出し側から来ることはなく、premaster secret は
+  `ecdh` の結果と同じく秘密として扱い、定数時間で計算します。`pgp_mpi` は秘密を受け取りません。
+  長さが先頭のゼロの数を明かすためです。
 - **予算 (budget)。** 1 つのオペレーションでレンダリングできるのは最大 128 MiB、PBKDF2 1,000,000
   ラウンド、署名と鍵合意あわせて 32 回までです。
 
@@ -231,6 +235,8 @@ let outcome = node.run(&call, &mut TlsTransport::new());
 | ブラウザーで暗号化するパスワード | `ecdh("p256", server_key)` + `sha256` + `aes_cbc_encrypt`、`u8(len(…))` の長さ接頭辞と `ecdh_public("p256")`。またはサーバーからキャプチャした鍵で `rsa_encrypt_oaep("sha256", key, password)` |
 | JWT RS256 | 接続なし: `b64urlraw(header) + "." + b64urlraw($input) + "." + b64urlraw(rsa_sign_pkcs1_sha256(pem(key), …))` |
 | ポリシーが有効期間を決める JWT | `iss`/`aud` を固定し `iat`/`exp` をノードが `set` する `json` input スキーマ、またはテンプレートの `json_set_number(..., "exp", add($unix, "300"))` |
+| SRP-6a ログイン | `random("32")` の `srp_public`、salt と `B` を受け取った後に `srp_x`、`srp_premaster`、`sha256`、`srp_m1`、何かを返す前にサーバーの `M2` を `srp_verify` |
+| OpenPGP 分離署名 | 接続なし: `rsa_sign_pkcs1("sha256", ...)`（MPI）またはダイジェストの `ed25519_sign` を `pgp_armor("SIGNATURE", pgp_packet("2", ...))` で包み、`pgp_subpacket` と trailer は `be16`、`be32`、`len` で書く。v4 は GnuPG で検証 |
 | SAML サービスプロバイダー、WS-Security | HTTP-Redirect: `b64(deflate(authn))` と、クエリへの `rsa_sign_pkcs1_sha256` または `p256_sign`。HTTP-POST: `xml_c14n("http://www.w3.org/2001/10/xml-exc-c14n#", ...)` に対する enveloped 署名。いずれも `rsa` と ring で検証 |
 | OAuth 1.0a (RFC 5849) | base string に対する `sorted_params($query, $body, ...)` と `hmac_sha1` または `rsa_sign_pkcs1("sha1", ...)`。RFC 5849 のベクター、`hmac` と `rsa` で検証 |
 | AWS Signature Version 4A | `kbkdf_ec_key("p256", "sha256", ...)`(SP 800-108 カウンターモード、FIPS 186-5 rejection sampling)と `p256_sign_der`。テストで別に導出した鍵で ring が検証 |

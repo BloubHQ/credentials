@@ -23,7 +23,9 @@ pub(crate) mod hpke;
 mod kdf;
 mod modes;
 pub mod params;
+mod pgp;
 mod sign;
+mod srp;
 pub(crate) mod turbo;
 pub mod xml;
 
@@ -893,6 +895,9 @@ fn pbkdf2_any(args: &[Bytes], budget: &Budget) -> Result<Bytes> {
 /// function allocates.
 pub(crate) fn output_bound(func: Func, args: &[Bytes]) -> usize {
     let len = |i: usize| args.get(i).map_or(0, |a| a.len());
+    if let Some(bound) = srp::output_bound(func).or_else(|| pgp::output_bound(func, args)) {
+        return bound;
+    }
     match func {
         Func::B64 | Func::B64Raw | Func::B64Url | Func::B64UrlRaw => len(0) / 3 * 4 + 4,
         Func::Hex => len(0) * 2,
@@ -1220,6 +1225,12 @@ pub(crate) fn tls_exporter(
 }
 
 pub(crate) fn call(func: Func, args: &[Bytes], unix: u64, budget: &Budget) -> Result<Bytes> {
+    if let Some(out) = srp::call(func, args, budget)? {
+        return Ok(out);
+    }
+    if let Some(out) = pgp::call(func, args)? {
+        return Ok(out);
+    }
     if let Some(out) = call_family(func, args, budget)? {
         return Ok(out);
     }

@@ -296,6 +296,16 @@ funcs! {
     MldsaSign = "mldsa_sign"(3, 4): "`mldsa_sign(level, seed, message[, context])`: ML-DSA (FIPS 204) with the parameter set `44`, `65` or `87`, hedged; the key is the 32-byte seed.",
     MldsaPublic = "mldsa_public"(2, 2): "`mldsa_public(level, seed)`: the encoded ML-DSA public key of a 32-byte seed (one-way).",
     Sm2Sign = "sm2_sign"(2, 3): "`sm2_sign(key, message[, id])`: SM2 with SM3 (GB/T 32918.2, RFC 8998), `r || s`; the identifier defaults to `1234567812345678`.",
+    SrpPublic = "srp_public"(2, 2): "`srp_public(group, private)`: `g^private mod N` padded to the length of `N` in an RFC 5054 group (`rfc5054_1024`, `_1536`, `_2048`, `_3072`, `_4096`, `_6144`, `_8192`): SRP-6a `A` of the private value `a`, or the verifier `v` of `x`; constant time (one-way).",
+    SrpX = "srp_x"(4, 4): "`srp_x(hash, salt, identity, password)`: SRP `x = H(salt | H(identity | \":\" | password))` (RFC 5054 section 2.4); a secret when the password is.",
+    SrpU = "srp_u"(4, 4): "`srp_u(group, hash, A, B)`: the SRP-6a scrambling parameter `u = H(PAD(A) | PAD(B))` (RFC 5054 section 2.6).",
+    SrpPremaster = "srp_premaster"(5, 5): "`srp_premaster(group, hash, x, private, B)`: the SRP-6a client premaster secret `S = (B - k * g^x)^(private + u * x) mod N` padded to the length of `N`, `k = H(N | PAD(g))`; refuses `B` not below `N` or zero, and `u` of zero; constant time; always a secret.",
+    SrpM1 = "srp_m1"(7, 7): "`srp_m1(group, hash, identity, salt, A, B, K)`: the client's proof `H(H(N) xor H(g) | H(identity) | salt | A | B | K)` (RFC 2945 section 3), `N` and `g` without leading zeros, `A` and `B` as given.",
+    SrpVerify = "srp_verify"(5, 5): "`srp_verify(hash, A, M1, K, M2)`: empty when the server's proof `M2` is `H(A | M1 | K)` (RFC 2945 section 3), compared in constant time; fails otherwise.",
+    PgpPacket = "pgp_packet"(2, 2): "`pgp_packet(type, body)`: an OpenPGP packet (RFC 9580 section 4.2) of the type 1 to 63, in the OpenPGP format with the shortest length.",
+    PgpSubpacket = "pgp_subpacket"(2, 2): "`pgp_subpacket(type, body)`: an OpenPGP signature subpacket (RFC 9580 section 5.2.3.7), its length then the type 1 to 255 (bit 7 the critical flag) and the body.",
+    PgpMpi = "pgp_mpi"(1, 1): "`pgp_mpi(value)`: an OpenPGP multiprecision integer (RFC 9580 section 3.2), the bit count then the bytes without leading zeros; the value must not be a secret.",
+    PgpArmor = "pgp_armor"(2, 3): "`pgp_armor(label, data[, \"crc24\"])`: OpenPGP ASCII armor (RFC 9580 section 6) with the label `SIGNATURE`, `MESSAGE`, `PUBLIC KEY BLOCK` or `PRIVATE KEY BLOCK`, base64 lines of 64 characters, and the CRC-24 line only when asked.",
     AeadCiphertext = "aead_ciphertext"(1, 1): "`aead_ciphertext(encryption)`: the ciphertext of an AEAD encryption call written in place (`aes_gcm_encrypt`, `chacha20_poly1305_encrypt`, `aes_cbc_hmac_encrypt`, `aes_ccm_encrypt`, `aes_eax_encrypt`), without its tag.",
     AeadTag = "aead_tag"(1, 1): "`aead_tag(encryption)`: the tag alone of an AEAD encryption call written in place; its length is the algorithm's (16 bytes, the CCM tag length, half the AES-CBC-HMAC key).",
     Ed25519Public = "ed25519_public"(1, 1): "`ed25519_public(key)`: the 32-byte Ed25519 public key of a private key (raw 32 bytes or PKCS#8 DER; one-way).",
@@ -997,6 +1007,9 @@ fn analyze(expr: &Expr, kind: &dyn Fn(&str) -> NameKind) -> core::result::Result
 }
 
 fn call_info(func: Func, args: &[Info]) -> core::result::Result<Info, Rule> {
+    if let Some(info) = srp_pgp_info(func, args) {
+        return info;
+    }
     let at = |i: usize| args.get(i).copied().unwrap_or_default();
     let any_tainted = args.iter().any(|i| i.tainted);
     let any_controlled = args.iter().any(|i| i.controlled);
@@ -1130,6 +1143,127 @@ fn call_info(func: Func, args: &[Info]) -> core::result::Result<Info, Rule> {
         caller: controlled && args.iter().any(|i| i.caller),
         secret_key,
         guessable,
+    })
+}
+
+const NAME_FIXED: Rule = "a hash or curve name must be fixed by the policy";
+
+const MIXED_ARGUMENT: Rule = "a secret mixed with a chosen value reaches a decoder, number or key";
+
+const SRP_PRIVATE: Rule =
+    "an SRP private value must not be chosen by the caller or a server: random or a field";
+
+const SRP_SERVER_VALUE: Rule =
+    "an SRP server value or proof must come from the policy or the destination, not the caller";
+
+const MPI_SECRET: Rule = "a secret may not be an OpenPGP integer: the length would tell it";
+
+/// The SRP-6a and OpenPGP functions (`docs/design.md` section 11): their rules and the
+/// properties of their output, in one place; `None` for any other function.
+fn srp_pgp_info(func: Func, args: &[Info]) -> Option<core::result::Result<Info, Rule>> {
+    let at = |i: usize| args.get(i).copied().unwrap_or_default();
+    let fixed =
+        |r: core::ops::Range<usize>| r.into_iter().all(|i| !at(i).tainted && !at(i).controlled);
+    let mixed = |r: core::ops::Range<usize>| r.into_iter().any(|i| at(i).mixed());
+    // What the arguments in `r` hold together.
+    let union = |r: core::ops::Range<usize>| {
+        r.into_iter().map(at).fold(Info::default(), |a, b| Info {
+            tainted: a.tainted || b.tainted,
+            controlled: a.controlled || b.controlled,
+            caller: a.caller || b.caller,
+            secret_key: false,
+            guessable: a.guessable || b.guessable,
+        })
+    };
+    // A hash of its inputs: tainted only when nothing chosen is in it (rule 3).
+    let hash = |r: core::ops::Range<usize>| {
+        let input = union(r);
+        Info {
+            tainted: input.tainted && !input.controlled,
+            ..input
+        }
+    };
+    let one_way = Info {
+        guessable: args.iter().any(|i| i.guessable),
+        ..Info::default()
+    };
+    let check = |names: core::ops::Range<usize>, sensitive: core::ops::Range<usize>| {
+        if !fixed(names) {
+            Err(NAME_FIXED)
+        } else if mixed(sensitive) {
+            Err(MIXED_ARGUMENT)
+        } else {
+            Ok(())
+        }
+    };
+    Some(match func {
+        // One-way (a discrete logarithm), like `hpke_public`. The private value is the
+        // node's own: a value someone chose would make `A` and the premaster secret theirs.
+        Func::SrpPublic => check(0..1, 1..2).and_then(|()| {
+            if at(1).controlled {
+                Err(SRP_PRIVATE)
+            } else {
+                Ok(one_way)
+            }
+        }),
+        // A key derived from the password: a secret when any input is, and then of no byte
+        // the caller chooses (rule 8).
+        Func::SrpX => check(0..1, 0..0).map(|()| {
+            let input = union(1..4);
+            let controlled = !input.tainted && input.controlled;
+            Info {
+                tainted: input.tainted,
+                controlled,
+                caller: controlled && input.caller,
+                secret_key: false,
+                guessable: input.guessable,
+            }
+        }),
+        // Padding fails on a value longer than N: a mixed value may not reach it.
+        Func::SrpU => check(0..2, 2..4).map(|()| hash(2..4)),
+        // A shared secret, like `ecdh`: always tainted, never controlled. `B` comes from the
+        // destination, and the private value is the node's.
+        Func::SrpPremaster => check(0..2, 2..5).and_then(|()| {
+            if at(3).controlled {
+                Err(SRP_PRIVATE)
+            } else if at(4).caller {
+                Err(SRP_SERVER_VALUE)
+            } else {
+                Ok(Info {
+                    tainted: true,
+                    guessable: args.iter().any(|i| i.guessable),
+                    ..Info::default()
+                })
+            }
+        }),
+        Func::SrpM1 => check(0..2, 0..0).map(|()| hash(2..7)),
+        // Whether it fails tells whether M2 matches a hash of the session key: only the
+        // destination may supply what is compared, never the caller.
+        Func::SrpVerify => check(0..1, 1..5).and_then(|()| {
+            if (1..5).any(|i| at(i).caller) {
+                Err(SRP_SERVER_VALUE)
+            } else {
+                Ok(one_way)
+            }
+        }),
+        // Framing keeps the properties of what it frames; the type is a number argument.
+        Func::PgpPacket | Func::PgpSubpacket => check(0..0, 0..1).map(|()| union(0..2)),
+        // The encoding drops leading zeros, so its length depends on the value (rule 10).
+        Func::PgpMpi => {
+            if at(0).tainted {
+                Err(MPI_SECRET)
+            } else {
+                Ok(union(0..1))
+            }
+        }
+        Func::PgpArmor => check(0..1, 0..0).and_then(|()| {
+            if fixed(2..3) {
+                Ok(union(1..2))
+            } else {
+                Err(NAME_FIXED)
+            }
+        }),
+        _ => return None,
     })
 }
 
