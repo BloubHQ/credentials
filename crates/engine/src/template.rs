@@ -311,6 +311,12 @@ funcs! {
     GzipInflate = "gzip_inflate"(1, 1): "`gzip_inflate(value)`: one gzip member (RFC 1952) decompressed, its CRC-32 and length checked; at most 1 MiB.",
     XmlC14n = "xml_c14n"(2, 3): "`xml_c14n(algorithm, document[, inclusive_prefixes])`: the canonical form of an XML document under the algorithm its W3C identifier names (Canonical XML 1.0 or 1.1, Exclusive XML Canonicalization 1.0, with or without comments); no DTD.",
     XmlEscape = "xml_escape"(1, 1): "`xml_escape(text)`: text escaped for XML character data and attribute values.",
+    SortedParams = "sorted_params"(1, 8): "`sorted_params(list, ...)`: the pairs of 1 to 8 `application/x-www-form-urlencoded` lists, decoded, percent-encoded again (RFC 3986), sorted by name then value and joined with `&` (RFC 5849 section 3.4.1.3.2).",
+    Utf16Le = "utf16le"(1, 1): "`utf16le(text)`: UTF-8 text as UTF-16 little-endian code units, without a byte order mark.",
+    Utf16Be = "utf16be"(1, 1): "`utf16be(text)`: UTF-8 text as UTF-16 big-endian code units, without a byte order mark.",
+    UintBe = "uint_be"(1, 1): "`uint_be(value)`: 1 to 8 bytes read as a big-endian unsigned integer, in decimal; the value must not be a secret.",
+    UintLe = "uint_le"(1, 1): "`uint_le(value)`: 1 to 8 bytes read as a little-endian unsigned integer, in decimal; the value must not be a secret.",
+    KbkdfEcKey = "kbkdf_ec_key"(5, 5): "`kbkdf_ec_key(curve, hash, key, fixed_prefix, fixed_suffix)`: the private key on `p256`, `p384` or `k256` from the first NIST SP 800-108 counter-mode candidate (HMAC with `sha256`, `sha384` or `sha512`; fixed input `prefix || i || suffix`, `i` one byte from 1 to 254) that FIPS 186-5 appendix A.2.2 accepts (`c <= n - 2`, `d = c + 1`); a secret when the input is.",
 }
 
 impl Func {
@@ -405,6 +411,7 @@ impl Func {
                 | Func::KbkdfCounter
                 | Func::KerberosDk
                 | Func::HpkeDeriveKey
+                | Func::KbkdfEcKey
         )
     }
 
@@ -476,6 +483,8 @@ impl Func {
             Func::HpkeReceiverExport => &[6],
             // The prefix list sets which namespace declarations come out.
             Func::XmlC14n => &[2],
+            // A decimal number is as long as the value is large.
+            Func::UintBe | Func::UintLe => &[0],
             _ => &[],
         }
     }
@@ -511,6 +520,7 @@ impl Func {
                 &[0, 1]
             }
             Func::Turboshake128 | Func::Turboshake256 => &[1],
+            Func::KbkdfEcKey => &[0, 1],
             Func::HpkePublic
             | Func::HpkeDeriveKey
             | Func::MldsaSign
@@ -570,6 +580,8 @@ impl Func {
                 | Func::Add
                 | Func::JsonSetNumber
                 | Func::XmlC14n
+                // Sorting compares the pairs of every list.
+                | Func::SortedParams
         )
     }
 
@@ -601,7 +613,13 @@ impl Func {
             | Func::Inflate
             | Func::ZlibInflate
             | Func::GzipInflate
-            | Func::XmlEscape => 0..1,
+            | Func::XmlEscape
+            | Func::Utf16Le
+            | Func::Utf16Be
+            | Func::UintBe
+            | Func::UintLe => 0..1,
+            // Each list is decoded: whether it fails tells whether a secret is well formed.
+            Func::SortedParams => 0..8,
             Func::Shake128 | Func::Shake256 | Func::Nfold => 1..2,
             Func::Turboshake128 | Func::Turboshake256 => 1..3,
             Func::Kt128 | Func::Kt256 | Func::TlsExporter => 2..3,

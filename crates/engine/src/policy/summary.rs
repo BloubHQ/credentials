@@ -14,7 +14,7 @@ use super::{
     Policy, QueryRule, Return, RunModule, Send, Step, StepRequest, Store, Target,
 };
 use crate::item::{Disclosure, Origin};
-use crate::template::Template;
+use crate::template::{Func, Template};
 
 /// A place a value can reach.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -306,8 +306,8 @@ pub enum FlagCode {
     /// itself (SSH `password`, `PLAIN`, `LOGIN`, Redis `AUTH`, FTP and POP3 `USER`).
     PasswordToServer,
     /// A protocol connection signs in with a weak mechanism (POP3 `APOP`, MD5 over the
-    /// server's timestamp and the password): the server, or whoever reads a captured
-    /// exchange, can test guesses of the password offline.
+    /// server's timestamp and the password), or a template computes MD4 (NTLM): the server,
+    /// or whoever reads a captured exchange, can test guesses of the password offline.
     WeakMechanism,
     /// A command parameter of the caller takes any value up to its length (no pattern).
     ParamUnpinned,
@@ -997,6 +997,18 @@ fn risk_flags(policy: &Policy, origin: Option<&Origin>, flags: &mut Vec<Flag>) {
                 FlagCode::WeakMechanism,
                 &at,
                 "the POP3 sign-in (apop) is MD5 over the server's timestamp and the password: guesses can be tested offline against the exchange",
+            );
+        }
+        if operation
+            .templates()
+            .into_iter()
+            .any(|t| Template::parse(t).is_ok_and(|t| t.calls(Func::Md4)))
+        {
+            flag(
+                flags,
+                FlagCode::WeakMechanism,
+                &at,
+                "a template computes MD4, a broken hash kept for protocols that require it (NTLM): whoever reads an exchange built on it can test guesses of the password offline",
             );
         }
         if let Some(Input::Raw(raw)) = &operation.input

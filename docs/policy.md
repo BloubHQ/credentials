@@ -1290,7 +1290,7 @@ crate, which checks the policy first) gives the owner, in JSON:
 | `frames_unpinned` | A WebSocket relays the caller's frames of a kind with no shape (or a `raw` shape with no pattern). |
 | `server_frames` | A WebSocket hands the server's messages back to the caller, or an SSH shell what it prints. |
 | `password_to_server` | A protocol connection signs in with a mechanism that hands the server the password itself: SSH `password`, `plain`, `login`, Redis `auth`, FTP and POP3 `user` (not `scram-sha-256`, `publickey`, `xoauth2` or `apop`). |
-| `weak_mechanism` | A protocol connection signs in with POP3 `apop`: MD5 over the server's timestamp and the password, so whoever reads the exchange can test guesses of the password offline. |
+| `weak_mechanism` | A protocol connection signs in with POP3 `apop` (MD5 over the server's timestamp and the password), or a template computes `md4` (NTLM): whoever reads the exchange can test guesses of the password offline. |
 | `param_unpinned` | A command parameter of the caller has no pattern (only its length bounds it). |
 | `mail_relay` | The caller sends mail over SMTP as the item's account. |
 | `shell_relay` | The caller types into an SSH shell. |
@@ -1880,10 +1880,12 @@ reads.
 | --- | --- |
 | Encoding | `b64` `b64raw` `b64url` `b64urlraw` `b64decode` `b32decode` `hex` `hexdecode` `pct` `pctdecode` `json` `pem` |
 | Text | `upper` `lower` `trim` `replace(text, from, to)` `json_set(object, key, value)` `json_set_number(object, key, integer)` `canonical_query` `time(unix, format)` `len` `xor(a, b)` `slice(value, start, length)` `between(value, start, end)` |
-| Numbers | `add(a, b)` (signed 64-bit decimal); fixed-width encoders of a decimal number: `u8`, `be16` `be32` `be64`, `le16` `le32` `le64` |
+| Numbers | `add(a, b)` (signed 64-bit decimal); fixed-width encoders of a decimal number: `u8`, `be16` `be32` `be64`, `le16` `le32` `le64`; their inverse, 1 to 8 bytes read as a decimal number: `uint_be(value)` `uint_le(value)` |
+| Parameter lists | `sorted_params(list, ...)`: 1 to 8 form-encoded lists, decoded, encoded again (RFC 3986), sorted and joined (RFC 5849 section 3.4.1.3.2) |
+| UTF-16 | `utf16le(text)` `utf16be(text)` (no byte order mark) |
 | Random | `random(n)`: n fresh bytes (1 to 1024), new at every call |
 | Hash and MAC | `md4` `md5` `sha1` `sha256` `sha384` `sha512` `sha512_256` `keccak256` `sha3_224` `sha3_256` `sha3_384` `sha3_512` `shake128(msg, length)` `shake256(msg, length)` `turboshake128(msg, domain, length)` `turboshake256(msg, domain, length)` `kt128(msg, customization, length)` `kt256(msg, customization, length)` `hmac_md5(key, msg)` `hmac_sha1` `hmac_sha256` `hmac_sha384` `hmac_sha512` `aes_cmac(key, msg)` `aes_cbc_mac(key, msg)` `pbkdf2(hash, password, salt, rounds[, length])` `pbkdf2_sha256(password, salt, rounds[, length])` `totp(seed[, digits[, period]])` |
-| Key derivation | `hkdf(hash, ikm, salt, info, length)` `hkdf_expand(hash, prk, info, length)` `concat_kdf(hash, z, other_info, length)` `kbkdf_counter(hash, key, fixed_input, length)` `nfold(value, bits)` `kerberos_dk(key, constant)` |
+| Key derivation | `hkdf(hash, ikm, salt, info, length)` `hkdf_expand(hash, prk, info, length)` `concat_kdf(hash, z, other_info, length)` `kbkdf_counter(hash, key, fixed_input, length)` `kbkdf_ec_key(curve, hash, key, fixed_prefix, fixed_suffix)` (an EC private key from SP 800-108 candidates, FIPS 186-5 A.2.2) `nfold(value, bits)` `kerberos_dk(key, constant)` |
 | Signature | `ed25519_sign(key, msg)` `ed448_sign(key, msg[, context])` `p256_sign` `p256_sign_der` `p384_sign` `p521_sign` `k256_sign` `k256_sign_recoverable(key, digest32)` `ecdsa_sign_prehash(curve, key, digest)` `rsa_sign_pkcs1(hash, key, msg)` `rsa_sign_pss(hash, key, msg)` `rsa_sign_pkcs1_sha256(key, msg)` `rsa_sign_pss_sha256(key, msg)` `dsa_sign(hash, key, msg)` `dsa_sign_der(hash, key, msg)` `mldsa_sign(level, seed, msg[, context])` `mldsa_public(level, seed)` `sm2_sign(key, msg[, id])` |
 | Key agreement | `ecdh(curve, peer_public[, private])` `ecdh_public(curve)` |
 | HPKE (RFC 9180) | `hpke_seal(suite, mode, recipient_public, info, aad, plaintext[, psk, psk_id][, sender_private])` `hpke_open(suite, mode, recipient_private, enc, info, aad, ciphertext[, psk, psk_id][, sender_public])` `hpke_export(suite, mode, recipient_public, info, context, length[, ...])` `hpke_receiver_export(suite, mode, recipient_private, enc, info, context, length[, ...])` `hpke_public(kem, private)` `hpke_derive_key(kem, ikm)` |
@@ -2300,13 +2302,146 @@ to add a second, or carries a DTD) fails the canonicalization, so nothing is sig
  ]}
 ```
 
+#### Parameter lists, derived EC keys and binary messages
+
+Three families for the schemes of `docs/design.md` section 11 that needed them, each
+checked against the published vectors in `crates/engine/tests/schemes_primitives.rs`:
+
+- `sorted_params(list, ...)` is the parameter normalization of RFC 5849 section 3.4.1.3.2
+  (OAuth 1.0a), which other query-string signatures share. Each of its 1 to 8 arguments is a
+  list in the `application/x-www-form-urlencoded` form (`&` between pairs, the first `=`
+  between name and value, `+` a space, `%XX` a byte); every pair of every list is decoded,
+  percent-encoded again as RFC 3986 says (all but `A-Z a-z 0-9 - . _ ~` as `%XX`, in
+  uppercase), sorted by name and then value in byte order, and joined as `name=value` with `&`.
+  A pair without `=` has an empty value, empty pairs are dropped, and a `%` not followed by
+  two hex digits fails. `canonical_query` keeps a `+` as itself, as SigV4 does; this one reads
+  it as a space, as form decoding does.
+- `utf16le(text)` and `utf16be(text)` write UTF-8 text as UTF-16 code units (RFC 2781),
+  without a byte order mark; text that is not UTF-8 fails. `uint_be(value)` and
+  `uint_le(value)` read 1 to 8 bytes as an unsigned integer, in decimal: the inverse of
+  `be16` ... `le64`, for the length and offset fields of a binary message a server sends.
+- `kbkdf_ec_key(curve, hash, key, fixed_prefix, fixed_suffix)` derives an elliptic-curve
+  private key from a KDF: candidate `i` (one byte, 1 to 254) is `kbkdf_counter(hash, key,
+  fixed_prefix + i + fixed_suffix, n)` for the length `n` of the curve's order, and the first
+  candidate `c` with `c <= n - 2` gives the key `c + 1` (FIPS 186-5 appendix A.2.2, rejection
+  sampling; the comparison is constant time). The curve is `p256`, `p384` or `k256` and the
+  hash `sha256`, `sha384` or `sha512` (rule 6). The key is a secret like any derived key
+  (rule 8): it may sign, and `ecdsa_public` of it may be handed back; it never may itself.
+  Feedback and double-pipeline modes of SP 800-108 are not offered (no published vector was
+  at hand to check them).
+
+`md4` is MD4 (RFC 1320), broken; it is kept for NTLM and flagged `weak_mechanism` in the
+summary of every operation that calls it.
+
+OAuth 1.0a with HMAC-SHA1 (RFC 5849 section 3.4.2) over the caller's query and form body.
+The base string is the method, the base string URI (`$scheme`, `$authority` without the
+default port, `$pathname`) and the normalized parameters of the query, the body and the
+protocol parameters, each part encoded once more; the key is the two secrets, encoded, joined
+by `&`. The token is public in OAuth 1.0a (it travels in every request); its secret is not:
+
+```json
+{"name": "oauth1-hmac-sha1",
+ "steps": [
+  {"do": "open", "connection": "https", "destinations": [{"host": "api.example.com", "port": 443}]},
+  {"do": "send", "request": {"from": "caller", "methods": ["GET", "POST"], "paths": ["/1.1/**"], "query": [{"name": "count", "pattern": "[0-9]{1,3}"}, {"name": "q", "pattern": "[a-z ]{1,64}"}]},
+   "inject": [
+    {"target": {"kind": "header", "name": "Content-Type"}, "template": "application/x-www-form-urlencoded"},
+    {"target": {"kind": "header", "name": "Authorization"}, "template": "OAuth oauth_consumer_key=\"{{ pct(consumer_key) }}\", oauth_nonce=\"{{ $nonce }}\", oauth_signature=\"{{ pct(b64(hmac_sha1(pct(consumer_secret) + \"&\" + pct(token_secret), $method + \"&\" + pct($scheme + \"://\" + $authority + $pathname) + \"&\" + pct(sorted_params($query, $body, \"oauth_consumer_key=\" + pct(consumer_key) + \"&oauth_nonce=\" + $nonce + \"&oauth_signature_method=HMAC-SHA1&oauth_timestamp=\" + $unix + \"&oauth_token=\" + pct(token) + \"&oauth_version=1.0\"))))) }}\", oauth_signature_method=\"HMAC-SHA1\", oauth_timestamp=\"{{ $unix }}\", oauth_token=\"{{ pct(token) }}\", oauth_version=\"1.0\""}]},
+  {"do": "return", "response": {"body": "all"}}
+ ]}
+```
+
+The body counts only when it is a form (RFC 5849 section 3.4.1.3.1), so this policy sets
+the content type itself; for a JSON body, leave `$body` out of `sorted_params` and the
+`Content-Type` injection out. RSA-SHA1 (section 3.4.3) signs the same base string with the
+consumer's RSA key (`key`, PEM):
+
+```json
+{"name": "oauth1-rsa-sha1",
+ "steps": [
+  {"do": "open", "connection": "https", "destinations": [{"host": "api.example.com", "port": 443}]},
+  {"do": "send", "request": {"from": "caller", "methods": ["GET", "POST"], "paths": ["/1.1/**"], "query": [{"name": "count", "pattern": "[0-9]{1,3}"}, {"name": "q", "pattern": "[a-z ]{1,64}"}]},
+   "inject": [
+    {"target": {"kind": "header", "name": "Content-Type"}, "template": "application/x-www-form-urlencoded"},
+    {"target": {"kind": "header", "name": "Authorization"}, "template": "OAuth oauth_consumer_key=\"{{ pct(consumer_key) }}\", oauth_nonce=\"{{ $nonce }}\", oauth_signature=\"{{ pct(b64(rsa_sign_pkcs1(\"sha1\", pem(key), $method + \"&\" + pct($scheme + \"://\" + $authority + $pathname) + \"&\" + pct(sorted_params($query, $body, \"oauth_consumer_key=\" + pct(consumer_key) + \"&oauth_nonce=\" + $nonce + \"&oauth_signature_method=RSA-SHA1&oauth_timestamp=\" + $unix + \"&oauth_token=\" + pct(token) + \"&oauth_version=1.0\"))))) }}\", oauth_signature_method=\"RSA-SHA1\", oauth_timestamp=\"{{ $unix }}\", oauth_token=\"{{ pct(token) }}\", oauth_version=\"1.0\""}]},
+  {"do": "return", "response": {"body": "all"}}
+ ]}
+```
+
+PLAINTEXT (section 3.4.4) is the key itself, `oauth_signature="{{ pct(pct(consumer_secret) +
+"&" + pct(token_secret)) }}"`, which TLS alone protects.
+
+AWS Signature Version 4A signs with an ECDSA P-256 key derived from the secret access key:
+the KDF key is `"AWS4A"` and the secret, the fixed input the label
+`AWS4-ECDSA-P256-SHA256`, a zero byte, the access key ID and the candidate byte, then the
+length 256 in bits. The string to sign and the canonical request are those of SigV4 with the
+credential scope `date/service/aws4_request` and the region set in a signed header:
+
+```json
+{"name": "sigv4a",
+ "steps": [
+  {"do": "open", "connection": "https", "destinations": [{"host": "s3.example.com", "port": 443}]},
+  {"do": "compute", "into": "signing_key", "template": "{{ kbkdf_ec_key(\"p256\", \"sha256\", \"AWS4A\" + secret_access_key, \"AWS4-ECDSA-P256-SHA256\\0\" + access_key_id, be32(\"256\")) }}"},
+  {"do": "compute", "into": "amz_date", "template": "{{ time($unix, \"%Y%m%dT%H%M%SZ\") }}"},
+  {"do": "compute", "into": "scope", "template": "{{ time($unix, \"%Y%m%d\") }}/s3/aws4_request"},
+  {"do": "send", "request": {"from": "caller", "methods": ["GET", "PUT"], "paths": ["/bucket/**"], "query": [{"name": "versionId", "pattern": "[0-9]{1,8}"}, {"name": "list-type", "pattern": "2"}]},
+   "inject": [
+    {"target": {"kind": "header", "name": "X-Amz-Date"}, "template": "{{ amz_date }}"},
+    {"target": {"kind": "header", "name": "X-Amz-Region-Set"}, "template": "*"},
+    {"target": {"kind": "header", "name": "X-Amz-Content-Sha256"}, "template": "{{ hex(sha256($body)) }}"},
+    {"target": {"kind": "header", "name": "Authorization"}, "template": "AWS4-ECDSA-P256-SHA256 Credential={{ access_key_id }}/{{ scope }}, SignedHeaders=host;x-amz-content-sha256;x-amz-date;x-amz-region-set, Signature={{ hex(p256_sign_der(signing_key, \"AWS4-ECDSA-P256-SHA256\\n\" + amz_date + \"\\n\" + scope + \"\\n\" + hex(sha256($method + \"\\n\" + $pathname + \"\\n\" + canonical_query($query) + \"\\nhost:\" + $host + \"\\nx-amz-content-sha256:\" + hex(sha256($body)) + \"\\nx-amz-date:\" + amz_date + \"\\nx-amz-region-set:*\\n\\nhost;x-amz-content-sha256;x-amz-date;x-amz-region-set\\n\" + hex(sha256($body)))))) }}"}]},
+  {"do": "return", "response": {"body": "all"}}
+ ]}
+```
+
+NTLMv2 (MS-NLMP) over HTTP is bound to its connection: the server answers NEGOTIATE with a
+CHALLENGE and accepts AUTHENTICATE only on the same connection. An HTTPS `send` opens its own
+connection, so the policy writes HTTP/1.1 itself over one `tls` connection, then relays the
+caller's requests on the authenticated connection. AUTHENTICATE carries NTLMv2 with the
+server's timestamp (MS-NLMP section 3.1.5.1.2), `MsvAvFlags` announcing a MIC, and the MIC
+over the three messages; `user` and `domain` are public fields, `password` a guessable one:
+
+```json
+{"name": "ntlm-http",
+ "steps": [
+  {"do": "open", "connection": "tls", "destinations": [{"host": "intranet.example.com", "port": 443}]},
+  {"do": "compute", "into": "negotiate", "template": "{{ hexdecode(\"4e544c4d5353500001000000058208a2000000002800000000000000280000000a00614a0000000f\") }}"},
+  {"do": "send", "template": "GET /api/ HTTP/1.1\r\nHost: {{ $host }}\r\nAuthorization: NTLM {{ b64(negotiate) }}\r\n\r\n"},
+  {"do": "receive", "until": ["\r\n\r\n"], "capture": [{"source": {"from": "regex", "pattern": "\r\nWWW-Authenticate: NTLM ([A-Za-z0-9+/=]+)\r\n"}, "into": {"kind": "temp", "name": "challenge", "secret": false}}]},
+  {"do": "compute", "into": "type2", "template": "{{ b64decode(challenge) }}"},
+  {"do": "compute", "into": "target_info", "template": "{{ slice(type2, uint_le(slice(type2, \"44\", \"4\")), uint_le(slice(type2, \"40\", \"2\"))) }}"},
+  {"do": "compute", "into": "client_challenge", "template": "{{ random(\"8\") }}"},
+  {"do": "compute", "into": "blob", "template": "{{ hexdecode(\"0101000000000000\") + slice(between(target_info, hexdecode(\"07000800\"), \"\"), \"0\", \"8\") + client_challenge + hexdecode(\"00000000\") + slice(target_info, \"0\", add(len(target_info), \"-4\")) + hexdecode(\"0600040002000000\") + hexdecode(\"0000000000000000\") }}"},
+  {"do": "compute", "into": "nt_owf", "template": "{{ hmac_md5(md4(utf16le(password)), utf16le(upper(user) + domain)) }}"},
+  {"do": "compute", "into": "nt_proof", "template": "{{ hmac_md5(nt_owf, slice(type2, \"24\", \"8\") + blob) }}"},
+  {"do": "compute", "into": "nt_response", "template": "{{ nt_proof + blob }}"},
+  {"do": "compute", "into": "session_key", "template": "{{ hmac_md5(nt_owf, nt_proof) }}"},
+  {"do": "compute", "into": "o_user", "template": "{{ add(\"88\", len(utf16le(domain))) }}"},
+  {"do": "compute", "into": "o_host", "template": "{{ add(o_user, len(utf16le(user))) }}"},
+  {"do": "compute", "into": "o_lm", "template": "{{ add(o_host, len(utf16le(\"NODE\"))) }}"},
+  {"do": "compute", "into": "o_nt", "template": "{{ add(o_lm, \"24\") }}"},
+  {"do": "compute", "into": "head", "template": "{{ \"NTLMSSP\\0\" + le32(\"3\") + le16(\"24\") + le16(\"24\") + le32(o_lm) + le16(len(nt_response)) + le16(len(nt_response)) + le32(o_nt) + le16(len(utf16le(domain))) + le16(len(utf16le(domain))) + le32(\"88\") + le16(len(utf16le(user))) + le16(len(utf16le(user))) + le32(o_user) + le16(len(utf16le(\"NODE\"))) + le16(len(utf16le(\"NODE\"))) + le32(o_host) + le16(\"0\") + le16(\"0\") + le32(add(o_nt, len(nt_response))) + slice(type2, \"20\", \"4\") + hexdecode(\"0a00614a0000000f\") }}"},
+  {"do": "compute", "into": "payload", "template": "{{ utf16le(domain) + utf16le(user) + utf16le(\"NODE\") + hexdecode(\"000000000000000000000000000000000000000000000000\") + nt_response }}"},
+  {"do": "compute", "into": "mic", "template": "{{ hmac_md5(session_key, negotiate + type2 + head + hexdecode(\"00000000000000000000000000000000\") + payload) }}"},
+  {"do": "send", "template": "GET /api/ HTTP/1.1\r\nHost: {{ $host }}\r\nAuthorization: NTLM {{ b64(head + mic + payload) }}\r\n\r\n"},
+  {"do": "receive", "until": ["\r\n\r\n"]},
+  {"do": "return", "relay": {"sends": ["GET /api/[a-z0-9/]{0,64} HTTP/1\\.1\r\nHost: intranet\\.example\\.com\r\n\r\n"]}}
+ ]}
+```
+
+What the node reads is cut at the end of each header block (`until`), so a server that sends
+a body with its 401 leaves that body for the next read; the relay hands the caller each read
+as it comes. The user name is upper-cased in ASCII only (`upper`), so a name outside ASCII
+needs the owner to store it upper-cased. A Kerberos `Negotiate` token
+(SPNEGO) is not built here either.
+
 ### The analysis
 
 Every template is analysed before the policy is signed. Each expression has four properties:
 
 | Property | Set by | Kept through | Removed by |
 | --- | --- | --- | --- |
-| *tainted*: holds a secret in reversible form | secret fields (guessable or not), secret temps, every `ecdh`, `tls_exporter`, `hpke_open`, `hpke_export` and `hpke_receiver_export` result; a key derived from a tainted value (`hkdf`, `hkdf_expand`, `concat_kdf`, `kbkdf_counter`, `kerberos_dk`, `hpke_derive_key`: rule 8); a plain hash (`md4` `md5` `sha1` `sha256` `sha384` `sha512` `sha512_256` `keccak256` `sha3_*` `shake128` `shake256` `turboshake*` `kt*`) of a tainted value with no controlled bytes in it | every function not listed as removing it, and `+`: the encodings, `slice`, `between`, `add`, the fixed-width encoders, `json_set_number`, `nfold`, the `cbor_*` functions, and encryption to a public key (`rsa_encrypt_*`, and `hpke_seal` when the info, AAD or plaintext is tainted, or a PSK or sender key that is not a *secret key*: whoever holds the private key reads it) | a plain hash of a value that is also controlled; `hmac_*`, `pbkdf2`, `pbkdf2_sha256`, `totp`, `hpke_public`, the signatures and `len`; `aes_cmac` and `aes_cbc_mac` under a secret key; symmetric encryption and key wrapping, only as rule 4 says |
+| *tainted*: holds a secret in reversible form | secret fields (guessable or not), secret temps, every `ecdh`, `tls_exporter`, `hpke_open`, `hpke_export` and `hpke_receiver_export` result; a key derived from a tainted value (`hkdf`, `hkdf_expand`, `concat_kdf`, `kbkdf_counter`, `kbkdf_ec_key`, `kerberos_dk`, `hpke_derive_key`: rule 8); a plain hash (`md4` `md5` `sha1` `sha256` `sha384` `sha512` `sha512_256` `keccak256` `sha3_*` `shake128` `shake256` `turboshake*` `kt*`) of a tainted value with no controlled bytes in it | every function not listed as removing it, and `+`: the encodings, `slice`, `between`, `add`, the fixed-width encoders, `json_set_number`, `nfold`, the `cbor_*` functions, and encryption to a public key (`rsa_encrypt_*`, and `hpke_seal` when the info, AAD or plaintext is tainted, or a PSK or sender key that is not a *secret key*: whoever holds the private key reads it) | a plain hash of a value that is also controlled; `hmac_*`, `pbkdf2`, `pbkdf2_sha256`, `totp`, `hpke_public`, the signatures and `len`; `aes_cmac` and `aes_cbc_mac` under a secret key; symmetric encryption and key wrapping, only as rule 4 says |
 | *controlled*: chosen by the caller or the server | `$method` `$path` `$pathname` `$query` `$body` `$input`, captured values (temps) | everything except `ecdh`, `tls_exporter`, `hpke_export` and `hpke_receiver_export`, whose result depends on a key nobody chooses, and a key derived from a tainted value, of which the caller chooses no byte | — |
 | *caller-chosen*: chosen by the caller (not only a server) | `$method` `$path` `$pathname` `$query` `$body` `$input` | everything except `ecdh`, `tls_exporter`, `hpke_export`, `hpke_receiver_export` and a key derived from a tainted value | — |
 | *secret key*: a strong secret nobody else knows, usable as a key | a secret field that is not guessable | `b64decode` `b32decode` `hexdecode` `pem` `trim` `slice` of it | everything else, including hashes, MACs and `+`: a hash or MAC of a key is a new value some operation may hand back |
@@ -2343,12 +2478,14 @@ Rules:
    | `ed25519_public` `ed448_public` | the key |
    | `ecdsa_public(curve, key)` `rsa_public(form, key)` | the key |
    | `inflate` `zlib_inflate` `gzip_inflate` `xml_escape` | the input: whether it fails tells whether the secret is a well-formed stream or text |
+   | `utf16le` `utf16be` `uint_be` `uint_le` | the input: whether it fails tells whether the secret is UTF-8, or 1 to 8 bytes |
+   | `sorted_params` | every list: whether it fails tells whether the secret is a well-formed list |
 
    A tainted value in one sensitive argument of `time`, `totp`, `pbkdf2_sha256` or `pbkdf2` and
    a controlled value in another are refused too: `time(secret, $input)` lets the caller pick
    which digits of the secret come out.
 2. A tainted and a controlled value may not meet anywhere in `replace`, `xor`, `slice`,
-   `between`, `add`, `json_set_number` or `xml_c14n`: `slice(key, $input, "1")` would hand the secret out
+   `between`, `add`, `json_set_number`, `xml_c14n` or `sorted_params`: `slice(key, $input, "1")` would hand the secret out
    a byte at a time, `between(key, $input, "")` would tell where a chosen text sits in it, and
    `add` would fail or not with its size. A captured secret temp is both tainted and
    controlled, so these functions cut only public temps and secret fields (with fixed
@@ -2358,7 +2495,8 @@ Rules:
    whether two keys are equal, compare them.
    `xml_c14n` sorts attributes and namespace declarations by comparing them, drops what is
    not used, and fails on a malformed document: a secret next to chosen markup would be
-   compared, cut or tested by it.
+   compared, cut or tested by it. `sorted_params` sorts the pairs of all its lists together:
+   the order a secret pair comes out in tells how it compares with chosen pairs.
 3. A hash of secret bytes alone is as good as the secret wherever the secret is hashed
    before use (an HMAC key longer than its block, an Ed25519 seed), so it stays tainted:
    `hex(sha256(key))` is refused as a derivation output, `hex(sha256(key + $input))` is not.
@@ -2377,7 +2515,7 @@ Rules:
    *guessable*, a derivation may depend on a guessable field only through `len`.
 6. An argument that names a hash or a curve (`pbkdf2`, `rsa_sign_pkcs1`, `rsa_sign_pss`,
    `rsa_encrypt_oaep`, `ecdh`, `ecdh_public`, `hkdf`, `hkdf_expand`, `concat_kdf`,
-   `kbkdf_counter`, `ecdsa_sign_prehash`, `dsa_sign`, `dsa_sign_der`, the suite and mode of
+   `kbkdf_counter`, `kbkdf_ec_key` (its curve and hash), `ecdsa_sign_prehash`, `dsa_sign`, `dsa_sign_der`, the suite and mode of
    the `hpke_*` functions, the KEM of `hpke_public` and `hpke_derive_key`, the domain byte of
    `turboshake*`, the parameter set of `mldsa_sign` and `mldsa_public`) must be neither tainted nor controlled: the policy fixes the algorithm, so no caller can downgrade it.
    So must the curve of `ecdsa_public`, the form of `rsa_public` and the algorithm of
@@ -2388,7 +2526,7 @@ Rules:
    response. A key from `$input`, `$body`, `$query` or another request variable would let the
    caller encrypt the secret to itself, or pass as the sender of an authenticated HPKE mode.
 8. A key derived from a secret is a secret: the output of `hkdf`, `hkdf_expand`,
-   `concat_kdf`, `kbkdf_counter`, `kerberos_dk` and `hpke_derive_key` is tainted when any input is, and then not
+   `concat_kdf`, `kbkdf_counter`, `kbkdf_ec_key`, `kerberos_dk` and `hpke_derive_key` is tainted when any input is, and then not
    controlled, since the caller chooses no byte of it (as with `ecdh`). So a plain hash of it
    stays tainted, a derivation cannot hand it back, and it may key an encryption whose
    output then stays tainted (it is not a *secret key*: some operation may derive the same
@@ -2400,7 +2538,8 @@ Rules:
    `kt256`, `nfold`, `tls_exporter`, `hpke_export` and `hpke_receiver_export`, the tag length of
    `aes_ccm_encrypt`,
    the start and length of `slice`, the delimiters of `between`, the text `replace` looks
-   for, and the prefix list of `xml_c14n` (it sets which declarations come out). The length of the output, or whether the call fails, would give the secret back
+   for, the prefix list of `xml_c14n` (it sets which declarations come out), and the input of
+   `uint_be` and `uint_le` (a decimal number is as long as the value is large). The length of the output, or whether the call fails, would give the secret back
    through `len`. The value being cut or searched may be a secret (`slice(key, "0", "4")`).
    `aead_ciphertext` and `aead_tag` take no length: they cut at the tag length the algorithm
    fixes (the CCM tag length is the argument above), counted from the end, so a secret in the
