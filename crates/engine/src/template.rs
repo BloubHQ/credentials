@@ -73,19 +73,23 @@ pub enum Var {
     Authority,
     /// The target URI: scheme, authority, path and query (RFC 9421 section 2.2.2).
     TargetUri,
-    /// A header of the caller's request, named by a literal: `$header("content-type")`. The
-    /// name is not stored here; [`Template::headers`] lists the names a template reads.
+    /// A header of the request as it is sent, named by a literal: `$header("content-type")`,
+    /// one the caller's contract lists or one the `send` injects. The name is not stored
+    /// here; [`Template::headers`] lists the names a template reads.
     Header,
-    /// A query parameter of the caller's request, named by a literal:
+    /// A query parameter of the request as it is sent, named by a literal:
     /// `$query_param("page")`. [`Template::query_params`] lists the names.
     QueryParam,
-    /// Path and query of the request, before path parameters are filled.
+    /// Path and query of the request as it is sent: path parameters filled and injected query
+    /// parameters appended, but for the injection that reads it (`docs/policy.md`, Injection
+    /// order).
     Path,
     /// The path without its query.
     PathName,
     /// The query, without `?`.
     Query,
-    /// The body of the request.
+    /// The body of the request as it is sent (an injected body, else the caller's), before
+    /// gRPC framing; in the body's own injection, the caller's body.
     Body,
     /// Unix seconds.
     Unix,
@@ -686,6 +690,17 @@ pub enum NameKind {
     Computed(Props),
 }
 
+/// A request component a template reads, as the analysis asks about it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Component<'a> {
+    /// A variable.
+    Var(Var),
+    /// `$header("name")`, the name in lowercase.
+    Header(&'a str),
+    /// `$query_param("name")`, the name as the template writes it.
+    QueryParam(&'a str),
+}
+
 /// The properties the analysis gives the output of a template (taint, control, key strength,
 /// guessability), kept for a name a `compute` step defines.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -708,6 +723,40 @@ impl Props {
     /// True when the value can hold a secret in reversible form.
     pub fn tainted(self) -> bool {
         self.0.tainted
+    }
+
+    /// A request component as the caller chooses it, before the policy puts anything in it:
+    /// what the analysis takes `var` to be when nothing is injected into it.
+    pub(crate) fn chosen(var: Var) -> Self {
+        Props(Info {
+            controlled: var.controlled(),
+            caller: var.controlled(),
+            ..Info::default()
+        })
+    }
+
+    /// The properties of `self` followed by `other` in one value, as `+` gives them: either's
+    /// taint, control and guessability, and never a secret key.
+    #[must_use]
+    pub(crate) fn then(self, other: Props) -> Props {
+        let (a, b) = (self.0, other.0);
+        Props(Info {
+            tainted: a.tainted || b.tainted,
+            controlled: a.controlled || b.controlled,
+            caller: a.caller || b.caller,
+            secret_key: false,
+            guessable: a.guessable || b.guessable,
+        })
+    }
+
+    /// The value in another form (percent-encoded, normalized): the same properties, never a
+    /// secret key.
+    #[must_use]
+    pub(crate) fn encoded(self) -> Props {
+        Props(Info {
+            secret_key: false,
+            ..self.0
+        })
     }
 
     /// What a name is when either of two definitions may have set it (the two bodies of a
@@ -934,10 +983,21 @@ const COMPRESSED_SECRET: Rule = "a secret may not be compressed: the length woul
 const AEAD_IN_PLACE: Rule =
     "aead_ciphertext and aead_tag take an AEAD encryption call written in place";
 
-fn analyze(expr: &Expr, kind: &dyn Fn(&str) -> NameKind) -> core::result::Result<Info, Rule> {
+/// What the analysis reads: what each name is, and what each request component is.
+struct Env<'e> {
+    kind: &'e dyn Fn(&str) -> NameKind,
+    component: &'e dyn Fn(Component<'_>) -> Option<Props>,
+}
+
+fn no_component(_: Component<'_>) -> Option<Props> {
+    None
+}
+
+fn analyze(expr: &Expr, env: &Env<'_>) -> core::result::Result<Info, Rule> {
+    let chosen = |v: Var| Props::chosen(v).0;
     Ok(match expr {
         Expr::Lit(_) => Info::default(),
-        Expr::Name(name) => match kind(name) {
+        Expr::Name(name) => match (env.kind)(name) {
             NameKind::SecretField => Info {
                 tainted: true,
                 secret_key: true,
@@ -960,17 +1020,14 @@ fn analyze(expr: &Expr, kind: &dyn Fn(&str) -> NameKind) -> core::result::Result
             },
             NameKind::Computed(props) => props.0,
         },
-        Expr::Var(v) => Info {
-            controlled: v.controlled(),
-            caller: v.controlled(),
-            ..Info::default()
-        },
-        // The caller chooses a header's value and a query parameter's, as it does `$body`.
-        Expr::Header(_) | Expr::QueryParam(_) => Info {
-            controlled: true,
-            caller: true,
-            ..Info::default()
-        },
+        Expr::Var(v) => (env.component)(Component::Var(*v)).map_or_else(|| chosen(*v), |p| p.0),
+        // The caller chooses a header's value and a query parameter's, as it does `$body`,
+        // unless the policy injects it: then it is what the injected template is.
+        Expr::Header(name) => {
+            (env.component)(Component::Header(name)).map_or_else(|| chosen(Var::Header), |p| p.0)
+        }
+        Expr::QueryParam(name) => (env.component)(Component::QueryParam(name))
+            .map_or_else(|| chosen(Var::QueryParam), |p| p.0),
         Expr::Call(Func::AeadCiphertext | Func::AeadTag, args) => match args.as_slice() {
             // The cut falls where the algorithm puts it, at the tag length from the end; the
             // caller's bytes set only how long the whole is. Each part covers the whole
@@ -979,14 +1036,14 @@ fn analyze(expr: &Expr, kind: &dyn Fn(&str) -> NameKind) -> core::result::Result
             // `slice` of a mixed value would: each part has the properties of the encryption.
             [inner @ Expr::Call(f, _)] if f.aead() => Info {
                 secret_key: false,
-                ..analyze(inner, kind)?
+                ..analyze(inner, env)?
             },
             _ => return Err(AEAD_IN_PLACE),
         },
         Expr::Concat(parts) => {
             let infos = parts
                 .iter()
-                .map(|p| analyze(p, kind))
+                .map(|p| analyze(p, env))
                 .collect::<core::result::Result<Vec<_>, _>>()?;
             Info {
                 tainted: infos.iter().any(|i| i.tainted),
@@ -999,7 +1056,7 @@ fn analyze(expr: &Expr, kind: &dyn Fn(&str) -> NameKind) -> core::result::Result
         Expr::Call(func, args) => {
             let infos = args
                 .iter()
-                .map(|a| analyze(a, kind))
+                .map(|a| analyze(a, env))
                 .collect::<core::result::Result<Vec<_>, _>>()?;
             call_info(*func, &infos)?
         }
@@ -1375,20 +1432,29 @@ impl Template {
     /// Checks the rules of the analysis and returns true when the output can give a secret
     /// back. `kind` says what each name is.
     pub fn analyze(&self, kind: &dyn Fn(&str) -> NameKind) -> core::result::Result<bool, Rule> {
-        let mut tainted = false;
-        for expr in self.exprs() {
-            tainted |= analyze(expr, kind)?.tainted;
-        }
-        Ok(tainted)
+        Ok(self.props(kind)?.tainted())
     }
 
     /// The properties of the whole output: what a name a `compute` step defines from this
     /// template is. Text around the expressions is fixed by the policy; the output is a
     /// secret key only when it is one expression and nothing else.
     pub fn props(&self, kind: &dyn Fn(&str) -> NameKind) -> core::result::Result<Props, Rule> {
+        self.props_in(kind, &no_component)
+    }
+
+    /// [`Self::props`] where the request components a template reads are not only what the
+    /// caller chose: `component` gives the properties of one the policy fills (a header or
+    /// query parameter it injects, a path holding a path parameter), and `None` for one it
+    /// does not touch.
+    pub(crate) fn props_in(
+        &self,
+        kind: &dyn Fn(&str) -> NameKind,
+        component: &dyn Fn(Component<'_>) -> Option<Props>,
+    ) -> core::result::Result<Props, Rule> {
+        let env = Env { kind, component };
         let infos = self
             .exprs()
-            .map(|e| analyze(e, kind))
+            .map(|e| analyze(e, &env))
             .collect::<core::result::Result<Vec<_>, _>>()?;
         let single = self.segments.len() == 1 && infos.len() == 1;
         Ok(Props(Info {
@@ -1403,9 +1469,13 @@ impl Template {
     /// True when the output depends on a guessable field in a way a guess can be checked
     /// against (a template that breaks a rule counts as guessable).
     pub fn guessable(&self, kind: &dyn Fn(&str) -> NameKind) -> bool {
+        let env = Env {
+            kind,
+            component: &no_component,
+        };
         let mut guessable = false;
         for expr in self.exprs() {
-            match analyze(expr, kind) {
+            match analyze(expr, &env) {
                 Ok(info) => guessable |= info.guessable,
                 Err(_) => return true,
             }
@@ -1537,8 +1607,9 @@ pub(crate) struct Context<'a> {
     pub fields: &'a Fields,
     pub temps: &'a Temps,
     pub vars: HashMap<Var, Vec<u8>>,
-    /// The headers of the caller's request (none where a template reads no request).
-    pub headers: &'a [(String, String)],
+    /// The headers of the request as it is sent, the caller's and those injected so far
+    /// (none where a template reads no request).
+    pub headers: &'a [(&'a str, &'a [u8])],
     pub unix: u64,
     pub budget: &'a Budget,
 }
@@ -1639,17 +1710,22 @@ fn call(
     Ok((args, out))
 }
 
-/// The value of a header of the caller's request as RFC 9110 section 5.3 combines it: every
-/// field line of that name (case does not matter), each without the whitespace around it,
-/// joined by `, `; empty when the request has none. (A caller contract refuses a header sent
-/// twice, under any case, so a checked request holds one line at most.)
-pub(crate) fn header_value(headers: &[(String, String)], name: &str) -> Bytes {
+/// The value of a header of the request as RFC 9110 section 5.3 combines it: every field
+/// line of that name (case does not matter), each without the whitespace around it, joined
+/// by `, `; empty when the request has none. (A caller contract refuses a header sent twice,
+/// under any case, and an injected header is set once and is never a caller header, so a
+/// built request holds one line at most.)
+pub(crate) fn header_value(headers: &[(&str, &[u8])], name: &str) -> Bytes {
     let mut out = Zeroizing::new(Vec::new());
     for (_, value) in headers.iter().filter(|(n, _)| n.eq_ignore_ascii_case(name)) {
         if !out.is_empty() {
             out.extend_from_slice(b", ");
         }
-        out.extend_from_slice(value.trim_matches([' ', '\t']).as_bytes());
+        let start = value.iter().position(|b| !matches!(b, b' ' | b'\t'));
+        let end = value.iter().rposition(|b| !matches!(b, b' ' | b'\t'));
+        if let (Some(start), Some(end)) = (start, end) {
+            out.extend_from_slice(value.get(start..=end).unwrap_or_default());
+        }
     }
     out
 }
@@ -2203,10 +2279,10 @@ mod tests {
 
     #[test]
     fn header_values_combine_as_rfc_9110_says() {
-        let headers = vec![
-            ("Accept".to_string(), " a/b ".to_string()),
-            ("X-Other".to_string(), "x".to_string()),
-            ("accept".to_string(), "\tc/d".to_string()),
+        let headers: Vec<(&str, &[u8])> = vec![
+            ("Accept", b" a/b "),
+            ("X-Other", b"x"),
+            ("accept", b"\tc/d"),
         ];
         assert_eq!(header_value(&headers, "accept").as_slice(), b"a/b, c/d");
         assert_eq!(header_value(&headers, "x-other").as_slice(), b"x");

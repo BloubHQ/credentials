@@ -868,6 +868,55 @@ encryption's taint (5 derivations refused as tainted, one of them over a guessab
 signed), a part of a mixed message cannot be cut or decoded, and rule 9 still refuses a cut, a
 CCM tag length or a `random` length that depends on a secret.
 
+**The request as it is sent** (the open question of section 13 that the request components
+left; tests in `crates/engine/tests/final_request.rs`, `docs/policy.md`, Injection order).
+Until then the request variables read the caller's request before injection: `$path` held a
+path parameter's `{name}` unfilled, `$query` and `$target_uri` lacked the injected query
+parameters, `$header` read caller headers only and `$body` was the caller's body under an
+injected one, so a signature could not cover a path, query parameter, header or body the
+policy fills. Now every request variable of an injection reads the request with every other
+injection in place and never its own target, and the injections render in dependency order:
+
+- **Why dependencies, not two phases.** Rendering the injections that read no request
+  variable first and the rest second fails the commonest case: an RFC 9421 `Signature` covers
+  `content-digest`, which itself reads `$body` (so is in the second phase too), and an AWS
+  presigned URL's `X-Amz-Signature` covers `X-Amz-Date`, which is a query parameter like
+  itself. An edge from each injection to each other whose target lies in a component its
+  template reads is exact (the components are literals, a variable is a fixed part of the
+  request), costs at most 16 x 16 checks, and orders every chain; the first listed ready
+  injection goes next, so the order is a function of the policy alone. A cycle has no order
+  and is refused at signing, so the node never meets one.
+- **Own target.** A template that names the header or query parameter it sets is refused (it
+  could only read itself); a variable that holds it holds the request without it, which is what
+  the schemes sign: `X-Amz-Signature` and `oauth_signature` over the query without
+  themselves, a path parameter over the path with its own placeholder, a body over the
+  caller's body.
+- **Taint.** A request variable has the properties of everything injected into it, joined
+  as `+` joins them (the caller's part, then each injected value), and an injected header,
+  query parameter or body read by name is exactly its template: so a secret path parameter
+  taints `$path` as the secret written in its place would, every rule applies unchanged, and
+  a rendered value that reads it is a tainted rendered value for the reflection check. The
+  summary lists such a secret in every injection that reads it.
+- **Summary and diff.** The wire order stays the listed order; the render order is internal
+  and depends only on the policy, so it is not a new summary field. A signature that covers
+  more is not `wider`; any change to an injection was already `wider`, so a reordering is
+  flagged as before.
+
+| Scheme | Result | Tests | Checked against |
+| --- | --- | --- | --- |
+| HTTP Message Signatures over what the policy injects | works as-is | `rfc9421_b26_and_b25_cover_policy_injected_headers`, `rfc9421_covers_an_injected_query_parameter_header_and_body` | RFC 9421 B.2.6 and B.2.5 byte for byte with `date`, `content-type` and the query `param=Value&Pet=dog` injected and the signature listed first; 2 signatures over `@method`, `@target-uri`, the `@query-param` of an injected `client_id`, an injected header and the `content-digest` of an injected body verified by ring over a base rebuilt from the wire |
+| AWS Signature Version 4 over an injected path segment | works as-is | `sigv4_signs_a_policy_injected_path_segment` | A path parameter (with a space) and an injected `X-Amz-Date` read with `$header`, and a presigned URL of 5 injected `X-Amz-*` parameters signed over the query without `X-Amz-Signature`: both signatures recomputed by a signer written in the test (`hmac`, `sha2`) from the wire |
+| OAuth 1.0a with injected protocol parameters | works as-is | `oauth1_rfc5849_vector_with_injected_query_parameters`, `oauth1_query_example_of_policy_md_verifies`, `oauth1_signs_injected_form_and_query_parameters` | RFC 5849 section 1.2 byte for byte with every `oauth_*` parameter in the query (section 3.5.3); the `oauth1-query` example and a signature over an `oauth_nonce` appended to the form body and an `oauth_version` in the query, recomputed from the wire with `hmac` (3 requests) |
+| Hawk with an injected `ext` and query | works as-is | `hawk_specification_example_with_injected_query_and_ext` | The specification's GET MAC byte for byte with `b=1&a=2` injected and `ext` read from an injected header |
+
+Attacks measured with them: 5 cycles (two headers, two query parameters through `$query`, a
+path parameter and a query parameter, the body and a header, three long) and 3 own targets
+(a header, a query parameter in two cases) refused at signing, a chain of 3 headers signed; 8
+policies refused by rule 2 through a variable holding an injected secret (the 6 over one
+variable sign over a public value); 3 echoes of a secret injected into the query or path
+dropped by the reflection check (one in base64 not aligned with the secret's own), the same
+echo of a public value returned.
+
 
 The two families that row found missing were then added (tests in
 `crates/engine/tests/schemes_xml.rs`, which reads its policies from `docs/policy.md`,
@@ -1027,9 +1076,11 @@ approvals inside another company's app (KakaoTalk, a bank's app push).
   revoked delegation or forget a cancellation; the anchor is the defence, as for limits.
 - Covering the caller's own header fields in a signature (RFC 9421, Hawk's content type):
   settled as `$header("name")`, only for headers the `send`'s contract lists, caller-chosen
-  like `$body` (section 11). Still open: the path parameters a policy fills are not in `$path`
-  or `$pathname`, which are read before they are filled, so a signature cannot cover a
-  path that holds one.
+  like `$body` (section 11). The part left open, covering what the policy fills (path
+  parameters, injected query parameters and headers, an injected body), is closed: request
+  variables read the request as it is sent but for the reading injection's own target, the
+  injections render in dependency order and signing refuses a cycle (section 11, The request
+  as it is sent).
 - Nonce retries (DPoP `use_dpop_nonce`, ACME `badNonce`) are written unconditionally until IR
   `if` runs; until then a policy fits only servers that always ask for a nonce first.
 - SRP variants. The functions follow RFC 5054: `u` and `k` over values padded to `N`, `M1`
