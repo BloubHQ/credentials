@@ -4,6 +4,9 @@ on:
   push:
     branches: [main]
   pull_request:
+  # The long fuzz run (see the fuzz job).
+  schedule:
+    - cron: "17 3 * * *"
 
 permissions:
   contents: read
@@ -114,8 +117,11 @@ jobs:
 
   fuzz:
     runs-on: ubuntu-latest
-    # 60 seconds per target plus the build: one more minute for each new target.
-    timeout-minutes: 75
+    # Seconds per target: 10 on a pull request, 60 on main, 300 in the daily run. With 28
+    # targets that is about 5, 28 and 140 minutes plus the build.
+    timeout-minutes: ${{ github.event_name == 'schedule' && 180 || github.event_name == 'push' && 75 || 30 }}
+    env:
+      FUZZ_SECONDS: ${{ github.event_name == 'schedule' && 300 || github.event_name == 'push' && 60 || 10 }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -128,7 +134,7 @@ jobs:
         with:
           workspaces: crates/fuzz -> target
           key: fuzz-nightly
-      - name: Run each fuzz target for 60 seconds
+      - name: Run each fuzz target for FUZZ_SECONDS
         working-directory: crates/fuzz
         run: |
           cargo +nightly fuzz build --fuzz-dir . --target x86_64-unknown-linux-gnu
@@ -137,7 +143,7 @@ jobs:
           cp ../attest/tests/fixtures/*.cbor corpus/attestation/
           for target in $(cargo +nightly fuzz list --fuzz-dir .); do
             echo "::group::$target"
-            cargo +nightly fuzz run --fuzz-dir . --target x86_64-unknown-linux-gnu "$target" -- -max_total_time=60
+            cargo +nightly fuzz run --fuzz-dir . --target x86_64-unknown-linux-gnu "$target" -- -max_total_time="$FUZZ_SECONDS"
             echo "::endgroup::"
           done
       - name: Keep crashing inputs

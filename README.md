@@ -652,7 +652,7 @@ cargo test --workspace --locked
 ```
 
 Minimum Rust: 1.88 (the `enclave` crate: 1.92, for `aws-nitro-enclaves-nsm-api`). CI also runs `cargo audit`, `cargo deny`, tests on the MSRV, a
-reproducible-build check and 60 seconds of fuzzing per target. See [CONTRIBUTING.md](.github/CONTRIBUTING.md); changes are listed in
+reproducible-build check and fuzzing per target (10 seconds on a pull request, 60 on main, 300 in a daily run). See [CONTRIBUTING.md](.github/CONTRIBUTING.md); changes are listed in
 [docs/CHANGELOG.md](docs/CHANGELOG.md).
 
 ## Security

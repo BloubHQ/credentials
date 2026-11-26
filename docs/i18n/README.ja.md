@@ -623,7 +623,7 @@ cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace --locked
 ```
 
-最小 Rust バージョン: 1.88 (`enclave` クレートは `aws-nitro-enclaves-nsm-api` のため 1.92)。CI では `cargo audit`、`cargo deny`、MSRV テスト、ターゲットごとに 60 秒のファジング、再現可能ビルドの
+最小 Rust バージョン: 1.88 (`enclave` クレートは `aws-nitro-enclaves-nsm-api` のため 1.92)。CI では `cargo audit`、`cargo deny`、MSRV テスト、ターゲットごとのファジング (プルリクエストで 10 秒、main で 60 秒、毎日の実行で 300 秒)、再現可能ビルドの
 チェックも実行します。[CONTRIBUTING.md](../../.github/CONTRIBUTING.md) を参照してください。変更履歴は [CHANGELOG](../CHANGELOG.md) にあります。
 
 ## セキュリティ
