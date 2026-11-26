@@ -1,0 +1,517 @@
+{
+"lxml": "6.1.1.0",
+"libxml2": "2.11.9",
+"cases": [
+{
+"name": "w3c-3.1",
+"algorithm": "http://www.w3.org/TR/2001/REC-xml-c14n-20010315",
+"prefixes": "",
+"input": "<?xml version=\"1.0\"?>\n\n<?xml-stylesheet   href=\"doc.xsl\"\n   type=\"text/xsl\"   ?>\n\n<doc>Hello, world!<!-- Comment 1 --></doc>\n\n<?pi-without-data     ?>\n\n<!-- Comment 2 -->\n\n<!-- Comment 3 -->\n",
+"output": "<?xml-stylesheet href=\"doc.xsl\"\n   type=\"text/xsl\"   ?>\n<doc>Hello, world!</doc>\n<?pi-without-data?>"
+},
+{
+"name": "w3c-3.1",
+"algorithm": "http://www.w3.org/TR/2001/REC-xml-c14n-20010315#WithComments",
+"prefixes": "",
+"input": "<?xml version=\"1.0\"?>\n\n<?xml-stylesheet   href=\"doc.xsl\"\n   type=\"text/xsl\"   ?>\n\n<doc>Hello, world!<!-- Comment 1 --></doc>\n\n<?pi-without-data     ?>\n\n<!-- Comment 2 -->\n\n<!-- Comment 3 -->\n",
+"output": "<?xml-stylesheet href=\"doc.xsl\"\n   type=\"text/xsl\"   ?>\n<doc>Hello, world!<!-- Comment 1 --></doc>\n<?pi-without-data?>\n<!-- Comment 2 -->\n<!-- Comment 3 -->"
+},
+{
+"name": "w3c-3.1",
+"algorithm": "http://www.w3.org/2001/10/xml-exc-c14n#",
+"prefixes": "",
+"input": "<?xml version=\"1.0\"?>\n\n<?xml-stylesheet   href=\"doc.xsl\"\n   type=\"text/xsl\"   ?>\n\n<doc>Hello, world!<!-- Comment 1 --></doc>\n\n<?pi-without-data     ?>\n\n<!-- Comment 2 -->\n\n<!-- Comment 3 -->\n",
+"output": "<?xml-stylesheet href=\"doc.xsl\"\n   type=\"text/xsl\"   ?>\n<doc>Hello, world!</doc>\n<?pi-without-data?>"
+},
+{
+"name": "w3c-3.1",
+"algorithm": "http://www.w3.org/2001/10/xml-exc-c14n#WithComments",
+"prefixes": "",
+"input": "<?xml version=\"1.0\"?>\n\n<?xml-stylesheet   href=\"doc.xsl\"\n   type=\"text/xsl\"   ?>\n\n<doc>Hello, world!<!-- Comment 1 --></doc>\n\n<?pi-without-data     ?>\n\n<!-- Comment 2 -->\n\n<!-- Comment 3 -->\n",
+"output": "<?xml-stylesheet href=\"doc.xsl\"\n   type=\"text/xsl\"   ?>\n<doc>Hello, world!<!-- Comment 1 --></doc>\n<?pi-without-data?>\n<!-- Comment 2 -->\n<!-- Comment 3 -->"
+},
+{
+"name": "w3c-3.2",
+"algorithm": "http://www.w3.org/TR/2001/REC-xml-c14n-20010315",
+"prefixes": "",
+"input": "<doc>\n   <clean>   </clean>\n   <dirty>   A   B   </dirty>\n   <mixed>\n      A\n      <clean>   </clean>\n      B\n      <dirty>   A   B   </dirty>\n      C\n   </mixed>\n</doc>",
+"output": "<doc>\n   <clean>   </clean>\n   <dirty>   A   B   </dirty>\n   <mixed>\n      A\n      <clean>   </clean>\n      B\n      <dirty>   A   B   </dirty>\n      C\n   </mixed>\n</doc>"
+},
+{
+"name": "w3c-3.2",
+"algorithm": "http://www.w3.org/TR/2001/REC-xml-c14n-20010315#WithComments",
+"prefixes": "",
+"input": "<doc>\n   <clean>   </clean>\n   <dirty>   A   B   </dirty>\n   <mixed>\n      A\n      <clean>   </clean>\n      B\n      <dirty>   A   B   </dirty>\n      C\n   </mixed>\n</doc>",
+"output": "<doc>\n   <clean>   </clean>\n   <dirty>   A   B   </dirty>\n   <mixed>\n      A\n      <clean>   </clean>\n      B\n      <dirty>   A   B   </dirty>\n      C\n   </mixed>\n</doc>"
+},
+{
+"name": "w3c-3.2",
+"algorithm": "http://www.w3.org/2001/10/xml-exc-c14n#",
+"prefixes": "",
+"input": "<doc>\n   <clean>   </clean>\n   <dirty>   A   B   </dirty>\n   <mixed>\n      A\n      <clean>   </clean>\n      B\n      <dirty>   A   B   </dirty>\n      C\n   </mixed>\n</doc>",
+"output": "<doc>\n   <clean>   </clean>\n   <dirty>   A   B   </dirty>\n   <mixed>\n      A\n      <clean>   </clean>\n      B\n      <dirty>   A   B   </dirty>\n      C\n   </mixed>\n</doc>"
+},
+{
+"name": "w3c-3.2",
+"algorithm": "http://www.w3.org/2001/10/xml-exc-c14n#WithComments",
+"prefixes": "",
+"input": "<doc>\n   <clean>   </clean>\n   <dirty>   A   B   </dirty>\n   <mixed>\n      A\n      <clean>   </clean>\n      B\n      <dirty>   A   B   </dirty>\n      C\n   </mixed>\n</doc>",
+"output": "<doc>\n   <clean>   </clean>\n   <dirty>   A   B   </dirty>\n   <mixed>\n      A\n      <clean>   </clean>\n      B\n      <dirty>   A   B   </dirty>\n      C\n   </mixed>\n</doc>"
+},
+{
+"name": "w3c-3.3",
+"algorithm": "http://www.w3.org/TR/2001/REC-xml-c14n-20010315",
+"prefixes": "",
+"input": "<doc>\n   <e1   />\n   <e2   ></e2>\n   <e3   name = \"elem3\"   id=\"elem3\"   />\n   <e4   name=\"elem4\"   id=\"elem4\"   ></e4>\n   <e5 a:attr=\"out\" b:attr=\"sorted\" attr2=\"all\" attr=\"I'm\"\n      xmlns:b=\"http://www.ietf.org\"\n      xmlns:a=\"http://www.w3.org\"\n      xmlns=\"http://example.org\"/>\n   <e6 xmlns=\"\" xmlns:a=\"http://www.w3.org\">\n      <e7 xmlns=\"http://www.ietf.org\">\n         <e8 xmlns=\"\" xmlns:a=\"http://www.w3.org\">\n            <e9 xmlns=\"\" xmlns:a=\"http://www.ietf.org\"/>\n         </e8>\n      </e7>\n   </e6>\n</doc>",
+"output": "<doc>\n   <e1></e1>\n   <e2></e2>\n   <e3 id=\"elem3\" name=\"elem3\"></e3>\n   <e4 id=\"elem4\" name=\"elem4\"></e4>\n   <e5 xmlns=\"http://example.org\" xmlns:a=\"http://www.w3.org\" xmlns:b=\"http://www.ietf.org\" attr=\"I'm\" attr2=\"all\" b:attr=\"sorted\" a:attr=\"out\"></e5>\n   <e6 xmlns:a=\"http://www.w3.org\">\n      <e7 xmlns=\"http://www.ietf.org\">\n         <e8 xmlns=\"\">\n            <e9 xmlns:a=\"http://www.ietf.org\"></e9>\n         </e8>\n      </e7>\n   </e6>\n</doc>"
+},
+{
+"name": "w3c-3.3",
+"algorithm": "http://www.w3.org/TR/2001/REC-xml-c14n-20010315#WithComments",
+"prefixes": "",
+"input": "<doc>\n   <e1   />\n   <e2   ></e2>\n   <e3   name = \"elem3\"   id=\"elem3\"   />\n   <e4   name=\"elem4\"   id=\"elem4\"   ></e4>\n   <e5 a:attr=\"out\" b:attr=\"sorted\" attr2=\"all\" attr=\"I'm\"\n      xmlns:b=\"http://www.ietf.org\"\n      xmlns:a=\"http://www.w3.org\"\n      xmlns=\"http://example.org\"/>\n   <e6 xmlns=\"\" xmlns:a=\"http://www.w3.org\">\n      <e7 xmlns=\"http://www.ietf.org\">\n         <e8 xmlns=\"\" xmlns:a=\"http://www.w3.org\">\n            <e9 xmlns=\"\" xmlns:a=\"http://www.ietf.org\"/>\n         </e8>\n      </e7>\n   </e6>\n</doc>",
+"output": "<doc>\n   <e1></e1>\n   <e2></e2>\n   <e3 id=\"elem3\" name=\"elem3\"></e3>\n   <e4 id=\"elem4\" name=\"elem4\"></e4>\n   <e5 xmlns=\"http://example.org\" xmlns:a=\"http://www.w3.org\" xmlns:b=\"http://www.ietf.org\" attr=\"I'm\" attr2=\"all\" b:attr=\"sorted\" a:attr=\"out\"></e5>\n   <e6 xmlns:a=\"http://www.w3.org\">\n      <e7 xmlns=\"http://www.ietf.org\">\n         <e8 xmlns=\"\">\n            <e9 xmlns:a=\"http://www.ietf.org\"></e9>\n         </e8>\n      </e7>\n   </e6>\n</doc>"
+},
+{
+"name": "w3c-3.3",
+"algorithm": "http://www.w3.org/2001/10/xml-exc-c14n#",
+"prefixes": "",
+"input": "<doc>\n   <e1   />\n   <e2   ></e2>\n   <e3   name = \"elem3\"   id=\"elem3\"   />\n   <e4   name=\"elem4\"   id=\"elem4\"   ></e4>\n   <e5 a:attr=\"out\" b:attr=\"sorted\" attr2=\"all\" attr=\"I'm\"\n      xmlns:b=\"http://www.ietf.org\"\n      xmlns:a=\"http://www.w3.org\"\n      xmlns=\"http://example.org\"/>\n   <e6 xmlns=\"\" xmlns:a=\"http://www.w3.org\">\n      <e7 xmlns=\"http://www.ietf.org\">\n         <e8 xmlns=\"\" xmlns:a=\"http://www.w3.org\">\n            <e9 xmlns=\"\" xmlns:a=\"http://www.ietf.org\"/>\n         </e8>\n      </e7>\n   </e6>\n</doc>",
+"output": "<doc>\n   <e1></e1>\n   <e2></e2>\n   <e3 id=\"elem3\" name=\"elem3\"></e3>\n   <e4 id=\"elem4\" name=\"elem4\"></e4>\n   <e5 xmlns=\"http://example.org\" xmlns:a=\"http://www.w3.org\" xmlns:b=\"http://www.ietf.org\" attr=\"I'm\" attr2=\"all\" b:attr=\"sorted\" a:attr=\"out\"></e5>\n   <e6>\n      <e7 xmlns=\"http://www.ietf.org\">\n         <e8 xmlns=\"\">\n            <e9></e9>\n         </e8>\n      </e7>\n   </e6>\n</doc>"
+},
+{
+"name": "w3c-3.3",
+"algorithm": "http://www.w3.org/2001/10/xml-exc-c14n#WithComments",
+"prefixes": "",
+"input": "<doc>\n   <e1   />\n   <e2   ></e2>\n   <e3   name = \"elem3\"   id=\"elem3\"   />\n   <e4   name=\"elem4\"   id=\"elem4\"   ></e4>\n   <e5 a:attr=\"out\" b:attr=\"sorted\" attr2=\"all\" attr=\"I'm\"\n      xmlns:b=\"http://www.ietf.org\"\n      xmlns:a=\"http://www.w3.org\"\n      xmlns=\"http://example.org\"/>\n   <e6 xmlns=\"\" xmlns:a=\"http://www.w3.org\">\n      <e7 xmlns=\"http://www.ietf.org\">\n         <e8 xmlns=\"\" xmlns:a=\"http://www.w3.org\">\n            <e9 xmlns=\"\" xmlns:a=\"http://www.ietf.org\"/>\n         </e8>\n      </e7>\n   </e6>\n</doc>",
+"output": "<doc>\n   <e1></e1>\n   <e2></e2>\n   <e3 id=\"elem3\" name=\"elem3\"></e3>\n   <e4 id=\"elem4\" name=\"elem4\"></e4>\n   <e5 xmlns=\"http://example.org\" xmlns:a=\"http://www.w3.org\" xmlns:b=\"http://www.ietf.org\" attr=\"I'm\" attr2=\"all\" b:attr=\"sorted\" a:attr=\"out\"></e5>\n   <e6>\n      <e7 xmlns=\"http://www.ietf.org\">\n         <e8 xmlns=\"\">\n            <e9></e9>\n         </e8>\n      </e7>\n   </e6>\n</doc>"
+},
+{
+"name": "w3c-3.4",
+"algorithm": "http://www.w3.org/TR/2001/REC-xml-c14n-20010315",
+"prefixes": "",
+"input": "<doc>\n   <text>First line&#x0d;&#10;Second line</text>\n   <value>&#x32;</value>\n   <compute><![CDATA[value>\"0\" && value<\"10\" ?\"valid\":\"error\"]]></compute>\n   <compute expr='value>\"0\" &amp;&amp; value&lt;\"10\" ?\"valid\":\"error\"'>valid</compute>\n   <norm attr=' &apos;   &#x20;&#13;&#xa;&#9;   &apos; '/>\n   <normNames attr='   A   &#x20;&#13;&#xa;&#9;   B   '/>\n   <normId id=' &apos;   &#x20;&#13;&#xa;&#9;   &apos; '/>\n</doc>",
+"output": "<doc>\n   <text>First line&#xD;\nSecond line</text>\n   <value>2</value>\n   <compute>value&gt;\"0\" &amp;&amp; value&lt;\"10\" ?\"valid\":\"error\"</compute>\n   <compute expr=\"value>&quot;0&quot; &amp;&amp; value&lt;&quot;10&quot; ?&quot;valid&quot;:&quot;error&quot;\">valid</compute>\n   <norm attr=\" '    &#xD;&#xA;&#x9;   ' \"></norm>\n   <normNames attr=\"   A    &#xD;&#xA;&#x9;   B   \"></normNames>\n   <normId id=\" '    &#xD;&#xA;&#x9;   ' \"></normId>\n</doc>"
+},
+{
+"name": "w3c-3.4",
+"algorithm": "http://www.w3.org/TR/2001/REC-xml-c14n-20010315#WithComments",
+"prefixes": "",
+"input": "<doc>\n   <text>First line&#x0d;&#10;Second line</text>\n   <value>&#x32;</value>\n   <compute><![CDATA[value>\"0\" && value<\"10\" ?\"valid\":\"error\"]]></compute>\n   <compute expr='value>\"0\" &amp;&amp; value&lt;\"10\" ?\"valid\":\"error\"'>valid</compute>\n   <norm attr=' &apos;   &#x20;&#13;&#xa;&#9;   &apos; '/>\n   <normNames attr='   A   &#x20;&#13;&#xa;&#9;   B   '/>\n   <normId id=' &apos;   &#x20;&#13;&#xa;&#9;   &apos; '/>\n</doc>",
+"output": "<doc>\n   <text>First line&#xD;\nSecond line</text>\n   <value>2</value>\n   <compute>value&gt;\"0\" &amp;&amp; value&lt;\"10\" ?\"valid\":\"error\"</compute>\n   <compute expr=\"value>&quot;0&quot; &amp;&amp; value&lt;&quot;10&quot; ?&quot;valid&quot;:&quot;error&quot;\">valid</compute>\n   <norm attr=\" '    &#xD;&#xA;&#x9;   ' \"></norm>\n   <normNames attr=\"   A    &#xD;&#xA;&#x9;   B   \"></normNames>\n   <normId id=\" '    &#xD;&#xA;&#x9;   ' \"></normId>\n</doc>"
+},
+{
+"name": "w3c-3.4",
+"algorithm": "http://www.w3.org/2001/10/xml-exc-c14n#",
+"prefixes": "",
+"input": "<doc>\n   <text>First line&#x0d;&#10;Second line</text>\n   <value>&#x32;</value>\n   <compute><![CDATA[value>\"0\" && value<\"10\" ?\"valid\":\"error\"]]></compute>\n   <compute expr='value>\"0\" &amp;&amp; value&lt;\"10\" ?\"valid\":\"error\"'>valid</compute>\n   <norm attr=' &apos;   &#x20;&#13;&#xa;&#9;   &apos; '/>\n   <normNames attr='   A   &#x20;&#13;&#xa;&#9;   B   '/>\n   <normId id=' &apos;   &#x20;&#13;&#xa;&#9;   &apos; '/>\n</doc>",
+"output": "<doc>\n   <text>First line&#xD;\nSecond line</text>\n   <value>2</value>\n   <compute>value&gt;\"0\" &amp;&amp; value&lt;\"10\" ?\"valid\":\"error\"</compute>\n   <compute expr=\"value>&quot;0&quot; &amp;&amp; value&lt;&quot;10&quot; ?&quot;valid&quot;:&quot;error&quot;\">valid</compute>\n   <norm attr=\" '    &#xD;&#xA;&#x9;   ' \"></norm>\n   <normNames attr=\"   A    &#xD;&#xA;&#x9;   B   \"></normNames>\n   <normId id=\" '    &#xD;&#xA;&#x9;   ' \"></normId>\n</doc>"
+},
+{
+"name": "w3c-3.4",
+"algorithm": "http://www.w3.org/2001/10/xml-exc-c14n#WithComments",
+"prefixes": "",
+"input": "<doc>\n   <text>First line&#x0d;&#10;Second line</text>\n   <value>&#x32;</value>\n   <compute><![CDATA[value>\"0\" && value<\"10\" ?\"valid\":\"error\"]]></compute>\n   <compute expr='value>\"0\" &amp;&amp; value&lt;\"10\" ?\"valid\":\"error\"'>valid</compute>\n   <norm attr=' &apos;   &#x20;&#13;&#xa;&#9;   &apos; '/>\n   <normNames attr='   A   &#x20;&#13;&#xa;&#9;   B   '/>\n   <normId id=' &apos;   &#x20;&#13;&#xa;&#9;   &apos; '/>\n</doc>",
+"output": "<doc>\n   <text>First line&#xD;\nSecond line</text>\n   <value>2</value>\n   <compute>value&gt;\"0\" &amp;&amp; value&lt;\"10\" ?\"valid\":\"error\"</compute>\n   <compute expr=\"value>&quot;0&quot; &amp;&amp; value&lt;&quot;10&quot; ?&quot;valid&quot;:&quot;error&quot;\">valid</compute>\n   <norm attr=\" '    &#xD;&#xA;&#x9;   ' \"></norm>\n   <normNames attr=\"   A    &#xD;&#xA;&#x9;   B   \"></normNames>\n   <normId id=\" '    &#xD;&#xA;&#x9;   ' \"></normId>\n</doc>"
+},
+{
+"name": "w3c-3.6",
+"algorithm": "http://www.w3.org/TR/2001/REC-xml-c14n-20010315",
+"prefixes": "",
+"input": "<doc>&#169;</doc>",
+"output": "<doc>\u00a9</doc>"
+},
+{
+"name": "w3c-3.6",
+"algorithm": "http://www.w3.org/TR/2001/REC-xml-c14n-20010315#WithComments",
+"prefixes": "",
+"input": "<doc>&#169;</doc>",
+"output": "<doc>\u00a9</doc>"
+},
+{
+"name": "w3c-3.6",
+"algorithm": "http://www.w3.org/2001/10/xml-exc-c14n#",
+"prefixes": "",
+"input": "<doc>&#169;</doc>",
+"output": "<doc>\u00a9</doc>"
+},
+{
+"name": "w3c-3.6",
+"algorithm": "http://www.w3.org/2001/10/xml-exc-c14n#WithComments",
+"prefixes": "",
+"input": "<doc>&#169;</doc>",
+"output": "<doc>\u00a9</doc>"
+},
+{
+"name": "crlf",
+"algorithm": "http://www.w3.org/TR/2001/REC-xml-c14n-20010315",
+"prefixes": "",
+"input": "<a\r\n b=\"x\r\ny\">one\r\ntwo\rthree&#13;</a>\r\n",
+"output": "<a b=\"x y\">one\ntwo\nthree&#xD;</a>"
+},
+{
+"name": "crlf",
+"algorithm": "http://www.w3.org/TR/2001/REC-xml-c14n-20010315#WithComments",
+"prefixes": "",
+"input": "<a\r\n b=\"x\r\ny\">one\r\ntwo\rthree&#13;</a>\r\n",
+"output": "<a b=\"x y\">one\ntwo\nthree&#xD;</a>"
+},
+{
+"name": "crlf",
+"algorithm": "http://www.w3.org/2001/10/xml-exc-c14n#",
+"prefixes": "",
+"input": "<a\r\n b=\"x\r\ny\">one\r\ntwo\rthree&#13;</a>\r\n",
+"output": "<a b=\"x y\">one\ntwo\nthree&#xD;</a>"
+},
+{
+"name": "crlf",
+"algorithm": "http://www.w3.org/2001/10/xml-exc-c14n#WithComments",
+"prefixes": "",
+"input": "<a\r\n b=\"x\r\ny\">one\r\ntwo\rthree&#13;</a>\r\n",
+"output": "<a b=\"x y\">one\ntwo\nthree&#xD;</a>"
+},
+{
+"name": "cdata-and-refs",
+"algorithm": "http://www.w3.org/TR/2001/REC-xml-c14n-20010315",
+"prefixes": "",
+"input": "<a>&lt;&gt;&amp;&quot;&apos;<![CDATA[<>&\"']]>&#x10FFFF;&#233;</a>",
+"output": "<a>&lt;&gt;&amp;\"'&lt;&gt;&amp;\"'\udbff\udfff\u00e9</a>"
+},
+{
+"name": "cdata-and-refs",
+"algorithm": "http://www.w3.org/TR/2001/REC-xml-c14n-20010315#WithComments",
+"prefixes": "",
+"input": "<a>&lt;&gt;&amp;&quot;&apos;<![CDATA[<>&\"']]>&#x10FFFF;&#233;</a>",
+"output": "<a>&lt;&gt;&amp;\"'&lt;&gt;&amp;\"'\udbff\udfff\u00e9</a>"
+},
+{
+"name": "cdata-and-refs",
+"algorithm": "http://www.w3.org/2001/10/xml-exc-c14n#",
+"prefixes": "",
+"input": "<a>&lt;&gt;&amp;&quot;&apos;<![CDATA[<>&\"']]>&#x10FFFF;&#233;</a>",
+"output": "<a>&lt;&gt;&amp;\"'&lt;&gt;&amp;\"'\udbff\udfff\u00e9</a>"
+},
+{
+"name": "cdata-and-refs",
+"algorithm": "http://www.w3.org/2001/10/xml-exc-c14n#WithComments",
+"prefixes": "",
+"input": "<a>&lt;&gt;&amp;&quot;&apos;<![CDATA[<>&\"']]>&#x10FFFF;&#233;</a>",
+"output": "<a>&lt;&gt;&amp;\"'&lt;&gt;&amp;\"'\udbff\udfff\u00e9</a>"
+},
+{
+"name": "attr-escapes",
+"algorithm": "http://www.w3.org/TR/2001/REC-xml-c14n-20010315",
+"prefixes": "",
+"input": "<a b=\"&#9;&#10;&#13;&quot;&lt;&gt;&amp;'\" c='\"'/>",
+"output": "<a b=\"&#x9;&#xA;&#xD;&quot;&lt;>&amp;'\" c=\"&quot;\"></a>"
+},
+{
+"name": "attr-escapes",
+"algorithm": "http://www.w3.org/TR/2001/REC-xml-c14n-20010315#WithComments",
+"prefixes": "",
+"input": "<a b=\"&#9;&#10;&#13;&quot;&lt;&gt;&amp;'\" c='\"'/>",
+"output": "<a b=\"&#x9;&#xA;&#xD;&quot;&lt;>&amp;'\" c=\"&quot;\"></a>"
+},
+{
+"name": "attr-escapes",
+"algorithm": "http://www.w3.org/2001/10/xml-exc-c14n#",
+"prefixes": "",
+"input": "<a b=\"&#9;&#10;&#13;&quot;&lt;&gt;&amp;'\" c='\"'/>",
+"output": "<a b=\"&#x9;&#xA;&#xD;&quot;&lt;>&amp;'\" c=\"&quot;\"></a>"
+},
+{
+"name": "attr-escapes",
+"algorithm": "http://www.w3.org/2001/10/xml-exc-c14n#WithComments",
+"prefixes": "",
+"input": "<a b=\"&#9;&#10;&#13;&quot;&lt;&gt;&amp;'\" c='\"'/>",
+"output": "<a b=\"&#x9;&#xA;&#xD;&quot;&lt;>&amp;'\" c=\"&quot;\"></a>"
+},
+{
+"name": "attr-order",
+"algorithm": "http://www.w3.org/TR/2001/REC-xml-c14n-20010315",
+"prefixes": "",
+"input": "<r xmlns:z=\"urn:a\" xmlns:y=\"urn:b\"><e z:b=\"1\" y:a=\"2\" b=\"3\" a=\"4\" xml:lang=\"en\"/></r>",
+"output": "<r xmlns:y=\"urn:b\" xmlns:z=\"urn:a\"><e a=\"4\" b=\"3\" xml:lang=\"en\" z:b=\"1\" y:a=\"2\"></e></r>"
+},
+{
+"name": "attr-order",
+"algorithm": "http://www.w3.org/TR/2001/REC-xml-c14n-20010315#WithComments",
+"prefixes": "",
+"input": "<r xmlns:z=\"urn:a\" xmlns:y=\"urn:b\"><e z:b=\"1\" y:a=\"2\" b=\"3\" a=\"4\" xml:lang=\"en\"/></r>",
+"output": "<r xmlns:y=\"urn:b\" xmlns:z=\"urn:a\"><e a=\"4\" b=\"3\" xml:lang=\"en\" z:b=\"1\" y:a=\"2\"></e></r>"
+},
+{
+"name": "attr-order",
+"algorithm": "http://www.w3.org/2001/10/xml-exc-c14n#",
+"prefixes": "",
+"input": "<r xmlns:z=\"urn:a\" xmlns:y=\"urn:b\"><e z:b=\"1\" y:a=\"2\" b=\"3\" a=\"4\" xml:lang=\"en\"/></r>",
+"output": "<r><e xmlns:y=\"urn:b\" xmlns:z=\"urn:a\" a=\"4\" b=\"3\" xml:lang=\"en\" z:b=\"1\" y:a=\"2\"></e></r>"
+},
+{
+"name": "attr-order",
+"algorithm": "http://www.w3.org/2001/10/xml-exc-c14n#WithComments",
+"prefixes": "",
+"input": "<r xmlns:z=\"urn:a\" xmlns:y=\"urn:b\"><e z:b=\"1\" y:a=\"2\" b=\"3\" a=\"4\" xml:lang=\"en\"/></r>",
+"output": "<r><e xmlns:y=\"urn:b\" xmlns:z=\"urn:a\" a=\"4\" b=\"3\" xml:lang=\"en\" z:b=\"1\" y:a=\"2\"></e></r>"
+},
+{
+"name": "unused-namespaces",
+"algorithm": "http://www.w3.org/TR/2001/REC-xml-c14n-20010315",
+"prefixes": "",
+"input": "<r xmlns:u=\"urn:unused\" xmlns:p=\"urn:p\" xmlns=\"urn:default\"><p:a><b xmlns=\"\" p:x=\"1\"/></p:a><c/></r>",
+"output": "<r xmlns=\"urn:default\" xmlns:p=\"urn:p\" xmlns:u=\"urn:unused\"><p:a><b xmlns=\"\" p:x=\"1\"></b></p:a><c></c></r>"
+},
+{
+"name": "unused-namespaces",
+"algorithm": "http://www.w3.org/TR/2001/REC-xml-c14n-20010315#WithComments",
+"prefixes": "",
+"input": "<r xmlns:u=\"urn:unused\" xmlns:p=\"urn:p\" xmlns=\"urn:default\"><p:a><b xmlns=\"\" p:x=\"1\"/></p:a><c/></r>",
+"output": "<r xmlns=\"urn:default\" xmlns:p=\"urn:p\" xmlns:u=\"urn:unused\"><p:a><b xmlns=\"\" p:x=\"1\"></b></p:a><c></c></r>"
+},
+{
+"name": "unused-namespaces",
+"algorithm": "http://www.w3.org/2001/10/xml-exc-c14n#",
+"prefixes": "",
+"input": "<r xmlns:u=\"urn:unused\" xmlns:p=\"urn:p\" xmlns=\"urn:default\"><p:a><b xmlns=\"\" p:x=\"1\"/></p:a><c/></r>",
+"output": "<r xmlns=\"urn:default\"><p:a xmlns:p=\"urn:p\"><b xmlns=\"\" p:x=\"1\"></b></p:a><c></c></r>"
+},
+{
+"name": "unused-namespaces",
+"algorithm": "http://www.w3.org/2001/10/xml-exc-c14n#WithComments",
+"prefixes": "",
+"input": "<r xmlns:u=\"urn:unused\" xmlns:p=\"urn:p\" xmlns=\"urn:default\"><p:a><b xmlns=\"\" p:x=\"1\"/></p:a><c/></r>",
+"output": "<r xmlns=\"urn:default\"><p:a xmlns:p=\"urn:p\"><b xmlns=\"\" p:x=\"1\"></b></p:a><c></c></r>"
+},
+{
+"name": "unused-namespaces",
+"algorithm": "http://www.w3.org/2001/10/xml-exc-c14n#",
+"prefixes": "u",
+"input": "<r xmlns:u=\"urn:unused\" xmlns:p=\"urn:p\" xmlns=\"urn:default\"><p:a><b xmlns=\"\" p:x=\"1\"/></p:a><c/></r>",
+"output": "<r xmlns=\"urn:default\" xmlns:u=\"urn:unused\"><p:a xmlns:p=\"urn:p\"><b xmlns=\"\" p:x=\"1\"></b></p:a><c></c></r>"
+},
+{
+"name": "unused-namespaces",
+"algorithm": "http://www.w3.org/2001/10/xml-exc-c14n#",
+"prefixes": "#default",
+"input": "<r xmlns:u=\"urn:unused\" xmlns:p=\"urn:p\" xmlns=\"urn:default\"><p:a><b xmlns=\"\" p:x=\"1\"/></p:a><c/></r>",
+"output": "<r xmlns=\"urn:default\"><p:a xmlns:p=\"urn:p\"><b xmlns=\"\" p:x=\"1\"></b></p:a><c></c></r>"
+},
+{
+"name": "unused-namespaces",
+"algorithm": "http://www.w3.org/2001/10/xml-exc-c14n#",
+"prefixes": "u #default",
+"input": "<r xmlns:u=\"urn:unused\" xmlns:p=\"urn:p\" xmlns=\"urn:default\"><p:a><b xmlns=\"\" p:x=\"1\"/></p:a><c/></r>",
+"output": "<r xmlns=\"urn:default\" xmlns:u=\"urn:unused\"><p:a xmlns:p=\"urn:p\"><b xmlns=\"\" p:x=\"1\"></b></p:a><c></c></r>"
+},
+{
+"name": "redeclared",
+"algorithm": "http://www.w3.org/TR/2001/REC-xml-c14n-20010315",
+"prefixes": "",
+"input": "<r xmlns:p=\"urn:1\"><p:a xmlns:p=\"urn:1\"><p:b xmlns:p=\"urn:2\"><c xmlns:p=\"urn:1\"/></p:b></p:a></r>",
+"output": "<r xmlns:p=\"urn:1\"><p:a><p:b xmlns:p=\"urn:2\"><c xmlns:p=\"urn:1\"></c></p:b></p:a></r>"
+},
+{
+"name": "redeclared",
+"algorithm": "http://www.w3.org/TR/2001/REC-xml-c14n-20010315#WithComments",
+"prefixes": "",
+"input": "<r xmlns:p=\"urn:1\"><p:a xmlns:p=\"urn:1\"><p:b xmlns:p=\"urn:2\"><c xmlns:p=\"urn:1\"/></p:b></p:a></r>",
+"output": "<r xmlns:p=\"urn:1\"><p:a><p:b xmlns:p=\"urn:2\"><c xmlns:p=\"urn:1\"></c></p:b></p:a></r>"
+},
+{
+"name": "redeclared",
+"algorithm": "http://www.w3.org/2001/10/xml-exc-c14n#",
+"prefixes": "",
+"input": "<r xmlns:p=\"urn:1\"><p:a xmlns:p=\"urn:1\"><p:b xmlns:p=\"urn:2\"><c xmlns:p=\"urn:1\"/></p:b></p:a></r>",
+"output": "<r><p:a xmlns:p=\"urn:1\"><p:b xmlns:p=\"urn:2\"><c></c></p:b></p:a></r>"
+},
+{
+"name": "redeclared",
+"algorithm": "http://www.w3.org/2001/10/xml-exc-c14n#WithComments",
+"prefixes": "",
+"input": "<r xmlns:p=\"urn:1\"><p:a xmlns:p=\"urn:1\"><p:b xmlns:p=\"urn:2\"><c xmlns:p=\"urn:1\"/></p:b></p:a></r>",
+"output": "<r><p:a xmlns:p=\"urn:1\"><p:b xmlns:p=\"urn:2\"><c></c></p:b></p:a></r>"
+},
+{
+"name": "default-undone",
+"algorithm": "http://www.w3.org/TR/2001/REC-xml-c14n-20010315",
+"prefixes": "",
+"input": "<r xmlns=\"urn:d\"><a xmlns=\"\"><b xmlns=\"urn:d\"/><c/></a></r>",
+"output": "<r xmlns=\"urn:d\"><a xmlns=\"\"><b xmlns=\"urn:d\"></b><c></c></a></r>"
+},
+{
+"name": "default-undone",
+"algorithm": "http://www.w3.org/TR/2001/REC-xml-c14n-20010315#WithComments",
+"prefixes": "",
+"input": "<r xmlns=\"urn:d\"><a xmlns=\"\"><b xmlns=\"urn:d\"/><c/></a></r>",
+"output": "<r xmlns=\"urn:d\"><a xmlns=\"\"><b xmlns=\"urn:d\"></b><c></c></a></r>"
+},
+{
+"name": "default-undone",
+"algorithm": "http://www.w3.org/2001/10/xml-exc-c14n#",
+"prefixes": "",
+"input": "<r xmlns=\"urn:d\"><a xmlns=\"\"><b xmlns=\"urn:d\"/><c/></a></r>",
+"output": "<r xmlns=\"urn:d\"><a xmlns=\"\"><b xmlns=\"urn:d\"></b><c></c></a></r>"
+},
+{
+"name": "default-undone",
+"algorithm": "http://www.w3.org/2001/10/xml-exc-c14n#WithComments",
+"prefixes": "",
+"input": "<r xmlns=\"urn:d\"><a xmlns=\"\"><b xmlns=\"urn:d\"/><c/></a></r>",
+"output": "<r xmlns=\"urn:d\"><a xmlns=\"\"><b xmlns=\"urn:d\"></b><c></c></a></r>"
+},
+{
+"name": "comments-and-pis",
+"algorithm": "http://www.w3.org/TR/2001/REC-xml-c14n-20010315",
+"prefixes": "",
+"input": "<!--before--><?before data?><r><!-- inside --><?pi   spaced   data ?>x<?empty?></r><!--after--><?after?>",
+"output": "<?before data?>\n<r><?pi spaced   data ?>x<?empty?></r>\n<?after?>"
+},
+{
+"name": "comments-and-pis",
+"algorithm": "http://www.w3.org/TR/2001/REC-xml-c14n-20010315#WithComments",
+"prefixes": "",
+"input": "<!--before--><?before data?><r><!-- inside --><?pi   spaced   data ?>x<?empty?></r><!--after--><?after?>",
+"output": "<!--before-->\n<?before data?>\n<r><!-- inside --><?pi spaced   data ?>x<?empty?></r>\n<!--after-->\n<?after?>"
+},
+{
+"name": "comments-and-pis",
+"algorithm": "http://www.w3.org/2001/10/xml-exc-c14n#",
+"prefixes": "",
+"input": "<!--before--><?before data?><r><!-- inside --><?pi   spaced   data ?>x<?empty?></r><!--after--><?after?>",
+"output": "<?before data?>\n<r><?pi spaced   data ?>x<?empty?></r>\n<?after?>"
+},
+{
+"name": "comments-and-pis",
+"algorithm": "http://www.w3.org/2001/10/xml-exc-c14n#WithComments",
+"prefixes": "",
+"input": "<!--before--><?before data?><r><!-- inside --><?pi   spaced   data ?>x<?empty?></r><!--after--><?after?>",
+"output": "<!--before-->\n<?before data?>\n<r><!-- inside --><?pi spaced   data ?>x<?empty?></r>\n<!--after-->\n<?after?>"
+},
+{
+"name": "saml-like",
+"algorithm": "http://www.w3.org/TR/2001/REC-xml-c14n-20010315",
+"prefixes": "",
+"input": "<samlp:AuthnRequest xmlns:samlp=\"urn:oasis:names:tc:SAML:2.0:protocol\" xmlns:saml=\"urn:oasis:names:tc:SAML:2.0:assertion\" ID=\"_a1\" Version=\"2.0\" IssueInstant=\"2027-01-15T08:00:00Z\" Destination=\"https://idp.example.com/sso\"><saml:Issuer>https://sp.example.com</saml:Issuer><samlp:NameIDPolicy Format=\"urn:oasis:names:tc:SAML:1.1:nameid-format:unspecified\" AllowCreate=\"true\"/></samlp:AuthnRequest>",
+"output": "<samlp:AuthnRequest xmlns:saml=\"urn:oasis:names:tc:SAML:2.0:assertion\" xmlns:samlp=\"urn:oasis:names:tc:SAML:2.0:protocol\" Destination=\"https://idp.example.com/sso\" ID=\"_a1\" IssueInstant=\"2027-01-15T08:00:00Z\" Version=\"2.0\"><saml:Issuer>https://sp.example.com</saml:Issuer><samlp:NameIDPolicy AllowCreate=\"true\" Format=\"urn:oasis:names:tc:SAML:1.1:nameid-format:unspecified\"></samlp:NameIDPolicy></samlp:AuthnRequest>"
+},
+{
+"name": "saml-like",
+"algorithm": "http://www.w3.org/TR/2001/REC-xml-c14n-20010315#WithComments",
+"prefixes": "",
+"input": "<samlp:AuthnRequest xmlns:samlp=\"urn:oasis:names:tc:SAML:2.0:protocol\" xmlns:saml=\"urn:oasis:names:tc:SAML:2.0:assertion\" ID=\"_a1\" Version=\"2.0\" IssueInstant=\"2027-01-15T08:00:00Z\" Destination=\"https://idp.example.com/sso\"><saml:Issuer>https://sp.example.com</saml:Issuer><samlp:NameIDPolicy Format=\"urn:oasis:names:tc:SAML:1.1:nameid-format:unspecified\" AllowCreate=\"true\"/></samlp:AuthnRequest>",
+"output": "<samlp:AuthnRequest xmlns:saml=\"urn:oasis:names:tc:SAML:2.0:assertion\" xmlns:samlp=\"urn:oasis:names:tc:SAML:2.0:protocol\" Destination=\"https://idp.example.com/sso\" ID=\"_a1\" IssueInstant=\"2027-01-15T08:00:00Z\" Version=\"2.0\"><saml:Issuer>https://sp.example.com</saml:Issuer><samlp:NameIDPolicy AllowCreate=\"true\" Format=\"urn:oasis:names:tc:SAML:1.1:nameid-format:unspecified\"></samlp:NameIDPolicy></samlp:AuthnRequest>"
+},
+{
+"name": "saml-like",
+"algorithm": "http://www.w3.org/2001/10/xml-exc-c14n#",
+"prefixes": "",
+"input": "<samlp:AuthnRequest xmlns:samlp=\"urn:oasis:names:tc:SAML:2.0:protocol\" xmlns:saml=\"urn:oasis:names:tc:SAML:2.0:assertion\" ID=\"_a1\" Version=\"2.0\" IssueInstant=\"2027-01-15T08:00:00Z\" Destination=\"https://idp.example.com/sso\"><saml:Issuer>https://sp.example.com</saml:Issuer><samlp:NameIDPolicy Format=\"urn:oasis:names:tc:SAML:1.1:nameid-format:unspecified\" AllowCreate=\"true\"/></samlp:AuthnRequest>",
+"output": "<samlp:AuthnRequest xmlns:samlp=\"urn:oasis:names:tc:SAML:2.0:protocol\" Destination=\"https://idp.example.com/sso\" ID=\"_a1\" IssueInstant=\"2027-01-15T08:00:00Z\" Version=\"2.0\"><saml:Issuer xmlns:saml=\"urn:oasis:names:tc:SAML:2.0:assertion\">https://sp.example.com</saml:Issuer><samlp:NameIDPolicy AllowCreate=\"true\" Format=\"urn:oasis:names:tc:SAML:1.1:nameid-format:unspecified\"></samlp:NameIDPolicy></samlp:AuthnRequest>"
+},
+{
+"name": "saml-like",
+"algorithm": "http://www.w3.org/2001/10/xml-exc-c14n#WithComments",
+"prefixes": "",
+"input": "<samlp:AuthnRequest xmlns:samlp=\"urn:oasis:names:tc:SAML:2.0:protocol\" xmlns:saml=\"urn:oasis:names:tc:SAML:2.0:assertion\" ID=\"_a1\" Version=\"2.0\" IssueInstant=\"2027-01-15T08:00:00Z\" Destination=\"https://idp.example.com/sso\"><saml:Issuer>https://sp.example.com</saml:Issuer><samlp:NameIDPolicy Format=\"urn:oasis:names:tc:SAML:1.1:nameid-format:unspecified\" AllowCreate=\"true\"/></samlp:AuthnRequest>",
+"output": "<samlp:AuthnRequest xmlns:samlp=\"urn:oasis:names:tc:SAML:2.0:protocol\" Destination=\"https://idp.example.com/sso\" ID=\"_a1\" IssueInstant=\"2027-01-15T08:00:00Z\" Version=\"2.0\"><saml:Issuer xmlns:saml=\"urn:oasis:names:tc:SAML:2.0:assertion\">https://sp.example.com</saml:Issuer><samlp:NameIDPolicy AllowCreate=\"true\" Format=\"urn:oasis:names:tc:SAML:1.1:nameid-format:unspecified\"></samlp:NameIDPolicy></samlp:AuthnRequest>"
+},
+{
+"name": "xsi-type",
+"algorithm": "http://www.w3.org/TR/2001/REC-xml-c14n-20010315",
+"prefixes": "",
+"input": "<saml:Attribute xmlns:saml=\"urn:oasis:names:tc:SAML:2.0:assertion\" xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" Name=\"mail\"><saml:AttributeValue xsi:type=\"xs:string\">a@example.com</saml:AttributeValue></saml:Attribute>",
+"output": "<saml:Attribute xmlns:saml=\"urn:oasis:names:tc:SAML:2.0:assertion\" xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" Name=\"mail\"><saml:AttributeValue xsi:type=\"xs:string\">a@example.com</saml:AttributeValue></saml:Attribute>"
+},
+{
+"name": "xsi-type",
+"algorithm": "http://www.w3.org/TR/2001/REC-xml-c14n-20010315#WithComments",
+"prefixes": "",
+"input": "<saml:Attribute xmlns:saml=\"urn:oasis:names:tc:SAML:2.0:assertion\" xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" Name=\"mail\"><saml:AttributeValue xsi:type=\"xs:string\">a@example.com</saml:AttributeValue></saml:Attribute>",
+"output": "<saml:Attribute xmlns:saml=\"urn:oasis:names:tc:SAML:2.0:assertion\" xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" Name=\"mail\"><saml:AttributeValue xsi:type=\"xs:string\">a@example.com</saml:AttributeValue></saml:Attribute>"
+},
+{
+"name": "xsi-type",
+"algorithm": "http://www.w3.org/2001/10/xml-exc-c14n#",
+"prefixes": "",
+"input": "<saml:Attribute xmlns:saml=\"urn:oasis:names:tc:SAML:2.0:assertion\" xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" Name=\"mail\"><saml:AttributeValue xsi:type=\"xs:string\">a@example.com</saml:AttributeValue></saml:Attribute>",
+"output": "<saml:Attribute xmlns:saml=\"urn:oasis:names:tc:SAML:2.0:assertion\" Name=\"mail\"><saml:AttributeValue xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" xsi:type=\"xs:string\">a@example.com</saml:AttributeValue></saml:Attribute>"
+},
+{
+"name": "xsi-type",
+"algorithm": "http://www.w3.org/2001/10/xml-exc-c14n#WithComments",
+"prefixes": "",
+"input": "<saml:Attribute xmlns:saml=\"urn:oasis:names:tc:SAML:2.0:assertion\" xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" Name=\"mail\"><saml:AttributeValue xsi:type=\"xs:string\">a@example.com</saml:AttributeValue></saml:Attribute>",
+"output": "<saml:Attribute xmlns:saml=\"urn:oasis:names:tc:SAML:2.0:assertion\" Name=\"mail\"><saml:AttributeValue xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" xsi:type=\"xs:string\">a@example.com</saml:AttributeValue></saml:Attribute>"
+},
+{
+"name": "xsi-type",
+"algorithm": "http://www.w3.org/2001/10/xml-exc-c14n#",
+"prefixes": "xs",
+"input": "<saml:Attribute xmlns:saml=\"urn:oasis:names:tc:SAML:2.0:assertion\" xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" Name=\"mail\"><saml:AttributeValue xsi:type=\"xs:string\">a@example.com</saml:AttributeValue></saml:Attribute>",
+"output": "<saml:Attribute xmlns:saml=\"urn:oasis:names:tc:SAML:2.0:assertion\" xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" Name=\"mail\"><saml:AttributeValue xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" xsi:type=\"xs:string\">a@example.com</saml:AttributeValue></saml:Attribute>"
+},
+{
+"name": "soap",
+"algorithm": "http://www.w3.org/TR/2001/REC-xml-c14n-20010315",
+"prefixes": "",
+"input": "<soap:Envelope xmlns:soap=\"http://schemas.xmlsoap.org/soap/envelope/\" xmlns:wsu=\"http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-utility-1.0.xsd\"><soap:Body wsu:Id=\"body\"><m:GetPrice xmlns:m=\"urn:example:m\" b=\"2\" a=\"1\"/></soap:Body></soap:Envelope>",
+"output": "<soap:Envelope xmlns:soap=\"http://schemas.xmlsoap.org/soap/envelope/\" xmlns:wsu=\"http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-utility-1.0.xsd\"><soap:Body wsu:Id=\"body\"><m:GetPrice xmlns:m=\"urn:example:m\" a=\"1\" b=\"2\"></m:GetPrice></soap:Body></soap:Envelope>"
+},
+{
+"name": "soap",
+"algorithm": "http://www.w3.org/TR/2001/REC-xml-c14n-20010315#WithComments",
+"prefixes": "",
+"input": "<soap:Envelope xmlns:soap=\"http://schemas.xmlsoap.org/soap/envelope/\" xmlns:wsu=\"http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-utility-1.0.xsd\"><soap:Body wsu:Id=\"body\"><m:GetPrice xmlns:m=\"urn:example:m\" b=\"2\" a=\"1\"/></soap:Body></soap:Envelope>",
+"output": "<soap:Envelope xmlns:soap=\"http://schemas.xmlsoap.org/soap/envelope/\" xmlns:wsu=\"http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-utility-1.0.xsd\"><soap:Body wsu:Id=\"body\"><m:GetPrice xmlns:m=\"urn:example:m\" a=\"1\" b=\"2\"></m:GetPrice></soap:Body></soap:Envelope>"
+},
+{
+"name": "soap",
+"algorithm": "http://www.w3.org/2001/10/xml-exc-c14n#",
+"prefixes": "",
+"input": "<soap:Envelope xmlns:soap=\"http://schemas.xmlsoap.org/soap/envelope/\" xmlns:wsu=\"http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-utility-1.0.xsd\"><soap:Body wsu:Id=\"body\"><m:GetPrice xmlns:m=\"urn:example:m\" b=\"2\" a=\"1\"/></soap:Body></soap:Envelope>",
+"output": "<soap:Envelope xmlns:soap=\"http://schemas.xmlsoap.org/soap/envelope/\"><soap:Body xmlns:wsu=\"http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-utility-1.0.xsd\" wsu:Id=\"body\"><m:GetPrice xmlns:m=\"urn:example:m\" a=\"1\" b=\"2\"></m:GetPrice></soap:Body></soap:Envelope>"
+},
+{
+"name": "soap",
+"algorithm": "http://www.w3.org/2001/10/xml-exc-c14n#WithComments",
+"prefixes": "",
+"input": "<soap:Envelope xmlns:soap=\"http://schemas.xmlsoap.org/soap/envelope/\" xmlns:wsu=\"http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-utility-1.0.xsd\"><soap:Body wsu:Id=\"body\"><m:GetPrice xmlns:m=\"urn:example:m\" b=\"2\" a=\"1\"/></soap:Body></soap:Envelope>",
+"output": "<soap:Envelope xmlns:soap=\"http://schemas.xmlsoap.org/soap/envelope/\"><soap:Body xmlns:wsu=\"http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-utility-1.0.xsd\" wsu:Id=\"body\"><m:GetPrice xmlns:m=\"urn:example:m\" a=\"1\" b=\"2\"></m:GetPrice></soap:Body></soap:Envelope>"
+},
+{
+"name": "soap",
+"algorithm": "http://www.w3.org/2001/10/xml-exc-c14n#",
+"prefixes": "wsu",
+"input": "<soap:Envelope xmlns:soap=\"http://schemas.xmlsoap.org/soap/envelope/\" xmlns:wsu=\"http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-utility-1.0.xsd\"><soap:Body wsu:Id=\"body\"><m:GetPrice xmlns:m=\"urn:example:m\" b=\"2\" a=\"1\"/></soap:Body></soap:Envelope>",
+"output": "<soap:Envelope xmlns:soap=\"http://schemas.xmlsoap.org/soap/envelope/\" xmlns:wsu=\"http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-utility-1.0.xsd\"><soap:Body wsu:Id=\"body\"><m:GetPrice xmlns:m=\"urn:example:m\" a=\"1\" b=\"2\"></m:GetPrice></soap:Body></soap:Envelope>"
+},
+{
+"name": "unicode",
+"algorithm": "http://www.w3.org/TR/2001/REC-xml-c14n-20010315",
+"prefixes": "",
+"input": "<\u00e9l\u00e9ment attr=\"\u65e5\u672c\" xmlns:\u03b1=\"urn:alpha\"><\u03b1:x>\ud83d\ude00</\u03b1:x></\u00e9l\u00e9ment>",
+"output": "<\u00e9l\u00e9ment xmlns:\u03b1=\"urn:alpha\" attr=\"\u65e5\u672c\"><\u03b1:x>\ud83d\ude00</\u03b1:x></\u00e9l\u00e9ment>"
+},
+{
+"name": "unicode",
+"algorithm": "http://www.w3.org/TR/2001/REC-xml-c14n-20010315#WithComments",
+"prefixes": "",
+"input": "<\u00e9l\u00e9ment attr=\"\u65e5\u672c\" xmlns:\u03b1=\"urn:alpha\"><\u03b1:x>\ud83d\ude00</\u03b1:x></\u00e9l\u00e9ment>",
+"output": "<\u00e9l\u00e9ment xmlns:\u03b1=\"urn:alpha\" attr=\"\u65e5\u672c\"><\u03b1:x>\ud83d\ude00</\u03b1:x></\u00e9l\u00e9ment>"
+},
+{
+"name": "unicode",
+"algorithm": "http://www.w3.org/2001/10/xml-exc-c14n#",
+"prefixes": "",
+"input": "<\u00e9l\u00e9ment attr=\"\u65e5\u672c\" xmlns:\u03b1=\"urn:alpha\"><\u03b1:x>\ud83d\ude00</\u03b1:x></\u00e9l\u00e9ment>",
+"output": "<\u00e9l\u00e9ment attr=\"\u65e5\u672c\"><\u03b1:x xmlns:\u03b1=\"urn:alpha\">\ud83d\ude00</\u03b1:x></\u00e9l\u00e9ment>"
+},
+{
+"name": "unicode",
+"algorithm": "http://www.w3.org/2001/10/xml-exc-c14n#WithComments",
+"prefixes": "",
+"input": "<\u00e9l\u00e9ment attr=\"\u65e5\u672c\" xmlns:\u03b1=\"urn:alpha\"><\u03b1:x>\ud83d\ude00</\u03b1:x></\u00e9l\u00e9ment>",
+"output": "<\u00e9l\u00e9ment attr=\"\u65e5\u672c\"><\u03b1:x xmlns:\u03b1=\"urn:alpha\">\ud83d\ude00</\u03b1:x></\u00e9l\u00e9ment>"
+}
+]
+}

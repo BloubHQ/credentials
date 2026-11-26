@@ -303,6 +303,14 @@ funcs! {
     EcdsaPublic = "ecdsa_public"(2, 2): "`ecdsa_public(curve, key)`: the SEC1 uncompressed public key of a private key on `p256`, `p384`, `p521`, `k256`, `bp256`, `bp384` or `sm2` (raw scalar or PKCS#8 DER; one-way).",
     RsaPublic = "rsa_public"(2, 2): "`rsa_public(form, key)`: the public key of an RSA private key (PKCS#8 or PKCS#1 DER) as `spki` or `pkcs1` DER, or its modulus `n` or exponent `e` as big-endian bytes without leading zeros (one-way).",
     TlsExporter = "tls_exporter"(3, 3): "`tls_exporter(label, context, length)`: keying material exported from the TLS 1.3 connection of the operation (RFC 8446 section 7.5), 1 to 8192 bytes; only in a TLS send, after the handshake; a secret.",
+    Deflate = "deflate"(1, 1): "`deflate(value)`: raw DEFLATE (RFC 1951) at level 6; the value must not be a secret.",
+    Inflate = "inflate"(1, 1): "`inflate(value)`: raw DEFLATE decompressed, at most 1 MiB and no more than the budget has left.",
+    ZlibDeflate = "zlib_deflate"(1, 1): "`zlib_deflate(value)`: DEFLATE in the zlib format (RFC 1950); the value must not be a secret.",
+    ZlibInflate = "zlib_inflate"(1, 1): "`zlib_inflate(value)`: a zlib stream (RFC 1950) decompressed, its Adler-32 checked; at most 1 MiB.",
+    GzipDeflate = "gzip_deflate"(1, 1): "`gzip_deflate(value)`: one gzip member (RFC 1952) with no name and MTIME 0; the value must not be a secret.",
+    GzipInflate = "gzip_inflate"(1, 1): "`gzip_inflate(value)`: one gzip member (RFC 1952) decompressed, its CRC-32 and length checked; at most 1 MiB.",
+    XmlC14n = "xml_c14n"(2, 3): "`xml_c14n(algorithm, document[, inclusive_prefixes])`: the canonical form of an XML document under the algorithm its W3C identifier names (Canonical XML 1.0 or 1.1, Exclusive XML Canonicalization 1.0, with or without comments); no DTD.",
+    XmlEscape = "xml_escape"(1, 1): "`xml_escape(text)`: text escaped for XML character data and attribute values.",
 }
 
 impl Func {
@@ -422,6 +430,12 @@ impl Func {
         }
     }
 
+    /// A compression: its output is as long as the input repeats itself, so its input may
+    /// not be a secret (rule 10).
+    fn compresses(self) -> bool {
+        matches!(self, Func::Deflate | Func::ZlibDeflate | Func::GzipDeflate)
+    }
+
     /// A MAC built on a block cipher: one-way only under a secret key. Under a known key
     /// it is reversible (a one-block CBC-MAC is the block encrypted).
     fn block_mac(self) -> bool {
@@ -460,6 +474,8 @@ impl Func {
             | Func::TlsExporter => &[2],
             Func::HpkeExport => &[5],
             Func::HpkeReceiverExport => &[6],
+            // The prefix list sets which namespace declarations come out.
+            Func::XmlC14n => &[2],
             _ => &[],
         }
     }
@@ -500,7 +516,8 @@ impl Func {
             | Func::MldsaSign
             | Func::MldsaPublic
             | Func::EcdsaPublic
-            | Func::RsaPublic => &[0],
+            | Func::RsaPublic
+            | Func::XmlC14n => &[0],
             f => match f.algorithm_arg() {
                 Some(0) => &[0],
                 _ => &[],
@@ -552,6 +569,7 @@ impl Func {
                 | Func::Between
                 | Func::Add
                 | Func::JsonSetNumber
+                | Func::XmlC14n
         )
     }
 
@@ -579,7 +597,11 @@ impl Func {
             | Func::AesCbcMac
             | Func::AesKwWrap
             | Func::AesKwpWrap
-            | Func::KerberosDk => 0..1,
+            | Func::KerberosDk
+            | Func::Inflate
+            | Func::ZlibInflate
+            | Func::GzipInflate
+            | Func::XmlEscape => 0..1,
             Func::Shake128 | Func::Shake256 | Func::Nfold => 1..2,
             Func::Turboshake128 | Func::Turboshake256 => 1..3,
             Func::Kt128 | Func::Kt256 | Func::TlsExporter => 2..3,
@@ -879,6 +901,8 @@ fn walk<'e>(expr: &'e Expr, visit: &mut dyn FnMut(&'e Expr)) {
 
 type Rule = &'static str;
 
+const COMPRESSED_SECRET: Rule = "a secret may not be compressed: the length would tell it";
+
 const AEAD_IN_PLACE: Rule =
     "aead_ciphertext and aead_tag take an AEAD encryption call written in place";
 
@@ -964,6 +988,9 @@ fn call_info(func: Func, args: &[Info]) -> core::result::Result<Info, Rule> {
         .any(|&i| at(i).tainted || at(i).controlled)
     {
         return Err("a hash or curve name must be fixed by the policy");
+    }
+    if func.compresses() && at(0).tainted {
+        return Err(COMPRESSED_SECRET);
     }
     if func.public_key_args().iter().any(|&i| at(i).caller) {
         return Err(
@@ -1317,6 +1344,12 @@ impl Budget {
             return Err(Error::Budget { what: "bytes" });
         }
         Ok(())
+    }
+
+    /// The bytes left to spend: what a function whose output size it cannot know before it
+    /// runs (an inflation, a canonical form) may write at most.
+    pub(crate) fn left(&self) -> usize {
+        self.bytes.get()
     }
 
     /// Spends `n` bytes.

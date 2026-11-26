@@ -212,6 +212,10 @@ policy is signed, every template is analysed:
   guesses.
 - **Steps.** A `compute` step gives its name exactly the properties of its template, so a
   value passed between steps is analysed as if it were written inline.
+- **Compression and XML.** A secret is never compressed (`deflate`, `zlib_deflate`,
+  `gzip_deflate`): a compressed length tells how the input repeats itself (CRIME). One
+  inflation writes at most 1 MiB and the budget left; XML is read with no DTD, so no
+  external entity and no entity expansion.
 - **Budgets.** One operation may render at most 128 MiB, 1,000,000 PBKDF2 rounds and 32
   signatures and key agreements.
 
@@ -230,6 +234,7 @@ policy is signed, every template is analysed:
 | Password encrypted in the browser | `ecdh("p256", server_key)` + `sha256` + `aes_cbc_encrypt` with `u8(len(…))` prefixes and `ecdh_public("p256")`; or `rsa_encrypt_oaep("sha256", key, password)` with the key captured from the server |
 | JWT RS256 | no connection: `b64urlraw(header) + "." + b64urlraw($input) + "." + b64urlraw(rsa_sign_pkcs1_sha256(pem(key), …))` |
 | JWT with a lifetime the policy bounds | a `json` input schema that fixes `iss`/`aud` and has the node `set` `iat`/`exp`; or `json_set_number(..., "exp", add($unix, "300"))` in the template |
+| SAML service provider, WS-Security | HTTP-Redirect: `b64(deflate(authn))` and `rsa_sign_pkcs1_sha256` or `p256_sign` over the query; HTTP-POST: an enveloped signature over `xml_c14n("http://www.w3.org/2001/10/xml-exc-c14n#", ...)`; each verified with `rsa` and ring |
 | Ethereum | no connection: `{{ k256_sign_recoverable(key, keccak256($input)) }}` with an `rlp` input schema that fixes the recipient, chain and data and bounds the value |
 | IMAP | tls: receive the greeting, send `a1 LOGIN {{user}} {{password}}`, receive, relay the commands the policy lists |
 | TOTP | no connection: `{{ totp(b32decode(seed)) }}` |

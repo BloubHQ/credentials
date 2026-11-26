@@ -785,7 +785,7 @@ measured where a scheme would need the rules loosened.
 | JWE (RFC 7516): RSA-OAEP-256 + A256GCM, ECDH-ES+A128KW + A128GCM, `dir` + A256GCM | works with caveat | `jwe_rsa_oaep_256_a256gcm`, `jwe_ecdh_es_a128kw_a128gcm`, `jwe_ecdh_es_rfc7518_appendix_c`, `jwe_dir_a256gcm_over_the_callers_body`, `jwe_of_caller_bytes_and_a_secret_is_refused` | 6 JWEs decrypted by the test (`rsa` OAEP, `p256` ECDH, Concat KDF over `sha2`, `aes-kw`, `aes-gcm`), fresh content keys, IVs and ephemeral keys each call; RFC 7518 appendix C: the content opens under the published key `VqqN6vgjbSBcIijNcacQGg` | A plaintext that mixes the caller's bytes with a secret: `slice` still cannot separate ciphertext and tag (rule 2, measured); `aead_ciphertext` and `aead_tag` do (next table). Decrypting a JWE response is the `decrypt` row. |
 | `private_key_jwt`, `client_secret_jwt` (RFC 7523) | works as-is | `client_assertions_private_key_jwt_and_client_secret_jwt` | RS256 verified by ring, HS256 by `hmac`; claims `iss`, `sub`, `aud`, `jti`, `iat`, `exp`; the access token sealed, only its type and lifetime returned | |
 | SAML login through forms (`html` capture) | works with caveat | `saml_login_through_forms` | Redirect parameters, CSRF token and cookie, `SAMLResponse` (with an entity) and `RelayState` reach the right hosts unchanged; the session cookie sealed | `regex` reads bodies only, so the `Location` parameters are cut with `between`, in the order the service provider writes them. An OpenID Connect form login is the same steps (untested). |
-| SAML messages signed by a service provider | not shown | — | — | Not tested. The HTTP-Redirect binding needs DEFLATE (RFC 1951) and the POST binding XML signatures over Exclusive XML Canonicalization; neither family is small, so neither was added. |
+| SAML messages signed by a service provider | works as-is (after DEFLATE and XML canonicalization, below) | `saml_redirect_binding_rsa_sha256_verifies`, `saml_redirect_binding_ecdsa_p256_verifies`, `saml_post_binding_enveloped_signature_verifies` (`schemes_xml.rs`) | See the table of DEFLATE and XML canonicalization below | Was: not shown, since the HTTP-Redirect binding needs DEFLATE (RFC 1951) and the POST binding XML signatures over Exclusive XML Canonicalization. Reading and checking the identity provider's signed Response is not done. |
 
 The gaps of that table that are generic template capabilities were then added, each as a
 family (tests in `crates/engine/tests/schemes_more.rs`, which reads its policies from
@@ -828,6 +828,52 @@ signed), a part of a mixed message cannot be cut or decoded, and rule 9 still re
 CCM tag length or a `random` length that depends on a secret.
 
 
+The two families that row found missing were then added (tests in
+`crates/engine/tests/schemes_xml.rs`, which reads its policies from `docs/policy.md`,
+Compression and XML, and `crates/engine/src/primitives/xml/tests.rs`):
+
+- **DEFLATE**: `deflate`, `inflate`, `zlib_deflate`, `zlib_inflate`, `gzip_deflate`,
+  `gzip_inflate` over `miniz_oxide` 0.9.1 (pure Rust, `forbid(unsafe_code)`). An inflation
+  writes into one buffer sized before it starts, at most 1 MiB and the budget left, and is
+  refused past it; anything after the stream, a second gzip member, a preset dictionary and a
+  wrong checksum are refused. A new rule of the analysis, rule 10, refuses compressing a
+  tainted value: a compressed length depends on how the input repeats itself (CRIME, BREACH),
+  and since `len` removes the taint and a request's size is seen on the wire, tracking the
+  length as a new property was rejected in favour of the refusal; no scheme measured needs to
+  compress a secret.
+- **XML canonicalization**: `xml_c14n(algorithm, document[, inclusive_prefixes])` for
+  Canonical XML 1.0 and 1.1 and Exclusive XML Canonicalization 1.0, with and without comments
+  (the W3C identifiers name them), and `xml_escape`. The tokenizer is `quick-xml` 0.42 (pure
+  Rust, `forbid(unsafe_code)`, MSRV 1.86, no default features), which keeps prefixes as
+  written; namespace resolution, attribute normalization and the well-formedness checks it
+  leaves out are the engine's. No DTD (so no XXE and no entity expansion), 1 MiB, 64 levels,
+  65,536 nodes, 8 MiB of canonical form and the budget left. A secret and a chosen value may
+  not meet in `xml_c14n` (rule 2). No element selection (XPath, by ID): a signing policy
+  builds each signed element, and under the exclusive form an element canonicalized alone is
+  the same as in place; selection would only be needed to check a document someone else
+  signed, which is not done.
+
+| Scheme or check | Result | Tests | Checked against |
+| --- | --- | --- | --- |
+| Inflation of what zlib writes | works as-is | `inflate_reads_what_zlib_writes_and_refuses_the_rest` | 41 streams of the zlib library (zlib-ng 1.3.1 through Python): raw at levels 0, 1, 6 and 9, fixed Huffman and Huffman only, zlib, zlib with a small window, gzip, gzip with every optional header field, of 4 inputs, and 1 MiB of zeros at the cap; 19 refused: damaged, wrong Adler-32, CRC-32, length and header CRC, a preset dictionary, trailing bytes, two members, a reserved flag, 3 bombs of 4 MiB and 1 MiB plus one byte |
+| DEFLATE the engine writes | works as-is | `deflate_writes_streams_an_independent_decoder_reads` | A DEFLATE decoder written in the test (not `miniz_oxide`) reads every raw, zlib and gzip stream of 4 inputs, with the RFC 1950 header and Adler-32 and the RFC 1952 header, CRC-32 and length checked; the CRC-32 and Adler-32 of the test match their check values |
+| Canonical XML 1.0, Exclusive XML Canonicalization 1.0 (with and without comments, prefix lists) | works as-is | `matches_libxml2_on_every_fixture`, `specification_examples`, `exclusive_specification_example`, `prefix_lists_and_algorithms` | 73 canonical forms of libxml2 2.11.9 (lxml 6.1.1) over 17 documents (C14N 1.0 sections 3.1 to 3.4 and 3.6 without their DTDs; namespaces declared, redeclared, undone and unused; CR LF, CDATA and references, attribute escapes and order, comments and PIs, SAML, `xsi:type` with a prefix list, SOAP, non-ASCII names) byte for byte, each its own canonical form; the lines of the specification that do not depend on a DTD; the subtree example of Exclusive XML Canonicalization section 2.2 in both contexts under both forms (libxml2 leaves out the inherited `xml:space`; the specification and the engine keep it) |
+| Canonical XML 1.1 | works with caveat | the same | Equal to 1.0 on the 34 whole-document cases of the fixture, as the specification says; on a subtree it inherits `xml:lang` and `xml:space`; the `xml:base` fix-up of a subtree is not implemented and is refused. No 1.1 output of another implementation was compared (unmeasured) |
+| SAML HTTP-Redirect binding, RSA-SHA256 and ECDSA P-256 | works as-is | `saml_redirect_binding_rsa_sha256_verifies`, `saml_redirect_binding_ecdsa_p256_verifies` | 3 query signatures over `SAMLRequest`, `RelayState` and `SigAlg` as sent, verified by `rsa` and ring; the message inflated by the decoder of the test equals the AuthnRequest; a fresh ID per call; a changed parameter fails |
+| SAML HTTP-POST binding, enveloped XML signature | works as-is | `saml_post_binding_enveloped_signature_verifies` | The reference digest equals the SHA-256 of the exclusive canonical form written out by hand (namespace moved to its user, attributes sorted, empty elements expanded, `&` escaped by `xml_escape`); the RSA-SHA256 signature verified by `rsa` over the canonical `SignedInfo` written out by hand, and not over the text as sent |
+| WS-Security: UsernameToken digest, X.509 BinarySecurityToken signature | works as-is | `ws_security_username_token_digest`, `ws_security_binary_security_token_signature_verifies` | The digest recomputed from the nonce and time sent (no new function needed); two references (the timestamp, the caller's body written unsorted) against canonical forms written out by hand, the signature verified by `rsa`, the token the record's certificate; 3 hostile bodies refused before sending |
+| What these tests send, checked outside Rust | works as-is | `CREDENTIALS_INTEROP_DIR=<dir>` with `schemes_xml`, then `crates/engine/tests/fixtures/xml/interop/check.py` | 21 of 21: Python's zlib (zlib-ng 1.3.1) reads the 12 raw, zlib and gzip streams of 4 inputs exactly to their end and the 2 `SAMLRequest` values; OpenSSL 3 verifies both HTTP-Redirect signatures (RSA-SHA256, ECDSA P-256) and both `SignedInfo` signatures over libxml2's exclusive canonical form; libxml2 recomputes the 3 reference digests from the documents as sent (the enveloped signature removed). Not run in CI; a full XML-DSig validator (xmlsec, Java) was not run (unmeasured) |
+
+Attacks measured with them: rule 10 refuses 9 policies that compress a secret; a mixed input
+to `inflate`, `gzip_inflate` and `xml_escape` (rule 1), a mixed `xml_c14n` and a secret beside
+a chosen prefix list (rule 2), a chosen algorithm (rule 6), a tainted prefix list (rule 9) and
+a canonical or escaped secret handed back (rule 5) are refused at signing; bombs, DTDs,
+external entities, entity expansion, deep nesting, too many nodes and an amplified canonical
+form are refused at rendering (`hostile_documents_are_refused_in_templates`,
+`inflation_counts_against_the_budget`, `dtds_and_entities_are_refused`, `limits_are_enforced`,
+`malformed_documents_are_refused`). Fuzz targets `inflate_stream` and `xml_c14n` (a canonical
+form must be its own) type-check; libFuzzer was not run on this Windows host (unmeasured).
+
 Not done; each needs a primitive or a feature, not a site name: OAuth 1.0a normalization in
 `canonical_query`; SigV4A key derivation; NTLM and Negotiate (connection-bound: each HTTPS
 send opens its own connection today, so the handshake and the request would need one
@@ -836,9 +882,9 @@ decryption and CMS signatures); software passkeys; HOTP and the Steam alphabet; 
 without the owner (reading a code from another record, like the `mail` item of part 5);
 OpenPGP; ssh-agent (`credentials tunnel --agent`); BIP-340 Schnorr; incoming webhook
 `verify`; `decrypt`; `generate` and rotation; egress through a proxy; SNMPv3 (RFC 3414 key
-localization and AES-CFB over the UDP relay); OAUTHBEARER; found by the table above: DEFLATE and
-Exclusive XML Canonicalization (the request components, the AEAD parts and the public keys it
-found are done). IR `repeat` and `if` run on HTTPS and derivations, with tests on values no
+localization and AES-CFB over the UDP relay); OAUTHBEARER; checking a signed SAML Response
+(element selection by ID and XML signature verification). Found by the table above and done:
+the request components, the AEAD parts, the public keys, DEFLATE and XML canonicalization. IR `repeat` and `if` run on HTTPS and derivations, with tests on values no
 secret influences, static request bounds and the other limits of `docs/policy.md` (Loops and
 branches; `engine::policy::flow`), so the nonce retries the table marks as unconditional can now
 be conditional.

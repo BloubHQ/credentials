@@ -39,6 +39,26 @@ before 1.0, minor versions may break formats and APIs.
 
 ### Added
 
+- DEFLATE and XML canonicalization as template families (`docs/policy.md`, Compression and
+  XML; `docs/design.md` section 11), the two gaps of the scheme table:
+  - `deflate`, `inflate`, `zlib_deflate`, `zlib_inflate`, `gzip_deflate` and `gzip_inflate`
+    (RFC 1951, 1950, 1952) over `miniz_oxide` 0.9.1. One inflation writes at most 1 MiB and
+    no more than the budget has left, into a buffer sized before it starts; past it the stream
+    is refused. Trailing bytes, a second gzip member, a zlib preset dictionary and a wrong
+    checksum or length are refused. The gzip header the engine writes has no name, MTIME 0 and
+    OS 255.
+  - `xml_c14n(algorithm, document[, inclusive_prefixes])`: Canonical XML 1.0 and 1.1 and
+    Exclusive XML Canonicalization 1.0, with and without comments, named by their W3C
+    identifiers, with the `InclusiveNamespaces` prefix list; and `xml_escape(text)`. Over the
+    `quick-xml` 0.42 tokenizer (no default features). Documents are UTF-8 XML 1.0 of at most
+    1 MiB, 64 levels and 65,536 nodes, with no DTD; a canonical form is at most 8 MiB and the
+    budget left.
+  - `engine::compress` and `engine::xml` are public, for the fuzz targets `inflate_stream` and
+    `xml_c14n`.
+  - The SAML 2.0 service provider bindings are policies over them: HTTP-Redirect signed with
+    RSA-SHA256 and ECDSA P-256, HTTP-POST with an enveloped XML signature, and WS-Security
+    (UsernameToken digest, BinarySecurityToken signature over the timestamp and the caller's
+    body); `crates/engine/tests/schemes_xml.rs` verifies each with `rsa` and ring.
 - Protocol connections `pop3` and `ftp` (`engine::proto::pop3`, `engine::proto::ftp`;
   `docs/policy.md`, Protocol connections), and typed SFTP operations:
   - POP3 (RFC 1939) over implicit TLS or `STLS` (RFC 2595): `CAPA`, then the mechanism the
@@ -572,6 +592,13 @@ before 1.0, minor versions may break formats and APIs.
 
 ### Security
 
+- Rule 10 of the template analysis: the input of `deflate`, `zlib_deflate` and
+  `gzip_deflate` may not be tainted (a compressed length tells how the input repeats itself:
+  CRIME, BREACH). `inflate`, `zlib_inflate`, `gzip_inflate` and `xml_escape` refuse a secret
+  mixed with chosen bytes (rule 1); `xml_c14n` joins rule 2 (no secret and chosen value in any
+  argument), its algorithm rule 6 and its prefix list rule 9.
+- XML: a document type declaration is refused, so no external entity and no entity expansion
+  can occur; nesting, node count, input and output size are capped.
 - A secret can no longer set an output's length or a cut: `random(n)`, the length of
   `pbkdf2_sha256` and `pbkdf2`, the start and length of `slice`, the delimiters of `between`
   and the text `replace` looks for are refused when tainted, as the new key-derivation lengths

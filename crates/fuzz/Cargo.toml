@@ -199,6 +199,20 @@ doc = false
 bench = false
 
 [[bin]]
+name = "inflate_stream"
+path = "fuzz_targets/inflate_stream.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "xml_c14n"
+path = "fuzz_targets/xml_c14n.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "ftp_pop3_replies"
 path = "fuzz_targets/ftp_pop3_replies.rs"
 test = false

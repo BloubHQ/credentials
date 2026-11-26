@@ -210,6 +210,9 @@ let outcome = node.run(&call, &mut TlsTransport::new());
   `len` を通してだけです。そのハッシュ、署名、MAC、暗号文はどれも呼び出し元に推測を照合させてしまいます。
 - **ステップ。** `compute` ステップの名前はそのテンプレートとまったく同じ性質を持つので、ステップ間で
   渡す値もインラインで書いたのと同じように解析される。
+- **圧縮と XML。** 秘密は圧縮しません（`deflate`、`zlib_deflate`、`gzip_deflate`）。圧縮後の
+  長さが入力の繰り返し方を明かすためです（CRIME）。1 回の展開で書けるのは最大 1 MiB と残りの
+  予算までです。XML は DTD なしで読むので、外部エンティティもエンティティ展開もありません。
 - **予算 (budget)。** 1 つのオペレーションでレンダリングできるのは最大 128 MiB、PBKDF2 1,000,000
   ラウンド、署名と鍵合意あわせて 32 回までです。
 
@@ -228,6 +231,7 @@ let outcome = node.run(&call, &mut TlsTransport::new());
 | ブラウザーで暗号化するパスワード | `ecdh("p256", server_key)` + `sha256` + `aes_cbc_encrypt`、`u8(len(…))` の長さ接頭辞と `ecdh_public("p256")`。またはサーバーからキャプチャした鍵で `rsa_encrypt_oaep("sha256", key, password)` |
 | JWT RS256 | 接続なし: `b64urlraw(header) + "." + b64urlraw($input) + "." + b64urlraw(rsa_sign_pkcs1_sha256(pem(key), …))` |
 | ポリシーが有効期間を決める JWT | `iss`/`aud` を固定し `iat`/`exp` をノードが `set` する `json` input スキーマ、またはテンプレートの `json_set_number(..., "exp", add($unix, "300"))` |
+| SAML サービスプロバイダー、WS-Security | HTTP-Redirect: `b64(deflate(authn))` と、クエリへの `rsa_sign_pkcs1_sha256` または `p256_sign`。HTTP-POST: `xml_c14n("http://www.w3.org/2001/10/xml-exc-c14n#", ...)` に対する enveloped 署名。いずれも `rsa` と ring で検証 |
 | Ethereum | 接続なし: `{{ k256_sign_recoverable(key, keccak256($input)) }}` と、宛先・チェーン・data を固定し金額を制限する `rlp` input スキーマ |
 | IMAP | tls: グリーティングを receive、`a1 LOGIN {{user}} {{password}}` を send、receive、ポリシーが列挙したコマンドだけ中継 |
 | TOTP | 接続なし: `{{ totp(b32decode(seed)) }}` |

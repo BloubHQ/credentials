@@ -1833,9 +1833,8 @@ sealed into the record. `regex` reads bodies only, so the parameters of the redi
 
 An OpenID Connect login through a form is the same steps, with the authorization code
 captured from the redirect and redeemed by `client-assertion`'s request. Signing a SAML
-message as a service provider is not covered: the HTTP-Redirect binding DEFLATEs the message
-and the POST binding signs XML after Exclusive XML Canonicalization, and neither family is a
-function.
+message as a service provider is the `saml-redirect`, `saml-redirect-ecdsa` and `saml-post`
+operations of [Compression and XML](#compression-and-xml).
 
 ## Converting a policy
 
@@ -1894,6 +1893,8 @@ reads.
 | AEAD parts | `aead_ciphertext(encryption)` `aead_tag(encryption)`, around an AEAD call written in place |
 | Public keys | `ed25519_public(key)` `ed448_public(key)` `ecdsa_public(curve, key)` `rsa_public(form, key)` |
 | CBOR | `cbor_int(n)` `cbor_bytes(value)` `cbor_text(value)` `cbor_array(item, ...)` `cbor_map(key, value, ...)` `cbor_tag(number, item)` |
+| Compression | `deflate(value)` `inflate(value)` (RFC 1951) `zlib_deflate` `zlib_inflate` (RFC 1950) `gzip_deflate` `gzip_inflate` (RFC 1952) |
+| XML | `xml_c14n(algorithm, document[, inclusive_prefixes])` (Canonical XML 1.0 and 1.1, Exclusive XML Canonicalization 1.0) `xml_escape(text)` |
 
 Keys are raw bytes or PKCS#8 DER (PKCS#1 DER for RSA); use `pem(...)` to read a PEM field.
 Hash names are `sha1`, `sha256`, `sha384` and `sha512`: `pbkdf2` and `rsa_sign_pkcs1` take all
@@ -2144,6 +2145,161 @@ A JWS whose header carries the Ed25519 key that signs it:
  ]}
 ```
 
+#### Compression and XML
+
+DEFLATE (RFC 1951) and its two framings, and XML canonicalization, as the SAML bindings, XML
+signatures and WS-Security use them:
+
+- `deflate(value)`, `zlib_deflate(value)` (RFC 1950) and `gzip_deflate(value)` (RFC 1952)
+  compress at level 6; the gzip header carries no name, MTIME 0 and OS 255, so the same input
+  always gives the same bytes. Their input must not be tainted (rule 10).
+- `inflate(value)`, `zlib_inflate(value)` and `gzip_inflate(value)` decompress, refusing a
+  damaged stream, a wrong Adler-32 or CRC-32 or length, a zlib preset dictionary, a second
+  gzip member and any byte after the end. One inflation writes at most 1 MiB (the size of a
+  caller's input), and no more than the operation's byte budget has left: a stream that would
+  inflate further is refused, never cut. The output counts against the budget like any other.
+- `xml_c14n(algorithm, document[, inclusive_prefixes])` is the canonical form of a whole
+  document. `algorithm` is the W3C identifier, fixed by the policy (rule 6):
+  `http://www.w3.org/TR/2001/REC-xml-c14n-20010315` (Canonical XML 1.0),
+  `http://www.w3.org/2006/12/xml-c14n11` (1.1, the same as 1.0 on a whole document) and
+  `http://www.w3.org/2001/10/xml-exc-c14n#` (Exclusive XML Canonicalization 1.0), each also
+  with `#WithComments` (exclusive: `WithComments` after the `#`). `inclusive_prefixes` is the
+  `PrefixList` of an `InclusiveNamespaces` element (`#default` for the default namespace),
+  exclusive only.
+- `xml_escape(text)` writes text so it reads back the same as character data and as an
+  attribute value: `& < > " '` as the predefined entities, TAB, LF and CR as character
+  references. It refuses bytes that are not UTF-8 or not XML characters.
+
+What a document may be: UTF-8, XML 1.0, at most 1 MiB, 64 levels of elements and 65,536
+nodes, with no document type declaration. Without a DTD there is no entity but the five
+predefined ones, so no external entity (XXE) and no expansion ("billion laughs") can occur;
+a `<!DOCTYPE` is refused, and so is a reference to any other entity. Namespaces are checked
+(an undeclared prefix, `xmlns:p=""` and a misused `xml` or `xmlns` are refused), and so are
+the rules of well-formedness the parser (`quick-xml`) leaves to its caller: one root
+element, no text outside it, legal characters, attributes unique by expanded name. Every
+attribute is CDATA. A canonical form is at most 8 MiB and no more than the budget has left:
+the exclusive form writes a declaration on every element that uses it, so 7 kB of input can
+canonicalize to 1 MB. Each refusal is a `TemplateInvalid` error at rendering, before anything
+is sent or returned. Selecting part of a document (an XPath, an element by ID) is not
+offered: a policy that signs builds each signed element itself, so it canonicalizes exactly
+that text, which under the exclusive form is the same as canonicalizing it in place.
+
+A service provider's AuthnRequest in the HTTP-Redirect binding (SAML 2.0 Bindings section
+3.4.4.1): DEFLATEd, base64- and URL-encoded, and signed over
+`SAMLRequest=...&RelayState=...&SigAlg=...` as URL-encoded, which is how the node encodes a
+query injection (`pct`). `key` is the service provider's RSA key, `sp_entity_id` and
+`relay_state` are public fields:
+
+```json
+{"name": "saml-redirect",
+ "steps": [
+  {"do": "open", "connection": "https", "destinations": [{"host": "idp.example.com", "port": 443}]},
+  {"do": "compute", "into": "request_id", "template": "_{{ $nonce }}"},
+  {"do": "compute", "into": "authn", "template": "<samlp:AuthnRequest xmlns:samlp=\"urn:oasis:names:tc:SAML:2.0:protocol\" xmlns:saml=\"urn:oasis:names:tc:SAML:2.0:assertion\" ID=\"{{ request_id }}\" Version=\"2.0\" IssueInstant=\"{{ time($unix, \"%Y-%m-%dT%H:%M:%SZ\") }}\" Destination=\"https://idp.example.com/sso\" AssertionConsumerServiceURL=\"https://sp.example.com/acs\" ProtocolBinding=\"urn:oasis:names:tc:SAML:2.0:bindings:HTTP-POST\"><saml:Issuer>{{ xml_escape(sp_entity_id) }}</saml:Issuer><samlp:NameIDPolicy Format=\"urn:oasis:names:tc:SAML:1.1:nameid-format:unspecified\" AllowCreate=\"true\"/></samlp:AuthnRequest>"},
+  {"do": "compute", "into": "saml_request", "template": "{{ b64(deflate(authn)) }}"},
+  {"do": "compute", "into": "signed_query", "template": "SAMLRequest={{ pct(saml_request) }}&RelayState={{ pct(relay_state) }}&SigAlg={{ pct(\"http://www.w3.org/2001/04/xmldsig-more#rsa-sha256\") }}"},
+  {"do": "send", "request": {"from": "fixed", "method": "GET", "path": "/sso"},
+   "inject": [
+    {"target": {"kind": "query", "name": "SAMLRequest"}, "template": "{{ saml_request }}"},
+    {"target": {"kind": "query", "name": "RelayState"}, "template": "{{ relay_state }}"},
+    {"target": {"kind": "query", "name": "SigAlg"}, "template": "http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"},
+    {"target": {"kind": "query", "name": "Signature"}, "template": "{{ b64(rsa_sign_pkcs1_sha256(pem(key), signed_query)) }}"}]},
+  {"do": "return", "response": {"body": "all"}}
+ ]}
+```
+
+The same with ECDSA P-256 (`ec_key` a raw scalar; the signature is `r || s`, as XML
+Signature 1.1 section 6.4.3 encodes it):
+
+```json
+{"name": "saml-redirect-ecdsa",
+ "steps": [
+  {"do": "open", "connection": "https", "destinations": [{"host": "idp.example.com", "port": 443}]},
+  {"do": "compute", "into": "request_id", "template": "_{{ $nonce }}"},
+  {"do": "compute", "into": "authn", "template": "<samlp:AuthnRequest xmlns:samlp=\"urn:oasis:names:tc:SAML:2.0:protocol\" xmlns:saml=\"urn:oasis:names:tc:SAML:2.0:assertion\" ID=\"{{ request_id }}\" Version=\"2.0\" IssueInstant=\"{{ time($unix, \"%Y-%m-%dT%H:%M:%SZ\") }}\" Destination=\"https://idp.example.com/sso\" AssertionConsumerServiceURL=\"https://sp.example.com/acs\" ProtocolBinding=\"urn:oasis:names:tc:SAML:2.0:bindings:HTTP-POST\"><saml:Issuer>{{ xml_escape(sp_entity_id) }}</saml:Issuer><samlp:NameIDPolicy Format=\"urn:oasis:names:tc:SAML:1.1:nameid-format:unspecified\" AllowCreate=\"true\"/></samlp:AuthnRequest>"},
+  {"do": "compute", "into": "saml_request", "template": "{{ b64(deflate(authn)) }}"},
+  {"do": "compute", "into": "signed_query", "template": "SAMLRequest={{ pct(saml_request) }}&RelayState={{ pct(relay_state) }}&SigAlg={{ pct(\"http://www.w3.org/2001/04/xmldsig-more#ecdsa-sha256\") }}"},
+  {"do": "send", "request": {"from": "fixed", "method": "GET", "path": "/sso"},
+   "inject": [
+    {"target": {"kind": "query", "name": "SAMLRequest"}, "template": "{{ saml_request }}"},
+    {"target": {"kind": "query", "name": "RelayState"}, "template": "{{ relay_state }}"},
+    {"target": {"kind": "query", "name": "SigAlg"}, "template": "http://www.w3.org/2001/04/xmldsig-more#ecdsa-sha256"},
+    {"target": {"kind": "query", "name": "Signature"}, "template": "{{ b64(p256_sign(ec_key, signed_query)) }}"}]},
+  {"do": "return", "response": {"body": "all"}}
+ ]}
+```
+
+The HTTP-POST binding carries the AuthnRequest with an enveloped signature (XML Signature
+1.1, SAML 2.0 Core section 5), placed after the `Issuer`. The policy writes the request
+around where the signature goes (`head`, `tail`); the reference covers the element its
+`URI` names with the signature removed (the `enveloped-signature` transform), which is
+`head + tail`, under the exclusive form. `SignedInfo` declares the `ds:` namespace itself,
+so its canonical form alone is its canonical form in place:
+
+```json
+{"name": "saml-post",
+ "steps": [
+  {"do": "open", "connection": "https", "destinations": [{"host": "idp.example.com", "port": 443}]},
+  {"do": "compute", "into": "request_id", "template": "_{{ $nonce }}"},
+  {"do": "compute", "into": "head", "template": "<samlp:AuthnRequest xmlns:samlp=\"urn:oasis:names:tc:SAML:2.0:protocol\" xmlns:saml=\"urn:oasis:names:tc:SAML:2.0:assertion\" ID=\"{{ request_id }}\" Version=\"2.0\" IssueInstant=\"{{ time($unix, \"%Y-%m-%dT%H:%M:%SZ\") }}\" Destination=\"https://idp.example.com/sso\" AssertionConsumerServiceURL=\"https://sp.example.com/acs\" ProtocolBinding=\"urn:oasis:names:tc:SAML:2.0:bindings:HTTP-POST\"><saml:Issuer>{{ xml_escape(sp_entity_id) }}</saml:Issuer>"},
+  {"do": "compute", "into": "tail", "template": "<samlp:NameIDPolicy Format=\"urn:oasis:names:tc:SAML:1.1:nameid-format:unspecified\" AllowCreate=\"true\"/></samlp:AuthnRequest>"},
+  {"do": "compute", "into": "signed_info", "template": "<ds:SignedInfo xmlns:ds=\"http://www.w3.org/2000/09/xmldsig#\"><ds:CanonicalizationMethod Algorithm=\"http://www.w3.org/2001/10/xml-exc-c14n#\"/><ds:SignatureMethod Algorithm=\"http://www.w3.org/2001/04/xmldsig-more#rsa-sha256\"/><ds:Reference URI=\"#{{ request_id }}\"><ds:Transforms><ds:Transform Algorithm=\"http://www.w3.org/2000/09/xmldsig#enveloped-signature\"/><ds:Transform Algorithm=\"http://www.w3.org/2001/10/xml-exc-c14n#\"/></ds:Transforms><ds:DigestMethod Algorithm=\"http://www.w3.org/2001/04/xmlenc#sha256\"/><ds:DigestValue>{{ b64(sha256(xml_c14n(\"http://www.w3.org/2001/10/xml-exc-c14n#\", head + tail))) }}</ds:DigestValue></ds:Reference></ds:SignedInfo>"},
+  {"do": "compute", "into": "signature", "template": "<ds:Signature xmlns:ds=\"http://www.w3.org/2000/09/xmldsig#\">{{ signed_info }}<ds:SignatureValue>{{ b64(rsa_sign_pkcs1_sha256(pem(key), xml_c14n(\"http://www.w3.org/2001/10/xml-exc-c14n#\", signed_info))) }}</ds:SignatureValue></ds:Signature>"},
+  {"do": "send", "request": {"from": "fixed", "method": "POST", "path": "/sso"},
+   "inject": [
+    {"target": {"kind": "header", "name": "Content-Type"}, "template": "application/x-www-form-urlencoded"},
+    {"target": {"kind": "body"}, "template": "SAMLRequest={{ pct(b64(head + signature + tail)) }}&RelayState={{ pct(relay_state) }}"}]},
+  {"do": "return", "response": {"body": "all"}}
+ ]}
+```
+
+A LogoutRequest is the same shape with its own elements. Reading and checking a SAML
+Response is not covered: it would need an element selected by ID inside a document the
+identity provider wrote, and checking a signature, neither of which is a function.
+
+WS-Security over SOAP 1.1. A UsernameToken with a password digest, `base64(SHA-1(nonce +
+created + password))` (UsernameToken Profile 1.1 section 3.1), needs no new function; the
+digest is a hash of a secret, so it may go into a request but not back to the caller:
+
+```json
+{"name": "wss-username-token",
+ "steps": [
+  {"do": "open", "connection": "https", "destinations": [{"host": "ws.example.com", "port": 443}]},
+  {"do": "compute", "into": "created", "template": "{{ time($unix, \"%Y-%m-%dT%H:%M:%SZ\") }}"},
+  {"do": "compute", "into": "wss_nonce", "template": "{{ random(\"16\") }}"},
+  {"do": "send", "request": {"from": "fixed", "method": "POST", "path": "/service"},
+   "inject": [
+    {"target": {"kind": "header", "name": "Content-Type"}, "template": "text/xml; charset=utf-8"},
+    {"target": {"kind": "body"}, "template": "<soap:Envelope xmlns:soap=\"http://schemas.xmlsoap.org/soap/envelope/\"><soap:Header><wsse:Security xmlns:wsse=\"http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd\" xmlns:wsu=\"http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-utility-1.0.xsd\" soap:mustUnderstand=\"1\"><wsse:UsernameToken><wsse:Username>{{ xml_escape(user) }}</wsse:Username><wsse:Password Type=\"http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-username-token-profile-1.0#PasswordDigest\">{{ b64(sha1(wss_nonce + created + password)) }}</wsse:Password><wsse:Nonce EncodingType=\"http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-soap-message-security-1.0#Base64Binary\">{{ b64(wss_nonce) }}</wsse:Nonce><wsu:Created>{{ created }}</wsu:Created></wsse:UsernameToken></wsse:Security></soap:Header><soap:Body><m:Ping xmlns:m=\"urn:example:m\"/></soap:Body></soap:Envelope>"}]},
+  {"do": "return", "response": {"body": "all"}}
+ ]}
+```
+
+The caller's SOAP body signed with a timestamp (X.509 Token Profile 1.1: the certificate in a
+BinarySecurityToken, a SecurityTokenReference to it). Each reference is the exclusive form of
+an element the policy writes: the timestamp, and the `Body` element around the caller's
+bytes. A body that is not one well-formed element there (one that closes the `Body` early
+to add a second, or carries a DTD) fails the canonicalization, so nothing is signed or sent.
+`certificate` is a public field (PEM):
+
+```json
+{"name": "wss-signed",
+ "steps": [
+  {"do": "open", "connection": "https", "destinations": [{"host": "ws.example.com", "port": 443}]},
+  {"do": "compute", "into": "exc", "template": "http://www.w3.org/2001/10/xml-exc-c14n#"},
+  {"do": "compute", "into": "timestamp", "template": "<wsu:Timestamp xmlns:wsu=\"http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-utility-1.0.xsd\" wsu:Id=\"ts\"><wsu:Created>{{ time($unix, \"%Y-%m-%dT%H:%M:%SZ\") }}</wsu:Created><wsu:Expires>{{ time(add($unix, \"300\"), \"%Y-%m-%dT%H:%M:%SZ\") }}</wsu:Expires></wsu:Timestamp>"},
+  {"do": "compute", "into": "body_open", "template": "<soap:Body xmlns:soap=\"http://schemas.xmlsoap.org/soap/envelope/\" xmlns:wsu=\"http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-utility-1.0.xsd\" wsu:Id=\"body\">"},
+  {"do": "compute", "into": "signed_info_head", "template": "<ds:SignedInfo xmlns:ds=\"http://www.w3.org/2000/09/xmldsig#\"><ds:CanonicalizationMethod Algorithm=\"http://www.w3.org/2001/10/xml-exc-c14n#\"/><ds:SignatureMethod Algorithm=\"http://www.w3.org/2001/04/xmldsig-more#rsa-sha256\"/><ds:Reference URI=\"#ts\"><ds:Transforms><ds:Transform Algorithm=\"http://www.w3.org/2001/10/xml-exc-c14n#\"/></ds:Transforms><ds:DigestMethod Algorithm=\"http://www.w3.org/2001/04/xmlenc#sha256\"/><ds:DigestValue>{{ b64(sha256(xml_c14n(exc, timestamp))) }}</ds:DigestValue></ds:Reference><ds:Reference URI=\"#body\"><ds:Transforms><ds:Transform Algorithm=\"http://www.w3.org/2001/10/xml-exc-c14n#\"/></ds:Transforms><ds:DigestMethod Algorithm=\"http://www.w3.org/2001/04/xmlenc#sha256\"/><ds:DigestValue>"},
+  {"do": "compute", "into": "security_head", "template": "<soap:Envelope xmlns:soap=\"http://schemas.xmlsoap.org/soap/envelope/\"><soap:Header><wsse:Security xmlns:wsse=\"http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd\" xmlns:wsu=\"http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-utility-1.0.xsd\" soap:mustUnderstand=\"1\"><wsse:BinarySecurityToken EncodingType=\"http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-soap-message-security-1.0#Base64Binary\" ValueType=\"http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-x509-token-profile-1.0#X509v3\" wsu:Id=\"cert\">{{ b64(pem(certificate)) }}</wsse:BinarySecurityToken>{{ timestamp }}<ds:Signature xmlns:ds=\"http://www.w3.org/2000/09/xmldsig#\">"},
+  {"do": "compute", "into": "key_info", "template": "<ds:KeyInfo><wsse:SecurityTokenReference><wsse:Reference URI=\"#cert\" ValueType=\"http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-x509-token-profile-1.0#X509v3\"/></wsse:SecurityTokenReference></ds:KeyInfo></ds:Signature></wsse:Security></soap:Header>"},
+  {"do": "send", "request": {"from": "caller", "methods": ["POST"], "paths": ["/service"]},
+   "inject": [
+    {"target": {"kind": "header", "name": "Content-Type"}, "template": "text/xml; charset=utf-8"},
+    {"target": {"kind": "body"}, "template": "{{ security_head + signed_info_head + b64(sha256(xml_c14n(exc, body_open + $body + \"</soap:Body>\"))) + \"</ds:DigestValue></ds:Reference></ds:SignedInfo><ds:SignatureValue>\" + b64(rsa_sign_pkcs1_sha256(pem(key), xml_c14n(exc, signed_info_head + b64(sha256(xml_c14n(exc, body_open + $body + \"</soap:Body>\"))) + \"</ds:DigestValue></ds:Reference></ds:SignedInfo>\"))) + \"</ds:SignatureValue>\" + key_info + body_open + $body + \"</soap:Body></soap:Envelope>\" }}"}]},
+  {"do": "return", "response": {"body": "all"}}
+ ]}
+```
+
 ### The analysis
 
 Every template is analysed before the policy is signed. Each expression has four properties:
@@ -2186,12 +2342,13 @@ Rules:
    | `cbor_array` `cbor_map` `cbor_tag` | every argument (each is checked to be one item) |
    | `ed25519_public` `ed448_public` | the key |
    | `ecdsa_public(curve, key)` `rsa_public(form, key)` | the key |
+   | `inflate` `zlib_inflate` `gzip_inflate` `xml_escape` | the input: whether it fails tells whether the secret is a well-formed stream or text |
 
    A tainted value in one sensitive argument of `time`, `totp`, `pbkdf2_sha256` or `pbkdf2` and
    a controlled value in another are refused too: `time(secret, $input)` lets the caller pick
    which digits of the secret come out.
 2. A tainted and a controlled value may not meet anywhere in `replace`, `xor`, `slice`,
-   `between`, `add` or `json_set_number`: `slice(key, $input, "1")` would hand the secret out
+   `between`, `add`, `json_set_number` or `xml_c14n`: `slice(key, $input, "1")` would hand the secret out
    a byte at a time, `between(key, $input, "")` would tell where a chosen text sits in it, and
    `add` would fail or not with its size. A captured secret temp is both tainted and
    controlled, so these functions cut only public temps and secret fields (with fixed
@@ -2199,6 +2356,9 @@ Rules:
    meet a controlled value in any argument (the value itself is only escaped and appended).
    In `cbor_map`, a tainted key may not meet a controlled key: the order of the pairs, and
    whether two keys are equal, compare them.
+   `xml_c14n` sorts attributes and namespace declarations by comparing them, drops what is
+   not used, and fails on a malformed document: a secret next to chosen markup would be
+   compared, cut or tested by it.
 3. A hash of secret bytes alone is as good as the secret wherever the secret is hashed
    before use (an HMAC key longer than its block, an Ed25519 seed), so it stays tainted:
    `hex(sha256(key))` is refused as a derivation output, `hex(sha256(key + $input))` is not.
@@ -2220,7 +2380,8 @@ Rules:
    `kbkdf_counter`, `ecdsa_sign_prehash`, `dsa_sign`, `dsa_sign_der`, the suite and mode of
    the `hpke_*` functions, the KEM of `hpke_public` and `hpke_derive_key`, the domain byte of
    `turboshake*`, the parameter set of `mldsa_sign` and `mldsa_public`) must be neither tainted nor controlled: the policy fixes the algorithm, so no caller can downgrade it.
-   So must the curve of `ecdsa_public` and the form of `rsa_public`.
+   So must the curve of `ecdsa_public`, the form of `rsa_public` and the algorithm of
+   `xml_c14n`.
 7. The public key of `rsa_encrypt_oaep`, `rsa_encrypt_pkcs1`, `hpke_seal` and `hpke_export`,
    and the PSK, PSK id and sender key of every `hpke_*` function, must not be caller-chosen: it
    comes from the policy (a literal or a field) or from a capture of the destination's
@@ -2238,12 +2399,22 @@ Rules:
    `kbkdf_counter`, `shake128`, `shake256`, `turboshake128`, `turboshake256`, `kt128`,
    `kt256`, `nfold`, `tls_exporter`, `hpke_export` and `hpke_receiver_export`, the tag length of
    `aes_ccm_encrypt`,
-   the start and length of `slice`, the delimiters of `between`, and the text `replace` looks
-   for. The length of the output, or whether the call fails, would give the secret back
+   the start and length of `slice`, the delimiters of `between`, the text `replace` looks
+   for, and the prefix list of `xml_c14n` (it sets which declarations come out). The length of the output, or whether the call fails, would give the secret back
    through `len`. The value being cut or searched may be a secret (`slice(key, "0", "4")`).
    `aead_ciphertext` and `aead_tag` take no length: they cut at the tag length the algorithm
    fixes (the CCM tag length is the argument above), counted from the end, so a secret in the
    message changes neither where the cut falls nor which bytes each part covers.
+10. The input of `deflate`, `zlib_deflate` and `gzip_deflate` must not be tainted. A
+    compressed length depends on how the input repeats itself: with chosen bytes next to a
+    secret, each guess that matches part of the secret makes the output shorter, which is how
+    CRIME and BREACH read secrets from compressed TLS records and HTTP bodies; even a secret
+    alone, or beside text the policy fixes, comes out as long as its repetitions make it.
+    `len` removes the taint and a request's size is seen on the wire, so a tainted compressed
+    value cannot be kept from an observable place: compression of a secret is refused, not
+    tracked. No scheme measured needs it (a SAML request holds no secret; its signature is
+    made after compression). Decompression keeps the taint like a decoder (rule 1 covers a
+    mixed input), and the output of `xml_c14n` is tainted when the document is.
 
 The request components (`$header`, `$query_param`, `$target_uri`) are controlled and
 caller-chosen like `$body`, so every rule above applies to them unchanged: a header value
@@ -2254,7 +2425,7 @@ properties of the encryption they split (never a *secret key*). `ed25519_public`
 `ed448_public`, `ecdsa_public` and `rsa_public` remove the taint, like `hpke_public`, and keep
 *guessable*.
 
-A template that breaks rule 1, 2, 6, 7 or 9 is refused wherever it appears; rule 5 applies to the
+A template that breaks rule 1, 2, 6, 7, 9 or 10 is refused wherever it appears; rule 5 applies to the
 `return` of an operation with no connection. A computed name carries the properties of its
 template, so the rules hold across steps exactly as they do inside one template.
 
