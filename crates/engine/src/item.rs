@@ -194,6 +194,10 @@ pub enum ShapeConnection {
     Smtp,
     /// IMAP: commands.
     Imap,
+    /// POP3: commands on message numbers.
+    Pop3,
+    /// FTP over TLS: file operations.
+    Ftp,
     /// No connection: a derivation.
     None,
 }
@@ -206,6 +210,8 @@ impl ShapeConnection {
             ShapeConnection::Ssh => "ssh",
             ShapeConnection::Smtp => "smtp",
             ShapeConnection::Imap => "imap",
+            ShapeConnection::Pop3 => "pop3",
+            ShapeConnection::Ftp => "ftp",
             ShapeConnection::None => "none",
         }
     }
@@ -214,7 +220,11 @@ impl ShapeConnection {
     fn is_protocol(self) -> bool {
         matches!(
             self,
-            ShapeConnection::Ssh | ShapeConnection::Smtp | ShapeConnection::Imap
+            ShapeConnection::Ssh
+                | ShapeConnection::Smtp
+                | ShapeConnection::Imap
+                | ShapeConnection::Pop3
+                | ShapeConnection::Ftp
         )
     }
 }
@@ -323,6 +333,12 @@ pub struct Shape {
     /// policy pins exactly that key, and it must be a whole key, not a fingerprint.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host_key: Option<String>,
+    /// The pinned field that fixes how a protocol connection reaches TLS: `implicit` (TLS
+    /// from the first byte), or `explicit` (`STARTTLS`, `STLS` or `AUTH TLS`). The policy's
+    /// `tls` must agree; any other value (`plain`) allows no protocol operation, since the
+    /// node sends no credential in the clear.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls: Option<String>,
 }
 
 /// A kind of item.
@@ -544,6 +560,14 @@ impl KindSchema {
             || "shape.host_key".into(),
             "an SSH connection pins its host key in a pinned field with an ssh_host_key check; other kinds name none",
         )?;
+        kind_ensure(
+            shape
+                .tls
+                .as_deref()
+                .is_none_or(|name| protocol && self.field(name).is_some_and(|f| f.pinned)),
+            || "shape.tls".into(),
+            "tls names a pinned field, for a protocol connection",
+        )?;
         match &shape.destinations {
             DestinationRule::Owner {} => {}
             DestinationRule::Origin { field } => kind_ensure(
@@ -641,9 +665,9 @@ impl KindSchema {
                 "a masked field has a mask, and only a masked field",
             )?;
             kind_ensure(
-                !field.pinned || (field.disclosure == Disclosure::Public && !field.optional),
+                !field.pinned || field.disclosure == Disclosure::Public,
                 || at.clone(),
-                "a pinned field is public and required",
+                "a pinned field is public",
             )?;
             kind_ensure(
                 field.checks.len() <= MAX_CHECKS,
@@ -985,6 +1009,8 @@ fn shape_connection(at: &str, operation: &Operation) -> Result<ShapeConnection> 
         Some(Connection::Ssh) => Ok(ShapeConnection::Ssh),
         Some(Connection::Smtp) => Ok(ShapeConnection::Smtp),
         Some(Connection::Imap) => Ok(ShapeConnection::Imap),
+        Some(Connection::Pop3) => Ok(ShapeConnection::Pop3),
+        Some(Connection::Ftp) => Ok(ShapeConnection::Ftp),
         Some(Connection::Websocket) => refuse("a typed item has no WebSocket operation"),
         Some(
             Connection::Postgres
@@ -1031,6 +1057,18 @@ fn check_login(
         || format!("{at}.login"),
         "each login member is exactly {{field}} of the field the kind names for it",
     )?;
+    if let Some(field) = &shape.tls {
+        let wanted = match pins.get(field).map(String::as_str) {
+            Some("implicit") => Some(crate::policy::TlsMode::Implicit),
+            Some("explicit") => Some(crate::policy::TlsMode::Starttls),
+            _ => None,
+        };
+        shape_ensure(
+            wanted.is_some_and(|w| open.tls.unwrap_or_default() == w),
+            || format!("{at}.tls"),
+            "the operation reaches TLS as the item's pinned mode says (implicit or explicit); a plain mode allows none",
+        )?;
+    }
     if let Some(field) = &shape.host_key {
         let pinned = pins.get(field);
         shape_ensure(

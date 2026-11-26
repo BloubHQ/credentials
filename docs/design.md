@@ -111,7 +111,7 @@ Each kind fixes its field names, their **disclosure level**, validation and defa
 | `totp` | seed (secret), digits, period | derive only |
 | `ssh` | host, port, host key (public, pinned), user (public), password or private key (secret) | host key must be pinned |
 | `database` | engine, host, port, database, user (public), password (secret), TLS mode and CA pin | TLS required unless the owner signs it off |
-| `ftp` | host, mode (FTPS explicit/implicit, SFTP goes to `ssh`), user, password | plain FTP only when signed off |
+| `ftp` | host, mode (FTPS explicit/implicit, SFTP goes to `ssh`), user, password | plain FTP only when signed off, and even then no operation (section 7c) |
 | `mail` | IMAP/SMTP/POP3 host, user, app password or OAuth | |
 | `queue` | MQTT, AMQP, Kafka, NATS, STOMP, XMPP host; user or client id (public); password, SASL secret, NATS nkey seed or client key (secret) | TLS required unless signed off |
 | `vpn` | WireGuard peer (endpoint, public key), private key (secret); or IPsec/IKEv2 identity and PSK or key | endpoint pinned |
@@ -464,10 +464,64 @@ written in the test process, and the SSH test server now does P-384 (SHA-384) an
 crate in the test), and verifies ECDSA P-256/P-384, RSA PKCS#1 and OpenSSH-format client
 keys, all generated in the tests.
 
+Then: `pop3` and `ftp` (over TLS only) as connection kinds, and SFTP `list`, `stat`,
+`rename`, `delete`, `mkdir` and `rmdir` (`proto/pop3.rs`, `proto/ftp.rs`, `proto/sftp.rs`;
+`docs/policy.md`, Protocol connections). No crate was added (`md5`, for APOP, was already in
+the tree). Choices, and the more secure option taken:
+
+- **No credential over plain FTP or POP3, for any address.** The rule allows plaintext only
+  where the owner's policy allows it for a private address the way other kinds do; no kind
+  allows that today, so neither do these: `tls` is `implicit` or `starttls` only, and the
+  `ftp` kind's `plain` mode, even signed off, allows no operation. A plain mode can be added
+  the day a kind has the private-address sign-off, not before.
+- **FTP data connections are passive, to the same address, over resumed TLS.** Active mode
+  (`PORT`, `EPRT`) would have the server connect to the node; it is never sent. `EPSV` gives
+  only a port; a `PASV` address must equal the address the control connection reached (the
+  transport's `peer_ip`), and the transport connects to that exact address
+  (`Connector::connect_again`), so a reply naming another host (FTP bounce, SSRF into the
+  node's network) is refused before anything connects, and DNS is not asked again. Ports
+  below 1024 are refused. The data connection uses the control connection's TLS client
+  configuration, so rustls resumes the session (RFC 4217 section 10: servers may require
+  that reuse), and verifies the same name. `PROT P` is required before any data connection
+  opens.
+- **The end of an FTP data connection must be a TLS `close_notify`.** For the other kinds a
+  cut is still an end the engine's framing checks; for FTP the end of the connection is the
+  framing, so a cut (a truncation attack) fails the transfer.
+- **Replies are scrubbed of the sign-in.** A server may echo the user name or password
+  (`530 Login incorrect for hunter2`); the values the sign-in used, raw and in base64, are
+  replaced by `[redacted]` in every reply text that goes back (`proto::io::Scrub`, values of 4
+  bytes or more, as the reflection search). The reflection search still fails a call whose
+  result holds a secret in any other form, such as a message body.
+- **APOP is allowed and flagged.** It never sends the password, but MD5 over a server-chosen
+  timestamp lets the server or a reader of the exchange test guesses offline; the summary
+  flags `weak_mechanism`. `USER`/`PASS` is flagged `password_to_server`, like `PLAIN`.
+- **Paths and numbers carry no command.** An FTP path is absolute UTF-8 of at most 4096 bytes
+  with no control byte, DEL or `0xFF` and no `.`/`..` segment; a POP3 parameter is 1 to 10
+  digits; verbs are the policy's.
+- **Bounds:** FTP replies of 256 lines of 4 KiB, listing lines of 8 KiB and 10,000 entries,
+  files within the connection's byte limit; POP3 status lines of 4 KiB and message lines of
+  64 KiB; SFTP listings of 10,000 entries. A protocol line that arrives whole is now held to
+  the line bound too (before, one longer than the bound passed when its end was buffered).
+- **SFTP management follows no link either.** `stat` takes no link; `delete` takes a regular
+  file, `rmdir` a directory, `rename` a file or directory to a name that does not exist (no
+  overwrite); a listing shows links as `link`.
+
+Measured on this host (Windows, `cargo test --workspace --locked --no-fail-fast`): tests
+659 before, TESTS_AFTER after, 0 failed; the release `credentials.exe` 12,968,448 bytes
+before, SIZE_AFTER after (SIZE_DELTA). The new tests run against an FTP and a POP3 server
+written in the test process (data connections as pipes through the test transport) and the
+SFTP test server's new requests; a transport test checks against local TLS servers that the
+data connection reaches the control connection's address and resumes its session
+(`HandshakeKind::Resumed`), and that a cut without `close_notify` is an error. Not measured:
+real FTP and POP3 servers.
+
 Left for later:
 
-- FTP (and FTPS), POP3, tunnels as an IR relay step; SSH agent forwarding, remote forwarding
-  and SFTP directory listing, rename and delete.
+- Tunnels as an IR relay step; SSH agent forwarding and remote forwarding (`tcpip-forward`:
+  the server would open channels to the node, a listener the policy would have to bound;
+  not trivial, so not done with FTP and POP3).
+- FTP over plain TCP for a private address, once a kind has that sign-off; FTP `REST`
+  (resumed transfers), `APPE`, `SITE`, `MDTM`; POP3 `PIPELINING`.
 - Typed protocol connections for the `database` and `queue` kinds (they still allow none:
   their `engine` or `protocol` field would choose the connection, which the kind's shape
   cannot express yet), and the `vpn` kind.
@@ -476,7 +530,10 @@ Left for later:
 - A live MQTT relay searches each message whole, but not a secret split across two messages;
   the stream search of SSH spans frames, the message search does not.
 - MQTT 5 properties beyond the maximum packet size (user properties, response topics), MQTT
-  over WebSocket, AMQP 1.0, and AMQP consumers (`basic.consume`) as a live relay.
+  over WebSocket, AMQP 1.0 (a different protocol from 0-9-1, with its own framing and SASL
+  layer; not trivial, so not done with FTP and POP3), and AMQP consumers (`basic.consume`)
+  as a live relay.
+
 - MySQL `COM_QUERY` text results, compression and the server's RSA key exchange (refused on
   purpose; listed so it stays a decision).
 - The transport's `open_plain` and `open_starttls` over a real socket, and real servers of
@@ -679,7 +736,7 @@ As built (part 10):
 | 3 | Typed items, disclosure levels, `describe`, custom kinds (done: `docs/policy.md`, Typed items) | 2 |
 | 4 | Policy JSON Schema, `client::summarize` with risk flags, approval format (done: `docs/policy.md`; the approval runtime is part 5) | 2, 3 |
 | 5 | Sessions, challenges, approvals, spending limits (done: `docs/policy.md`, Operations that wait; codes read from a `mail` item, `await` on TLS and amounts from body contracts are next) | 2 |
-| 6 | Connection kinds in layer 1: HTTP/2, WebSocket, streamed responses (first half done: `docs/policy.md`, HTTP versions and gRPC, WebSocket; own synchronous HTTP/2 client and HPACK, one thread per open connection, the Nitro host relay unchanged), then SSH, databases, FTP, mail, queues (second half done but for the rows left in section 7c: SSH with SFTP and local forwarding, PostgreSQL, MySQL, SMTP, IMAP, Redis, MQTT 3.1.1 and 5, AMQP 0-9-1, and the `ssh` and `mail` typed kinds; FTP, POP3 and tunnels as an IR relay step next) | 2 |
+| 6 | Connection kinds in layer 1: HTTP/2, WebSocket, streamed responses (first half done: `docs/policy.md`, HTTP versions and gRPC, WebSocket; own synchronous HTTP/2 client and HPACK, one thread per open connection, the Nitro host relay unchanged), then SSH, databases, FTP, mail, queues (second half done but for the rows left in section 7c: SSH with SFTP and local forwarding, PostgreSQL, MySQL, SMTP, IMAP, Redis, MQTT 3.1.1 and 5, AMQP 0-9-1, and the `ssh` and `mail` typed kinds; then POP3, FTP over TLS and SFTP management; tunnels as an IR relay step next) | 2 |
 | 7 | Trusted code sandbox (layer 3): WebAssembly runtime, JavaScript module, origin-pinned site code (done: `run` step, `crates/sandbox`, wasmi 1.1.0 chosen by measurement; JavaScript measured with boa in the sandbox, its shipping plan in `docs/sandbox.md`) | 2 |
 | 8 | Browser fills over CDP (done: the `browser` connection and `fill`, `engine::cdp`, `docs/policy.md` Browser fills; tested against an in-process fake CDP endpoint, never a real browser; typed `card` and `login` items with browser operations, and detaching the agent's controller, are next) | 4, 5 |
 | 9 | Remaining primitive families (Appendices A, B), UDP relay and its protocols (done: HPKE, TurboSHAKE, KangarooTwelve, ML-DSA, SM2, brainpool ECDSA, `tls_exporter` in TLS sends, the `udp` connection and the datagram relay; `docs/policy.md` and section 7b; the rows still open and why are listed under Appendix A, Part 9) | 1 |

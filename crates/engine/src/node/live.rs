@@ -421,7 +421,9 @@ impl<S: LogSink, C: Clock> Node<S, C> {
             | Connection::Browser
             | Connection::Mysql
             | Connection::Mqtt
-            | Connection::Amqp => Err(operation.unknown()),
+            | Connection::Amqp
+            | Connection::Ftp
+            | Connection::Pop3 => Err(operation.unknown()),
         }
     }
 

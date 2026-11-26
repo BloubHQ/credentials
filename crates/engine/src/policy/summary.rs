@@ -55,9 +55,9 @@ pub enum Form {
     StreamSend,
     /// The sign-in of a protocol connection (SSH, PostgreSQL, SMTP, IMAP, Redis).
     Login {
-        /// The mechanism. `password` (SSH), `plain`, `login` and `auth` hand the server the
-        /// secret itself; `scram-sha-256`, `publickey` and `xoauth2` (a token) do not hand it
-        /// a password.
+        /// The mechanism. `password` (SSH), `plain`, `login`, `auth` and `user` hand the
+        /// server the secret itself; `scram-sha-256`, `publickey` and `xoauth2` (a token) do
+        /// not hand it a password; `apop` does not either, but is MD5 (flagged weak).
         mechanism: String,
     },
     /// A command or query the node writes on a protocol connection.
@@ -303,8 +303,12 @@ pub enum FlagCode {
     /// A WebSocket hands the server's messages back to the caller.
     ServerFrames,
     /// A protocol connection signs in with a mechanism that hands the server the password
-    /// itself (SSH `password`, `PLAIN`, `LOGIN`, Redis `AUTH`).
+    /// itself (SSH `password`, `PLAIN`, `LOGIN`, Redis `AUTH`, FTP and POP3 `USER`).
     PasswordToServer,
+    /// A protocol connection signs in with a weak mechanism (POP3 `APOP`, MD5 over the
+    /// server's timestamp and the password): the server, or whoever reads a captured
+    /// exchange, can test guesses of the password offline.
+    WeakMechanism,
     /// A command parameter of the caller takes any value up to its length (no pattern).
     ParamUnpinned,
     /// The caller sends messages over SMTP as the item's account.
@@ -966,6 +970,7 @@ fn risk_flags(policy: &Policy, origin: Option<&Origin>, flags: &mut Vec<Flag>) {
                         | super::Mechanism::Plain
                         | super::Mechanism::Login
                         | super::Mechanism::Auth
+                        | super::Mechanism::User
                 )
             {
                 flag(
@@ -979,6 +984,20 @@ fn risk_flags(policy: &Policy, origin: Option<&Origin>, flags: &mut Vec<Flag>) {
                     ),
                 );
             }
+        }
+        if let Some(open) = operation.open()
+            && open
+                .login
+                .as_ref()
+                .and_then(|l| l.mechanism_for(open.connection))
+                == Some(super::Mechanism::Apop)
+        {
+            flag(
+                flags,
+                FlagCode::WeakMechanism,
+                &at,
+                "the POP3 sign-in (apop) is MD5 over the server's timestamp and the password: guesses can be tested offline against the exchange",
+            );
         }
         if let Some(Input::Raw(raw)) = &operation.input
             && raw.max_len.is_none()

@@ -6,6 +6,7 @@
 //! and only for the destination of that entry. An implementation must speak TLS that ends at
 //! `destination` and nowhere else, and must not keep the identity after the connection.
 
+use std::net::IpAddr;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -126,6 +127,25 @@ pub trait Stream {
         length: usize,
     ) -> Result<Zeroizing<Vec<u8>>> {
         let _ = (label, context, length);
+        Err(Error::transport(TransportKind::Unsupported, true))
+    }
+
+    /// The address of the server this connection reached, when the transport knows it (a
+    /// direct TCP connection; not one carried by a relay that connects on its own). An FTP
+    /// client compares it with the address a passive-mode reply names. The default: unknown.
+    fn peer_ip(&self) -> Option<IpAddr> {
+        None
+    }
+
+    /// Opens the data connection of an FTP control connection in passive mode (RFC 959,
+    /// RFC 2428): a new connection to `port` on the same server this one reached, never to
+    /// an address the server names, made the same way this one was (directly to the same
+    /// address, or through the same relay to the same host). Over TLS it makes TLS to the
+    /// same server name, resuming this connection's TLS session when the server allows
+    /// (RFC 4217 section 10), and the handshake runs on the first read or write, so the
+    /// client can send its command on the control connection first. The default refuses.
+    fn open_data(&mut self, port: u16) -> Result<Box<dyn Stream>> {
+        let _ = port;
         Err(Error::transport(TransportKind::Unsupported, true))
     }
 }
