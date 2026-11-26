@@ -21,6 +21,10 @@
 //!   ([`answer_challenge`]) or approves ([`approve`], which also takes the pending operation
 //!   the node handed back), sets spending limits ([`sign_limits`]) and renews a session the
 //!   node cannot ([`update_record`]); the app goes on with [`sign_resume_call`].
+//! - Delegation and emergency access: the device delegates a record to another owner's
+//!   callers under a narrower policy ([`delegate`], to a [`VerifiedNode`] only), cancels a
+//!   request of emergency access or revokes it ([`change_delegation`]); the delegate's app
+//!   signs its calls with [`sign_delegated_call`].
 //!
 //! - Node continuity: grants follow a node to its successor unless granted with
 //!   [`grant_without_successor`]; when the old node is gone, [`verify_successor`] checks a
@@ -56,6 +60,7 @@ mod attestation;
 pub(crate) mod backup;
 mod caller;
 mod continuity;
+mod delegation;
 mod error;
 mod keys;
 mod owner;
@@ -79,6 +84,7 @@ pub use backup::{
 };
 pub use caller::{sign_call, sign_derive_call, sign_describe_call};
 pub use continuity::{SuccessorPolicy, regrant, verify_successor};
+pub use delegation::{change_delegation, delegate, sign_delegated_call};
 pub use error::{ClientError, Result};
 pub use keys::{KeyKind, generate_key, import_key, public_key};
 pub use owner::{

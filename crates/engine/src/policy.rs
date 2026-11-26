@@ -46,6 +46,7 @@ mod proto;
 pub mod run;
 mod schema;
 pub mod summary;
+pub mod vend;
 mod wait;
 
 pub use browser::{
@@ -67,6 +68,8 @@ pub use proto::{
     MqttVersion, ParamRule, SshChannel, TlsMode, forward_target,
 };
 pub use run::{ModuleRef, ModuleSource, RunModule};
+pub use summary::diff;
+pub use vend::{Expiry, MAX_VEND_MS, TimeFormat, VEND_SKEW_MS, Vend};
 pub(crate) use wait::is_currency;
 pub use wait::{
     AmountSource, Await, Challenge, ChallengeKind, Condition, DEFAULT_CODE_PATTERN, MAX_AMOUNT,
@@ -1042,6 +1045,10 @@ pub struct Operation {
     /// True when every use needs the owner's approval, whatever the limits say.
     #[serde(default, skip_serializing_if = "is_false")]
     pub approval: bool,
+    /// What the operation vends: a short-lived credential minted from the secret, with the
+    /// longest it may stay valid and where its expiry is read ([`vend`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vend: Option<Vend>,
 }
 
 impl Operation {
@@ -2338,6 +2345,9 @@ impl Policy {
         if let Some(payment) = &operation.payment {
             self.check_payment(&format!("{at}.payment"), operation, payment)?;
         }
+        if let Some(vend) = &operation.vend {
+            vend::check(&format!("{at}.vend"), operation, vend)?;
+        }
         ensure(
             operation.returns().is_some(),
             || format!("{at}.steps"),
@@ -2867,6 +2877,13 @@ fn summarize_operation(operation: &Operation, out: &mut Vec<String>) {
     }
     if operation.approval {
         out.push("  every use waits for the owner's approval".into());
+    }
+    if let Some(v) = &operation.vend {
+        out.push(format!(
+            "  ! vends a credential minted from the secret, valid at most {} s, its expiry read from {}",
+            v.lifetime_ms / 1000,
+            v.describe()
+        ));
     }
     if let Some(open) = operation.open() {
         proto::open_lines(open, out);

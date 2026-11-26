@@ -60,6 +60,9 @@ Rust names; Swift and Kotlin use the same names in camel case (`verifyNode`), Ja
 | `answer_challenge(device_key, owner, identity_json, pending_json, code)` | sealed answer JSON | Answers a code challenge the node handed back, signed by the device and sealed to the node; the code is erased once sealed; for `POST /answer` |
 | `sign_resume_call(caller_key, caller, identity_json, record_json, operation, id)` | signed call JSON | Goes on with a waiting operation: the same caller, record (the last one the node handed back) and operation, and the pending `id` |
 | `sign_limits(device_key, owner, identity_json, record_id, rules_json)` | limits JSON | Spending limits of a record on the node: per currency and merchant, per payment, day and 30 days; for `POST /limits` |
+| `delegate(device_key, user_key, node: VerifiedNode, record_json, delegate_owner, policy_json, wait_secs, valid_for_secs)` | delegation request JSON | Lets another owner's callers use the record under `policy_json` (the record's policy or narrower, its callers the delegate's), the record key sealed to the verified node; `wait_secs` 0, or 1 hour to 90 days of emergency access; at most 366 days; for `POST /delegate` |
+| `change_delegation(device_key, owner, identity_json, record_id, id, change)` | change JSON | `cancel` an open request of emergency access, or `revoke` the delegation `id`; for `POST /delegation/change` |
+| `sign_delegated_call(caller_key, caller, identity_json, record_json, operation, body_json, delegation_id)` | signed call JSON | A call of the delegate's caller under the delegation; refused with `delegation_waiting` while emergency access waits |
 | `update_record(user_key, record_json, fields: [Field])` | record JSON | Replaces values one generation later, writing a session's expiry: how the owner renews a session the node cannot |
 
 A call whose operation waits for the owner gets `{"kind": "challenge", ...}` or

@@ -92,6 +92,7 @@ fn the_shape_of_an_operation_is_checked() {
         ],
         payment: None,
         approval: false,
+        vend: None,
     };
     assert!(rule_of(&one(fields(), late_open)).is_some());
     // An operation ends with `return`.
@@ -133,6 +134,7 @@ fn loops_and_branches_are_syntax_for_now() {
             steps: vec![step, Step::Return(Return::output("x"))],
             payment: None,
             approval: false,
+            vend: None,
         };
         let (_, rule) = rule_of(&one(vec![FieldSpec::secret("key")], operation)).expect("refused");
         assert!(rule.contains("not run yet"), "{rule}");

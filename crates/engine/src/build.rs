@@ -467,6 +467,7 @@ impl Operation {
             })],
             payment: None,
             approval: false,
+            vend: None,
         }
     }
 
@@ -494,6 +495,7 @@ impl Operation {
             steps: Vec::new(),
             payment: None,
             approval: false,
+            vend: None,
         }
     }
 

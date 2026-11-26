@@ -523,13 +523,13 @@ Left for later:
 | Scheme | Where it is used | Change |
 | --- | --- | --- |
 | Spending limits (done in part 5) | real cards, exchange orders, transfers | per item, merchant, day and month limits kept by the node; above them an approval (section 5); the day and month are rolling 24 hours and 30 days, so a payment cannot be split across a calendar boundary |
-| Short-lived credentials handed to the caller | `aws`, `gcloud`, `kubectl`, GitHub Apps, databases with IAM tokens | operation `vend`: the node mints a scoped, short-lived credential from the long-lived secret (STS AssumeRole with a session policy, a GCP downscoped token, a GitHub installation token, an RDS IAM token) and returns only that; the owner's policy sets scope and lifetime |
+| Short-lived credentials handed to the caller (done in part 11) | `aws`, `gcloud`, `kubectl`, GitHub Apps, databases with IAM tokens | operation `vend`: the node mints a scoped, short-lived credential from the long-lived secret (STS AssumeRole with a session policy, a GCP downscoped token, a GitHub installation token, an RDS IAM token) and returns only that; the owner's policy sets scope and lifetime |
 | SASL XOAUTH2 / OAUTHBEARER | Gmail, Outlook over IMAP and SMTP | the mail item takes an OAuth token instead of a password |
 | ACME, JWS in general | certificates (Let's Encrypt), any JWS API | account key JWS by derive |
 | Kubernetes | API servers | client certificates and bearer tokens over HTTPS; `exec` credentials through `vend` |
 | SNMPv3 | network devices | USM (HMAC, AES) over the UDP relay |
-| Delegation | family members, a colleague's agent | an owner grants another owner's callers a narrower policy on an item; revocable, logged on both sides |
-| Emergency access | when the owner is gone | a delegate whose access opens after a waiting period the owner can cancel from a device |
+| Delegation (done in part 11) | family members, a colleague's agent | an owner grants another owner's callers a narrower policy on an item; revocable, logged on both sides |
+| Emergency access (done in part 11) | when the owner is gone | a delegate whose access opens after a waiting period the owner can cancel from a device |
 
 ## 8c. Flows no list names
 
@@ -684,7 +684,50 @@ As built (part 10):
 | 8 | Browser fills over CDP (done: the `browser` connection and `fill`, `engine::cdp`, `docs/policy.md` Browser fills; tested against an in-process fake CDP endpoint, never a real browser; typed `card` and `login` items with browser operations, and detaching the agent's controller, are next) | 4, 5 |
 | 9 | Remaining primitive families (Appendices A, B), UDP relay and its protocols (done: HPKE, TurboSHAKE, KangarooTwelve, ML-DSA, SM2, brainpool ECDSA, `tls_exporter` in TLS sends, the `udp` connection and the datagram relay; `docs/policy.md` and section 7b; the rows still open and why are listed under Appendix A, Part 9) | 1 |
 | 10 | Node hand-over; key backup and device transfer in `client` (done: `crates/continuity`, `Node::hand_over`/`take_over`, `credentials hand-over`, `credentials verify --next`, `client` continuity, backup and transfer; real Nitro hardware and the real Sigstore root are not exercised by the tests, and the compiled Sigstore trust root is empty until it is committed, so nodes refuse every statement until then) | 3 |
-| 11 | Section 8a and 8b schemes as IR policies and reviewed modules | 6, 7 |
+| 11 | Section 8a and 8b schemes as IR policies and reviewed modules (started: section 8b delegation, emergency access and credential vending done, `docs/policy.md` Vending, Delegation and emergency access; the status of every row is below) | 6, 7 |
+
+**Part 11, row by row.** Done before part 11 started:
+
+- Spending limits (8b): `crates/engine/src/limits.rs`, `node/waits.rs` (`set_limits`, the
+  gate before a payment).
+- SASL XOAUTH2 (8b): `policy/proto.rs` (`mechanism: xoauth2`, `login.token`),
+  `proto/imap.rs`, `proto/smtp.rs`. OAUTHBEARER (RFC 7628) is not done.
+- Kubernetes client certificates and bearer tokens (8b): `open.identity` (`render_identity`
+  in `node.rs`) and header injections over HTTPS.
+- OAuth 2.0 refresh by the node (8a): the `oauth` kind in `items.json`, a fixed refresh
+  request that captures the tokens; the consent itself runs on the owner's device by design.
+
+Done in part 11 (tests in `crates/engine/tests/owner_controls.rs`, fuzz target
+`owner_controls`):
+
+- Delegation (8b): `engine::delegation`, `node/delegate.rs`, `POST /delegate` and
+  `/delegation/change`, `client::delegate`, `change_delegation`, `sign_delegated_call`. A
+  delegated policy is checked against the record's policy by the summary diff, so a new
+  operation kind or field in the policy needs no new delegation code.
+- Emergency access (8b): a delegation with a waiting period (1 hour to 90 days) that the
+  delegate's first call starts and a device of the owner cancels; it works while the owner
+  holds no grant, because the delegation carries the record key sealed to the node.
+- Short-lived credentials handed to the caller (8b, and the Kubernetes `exec` credential):
+  `Operation.vend` (`policy/vend.rs`). STS, downscoped tokens, installation tokens and IAM
+  database tokens are each a fixed HTTPS request or a signing derivation of the policy; the
+  node bounds what goes back by the expiry it reads, not by knowing the service. A
+  `kubectl` `exec` plugin that prints what the node vended is the caller's own code.
+
+Expressible by templates and the IR today, without new engine code, but not yet shown by a
+test (a hypothesis until one runs): DPoP, HTTP Message Signatures, Hawk, ACME and JWS in
+general, JWE encryption with the existing HPKE/AES-GCM/RSA functions, SAML and OIDC by `html`
+capture, `private_key_jwt`.
+
+Not done; each needs a primitive or a feature, not a site name: OAuth 1.0a normalization in
+`canonical_query`; SigV4A key derivation; NTLM and Negotiate (connection-bound: each HTTPS
+send opens its own connection today, so the handshake and the request would need one
+connection); SRP-6a big-integer functions; SEED and ARIA; Korean certificates (SEED-CBC key
+decryption and CMS signatures); software passkeys; HOTP and the Steam alphabet; SMS codes
+without the owner (reading a code from another record, like the `mail` item of part 5);
+OpenPGP; ssh-agent (`credentials tunnel --agent`); BIP-340 Schnorr; incoming webhook
+`verify`; `decrypt`; `generate` and rotation; egress through a proxy; SNMPv3 (RFC 3414 key
+localization and AES-CFB over the UDP relay); OAUTHBEARER; executing IR `repeat` and `if`
+(parsed and refused, section 8c).
 
 Each part adds its rows to `docs/threat-model.md`, fuzz targets for any new parser, and
 measured results in its pull request.
@@ -706,6 +749,18 @@ approvals inside another company's app (KakaoTalk, a bank's app push).
 - Legal limits on processing national ID numbers (주민등록번호) for identity items.
 - Which sites bind sessions to the client IP, so that a session made on the owner's device
   fails from the node.
+- Delegations across a hand-over. A delegation carries the record key sealed to one node, so
+  a hand-over (section 10) does not carry it: the owner delegates again on the successor.
+  Emergency access therefore assumes the owner's node outlives the owner by the waiting
+  period; carrying delegations would mean resealing their keys to the successor in the
+  package, which is possible but widens what a hand-over moves. Left closed for now, the
+  more secure choice.
+- Delegations and requests of emergency access are restored from the log, like spending
+  limits. A node restarted from a cut log without `restore_anchored` can bring back a
+  revoked delegation or forget a cancellation; the anchor is the defence, as for limits.
+- Vending checks the expiry the service states. A service that states a shorter expiry than
+  it honours is out of the node's reach; the owner's scope in the fixed request is the
+  other bound.
 
 ## Appendix A. Gaps found against the IANA registries (2026-11)
 

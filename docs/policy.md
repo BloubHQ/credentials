@@ -22,6 +22,7 @@ Policy
     ├── input:  raw | json | rlp     (operations with no connection)
     ├── payment: amount, currency    optional: checked against the owner's spending limits
     ├── approval: true               optional: every use waits for the owner's approval
+    ├── vend: lifetime_ms, expires   optional: hands back a credential minted from the secret, bounded
     └── steps:  [Step]               1–64
         ├── open     connection: https | tls | websocket | udp | browser, destinations, identity
         ├── send     https: request (caller contract | fixed) + inject;  tls: template;  browser: fill
@@ -1182,7 +1183,8 @@ crate, which checks the policy first) gives the owner, in JSON:
 | `plain_datagram` | An operation sends UDP datagrams, without TLS: what they carry is readable on the path. |
 | `browser_fill` | The node types secrets into a page in a browser over CDP: the page and the browser behind the endpoint get them, and the node cannot check the page's TLS through CDP. |
 | `frame_origin` | A fill puts values into a frame of another origin than the page's. |
-| `wider` | Against `previous`: a new destination, method, path, header, query rule, injection, operation, caller or caller key; more of the response; a looser limit; a new sign-in, host key, TLS mode, command or mail rule; a browser fill changed; a field made public or not guessable; a payment changed or an approval dropped; a session rule changed; the item unbound or its pins and sign-offs changed. |
+| `vend` | An operation hands back a credential minted from the secret ([Vending](#vending)): the caller holds it until it expires. |
+| `wider` | Against `previous`: a new destination, method, path, header, query rule, injection, operation, caller or caller key; more of the response; a looser limit; a new sign-in, host key, TLS mode, command or mail rule; a browser fill changed; a field made public or not guessable; a payment changed or an approval dropped; a session rule changed; a vended lifetime made longer or its expiry read elsewhere; open limits or a protocol changed; the item unbound or its pins and sign-offs changed. |
 | `new_destination` | Against `previous`: a destination it did not have. |
 
 What changed without widening (an operation or a caller removed) is listed in `changes`.
@@ -1332,6 +1334,69 @@ operation reads the session, the node checks its expiry; when it lapsed (or ther
 - `{"by": "owner"}`: the node refuses with `session_expired`; the owner logs in on the
   device and seals the new session with `Record::update` (`update_record` in the `client`
   crate), which writes its expiry too, one generation later.
+
+### Vending
+
+```json
+{"name": "mint",
+ "vend": {"lifetime_ms": 3600000,
+          "expires": {"source": {"from": "json", "pointer": "/expires_in"}, "format": "seconds"}},
+ "steps": [
+  {"do": "open", "connection": "https", "destinations": [{"host": "sts.example.com", "port": 443}]},
+  {"do": "send", "request": {"from": "fixed", "method": "POST", "path": "/token"},
+   "inject": [{"target": {"kind": "header", "name": "Authorization"}, "template": "Bearer {{access_token}}"},
+              {"target": {"kind": "body"}, "template": "scope=read&duration=900"}]},
+  {"do": "return", "response": {"body": {"json": ["/token", "/expires_in"]}}}]}
+```
+
+An operation whose output is a credential the secret mints: a short-lived token of a token
+service, a signed URL, a token the node signs itself. The caller keeps what it gets, so the
+node bounds it: the credential must expire within `lifetime_ms` (1 second to 12 hours).
+
+- **HTTPS**: the requests are fixed by the policy (no caller contract: the caller chooses no
+  scope and no lifetime); the expiry is read from the response by a capture source (`json`,
+  `header`, `regex`, …, not `all`), and the operation returns declared JSON members only.
+  After the response, before anything goes back, the node reads the expiry in `format`
+  (`unix` seconds, `unix_ms`, `rfc3339`, or `seconds` from now) and checks it is at most
+  `now + lifetime_ms + 60 s` (clock allowance). An expiry that is missing, unreadable or too
+  late refuses the call with `vend_refused`, and the response never leaves the node.
+- **No connection**: the expiry is a member of the operation's JSON input that the node
+  `set`s (`unix` or `unix_ms`, the format's unit) with an `offset` at most `lifetime_ms`,
+  checked when the policy is signed; the output template reads `$input`, the checked input
+  that holds it. Whatever the caller sends in that member is overwritten.
+
+A vend is logged (`vend`, with the expiry) under the owner. A summary flags `vend`, and a
+new version that makes the lifetime longer or reads the expiry elsewhere counts as wider.
+
+### Delegation and emergency access
+
+An owner can let another owner's callers use one record, without handing over the record key
+or the values (`docs/design.md`, section 8b). A device of the owner signs a `Delegation`
+(`client::delegate`, `POST /delegate` with the record):
+
+- **the delegated policy**: the record's policy or narrower, signed by the same device. It
+  declares the same fields and item binding; every operation it has is one the record's
+  policy has, no wider (the [summary diff](#summaries-and-risk-flags) against the record's
+  policy finds nothing wider); it captures into no field (a delegate never seals a new
+  generation of the owner's record); its callers are the delegate's. A delegate's call
+  names the delegation's id (signed with the call) and runs under this policy only; its
+  log entries carry the caller as `delegate/caller`, under the owner, and the call costs the
+  owner's rate limits like any;
+- **the record's policy, by hash**: if the owner changes the record's policy, the
+  delegation no longer holds (`delegation_unknown`), and the owner delegates again;
+- **the record and log keys, sealed to the node** (HPKE), so the node runs a delegated call
+  even while the owner holds no grant — which emergency access needs;
+- **a lifetime** of at most 366 days, and a **waiting period**: 0, or 1 hour to 90 days for
+  emergency access. The delegate's first call starts the wait (an `access_request` entry
+  under both owners) and is refused with `delegation_waiting` and the time it opens; a
+  device of the owner can cancel the request meanwhile (`client::change_delegation`,
+  `cancel`, `POST /delegation/change`), and the next call waits the whole period again.
+
+A device ends a delegation with `revoke`; a revocation of the owner's grant ends all of its
+delegations; a delegation whose device the node no longer knows stops working. At most 16
+delegations per record and 64 per owner. Delegations survive a restart (the log keeps them
+sealed under the node's state key) but not a hand-over to a successor: the record key is
+sealed to this node, so the owner delegates again on the new one.
 
 ### Next
 

@@ -26,6 +26,7 @@ use crate::encoding::{b64_array, b64_vec, canonical};
 use crate::grant::{NodeIdentity, RecordPin};
 use crate::keys::{DevicePublicKey, NodeKey, NodePublicKey, UserKey};
 use crate::policy::Method;
+use crate::secret::Secret;
 use crate::{Error, Result};
 
 const ENTRY_DOMAIN: &[u8] = b"entry/v2\0";
@@ -156,6 +157,72 @@ pub enum Event {
         generation: u64,
         /// The payment, sealed under the node's own state key.
         sealed: SealedDetail,
+    },
+    /// A device of the owner delegated the record to another owner's callers (written under
+    /// the owner of the record). The delegated policy and the keys are sealed so only this
+    /// node reads them.
+    Delegate {
+        /// The delegation.
+        #[serde(with = "b64_array")]
+        id: [u8; 16],
+        /// The other owner.
+        delegate: String,
+        /// 0, or the waiting period of emergency access.
+        wait_ms: u64,
+        /// When it ends.
+        expires_ms: u64,
+        /// When the device signed it.
+        issued_ms: u64,
+        /// The device.
+        device: Box<DevicePublicKey>,
+        /// The signed delegation, sealed under the node's own state key.
+        sealed: Box<SealedDetail>,
+    },
+    /// Another owner delegated one of its records to this owner's callers (written under the
+    /// delegate).
+    Delegated {
+        /// The delegation.
+        #[serde(with = "b64_array")]
+        id: [u8; 16],
+        /// The owner of the record.
+        from: String,
+        /// The record.
+        record_id: String,
+        /// 0, or the waiting period of emergency access.
+        wait_ms: u64,
+        /// When it ends.
+        expires_ms: u64,
+    },
+    /// A delegate's caller asked for emergency access: it opens at `opens_ms` unless a device
+    /// of the owner cancels it. Written under both owners.
+    AccessRequest {
+        /// The delegation.
+        #[serde(with = "b64_array")]
+        id: [u8; 16],
+        /// When the access opens.
+        opens_ms: u64,
+    },
+    /// A device of the owner cancelled the open request of emergency access, or revoked the
+    /// delegation. Written under both owners.
+    Undelegate {
+        /// The delegation.
+        #[serde(with = "b64_array")]
+        id: [u8; 16],
+        /// True when the delegation ended; false when only the request was cancelled.
+        revoke: bool,
+        /// When the device signed it.
+        issued_ms: u64,
+        /// The device.
+        device: DevicePublicKey,
+    },
+    /// The node handed a vended credential to the caller: it is valid until `expires_ms`.
+    Vend {
+        /// The operation.
+        operation: String,
+        /// The generation of the record.
+        generation: u64,
+        /// When the credential ends, as the node read it.
+        expires_ms: u64,
     },
     /// The node handed its grants, devices, floors and limits over to its successor, sealed
     /// to the successor's key, and stopped: the last entry of its chain. The next entry of the
@@ -307,12 +374,17 @@ pub struct SealedDetail {
 
 const DETAIL_KEY_INFO: &[u8] = b"log-detail/v1\0";
 
-fn detail_cipher(user_key: &UserKey) -> Result<ChaCha20Poly1305> {
-    let mut okm = zeroize::Zeroizing::new([0u8; 32]);
+/// The key log details of an owner are sealed under: HKDF-SHA256 of the user key.
+pub(crate) fn detail_key(user_key: &UserKey) -> Result<Secret<[u8; 32]>> {
+    let mut key = Secret::new([0u8; 32]);
     hkdf::Hkdf::<Sha256>::new(None, user_key.bytes())
-        .expand(DETAIL_KEY_INFO, okm.as_mut_slice())
+        .expand(DETAIL_KEY_INFO, key.expose_mut().as_mut_slice())
         .map_err(|_| Error::KeyInvalid)?;
-    ChaCha20Poly1305::new_from_slice(okm.as_slice()).map_err(|_| Error::KeyInvalid)
+    Ok(key)
+}
+
+fn detail_cipher(key: &Secret<[u8; 32]>) -> Result<ChaCha20Poly1305> {
+    ChaCha20Poly1305::new_from_slice(key.expose().as_slice()).map_err(|_| Error::KeyInvalid)
 }
 
 fn detail_aad(owner: &str, record_id: &str) -> Vec<u8> {
@@ -324,10 +396,11 @@ fn detail_aad(owner: &str, record_id: &str) -> Vec<u8> {
 }
 
 impl Detail {
-    /// Seals the detail of a use of `record_id` of `owner`.
+    /// Seals the detail of a use of `record_id` of `owner`, under the owner's detail key
+    /// (from the user key, or carried by a delegation).
     pub(crate) fn seal(
         &self,
-        user_key: &UserKey,
+        keys: &crate::delegation::RecordKeys,
         owner: &str,
         record_id: &str,
     ) -> Result<SealedDetail> {
@@ -335,7 +408,7 @@ impl Detail {
         let plain = serde_json::to_vec(self).map_err(|_| Error::Encoding)?;
         use chacha20poly1305::aead::Generate as _;
         let nonce: [u8; 12] = Nonce::generate().into();
-        let ct = detail_cipher(user_key)?
+        let ct = detail_cipher(&keys.detail)?
             .encrypt(
                 &Nonce::from(nonce),
                 Payload {
@@ -357,7 +430,7 @@ pub fn open_detail(user_key: &UserKey, entry: &Entry) -> Result<Option<Detail>> 
         }
         _ => return Ok(None),
     };
-    let plain = detail_cipher(user_key)?
+    let plain = detail_cipher(&detail_key(user_key)?)?
         .decrypt(
             &Nonce::from(sealed.nonce),
             Payload {

@@ -195,6 +195,22 @@ impl Registry {
         }
     }
 
+    /// Drops the operations of `record_id` of `owner` whose caller name starts with
+    /// `prefix` (the callers of one delegate).
+    pub fn drop_callers(&mut self, owner: &str, record_id: &str, prefix: &str) {
+        let ids: Vec<[u8; 16]> = self
+            .entries
+            .iter()
+            .filter(|(_, (p, _))| {
+                p.owner == owner && p.record.id == record_id && p.caller.starts_with(prefix)
+            })
+            .map(|(id, _)| *id)
+            .collect();
+        for id in ids {
+            self.remove(&id);
+        }
+    }
+
     /// How many operations wait, after dropping what lapsed.
     pub fn len(&mut self, now: u64) -> usize {
         self.sweep(now);

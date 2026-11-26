@@ -265,6 +265,15 @@ node builds from what it checked: merchant, amount, currency and the masked card
 the node obtains carry an expiry and are renewed by a login operation of the policy, or by the
 owner. The caller resumes with the id it was given, and only that caller can.
 
+**Delegation, emergency access and vending.** A device of the owner can let another owner's
+callers use one record under a narrower policy it signs (no wider operation, no capture into
+the record), with the record key sealed to the node, never to the delegate; with a waiting
+period, it is emergency access: the delegate's first call starts the wait, logged under both
+owners, and a device of the owner can cancel it or revoke the delegation before it opens. An
+operation can vend a credential minted from the secret (a short-lived token, a signed URL): the
+node refuses one that expires later than the policy's lifetime (at most 12 hours) and returns
+nothing of it.
+
 ## Records, generations and rollback
 
 A record is the fields, encrypted with ChaCha20-Poly1305 under a key derived from the user
@@ -343,7 +352,8 @@ credentials verify old.jsonl <old-node-key> --next new.jsonl     # one chain acr
 - **Command line and server.** [`credentials`](crates/cli) makes keys, signs policies, seals
   records, makes grants and signed calls, and `credentials serve` runs a node over HTTP with a
   durable JSONL log. `POST /answer`, `/approve` and `/limits` take what the owner's device
-  signs for operations that wait; operations waiting when the node restarts are gone.
+  signs for operations that wait, `/delegate` and `/delegation/change` its delegations;
+  operations waiting when the node restarts are gone.
   `POST /stream` runs a WebSocket, a streamed response or an SSH shell as framed messages
   both ways (`server::stream`), one thread per open connection.
   A browser fill is a plain `POST /call` and answers `{"kind": "fill", ...}`.

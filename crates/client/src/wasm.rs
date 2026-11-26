@@ -601,6 +601,73 @@ pub fn sign_limits(
     )?)
 }
 
+/// See [`crate::delegate`]. `wait_secs` and `valid_for_secs` are whole numbers of seconds.
+#[wasm_bindgen(js_name = delegate)]
+#[allow(clippy::too_many_arguments)]
+pub fn delegate(
+    device_key: String,
+    user_key: String,
+    node: &JsVerifiedNode,
+    record_json: String,
+    delegate_owner: String,
+    policy_json: String,
+    wait_secs: u32,
+    valid_for_secs: u32,
+) -> Result<String> {
+    Ok(crate::delegate(
+        device_key,
+        user_key,
+        Arc::clone(&node.0),
+        record_json,
+        delegate_owner,
+        policy_json,
+        u64::from(wait_secs),
+        u64::from(valid_for_secs),
+    )?)
+}
+
+/// See [`crate::change_delegation`]; `change` is `"cancel"` or `"revoke"`.
+#[wasm_bindgen(js_name = changeDelegation)]
+pub fn change_delegation(
+    device_key: String,
+    owner: String,
+    identity_json: String,
+    record_id: String,
+    id: String,
+    change: String,
+) -> Result<String> {
+    Ok(crate::change_delegation(
+        device_key,
+        owner,
+        identity_json,
+        record_id,
+        id,
+        change,
+    )?)
+}
+
+/// See [`crate::sign_delegated_call`].
+#[wasm_bindgen(js_name = signDelegatedCall)]
+pub fn sign_delegated_call(
+    caller_key: String,
+    caller: String,
+    identity_json: String,
+    record_json: String,
+    operation: String,
+    body_json: String,
+    delegation_id: String,
+) -> Result<String> {
+    Ok(crate::sign_delegated_call(
+        caller_key,
+        caller,
+        identity_json,
+        record_json,
+        operation,
+        body_json,
+        delegation_id,
+    )?)
+}
+
 /// See [`crate::update_record`]; `fields` is a `Map<string, Uint8Array>`.
 #[wasm_bindgen(js_name = updateRecord)]
 pub fn update_record(
