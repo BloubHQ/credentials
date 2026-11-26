@@ -17,11 +17,13 @@ use crate::template::{Budget, Bytes, Func};
 use crate::{Error, Result, totp};
 
 mod cbor;
+pub mod compress;
 pub(crate) mod hpke;
 mod kdf;
 mod modes;
 mod sign;
 pub(crate) mod turbo;
+pub mod xml;
 
 pub(crate) use kdf::MAX_DERIVED;
 
@@ -908,6 +910,10 @@ pub(crate) fn output_bound(func: Func, args: &[Bytes]) -> usize {
         Func::Sm2Sign => 64,
         Func::CborArray | Func::CborMap => args.iter().map(|a| a.len()).sum::<usize>() + 9,
         Func::CborTag => len(1) + 9,
+        Func::Deflate | Func::ZlibDeflate | Func::GzipDeflate => compress::deflate_bound(len(0)),
+        // Bounded inside by what the budget has left, which they are given.
+        Func::Inflate | Func::ZlibInflate | Func::GzipInflate | Func::XmlC14n => 0,
+        Func::XmlEscape => len(0) * 6,
         _ => len(0) + 128,
     }
 }
@@ -1074,6 +1080,14 @@ fn call_family(func: Func, args: &[Bytes], budget: &Budget) -> Result<Option<Byt
         Func::CborArray => cbor::array(args)?,
         Func::CborMap => cbor::map(args)?,
         Func::CborTag => cbor::tag(at(0)?, at(1)?)?,
+        Func::Deflate => compress::deflate(at(0)?, compress::Framing::Raw),
+        Func::ZlibDeflate => compress::deflate(at(0)?, compress::Framing::Zlib),
+        Func::GzipDeflate => compress::deflate(at(0)?, compress::Framing::Gzip),
+        Func::Inflate => compress::inflate(at(0)?, compress::Framing::Raw, budget.left())?,
+        Func::ZlibInflate => compress::inflate(at(0)?, compress::Framing::Zlib, budget.left())?,
+        Func::GzipInflate => compress::inflate(at(0)?, compress::Framing::Gzip, budget.left())?,
+        Func::XmlC14n => xml::c14n(at(0)?, at(1)?, opt(2), budget.left())?,
+        Func::XmlEscape => xml::escape(at(0)?)?,
         Func::Turboshake128 => turbo::turboshake(turbo::Level::L128, at(0)?, at(1)?, at(2)?)?,
         Func::Turboshake256 => turbo::turboshake(turbo::Level::L256, at(0)?, at(1)?, at(2)?)?,
         Func::Kt128 => turbo::kt(turbo::Level::L128, at(0)?, at(1)?, at(2)?)?,

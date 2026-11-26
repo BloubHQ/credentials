@@ -207,6 +207,9 @@ step 이전 형식(`"kind": "http" | "stream" | "derive"`)의 정책은 `credent
   있습니다.
 - **step.** `compute` step의 이름은 그 템플릿과 정확히 같은 성질을 가지므로, step 사이로 넘기는 값도
   인라인으로 쓴 것과 똑같이 분석합니다.
+- **압축과 XML.** 비밀 값은 압축하지 않습니다(`deflate`, `zlib_deflate`, `gzip_deflate`). 압축된
+  길이가 입력이 어떻게 반복되는지 알려 주기 때문입니다(CRIME). 압축 해제 한 번은 최대 1 MiB와
+  남은 예산까지만 쓰고, XML은 DTD 없이 읽으므로 외부 엔티티도 엔티티 확장도 없습니다.
 - **예산(budget).** operation 하나가 렌더링할 수 있는 양은 최대 128 MiB, PBKDF2 1,000,000 라운드,
   서명과 키 합의 합쳐 32개입니다.
 
@@ -225,6 +228,7 @@ step 이전 형식(`"kind": "http" | "stream" | "derive"`)의 정책은 `credent
 | 브라우저에서 암호화하는 비밀번호 | `ecdh("p256", server_key)` + `sha256` + `aes_cbc_encrypt`, `u8(len(…))` 길이 접두사와 `ecdh_public("p256")`; 또는 서버에서 캡처한 키로 `rsa_encrypt_oaep("sha256", key, password)` |
 | JWT RS256 | 연결 없음: `b64urlraw(header) + "." + b64urlraw($input) + "." + b64urlraw(rsa_sign_pkcs1_sha256(pem(key), …))` |
 | 정책이 수명을 정하는 JWT | `iss`/`aud`를 고정하고 `iat`/`exp`를 노드가 `set`하는 `json` input 스키마, 또는 템플릿의 `json_set_number(..., "exp", add($unix, "300"))` |
+| SAML 서비스 제공자, WS-Security | HTTP-Redirect: `b64(deflate(authn))`와 쿼리에 대한 `rsa_sign_pkcs1_sha256` 또는 `p256_sign`. HTTP-POST: `xml_c14n("http://www.w3.org/2001/10/xml-exc-c14n#", ...)` 위의 enveloped 서명. 모두 `rsa`와 ring으로 검증 |
 | Ethereum | 연결 없음: `{{ k256_sign_recoverable(key, keccak256($input)) }}`와, 받는 주소·체인·data를 고정하고 금액을 제한하는 `rlp` input 스키마 |
 | IMAP | tls: 인사말 receive, `a1 LOGIN {{user}} {{password}}` send, receive, 정책이 나열한 명령만 중계 |
 | TOTP | 연결 없음: `{{ totp(b32decode(seed)) }}` |

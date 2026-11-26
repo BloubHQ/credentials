@@ -121,3 +121,4 @@ mod vectors_part9;
 pub mod websocket;
 
 pub use error::{Error, Result};
+pub use primitives::{compress, xml};
