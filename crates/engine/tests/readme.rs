@@ -136,14 +136,15 @@ fn the_policy_reference_parses() {
                 ];
                 let policy = Policy {
                     item: None,
+                    // Only the names the block mentions: a policy holds at most 32 fields.
                     fields: names
                         .iter()
+                        .filter(|n| value.contains(**n))
                         .map(|n| match *n {
                             "cert" | "user" | "repo_id" | "client_id" | "server_key"
                             | "recipient" | "sp_entity_id" | "relay_state" | "certificate"
-                            | "key_created" | "consumer_key" | "token" | "access_key_id" | "domain" => {
-                                FieldSpec::public(n)
-                            }
+                            | "key_created" | "consumer_key" | "token" | "access_key_id"
+                            | "domain" => FieldSpec::public(n),
                             _ => FieldSpec::secret(n),
                         })
                         .collect(),
