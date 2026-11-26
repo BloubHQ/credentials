@@ -33,7 +33,8 @@ const SECRET: &[u8] = b"test-secret-7f3a9c";
 #[test]
 fn library_matches_its_source() {
     let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/libraries");
-    for name in LIBRARIES {
+    // The libraries written as WebAssembly text; `js` is checked by its hash (tests/js.rs).
+    for name in ["lenprefix8"] {
         let text = std::fs::read_to_string(format!("{dir}/{name}.wat")).unwrap();
         let compiled = wat::parse_str(&text).unwrap();
         if std::env::var_os("SANDBOX_WRITE_LIBRARIES").is_some() {
