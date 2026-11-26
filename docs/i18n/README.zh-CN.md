@@ -221,6 +221,9 @@ let outcome = node.run(&call, &mut TlsTransport::new());
 | JWT RS256 | 无连接：`b64urlraw(header) + "." + b64urlraw($input) + "." + b64urlraw(rsa_sign_pkcs1_sha256(pem(key), …))` |
 | 由策略限定有效期的 JWT | 固定 `iss`/`aud`、由节点 `set` `iat`/`exp` 的 `json` input 模式；或在模板中用 `json_set_number(..., "exp", add($unix, "300"))` |
 | SAML 服务提供方、WS-Security | HTTP-Redirect：`b64(deflate(authn))`，并对查询串用 `rsa_sign_pkcs1_sha256` 或 `p256_sign` 签名；HTTP-POST：对 `xml_c14n("http://www.w3.org/2001/10/xml-exc-c14n#", ...)` 的 enveloped 签名；均用 `rsa` 和 ring 验证 |
+| OAuth 1.0a (RFC 5849) | 对 base string 用 `sorted_params($query, $body, ...)` 和 `hmac_sha1` 或 `rsa_sign_pkcs1("sha1", ...)`；RFC 5849 向量，用 `hmac` 和 `rsa` 验证 |
+| AWS Signature Version 4A | `kbkdf_ec_key("p256", "sha256", ...)`（SP 800-108 计数器模式，FIPS 186-5 拒绝采样）和 `p256_sign_der`；用测试中另行派生的密钥由 ring 验证 |
+| HTTP 上的 NTLMv2 (MS-NLMP) | 在同一个 `tls` 连接上用 `md4`（标记为弱）、`hmac_md5`、`utf16le`、`uint_le`，含 MIC，之后 relay；MS-NLMP 4.2.4 向量 |
 | 以太坊 | 无连接：`{{ k256_sign_recoverable(key, keccak256($input)) }}`，配合固定收款地址、链和 data 并限制金额的 `rlp` input 模式 |
 | IMAP | tls：receive 问候，send `a1 LOGIN {{user}} {{password}}`，receive，只转发策略列出的命令 |
 | TOTP | 无连接：`{{ totp(b32decode(seed)) }}` |

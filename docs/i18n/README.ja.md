@@ -232,6 +232,9 @@ let outcome = node.run(&call, &mut TlsTransport::new());
 | JWT RS256 | 接続なし: `b64urlraw(header) + "." + b64urlraw($input) + "." + b64urlraw(rsa_sign_pkcs1_sha256(pem(key), …))` |
 | ポリシーが有効期間を決める JWT | `iss`/`aud` を固定し `iat`/`exp` をノードが `set` する `json` input スキーマ、またはテンプレートの `json_set_number(..., "exp", add($unix, "300"))` |
 | SAML サービスプロバイダー、WS-Security | HTTP-Redirect: `b64(deflate(authn))` と、クエリへの `rsa_sign_pkcs1_sha256` または `p256_sign`。HTTP-POST: `xml_c14n("http://www.w3.org/2001/10/xml-exc-c14n#", ...)` に対する enveloped 署名。いずれも `rsa` と ring で検証 |
+| OAuth 1.0a (RFC 5849) | base string に対する `sorted_params($query, $body, ...)` と `hmac_sha1` または `rsa_sign_pkcs1("sha1", ...)`。RFC 5849 のベクター、`hmac` と `rsa` で検証 |
+| AWS Signature Version 4A | `kbkdf_ec_key("p256", "sha256", ...)`(SP 800-108 カウンターモード、FIPS 186-5 rejection sampling)と `p256_sign_der`。テストで別に導出した鍵で ring が検証 |
+| HTTP 上の NTLMv2 (MS-NLMP) | 一つの `tls` 接続で `md4`(弱いと表示)、`hmac_md5`、`utf16le`、`uint_le`、MIC 付き、その後 relay。MS-NLMP 4.2.4 のベクター |
 | Ethereum | 接続なし: `{{ k256_sign_recoverable(key, keccak256($input)) }}` と、宛先・チェーン・data を固定し金額を制限する `rlp` input スキーマ |
 | IMAP | tls: グリーティングを receive、`a1 LOGIN {{user}} {{password}}` を send、receive、ポリシーが列挙したコマンドだけ中継 |
 | TOTP | 接続なし: `{{ totp(b32decode(seed)) }}` |

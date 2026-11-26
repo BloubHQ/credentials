@@ -230,6 +230,9 @@ step 이전 형식(`"kind": "http" | "stream" | "derive"`)의 정책은 `credent
 | JWT RS256 | 연결 없음: `b64urlraw(header) + "." + b64urlraw($input) + "." + b64urlraw(rsa_sign_pkcs1_sha256(pem(key), …))` |
 | 정책이 수명을 정하는 JWT | `iss`/`aud`를 고정하고 `iat`/`exp`를 노드가 `set`하는 `json` input 스키마, 또는 템플릿의 `json_set_number(..., "exp", add($unix, "300"))` |
 | SAML 서비스 제공자, WS-Security | HTTP-Redirect: `b64(deflate(authn))`와 쿼리에 대한 `rsa_sign_pkcs1_sha256` 또는 `p256_sign`. HTTP-POST: `xml_c14n("http://www.w3.org/2001/10/xml-exc-c14n#", ...)` 위의 enveloped 서명. 모두 `rsa`와 ring으로 검증 |
+| OAuth 1.0a (RFC 5849) | base string 위의 `sorted_params($query, $body, ...)`와 `hmac_sha1` 또는 `rsa_sign_pkcs1("sha1", ...)`. RFC 5849 벡터, `hmac`과 `rsa`로 검증 |
+| AWS Signature Version 4A | `kbkdf_ec_key("p256", "sha256", ...)`(SP 800-108 카운터 모드, FIPS 186-5 rejection sampling)와 `p256_sign_der`. 테스트에서 따로 도출한 키로 ring이 검증 |
+| HTTP 위의 NTLMv2 (MS-NLMP) | 하나의 `tls` 연결에서 `md4`(약함 표시), `hmac_md5`, `utf16le`, `uint_le`, MIC 포함, 이후 relay. MS-NLMP 4.2.4 벡터 |
 | Ethereum | 연결 없음: `{{ k256_sign_recoverable(key, keccak256($input)) }}`와, 받는 주소·체인·data를 고정하고 금액을 제한하는 `rlp` input 스키마 |
 | IMAP | tls: 인사말 receive, `a1 LOGIN {{user}} {{password}}` send, receive, 정책이 나열한 명령만 중계 |
 | TOTP | 연결 없음: `{{ totp(b32decode(seed)) }}` |
