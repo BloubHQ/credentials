@@ -11,11 +11,17 @@
 //! - **Query parameters** are allowed by name: each name the caller sends must be listed, at
 //!   most once, with its value within the rule; names the policy injects and reserved
 //!   method-override names are refused.
+//! - **Bodies** follow a [`BodyContract`] when the contract declares one: a JSON body checked
+//!   like a JSON input (closed, duplicate member names refused) or a form body whose fields are
+//!   allowed by name like query parameters. The node sends the body it checked, written again
+//!   by its own encoder, with the content type of the contract, so a server reads exactly the
+//!   values the node checked (and the amount of a payment it counted).
 
 use serde::{Deserialize, Serialize};
 
+use super::input::JsonInput;
 use super::{Method, is_false, is_token};
-use crate::primitives::pct_decode;
+use crate::primitives::{pct, pct_decode};
 use crate::request::{MAX_BODY, MAX_HEADER_VALUE, MAX_HEADERS, MAX_PATH, Request};
 use crate::{Error, Result};
 
@@ -25,6 +31,10 @@ pub const MAX_QUERY_RULES: usize = 32;
 pub const MAX_ONE_OF: usize = 32;
 /// Longest decimal bound of a `min` or `max` rule, in digits.
 pub const MAX_DIGITS: usize = 80;
+/// Most fields of a form body contract.
+pub const MAX_FORM_FIELDS: usize = 32;
+/// Longest body a body contract checks, in bytes.
+pub const MAX_CHECKED_BODY: usize = 1024 * 1024;
 
 /// Parameter names some web frameworks read as the method of the request. A caller may not
 /// send them, in the query or the body, unless the contract allows it.
@@ -62,6 +72,186 @@ pub struct CallerRequest {
     /// and the body. Off by default.
     #[serde(default, skip_serializing_if = "is_false")]
     pub override_params: bool,
+    /// What the body may hold. Without it any body of at most 8 MiB is sent as the caller
+    /// wrote it; with it the body is checked, written again by the node and sent with the
+    /// content type of the contract.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body: Option<BodyContract>,
+}
+
+/// The contract of a caller's request body.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum BodyContract {
+    /// A JSON body (`application/json`), checked like a JSON input: closed, duplicate member
+    /// names refused, written again compactly with numbers as written.
+    Json(JsonInput),
+    /// A form body (`application/x-www-form-urlencoded`).
+    Form(FormBody),
+}
+
+/// The fields of a form body: each field the caller sends must be listed, at most once.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FormBody {
+    /// The fields, with the rules of query parameters (`required`, `equals`, `one_of`,
+    /// `pattern`, `min`, `max`).
+    #[serde(default)]
+    pub fields: Vec<QueryRule>,
+}
+
+/// One field of a form body, decoded.
+pub(crate) struct FormField {
+    pub name: Vec<u8>,
+    pub value: Vec<u8>,
+}
+
+/// Reads a form body (`application/x-www-form-urlencoded`): fields separated by `&`, the
+/// name and value by the first `=`, `+` read as a space, then percent-decoded. Empty fields
+/// and malformed escapes are refused. The node writes the fields again with [`write_form`]
+/// before it sends them, so a server reads the fields the node read.
+pub(crate) fn parse_form(body: &[u8]) -> core::result::Result<Vec<FormField>, &'static str> {
+    if body.is_empty() {
+        return Ok(Vec::new());
+    }
+    let decode = |part: &[u8]| -> core::result::Result<Vec<u8>, &'static str> {
+        let spaced: Vec<u8> = part
+            .iter()
+            .map(|b| if *b == b'+' { b' ' } else { *b })
+            .collect();
+        pct_decode(&spaced)
+            .map(|v| v.to_vec())
+            .map_err(|_| "body holds a malformed percent escape")
+    };
+    body.split(|b| *b == b'&')
+        .map(|part| {
+            let (name, value) = match part.iter().position(|b| *b == b'=') {
+                Some(at) => (
+                    part.get(..at).unwrap_or_default(),
+                    part.get(at + 1..).unwrap_or_default(),
+                ),
+                None => (part, &[][..]),
+            };
+            if name.is_empty() {
+                return Err("form field without a name");
+            }
+            Ok(FormField {
+                name: decode(name)?,
+                value: decode(value)?,
+            })
+        })
+        .collect()
+}
+
+/// Writes form fields with every byte but the unreserved ones percent-encoded, so no server
+/// reads another separator, space or escape than the node meant.
+pub(crate) fn write_form(fields: &[FormField]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for (i, field) in fields.iter().enumerate() {
+        if i > 0 {
+            out.push(b'&');
+        }
+        out.extend_from_slice(&pct(&field.name));
+        out.push(b'=');
+        out.extend_from_slice(&pct(&field.value));
+    }
+    out
+}
+
+impl BodyContract {
+    /// The content type the node sends the body with.
+    pub fn content_type(&self) -> &'static str {
+        match self {
+            BodyContract::Json(_) => "application/json",
+            BodyContract::Form(_) => "application/x-www-form-urlencoded",
+        }
+    }
+
+    /// Why the contract itself is invalid, if it is.
+    pub fn fault(&self) -> Option<&'static str> {
+        match self {
+            BodyContract::Json(json) => json.fault(),
+            BodyContract::Form(form) => {
+                if form.fields.is_empty() || form.fields.len() > MAX_FORM_FIELDS {
+                    return Some("a form body lists 1 to 32 fields");
+                }
+                let mut names: Vec<String> = Vec::with_capacity(form.fields.len());
+                for field in &form.fields {
+                    let lower = field.name.to_ascii_lowercase();
+                    if !super::is_query_name(&field.name) || names.contains(&lower) {
+                        return Some(
+                            "a form field name is visible ASCII without & = # + %, each named once",
+                        );
+                    }
+                    names.push(lower);
+                    if let Some(rule) = field.allowed().fault() {
+                        return Some(rule);
+                    }
+                }
+                None
+            }
+        }
+    }
+
+    /// Checks a caller's body and gives the bytes the node sends: the body written again by
+    /// the node's own encoder.
+    pub fn apply(&self, body: &[u8], now_ms: u64) -> Result<Vec<u8>> {
+        if body.len() > MAX_CHECKED_BODY {
+            return Err(invalid("a body the contract checks is at most 1 MiB"));
+        }
+        match self {
+            BodyContract::Json(json) => json.apply(body, now_ms).map_err(|e| match e {
+                Error::InputInvalid { rule } => invalid(rule),
+                other => other,
+            }),
+            BodyContract::Form(form) => {
+                let fields = parse_form(body).map_err(invalid)?;
+                let mut seen: Vec<Vec<u8>> = Vec::with_capacity(fields.len());
+                for field in &fields {
+                    let lower = field.name.to_ascii_lowercase();
+                    if seen.contains(&lower) {
+                        return Err(invalid("form field repeated"));
+                    }
+                    seen.push(lower);
+                    let Some(rule) = form.fields.iter().find(|r| r.name.as_bytes() == field.name)
+                    else {
+                        return Err(invalid("form field not allowed by the policy"));
+                    };
+                    if !rule.allowed().admits(&field.value) {
+                        return Err(invalid("form field value not allowed by the policy"));
+                    }
+                }
+                let missing = form
+                    .fields
+                    .iter()
+                    .any(|r| r.required && !fields.iter().any(|f| f.name == r.name.as_bytes()));
+                if missing {
+                    return Err(invalid("a required form field is missing"));
+                }
+                Ok(write_form(&fields))
+            }
+        }
+    }
+
+    /// The text of the scalar value at `at` (a JSON pointer, or a form field name) of a body
+    /// this contract wrote, read by the parser that wrote it; with whether it is a JSON
+    /// number.
+    pub(crate) fn scalar(&self, body: &[u8], at: &str) -> Option<(String, bool)> {
+        match self {
+            BodyContract::Json(_) => JsonInput::scalar(body, at),
+            BodyContract::Form(_) => {
+                let fields = parse_form(body).ok()?;
+                let mut found = fields.iter().filter(|f| f.name == at.as_bytes());
+                let field = found.next()?;
+                if found.next().is_some() {
+                    return None;
+                }
+                String::from_utf8(field.value.clone())
+                    .ok()
+                    .map(|text| (text, false))
+            }
+        }
+    }
 }
 
 /// A query parameter the caller may send, and the values it may take. A rule with no

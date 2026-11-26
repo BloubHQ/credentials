@@ -7,7 +7,9 @@
 //! - [`Payment`]: where the amount of a payment is read, so the node can build the approval
 //!   summary and apply the owner's spending limits. The amount comes only from a value a
 //!   contract checked as a bounded integer (a query rule with `min` and `max`, an input member
-//!   of type number with `min` and `max`) or from the policy itself, never from free text.
+//!   of type number with `min` and `max`, a member or field of a body contract) or from the
+//!   policy itself, never from free text. An amount in a body is read from the body the node
+//!   wrote again and sends, by the parser that wrote it ([`read_amount`]).
 //! - [`SessionRule`]: a secret field that holds a session the node obtained (cookies, a
 //!   bearer token), its lifetime, and how it is renewed.
 
@@ -151,11 +153,115 @@ pub enum AmountSource {
         /// The JSON pointer of the member, as in the schema.
         pointer: String,
     },
+    /// A member of the caller's JSON body, checked by the body contract of the request: a
+    /// required member, read from the body the node wrote again and sends.
+    Body {
+        /// The JSON pointer of the member, as in the body contract.
+        pointer: String,
+        /// How the amount is written.
+        #[serde(default, skip_serializing_if = "AmountFormat::is_minor")]
+        format: AmountFormat,
+        /// The JSON pointer of the member that holds the currency, when the body holds one;
+        /// the contract must fix it to the payment's currency.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        currency_at: Option<String>,
+    },
+    /// A field of the caller's form body, checked by the body contract of the request.
+    Form {
+        /// The field name, as in the body contract.
+        name: String,
+        /// How the amount is written.
+        #[serde(default, skip_serializing_if = "AmountFormat::is_minor")]
+        format: AmountFormat,
+        /// The field that holds the currency, when the body holds one; the contract must fix
+        /// it to the payment's currency.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        currency_at: Option<String>,
+    },
     /// A fixed amount the policy states.
     Fixed {
         /// A decimal integer, in minor units.
         value: String,
     },
+}
+
+/// How an amount in a body is written.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AmountFormat {
+    /// An integer of minor units (`1250` for 12.50 EUR): a JSON number or string, or a form
+    /// field, bounded by the contract's `min` and `max`.
+    #[default]
+    Minor,
+    /// A decimal of major units with exactly `exponent` digits after the point (`"12.50"`;
+    /// no point when the exponent is 0): a JSON string or a form field, never a JSON number,
+    /// which many servers read as binary floating point.
+    Decimal,
+}
+
+impl AmountFormat {
+    /// True for [`AmountFormat::Minor`], the default.
+    pub fn is_minor(&self) -> bool {
+        *self == AmountFormat::Minor
+    }
+}
+
+/// Largest amount, in minor units, that a JSON number may carry: 2^53 - 1, the largest
+/// integer every JSON parser that reads numbers as binary floating point reads exactly.
+pub const MAX_JSON_NUMBER_AMOUNT: u64 = (1 << 53) - 1;
+
+/// Reads an amount of a body, as the node checked and sends it, into minor units: an integer
+/// written `0|[1-9][0-9]*`, or for [`AmountFormat::Decimal`] that and, when `exponent` is not
+/// 0, a point and exactly `exponent` digits. No sign, exponent, space or other form; at most
+/// [`MAX_AMOUNT`], and [`MAX_JSON_NUMBER_AMOUNT`] for a JSON number.
+pub fn read_amount(text: &str, number: bool, format: AmountFormat, exponent: u8) -> Option<u64> {
+    let canonical = |digits: &str| {
+        !digits.is_empty()
+            && digits.len() <= 19
+            && digits.bytes().all(|b| b.is_ascii_digit())
+            && (digits == "0" || !digits.starts_with('0'))
+    };
+    let minor: u64 = match format {
+        AmountFormat::Minor => {
+            if !canonical(text) {
+                return None;
+            }
+            text.parse().ok()?
+        }
+        AmountFormat::Decimal => {
+            if number {
+                return None;
+            }
+            let (whole, fraction) = match text.split_once('.') {
+                Some((w, f)) => (w, Some(f)),
+                None => (text, None),
+            };
+            let places = usize::from(exponent);
+            let fraction = match (fraction, places) {
+                (None, 0) => "",
+                (Some(f), p) if p > 0 && f.len() == p && f.bytes().all(|b| b.is_ascii_digit()) => f,
+                _ => return None,
+            };
+            if !canonical(whole) {
+                return None;
+            }
+            let whole: u64 = whole.parse().ok()?;
+            let fraction: u64 = if fraction.is_empty() {
+                0
+            } else {
+                fraction.parse().ok()?
+            };
+            whole
+                .checked_mul(10u64.checked_pow(u32::from(exponent))?)?
+                .checked_add(fraction)?
+        }
+    };
+    let most = if number {
+        MAX_JSON_NUMBER_AMOUNT
+    } else {
+        MAX_AMOUNT
+    };
+    (minor <= most).then_some(minor)
 }
 
 /// What an operation pays: the amount, in minor units of `currency`.

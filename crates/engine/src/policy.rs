@@ -58,8 +58,8 @@ pub use schema::JSON_SCHEMA;
 pub use summary::{Summary, summarize};
 
 pub use contract::{
-    CallerRequest, MAX_QUERY_RULES, QueryRule, RESERVED_PARAMS, path_fault, template_fault,
-    template_matches,
+    BodyContract, CallerRequest, FormBody, MAX_CHECKED_BODY, MAX_FORM_FIELDS, MAX_QUERY_RULES,
+    QueryRule, RESERVED_PARAMS, path_fault, template_fault, template_matches,
 };
 pub(crate) use contract::{parse_query, placeholders};
 pub use flow::{Branch, MAX_NESTING, MAX_REPEAT, MAX_TEST_VALUE, MAX_TEST_VALUES, Repeat, Test};
@@ -75,9 +75,9 @@ pub use summary::diff;
 pub use vend::{Expiry, MAX_VEND_MS, TimeFormat, VEND_SKEW_MS, Vend};
 pub(crate) use wait::is_currency;
 pub use wait::{
-    AmountSource, Await, Challenge, ChallengeKind, Condition, DEFAULT_CODE_PATTERN, MAX_AMOUNT,
-    MAX_AWAITS, MAX_EXPONENT, MAX_HINT, MAX_SESSION_MS, MAX_WAIT_MS, MIN_POLL_MS, Payment, Poll,
-    Renew, SessionRule,
+    AmountFormat, AmountSource, Await, Challenge, ChallengeKind, Condition, DEFAULT_CODE_PATTERN,
+    MAX_AMOUNT, MAX_AWAITS, MAX_EXPONENT, MAX_HINT, MAX_JSON_NUMBER_AMOUNT, MAX_SESSION_MS,
+    MAX_WAIT_MS, MIN_POLL_MS, Payment, Poll, Renew, SessionRule, read_amount,
 };
 
 const POLICY_DOMAIN: &[u8] = b"policy/v4\0";
@@ -1824,7 +1824,27 @@ impl Policy {
                     )?,
                 }
             }
-            StepRequest::Caller(contract) => self.check_caller_contract(at, contract, send)?,
+            StepRequest::Caller(contract) => {
+                self.check_caller_contract(at, contract, send)?;
+                if let Some(body) = &contract.body {
+                    let at = format!("{at}.request.body");
+                    if let Some(rule) = body.fault() {
+                        return fail(at, rule);
+                    }
+                    // The node sends the body it checked, with the content type it names: a
+                    // caller's or an injected content type, an injected body or a gRPC frame
+                    // would make the server read another body than the one checked.
+                    ensure(
+                        open.connection == Connection::Https
+                            && !send.grpc
+                            && !send.inject.iter().any(|i| i.target == Target::Body)
+                            && !names_header("content-type")
+                            && !names_header("content-encoding"),
+                        || at.clone(),
+                        "a body contract is for an HTTPS send that injects no body and sets no content type, content encoding or gRPC frame",
+                    )?;
+                }
+            }
         }
         let mut headers: Vec<String> = Vec::new();
         let mut query: Vec<String> = Vec::new();
@@ -2459,6 +2479,19 @@ impl Policy {
                         || at.clone(),
                         "a WebSocket or a browser does not wait; await is for HTTPS and derivations",
                     )?;
+                    if connection == Some(Connection::Tls) {
+                        // On TLS the node connects only after the awaits that directly follow
+                        // `open`: nothing reaches the site, and no connection is held, while
+                        // the operation waits.
+                        let leading = operation.steps.get(1..i).is_some_and(|before| {
+                            before.iter().all(|s| matches!(s, Step::Await(_)))
+                        });
+                        ensure(
+                            leading && wait.challenge.kind != ChallengeKind::External,
+                            || at.clone(),
+                            "on TLS, await waits for a code before the connection opens: only directly after open, before any other step",
+                        )?;
+                    }
                     if wait.challenge.poll.is_some() {
                         polls += 1;
                         ensure(
@@ -2471,6 +2504,17 @@ impl Policy {
                 }
             }
         }
+        // One caller request goes to every send that takes it: its body is checked and written
+        // again once, by the one body contract they all declare.
+        let bodies: Vec<Option<&BodyContract>> = operation
+            .caller_sends()
+            .map(|(contract, _)| contract.body.as_ref())
+            .collect();
+        ensure(
+            bodies.iter().all(|b| Some(b) == bodies.first()),
+            || format!("{at}.steps"),
+            "the sends that take the caller's request declare the same body contract, or none",
+        )?;
         if let Some(payment) = &operation.payment {
             self.check_payment(&format!("{at}.payment"), operation, payment)?;
         }
@@ -2521,9 +2565,9 @@ impl Policy {
         let at = format!("{at}.challenge");
         let challenge = &wait.challenge;
         ensure(
-            open.is_none_or(|o| o.connection == Connection::Https),
+            open.is_none_or(|o| matches!(o.connection, Connection::Https | Connection::Tls)),
             || at.clone(),
-            "an operation on a TLS stream cannot wait: its connection would stay open",
+            "await is for HTTPS, TLS before the connection opens, and operations with no connection: any other connection would stay open while it waits",
         )?;
         ensure(
             wait::is_plain_text(&challenge.hint, MAX_HINT),
@@ -2606,7 +2650,116 @@ impl Policy {
                 })
         };
         let at = format!("{at}.amount");
+        let from_request = matches!(
+            payment.amount,
+            AmountSource::Query { .. } | AmountSource::Body { .. } | AmountSource::Form { .. }
+        );
+        if from_request {
+            // The caller's request, and the amount in it, goes out once.
+            ensure(
+                operation.caller_sends().count() == 1,
+                || at.clone(),
+                "an amount read from the caller's request needs exactly one send of the caller's request",
+            )?;
+        }
+        let body = operation
+            .caller_sends()
+            .next()
+            .and_then(|(contract, _)| contract.body.as_ref());
         match &payment.amount {
+            AmountSource::Body {
+                pointer,
+                format,
+                currency_at,
+            } => {
+                let Some(BodyContract::Json(schema)) = body else {
+                    return fail(
+                        at,
+                        "an amount from the body needs a JSON body contract on the caller's request",
+                    );
+                };
+                let member = schema
+                    .member(pointer)
+                    .filter(|m| !m.optional && m.set.is_none());
+                let ruled = member.is_some_and(|m| match format {
+                    AmountFormat::Minor => {
+                        let most = match m.kind {
+                            Some(JsonType::Number) => MAX_JSON_NUMBER_AMOUNT.to_string(),
+                            _ => limit.clone(),
+                        };
+                        matches!(m.kind, Some(JsonType::Number | JsonType::String))
+                            && m.min.as_deref().is_some_and(|v| bounded(Some(v), Some(v)))
+                            && m.max.as_deref().is_some_and(|v| {
+                                bounded(Some(v), Some(v))
+                                    && contract::compare_decimal(v, &most)
+                                        != core::cmp::Ordering::Greater
+                            })
+                    }
+                    AmountFormat::Decimal => {
+                        m.kind == Some(JsonType::String) && m.allowed().is_any()
+                    }
+                });
+                ensure(
+                    ruled,
+                    || at.clone(),
+                    "the amount is a required member of the JSON body contract: of minor units, a number (at most 2^53 - 1) or string with min (at least 0) and max (at most 10^18); as a decimal, a string with no other rule",
+                )?;
+                let currency = |p: &str| {
+                    schema.member(p).is_some_and(|m| {
+                        !m.optional && m.equals.as_deref() == Some(payment.currency.as_str())
+                    })
+                };
+                let mentions: Vec<&str> = schema
+                    .members
+                    .iter()
+                    .map(|m| m.pointer.as_str())
+                    .filter(|p| p.to_ascii_lowercase().contains("currency"))
+                    .collect();
+                self.check_body_currency(&at, currency_at.as_deref(), &mentions, currency)?;
+                // No member the caller fills freely with structure: the amount read is then
+                // the only one the body can carry.
+                ensure(
+                    !schema.members.iter().any(Member::is_open),
+                    || at.clone(),
+                    "a body that pays declares every member with a type or a rule, so it carries no amount but the one the node reads",
+                )
+            }
+            AmountSource::Form {
+                name,
+                format,
+                currency_at,
+            } => {
+                let Some(BodyContract::Form(form)) = body else {
+                    return fail(
+                        at,
+                        "an amount from a form field needs a form body contract on the caller's request",
+                    );
+                };
+                let field = form.fields.iter().find(|f| f.name == *name && f.required);
+                let ruled = field.is_some_and(|f| match format {
+                    AmountFormat::Minor => bounded(f.min.as_deref(), f.max.as_deref()),
+                    AmountFormat::Decimal => f.allowed().is_any(),
+                });
+                ensure(
+                    ruled,
+                    || at.clone(),
+                    "the amount is a required field of the form body contract: of minor units with min (at least 0) and max (at most 10^18), or as a decimal with no other rule",
+                )?;
+                let currency = |n: &str| {
+                    form.fields.iter().any(|f| {
+                        f.name == n
+                            && f.required
+                            && f.equals.as_deref() == Some(payment.currency.as_str())
+                    })
+                };
+                let mentions: Vec<&str> = form
+                    .fields
+                    .iter()
+                    .map(|f| f.name.as_str())
+                    .filter(|n| n.to_ascii_lowercase().contains("currency"))
+                    .collect();
+                self.check_body_currency(&at, currency_at.as_deref(), &mentions, currency)
+            }
             AmountSource::Query { name } => {
                 let ruled = operation.caller_sends().any(|(contract, _)| {
                     contract.query.iter().any(|q| {
@@ -2615,8 +2768,20 @@ impl Policy {
                 });
                 ensure(
                     operation.connection() == Some(Connection::Https) && ruled,
-                    || at,
+                    || at.clone(),
                     "the amount is a required query parameter of the caller's request with min (at least 0) and max (at most 10^18)",
+                )?;
+                let unfixed = operation.caller_sends().any(|(contract, _)| {
+                    contract.query.iter().any(|q| {
+                        q.name.to_ascii_lowercase().contains("currency")
+                            && !(q.required
+                                && q.equals.as_deref() == Some(payment.currency.as_str()))
+                    })
+                });
+                ensure(
+                    !unfixed,
+                    || at.clone(),
+                    "a query parameter named for a currency is required and equals the payment's currency",
                 )
             }
             AmountSource::Input { pointer } => {
@@ -2642,6 +2807,22 @@ impl Policy {
                 "a fixed amount is a decimal integer from 0 to 10^18",
             ),
         }
+    }
+
+    /// The currency a paying body carries is the payment's: the member or field `currency_at`
+    /// names, and every one whose name holds `currency`, is fixed to it by the contract.
+    fn check_body_currency(
+        &self,
+        at: &str,
+        currency_at: Option<&str>,
+        mentions: &[&str],
+        fixed: impl Fn(&str) -> bool,
+    ) -> Checked {
+        ensure(
+            currency_at.is_none_or(&fixed) && mentions.iter().all(|m| fixed(m)),
+            || at.to_string(),
+            "the currency in a paying body (currency_at, and every member or field named for a currency) is required and equals the payment's currency",
+        )
     }
 
     fn check_sessions(&self) -> Checked {
@@ -2900,6 +3081,13 @@ fn summarize_send(send: &Send, out: &mut Vec<String>) {
             if c.query.iter().any(|q| q.allowed().is_any()) {
                 out.push("  ! some query parameters take any value".into());
             }
+            if let Some(body) = &c.body {
+                out.push(format!(
+                    "  the caller's body, checked and sent as {}: {}",
+                    body.content_type(),
+                    describe_body(body)
+                ));
+            }
         }
         None if send.fill.is_some() => {
             if let Some(fill) = &send.fill {
@@ -2918,6 +3106,34 @@ fn summarize_send(send: &Send, out: &mut Vec<String>) {
     }
     if send.grpc {
         out.push("  (a unary gRPC call over HTTP/2)".into());
+    }
+}
+
+/// A body contract in words, for a summary.
+pub(crate) fn describe_body(body: &BodyContract) -> String {
+    match body {
+        BodyContract::Json(json) => Input::Json(json.clone()).describe(),
+        BodyContract::Form(form) => format!(
+            "form with {}",
+            form.fields
+                .iter()
+                .map(|f| format!(
+                    "{}{} {}",
+                    f.name,
+                    if f.required { " (required)" } else { "" },
+                    f.allowed().describe()
+                ))
+                .collect::<Vec<_>>()
+                .join("; ")
+        ),
+    }
+}
+
+/// How a body amount is written, in words.
+fn amount_format(format: AmountFormat) -> &'static str {
+    match format {
+        AmountFormat::Minor => " (in minor units)",
+        AmountFormat::Decimal => " (a decimal of major units)",
     }
 }
 
@@ -3004,6 +3220,30 @@ fn summarize_operation(operation: &Operation, out: &mut Vec<String>) {
             match &payment.amount {
                 AmountSource::Query { name } => format!("the query parameter {name}"),
                 AmountSource::Input { pointer } => format!("the input member {pointer}"),
+                AmountSource::Body {
+                    pointer,
+                    format,
+                    currency_at,
+                } => format!(
+                    "the body member {pointer}{}{}",
+                    amount_format(*format),
+                    currency_at
+                        .as_deref()
+                        .map(|c| format!(", the currency fixed at {c}"))
+                        .unwrap_or_default()
+                ),
+                AmountSource::Form {
+                    name,
+                    format,
+                    currency_at,
+                } => format!(
+                    "the form field {name}{}{}",
+                    amount_format(*format),
+                    currency_at
+                        .as_deref()
+                        .map(|c| format!(", the currency fixed in {c}"))
+                        .unwrap_or_default()
+                ),
                 AmountSource::Fixed { value } => format!("the policy: {value}"),
             }
         ));
