@@ -1388,11 +1388,14 @@ impl<S: LogSink, C: Clock> Node<S, C> {
             }
             (None, _) => None,
         };
+        // The request the node sends when it is not the caller's as given: a body the body
+        // contract checked and wrote again.
+        let mut written: Option<Request> = None;
         match payload {
             Payload::Describe | Payload::Resume(_) => return Err(operation.unknown()),
             Payload::Http(request) | Payload::Socket(request) => {
                 match (request, operation.takes_request()) {
-                    (Some(request), true) => request.validate(operation)?,
+                    (Some(request), true) => written = request.checked(operation, now)?,
                     (None, false) => {}
                     (Some(_), false) => {
                         return Err(Error::RequestInvalid {
@@ -1427,6 +1430,13 @@ impl<S: LogSink, C: Clock> Node<S, C> {
                 };
             }
         }
+        // From here on every step, the payment's amount and a parked operation read the
+        // request as the node sends it.
+        let payload = match (payload, written.as_ref()) {
+            (Payload::Http(_), Some(request)) => Payload::Http(Some(request)),
+            (Payload::Socket(_), Some(request)) => Payload::Socket(Some(request)),
+            (payload, _) => payload,
+        };
         let user_key = checked.keys;
         let fields = self.open(record, &user_key)?;
         let mut run = Run {
@@ -1505,9 +1515,12 @@ impl<S: LogSink, C: Clock> Node<S, C> {
             Payload::Stream {
                 destination,
                 exchanges,
-            } => self
-                .run_tls(run, &payload, destination, exchanges, transport, updated)
-                .map(Output::Stream),
+            } => match self.run_tls(run, &payload, destination, exchanges, transport, updated)? {
+                Flow::Done(output) => Ok(Output::Stream(output)),
+                Flow::Park(at) => self
+                    .park_challenge(run, at, payload, input, updated)
+                    .map(Output::Pending),
+            },
             Payload::Derive(given) => match self.run_local(run, given, input)? {
                 Flow::Done(output) => Ok(Output::Derive(output)),
                 Flow::Park(at) => self
@@ -1915,10 +1928,24 @@ impl<S: LogSink, C: Clock> Node<S, C> {
         exchanges: &[CallerExchange],
         transport: &mut T,
         updated: &mut Option<Record>,
-    ) -> Result<StreamOutput> {
+    ) -> Result<Flow<StreamOutput>> {
         let operation = run.operation;
         let open = operation.open().ok_or_else(|| operation.unknown())?;
         let (now, who) = (run.now, run.who);
+        // The awaits directly after `open` (the only place a TLS operation may wait) run
+        // before anything is logged, rendered or connected: nothing reaches the site and no
+        // connection is held while the operation waits.
+        let waits_at = operation
+            .steps
+            .iter()
+            .enumerate()
+            .skip(1)
+            .take_while(|(_, step)| matches!(step, Step::Await(_)))
+            .map(|(i, _)| i)
+            .find(|i| *i >= run.start);
+        if let Some(at) = waits_at {
+            return Ok(Flow::Park(at));
+        }
         let client = render_identity(
             open.identity.as_ref(),
             &run.fields,
@@ -1954,7 +1981,8 @@ impl<S: LogSink, C: Clock> Node<S, C> {
         let mut steps_result = Ok(());
         for step in &operation.steps {
             let result = match step {
-                Step::Open(_) | Step::Return(_) => Ok(()),
+                // The awaits ran before the connection opened.
+                Step::Open(_) | Step::Return(_) | Step::Await(_) => Ok(()),
                 Step::Send(send) => run.stream_send(send, &destination.host, &mut *stream),
                 Step::Receive(receive) => {
                     let delimiters: Vec<&[u8]> =
@@ -1971,9 +1999,7 @@ impl<S: LogSink, C: Clock> Node<S, C> {
                         })
                 }
                 Step::Compute(compute) => run.compute(compute, compute_vars(now)),
-                Step::Run(_) | Step::Repeat(_) | Step::If(_) | Step::Await(_) => {
-                    Err(operation.unknown())
-                }
+                Step::Run(_) | Step::Repeat(_) | Step::If(_) => Err(operation.unknown()),
             };
             if let Err(error) = result {
                 steps_result = Err(error);
@@ -2032,7 +2058,7 @@ impl<S: LogSink, C: Clock> Node<S, C> {
         }
         let _ = stream.close();
         self.done(now, who, seq, None, output.error.is_none());
-        Ok(output)
+        Ok(Flow::Done(output))
     }
 
     /// Runs an operation with no connection: its `compute` steps, then the template of its

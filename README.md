@@ -280,7 +280,10 @@ answers: a one-time code signed and sealed to the node (`answer_challenge`), nev
 the caller, or an approval in another app that the node polls the site for. Every use of a
 card, an operation the owner marks, and a payment above the owner's spending limits (per
 item, merchant, day and 30 days, signed by the device) wait for an approval of a summary the
-node builds from what it checked: merchant, amount, currency and the masked card. Sessions
+node builds from what it checked: merchant, amount, currency and the masked card. An amount
+in the caller's body is read under a body contract (JSON or form): the node writes the body
+again and reads the amount from the bytes it sends, so the amount counted is the amount
+sent. A TLS operation waits only before it connects. Sessions
 the node obtains carry an expiry and are renewed by a login operation of the policy, or by the
 owner. The caller resumes with the id it was given, and only that caller can.
 

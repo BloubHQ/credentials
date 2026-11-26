@@ -34,10 +34,10 @@
 
 use crate::keys::CallerPublicKey;
 use crate::policy::{
-    Await, BodyProjection, Caller, CallerRequest, Capture, Challenge, ChallengeKind, Compute,
-    Connection, Destination, FieldSpec, Identity, Injection, Input, Limit, Method, Open, Operation,
-    Payment, Policy, Poll, Projection, QueryRule, Receive, Relay, Return, Send, Source, Step,
-    StepRequest, Store, Target,
+    Await, BodyContract, BodyProjection, Caller, CallerRequest, Capture, Challenge, ChallengeKind,
+    Compute, Connection, Destination, FieldSpec, Identity, Injection, Input, Limit, Method, Open,
+    Operation, Payment, Policy, Poll, Projection, QueryRule, Receive, Relay, Return, Send, Source,
+    Step, StepRequest, Store, Target,
 };
 
 impl Policy {
@@ -235,6 +235,13 @@ impl CallerRequest {
     #[must_use]
     pub fn override_params(mut self, allow: bool) -> Self {
         self.override_params = allow;
+        self
+    }
+
+    /// Checks the caller's body against `body`; the node sends the body it wrote again.
+    #[must_use]
+    pub fn body(mut self, body: BodyContract) -> Self {
+        self.body = Some(body);
         self
     }
 }

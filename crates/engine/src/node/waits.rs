@@ -12,7 +12,7 @@ use crate::item::Origin;
 use crate::limits::{LimitRule, Spend, SpendingLimits, StateKey, Verdict, decimal, from_minor};
 use crate::log::LogSink;
 use crate::policy::{
-    AmountSource, Destination, MAX_AMOUNT, Operation, Payment, Renew, parse_query,
+    AmountSource, Destination, MAX_AMOUNT, Operation, Payment, Renew, parse_query, read_amount,
 };
 use crate::request::{Outbound, Request};
 use crate::session::{Pending, SealedAnswer};
@@ -35,11 +35,16 @@ fn given_of(payload: Payload<'_>, input: &[u8]) -> Given {
             given: given.to_vec(),
             input: input.to_vec(),
         },
-        Payload::Stream { .. }
-        | Payload::Describe
-        | Payload::Resume(_)
-        | Payload::Socket(_)
-        | Payload::Session { .. } => Given::Http(None),
+        Payload::Stream {
+            destination,
+            exchanges,
+        } => Given::Stream {
+            destination: destination.clone(),
+            exchanges: exchanges.to_vec(),
+        },
+        Payload::Describe | Payload::Resume(_) | Payload::Socket(_) | Payload::Session { .. } => {
+            Given::Http(None)
+        }
     }
 }
 
@@ -69,6 +74,7 @@ fn first_page(operation: &Operation) -> Option<Destination> {
 /// The amount of a payment, read only from what the node checked against the contract: a
 /// query parameter of the caller's request or a member of the checked input, or the policy.
 fn spend_of(
+    operation: &Operation,
     payment: &Payment,
     request: Option<&Request>,
     input: &[u8],
@@ -88,6 +94,13 @@ fn spend_of(
         AmountSource::Query { name } => {
             let request = request.ok_or_else(missing)?;
             let query = request.path.split_once('?').map_or("", |(_, q)| q);
+            // Some servers also split a query at `;`: `amount=1&note=x;amount=9` would carry
+            // a second amount past the one counted.
+            if query.contains(';') {
+                return Err(Error::RequestInvalid {
+                    rule: "a query that carries the amount of a payment holds no ; (write %3B)",
+                });
+            }
             let params = parse_query(query).map_err(|_| missing())?;
             let mut found = params.iter().filter(|p| p.name == name.as_bytes());
             let param = found.next().ok_or_else(missing)?;
@@ -102,6 +115,38 @@ fn spend_of(
                 .pointer(pointer)
                 .and_then(serde_json::Value::as_u64)
                 .ok_or_else(missing)?
+        }
+        // The body the contract checked and wrote again is the one the node sends: the amount
+        // is read from those bytes, by the parser that wrote them.
+        AmountSource::Body {
+            pointer: at,
+            format,
+            currency_at,
+        }
+        | AmountSource::Form {
+            name: at,
+            format,
+            currency_at,
+        } => {
+            let request = request.ok_or_else(missing)?;
+            let contract = operation
+                .caller_sends()
+                .find_map(|(contract, _)| contract.body.as_ref())
+                .ok_or_else(missing)?;
+            if let Some(currency_at) = currency_at {
+                let (currency, _) = contract
+                    .scalar(&request.body, currency_at)
+                    .ok_or_else(missing)?;
+                if currency != payment.currency {
+                    return Err(Error::RequestInvalid {
+                        rule: "the currency in the body is not the payment's",
+                    });
+                }
+            }
+            let (text, number) = contract.scalar(&request.body, at).ok_or_else(missing)?;
+            read_amount(&text, number, *format, payment.exponent).ok_or(Error::RequestInvalid {
+                rule: "the amount in the body is not an amount in the form the policy names",
+            })?
         }
     };
     if minor > MAX_AMOUNT {
@@ -224,7 +269,7 @@ impl<S: LogSink, C: Clock> Node<S, C> {
                         }
                         .text()
                     });
-                Some(spend_of(payment, request, input, merchant)?)
+                Some(spend_of(operation, payment, request, input, merchant)?)
             }
         };
         if let Some(spend) = &spend {
@@ -545,6 +590,16 @@ impl<S: LogSink, C: Clock> Node<S, C> {
         let (payload, input) = match &given {
             Given::Http(request) => (Payload::Http(request.as_ref()), &[][..]),
             Given::Derive { given, input } => (Payload::Derive(given), input.as_slice()),
+            Given::Stream {
+                destination,
+                exchanges,
+            } => (
+                Payload::Stream {
+                    destination,
+                    exchanges,
+                },
+                &[][..],
+            ),
         };
         self.proceed(&mut run, payload, input, transport, updated)
     }

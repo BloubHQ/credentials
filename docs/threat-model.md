@@ -132,6 +132,9 @@ What the engine protects, against whom, under which assumptions, and what is lef
 | Approval replayed for a different amount, or for another use | The summary holds the amount and currency the node read from the contract-checked request or input; an approval of another summary, an id already spent, or a summary edited on the way is refused | `node`, `approval` |
 | Caller splits a payment to stay under a limit | Every payment within the limits is counted under the same lock as the check, over rolling 24-hour and 30-day windows; payments no rule covers, or above one, wait for approval; limits and counts survive a restart through sealed log entries | `limits`, `node` |
 | Caller writes the amount, currency or merchant of a summary | The currency is fixed by the policy, the amount is a decimal integer from a required, bounded query parameter or JSON member the contract checked (or the policy), the merchant is the origin of the destination the node sends to; summary lines are written by the node | `policy`, `node` |
+| Caller makes the site charge another amount than the one counted (duplicate keys `{"amount":1,"amount":9999}`, `amount`, `1e3`, `007`, `12.5`, numbers past 2^53, a second amount after `;` or in a free field, a JSON body sent as a form) | A body under a body contract is parsed once, duplicates refused, written again by the node (JSON compact; every form byte but the unreserved ones percent-encoded) and sent with the contract's content type, which neither the caller nor an injection may set; the amount is read from those bytes by the same parser, in canonical form only, at most 2^53 − 1 as a JSON number; a paying body has no member the caller fills freely, a query that carries an amount holds no `;`, and an operation that pays from the caller's request sends it once (tested: every form refused before anything is sent, and the amount another parser reads on the wire equals the one counted and shown) | `policy::contract`, `policy::wait`, `node` |
+| Caller pays in another currency than the limits count | A member, field or query parameter named for a currency, and the one `currency_at` names, must be required and equal the payment's currency, or the policy is refused; the node reads the currency again from the body it sends | `policy`, `node` |
+| A TLS operation that waits holds a connection, or replays a login on resume | `await` on TLS is accepted only directly after `open`; the node connects, renders and logs the stream only after the last of those awaits is answered; an `await` after a step that touches the connection is refused when signing; the caller's exchanges are kept with the waiting operation and run as signed (tested: no connection opened before the code, a resume by another caller or after a restart gets `parked_unknown`) | `policy`, `node` |
 | Another caller, or another owner's caller, resumes a waiting operation | The node resumes an id only for a signed call of the same caller name, record (the whole record) and operation; anything else gets `parked_unknown`, the answer for an id nobody parked | `node` |
 | Parked values leak (temporaries, the code, opened fields) | Kept in the node's memory only, never logged or returned; the pending reply holds the id, kind, hint and node-built summary; captured secrets and codes are redacted from responses and checked for; dropped on lapse (at most five minutes), revoke and restart | `node`, `session` |
 | Flood of waiting operations exhausts the node | At most 8 per owner, 256 in all and 128 MiB of values; an operation that may wait is refused before it sends anything when there is no room | `node` |
@@ -328,9 +331,19 @@ These remain by design; each is listed in the README.
 - **Payments counted early.** A payment within the limits is counted when the node decides
   to send it, also when the request then fails; an approved payment is counted when the
   operation goes on. This errs toward waiting for approval sooner.
-- **Amounts the contract cannot see.** A payment whose amount is only in a request body (no
-  body contract yet) cannot declare `payment`; such an operation should require approval
-  (`"approval": true`).
+- **Amounts the contract cannot see.** A payment whose amount is in a multipart or XML body,
+  or in a JSON or form body without a body contract, cannot declare `payment`; such an
+  operation should require approval (`"approval": true`). With a body contract the node
+  sends the body it wrote again and reads the amount from those bytes; what the site does
+  with a valid body (a currency field it ignores, a default it applies to a missing member)
+  is the site's, and the policy's members name what it reads.
+- **A site that reads JSON numbers loosely.** A JSON number amount is at most 2^53 − 1 and
+  never a decimal, so a server that reads doubles reads it exactly; a server that truncates
+  or rounds integers some other way is out of the node's reach.
+- **TLS operations that wait.** A TLS operation waits for a code only before it connects, so
+  a site that asks for the code after the password (on the same connection) cannot be served
+  by `await`; the more secure choice was taken over holding the connection or replaying the
+  login on a new one.
 - **Availability.** The operator can always stop the node or the log; the engine fails closed.
 - **Continuity rests on the release workflow and Sigstore.** Whoever can run the release
   workflow of this repository at a new tag (a maintainer, or anyone who takes over the
