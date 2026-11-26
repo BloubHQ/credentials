@@ -72,6 +72,23 @@ before 1.0, minor versions may break formats and APIs.
 
 ### Added
 
+- DTLS 1.2 and 1.3 (RFC 6347, RFC 9147) as the `dtls` connection (`docs/policy.md`, DTLS;
+  `docs/design.md` section 7b): `send` writes one record of 1 to 16,384 bytes, `receive`
+  reads one, over the datagram path of `udp` (a connected UDP socket, or the enclave's
+  datagram relay, `udp/host:port` in `--allow`). Nothing is written before the handshake is
+  complete and the server's certificate passes the verifier of a `tls` connection (WebPKI
+  chain to the transport's roots, validity, host name); `open.pins` (at most 16,
+  `sha256/` and the base64 of the SHA-256 of the `SubjectPublicKeyInfo`) also requires one
+  of those keys, and lets a self-signed certificate with a pinned key through. Sends may
+  hold secrets (encrypted, unlike `udp`); no client certificate, no PSK suite, no
+  `tls_exporter`. The caller's exchanges are at most 64 records with no delimiters, read
+  through the delimiter-safe reader and the stream search. A new pin, or dropping all pins,
+  widens a policy in its diff. The schema has `dtls` and `pins`; `Transport::open_dtls`
+  (default: refused); `transport::dtls` with `DtlsStream`, `Trust` and a `dimpl` crypto
+  provider on ring and rustls-webpki; the `dtls_client` fuzz target.
+- New dependency `dimpl` 0.8.0 (MIT OR Apache-2.0, `forbid(unsafe_code)`), built with no
+  crypto backend (DEPS_PLACEHOLDER).
+
 - Typed browser fills and the agent's controller kept out of a fill (`docs/policy.md`,
   Browser fills and Typed browser fills; `docs/design.md` section 6, part 8):
   - `open.browser` on a `browser` connection: `exclusive` (`header`, `value`) names the

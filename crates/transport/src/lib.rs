@@ -25,6 +25,7 @@
 //! of [`hpack`]: it reads the request the engine built in HTTP/1.1 form and hands the
 //! response back in that form, checked, so one parser of the engine reads both versions.
 
+pub mod dtls;
 pub mod h2;
 pub mod hpack;
 pub mod udp;
@@ -308,8 +309,8 @@ impl TlsTransport {
         self.connector(TcpConnector::with_resolver(resolve))
     }
 
-    /// Replaces what opens the datagram sockets of `udp` operations ([`udp::UdpConnector`] by
-    /// default; in an enclave, the relay's).
+    /// Replaces what opens the datagram sockets of `udp` and `dtls` operations
+    /// ([`udp::UdpConnector`] by default; in an enclave, the relay's).
     pub fn datagrams(mut self, connector: impl udp::DatagramConnector + 'static) -> Self {
         self.datagrams = Box::new(connector);
         self
@@ -698,6 +699,26 @@ impl Transport for TlsTransport {
             self.io_timeout.min(udp::READ_WAIT),
             deadline,
         )))
+    }
+
+    fn open_dtls(
+        &mut self,
+        destination: &Destination,
+        pins: &[[u8; 32]],
+    ) -> Result<Box<dyn Stream + '_>> {
+        let deadline = Instant::now() + self.total_timeout;
+        // The name is checked before anything is opened.
+        ServerName::try_from(destination.host.clone())
+            .map_err(|_| fault(TransportKind::Connect, false))?;
+        let socket = self
+            .datagrams
+            .open(&destination.host, destination.port, deadline)
+            .map_err(|e| fault(io_kind(&e), false))?;
+        let trust = dtls::Trust::new(self.roots.clone(), &destination.host, pins);
+        let stream =
+            dtls::DtlsStream::connect(socket, trust, self.io_timeout.min(udp::READ_WAIT), deadline)
+                .map_err(|e| e.into_engine(false))?;
+        Ok(Box::new(stream))
     }
 }
 

@@ -722,6 +722,11 @@ pub enum Connection {
     /// `receive` reads one. There is no TLS, so a send may not hold a secret in reversible
     /// form.
     Udp,
+    /// DTLS 1.2 or 1.3 (RFC 6347, RFC 9147) over UDP datagrams to one destination, for
+    /// request and response protocols over DTLS (CoAP, LwM2M): the server's certificate is
+    /// checked as for `tls` (and against `pins` when the policy gives them) before anything
+    /// is sent; then `send` writes one record and `receive` reads one.
+    Dtls,
     /// A browser, over the Chrome DevTools Protocol: a WebSocket to the CDP endpoint the
     /// policy fixes. The first `send` is the handshake, as for a WebSocket; each later one is
     /// a [`Fill`] the node runs itself. Nothing of the page goes back but the outcome and the
@@ -755,6 +760,11 @@ pub struct Open {
     /// The SSH host keys the server must prove it holds one of (`type base64`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub host_keys: Vec<String>,
+    /// The keys a DTLS server's certificate must hold one of, each `sha256/` and the
+    /// base64 of the SHA-256 of its DER `SubjectPublicKeyInfo`. A self-signed certificate is
+    /// accepted only with a pinned key.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pins: Vec<String>,
     /// How SMTP and IMAP reach TLS (implicit by default).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tls: Option<TlsMode>,
@@ -1388,6 +1398,49 @@ fn check_destinations(at: &str, destinations: &[Destination]) -> Checked {
     Ok(())
 }
 
+/// Most certificate pins of one `dtls` operation.
+pub const MAX_CERTIFICATE_PINS: usize = 16;
+
+/// The SHA-256 of a `SubjectPublicKeyInfo` that a pin names: `sha256/` and the standard,
+/// padded base64 of 32 bytes, in its one canonical spelling. `None` for anything else.
+pub fn parse_pin(pin: &str) -> Option<[u8; 32]> {
+    use base64::Engine as _;
+    let encoded = pin.strip_prefix("sha256/")?;
+    if encoded.len() != 44 {
+        return None;
+    }
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .ok()?;
+    let hash: [u8; 32] = bytes.try_into().ok()?;
+    (base64::engine::general_purpose::STANDARD.encode(hash) == encoded).then_some(hash)
+}
+
+/// Pins are for a `dtls` connection: at most 16, each a [`parse_pin`] and none twice.
+fn check_pins(at: &str, open: &Open) -> Checked {
+    if open.pins.is_empty() {
+        return Ok(());
+    }
+    ensure(
+        open.connection == Connection::Dtls,
+        || format!("{at}.pins"),
+        "pins are for a DTLS connection",
+    )?;
+    ensure(
+        open.pins.len() <= MAX_CERTIFICATE_PINS,
+        || format!("{at}.pins"),
+        "1 to 16 pins",
+    )?;
+    for (i, pin) in open.pins.iter().enumerate() {
+        ensure(
+            parse_pin(pin).is_some() && !open.pins.iter().take(i).any(|p| p == pin),
+            || format!("{at}.pins[{i}]"),
+            "a pin is sha256/ and the base64 of 32 bytes, each once",
+        )?;
+    }
+    Ok(())
+}
+
 /// A query name a policy may list: visible ASCII without the bytes that end it.
 fn is_query_name(name: &str) -> bool {
     !name.is_empty()
@@ -1958,7 +2011,7 @@ impl Policy {
                     self.check_proto_relay(at, kinds, c, relay, known)?;
                 }
             }
-            Some(Connection::Tls | Connection::Udp) => {
+            Some(Connection::Tls | Connection::Udp | Connection::Dtls) => {
                 ensure(
                     ret.response.is_none() && ret.template.is_none(),
                     || at.to_string(),
@@ -2123,6 +2176,15 @@ impl Policy {
                         || at.clone(),
                         "a UDP connection takes no identity, protocol or limits",
                     )?;
+                    ensure(
+                        open.connection != Connection::Dtls
+                            || (open.identity.is_none()
+                                && open.protocol.is_none()
+                                && open.limits.is_none()),
+                        || at.clone(),
+                        "a DTLS connection takes no identity, protocol or limits",
+                    )?;
+                    check_pins(&at, open)?;
                     ensure(
                         open.protocol.is_none() || open.connection == Connection::Https,
                         || format!("{at}.protocol"),
@@ -2306,6 +2368,29 @@ impl Policy {
                             "a UDP datagram is sent in clear: it may not depend on a guessable secret",
                         )?;
                     }
+                    Connection::Dtls => {
+                        ensure(
+                            send.request.is_none()
+                                && send.inject.is_empty()
+                                && !send.grpc
+                                && send.fill.is_none()
+                                && send.frame.is_none(),
+                            || at.clone(),
+                            "a DTLS send takes template only",
+                        )?;
+                        let Some(template) = &send.template else {
+                            return fail(at, "a DTLS send needs a template");
+                        };
+                        // A record is encrypted to the server whose certificate the
+                        // handshake checked, as a TLS write is; no exporter is offered.
+                        self.check_template(
+                            &format!("{at}.template"),
+                            &kinds,
+                            template,
+                            &known,
+                            Var::in_stream,
+                        )?;
+                    }
                 },
                 (Step::Receive(receive), Some(open)) => match open.connection {
                     Connection::Ssh
@@ -2353,6 +2438,14 @@ impl Policy {
                             receive.until.is_empty(),
                             || format!("{at}.until"),
                             "a UDP receive reads one datagram; until is for TLS streams",
+                        )?;
+                        self.check_captures(&at, &receive.capture, true, true, &mut known)?;
+                    }
+                    Connection::Dtls => {
+                        ensure(
+                            receive.until.is_empty(),
+                            || format!("{at}.until"),
+                            "a DTLS receive reads one record; until is for TLS streams",
                         )?;
                         self.check_captures(&at, &receive.capture, true, true, &mut known)?;
                     }
@@ -3197,6 +3290,7 @@ fn summarize_operation(operation: &Operation, out: &mut Vec<String>) {
                 Connection::Ftp => "FTP over TLS",
                 Connection::Pop3 => "POP3",
                 Connection::Udp => "UDP datagrams (no TLS)",
+                Connection::Dtls => "DTLS records over UDP",
             },
             destination_names(&open.destinations),
             if open.identity.is_some() {
@@ -3402,7 +3496,7 @@ fn summarize_steps(operation: &Operation, steps: &[Step], out: &mut Vec<String>)
                     }
                 }
                 (None, None, None) => out.push(match operation.connection() {
-                    Some(Connection::Tls | Connection::Udp) => {
+                    Some(Connection::Tls | Connection::Udp | Connection::Dtls) => {
                         "  return: no caller exchanges".into()
                     }
                     _ => "  return: status".into(),

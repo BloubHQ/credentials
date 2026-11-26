@@ -24,7 +24,7 @@ Policy
     ├── approval: true               optional: every use waits for the owner's approval
     ├── vend: lifetime_ms, expires   optional: hands back a credential minted from the secret, bounded
     └── steps:  [Step]               1–64
-        ├── open     connection: https | tls | websocket | udp | browser, destinations, identity
+        ├── open     connection: https | tls | websocket | udp | dtls | browser, destinations, identity
         ├── send     https: request (caller contract | fixed) + inject;  tls: template;  browser: fill
         ├── receive  https: the response of the send;  tls: until a delimiter;  + capture
         ├── compute  into a name, from a template
@@ -135,7 +135,7 @@ what its `send`, `receive` and `return` carry, and the template analysis stays t
 
 | Member | Meaning |
 | --- | --- |
-| `connection` | `https`, `tls`, `websocket` (always `wss`), or a [protocol connection](#protocol-connections): `ssh`, `postgres`, `smtp`, `imap`, `redis`; `udp` (see [UDP](#udp)); or `browser` (a CDP endpoint over `wss`; see [Browser fills](#browser-fills)). |
+| `connection` | `https`, `tls`, `websocket` (always `wss`), or a [protocol connection](#protocol-connections): `ssh`, `postgres`, `smtp`, `imap`, `redis`; `udp` (see [UDP](#udp)); `dtls` (see [DTLS](#dtls)); or `browser` (a CDP endpoint over `wss`; see [Browser fills](#browser-fills)). |
 | `destinations` | 1–32 hosts and ports. `*.example.com` matches exactly one label (`eu.example.com`, not `example.com` or `a.b.example.com`); `*.` must be followed by at least two labels, so `*.com` is refused. Hosts are lowercase labels of `a–z 0–9 -` (at most 253 bytes), and the port is not 0. The caller's request or stream names one of them. |
 | `identity` | Optional client certificate for mutual TLS: two templates, handed to the transport only. |
 | `protocol` | HTTPS only, optional: `h2` or `http1` pins the HTTP version. Without it the node offers both by ALPN and takes what the server picks. A pinned version the server does not agree to fails the call before the request is written (no downgrade). |
@@ -344,8 +344,50 @@ host that relays it. So:
   and its `until` is empty, the answer is one datagram, searched for reflected secrets like
   every read.
 
-The summary flags each `udp` operation with `plain_datagram`. DTLS is not offered
-(`docs/design.md`, section 7b).
+The summary flags each `udp` operation with `plain_datagram`. For a protocol that needs
+its messages encrypted, use [DTLS](#dtls).
+
+### DTLS
+
+`"connection": "dtls"` is DTLS 1.2 or 1.3 (RFC 6347, RFC 9147) over the datagram path of
+`udp` (the same connected socket, or in an enclave the same datagram relay, `udp/host:port`
+in `--allow`), for request and response protocols over DTLS (CoAP over DTLS, LwM2M). The
+node offers DTLS 1.3 and takes 1.2 when the server offers only that.
+
+```json
+{"do": "open", "connection": "dtls", "destinations": [{"host": "coap.example.com", "port": 5684}],
+ "pins": ["sha256/AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8="]}
+```
+
+- **The server is checked before anything is sent.** The handshake must complete and the
+  server's leaf certificate pass the verifier of a `tls` connection: a chain to the node's
+  roots, the validity period, the server-authentication usage, and the destination's host
+  name. With `pins` (at most 16, each `sha256/` and the standard base64 of the SHA-256 of
+  the certificate's DER `SubjectPublicKeyInfo`, as `openssl x509 -pubkey | openssl pkey
+  -pubin -outform der | openssl dgst -sha256 -binary | base64` prints it) the key must also
+  be one of them; a self-signed certificate is accepted only with a pinned key, as its own
+  root, and must still be valid and name the host. `pins` are for `dtls` only. The DTLS
+  library hands over the leaf only, not the intermediates the server sends: a certificate
+  must be issued by a root directly, or be pinned and self-signed; one under an
+  intermediate is refused.
+- Suites: ECDHE (X25519, P-256, P-384) with ECDSA and AES-GCM or ChaCha20-Poly1305 on 1.2,
+  `TLS_AES_128_GCM_SHA256`, `TLS_AES_256_GCM_SHA384` and `TLS_CHACHA20_POLY1305_SHA256` on
+  1.3; server signatures ECDSA P-256 with SHA-256 or P-384 with SHA-384. No PSK suite, no
+  RSA certificate, no client certificate (a server that asks for one fails the handshake),
+  no `tls_exporter`.
+- Each `send` writes its rendered template as one record (1 to 16,384 bytes), each `receive`
+  reads one (`until` is empty) and captures from it. A `send` may hold secrets, as a TLS
+  write may: the record is encrypted to the checked server.
+- `identity`, `protocol` and `limits` are refused on `dtls`.
+- The handshake takes at most 10 seconds, its flights resent on the timers of RFC 6347 and
+  RFC 9147; a receive waits at most 10 seconds and sends the last record again (as a new
+  record) after 1, 2 and 4 seconds without an answer. Records that fail authentication or
+  replay one already read are dropped; at most 64 records wait to be read.
+- The `return` takes `relay` only: each caller exchange is one record of 1 to 16,384 bytes
+  with an empty `until`, at most 64; the answer is one record, searched for reflected
+  secrets like every read (a hit ends the call with `reflection` and no read goes back).
+
+A new pin, or dropping every pin, widens the policy in its diff.
 
 ### HTTP versions and gRPC
 
