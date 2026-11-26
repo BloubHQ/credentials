@@ -72,6 +72,14 @@ impl Request {
     /// connection, and the method, path, path parameters, query, headers and body against the
     /// contract of every `send` that takes the caller's request.
     pub fn validate(&self, operation: &Operation) -> Result<()> {
+        self.checked(operation, 0).map(|_| ())
+    }
+
+    /// Checks the request like [`Request::validate`] and gives the request the node sends
+    /// when it differs: with a body contract, the body the contract wrote again (members the
+    /// node sets at `now_ms`) and the content type the contract names, first among the
+    /// headers.
+    pub fn checked(&self, operation: &Operation, now_ms: u64) -> Result<Option<Request>> {
         if !operation.takes_request() {
             return Err(invalid("the operation takes no request"));
         }
@@ -92,7 +100,25 @@ impl Request {
             });
             contract.check(self, &injected, &params)?;
         }
-        Ok(())
+        // Every send that takes the request declares the same body contract (checked when the
+        // policy is signed), so the body is checked and written once.
+        let body = operation
+            .caller_sends()
+            .find_map(|(contract, _)| contract.body.as_ref());
+        let Some(body) = body else {
+            return Ok(None);
+        };
+        let written = body.apply(&self.body, now_ms)?;
+        let mut headers = Vec::with_capacity(self.headers.len() + 1);
+        headers.push(("Content-Type".to_string(), body.content_type().to_string()));
+        headers.extend(self.headers.iter().cloned());
+        Ok(Some(Request {
+            method: self.method,
+            destination: self.destination.clone(),
+            path: self.path.clone(),
+            headers,
+            body: written,
+        }))
     }
 }
 

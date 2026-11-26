@@ -180,7 +180,13 @@ operations with no connection; parked operations in the node's memory (8 per own
 the device's sealed, signed answer. Where the design left a choice, the more secure one was
 taken:
 
-- `await` is refused on TLS: a parked operation would hold an open connection to the site.
+- `await` on TLS is accepted only directly after `open`, for a code: the node connects once
+  the code came, so no connection is held and nothing reaches the site while it waits. The
+  other option, closing the connection at the park and connecting again on resume with the
+  same signed steps, was not taken: it sends the steps before the `await` (a password) twice,
+  and a site that asks for a code mid-session tied it to the first connection, so it would
+  not even work. An `await` after any step that touches the connection stays refused, and so
+  does `await` on UDP, WebSocket and protocol connections.
 - A resume is accepted only from the caller that started the operation, on the same record
   and operation; every other case gets the same `parked_unknown` as an unknown id, so ids
   cannot be probed.
@@ -197,8 +203,12 @@ the node (merchant origin, amount, currency, item masked view), and the owner's 
 
 Done in part 5. The node asks before it sends anything (not between steps), so nothing
 reaches the site before the owner approved. Every use of a `card` waits, whatever the
-limits say. Amounts come only from a required, bounded query parameter or JSON input member
-(or the policy); a body contract is next. A payment within the owner's limits is counted
+limits say. Amounts come only from a required, bounded query parameter or JSON input member,
+a member or field of a body contract (JSON or form), or the policy. The node writes a body
+under a contract again and reads the amount from the bytes it sends, by the parser that
+wrote them, so the amount counted is the amount sent; the canonical spelling only, at most
+2^53 − 1 as a JSON number, the currency the policy's (`docs/policy.md`, Payments and
+spending limits). Multipart and XML bodies carry no amount the node reads. A payment within the owner's limits is counted
 when the node decides to send it, under the same lock as the check, even if the request then
 fails: counting early can only make the owner approve sooner, never let a split payment
 through.
@@ -776,7 +786,7 @@ As built (part 10):
 | 2 | Policy IR: one step language replacing `http`/`stream`/`derive`, with the contracts of section 2a, response projection and the path fixes; existing policies converted by a tool | 1 |
 | 3 | Typed items, disclosure levels, `describe`, custom kinds (done: `docs/policy.md`, Typed items) | 2 |
 | 4 | Policy JSON Schema, `client::summarize` with risk flags, approval format (done: `docs/policy.md`; the approval runtime is part 5) | 2, 3 |
-| 5 | Sessions, challenges, approvals, spending limits (done: `docs/policy.md`, Operations that wait; codes read from a `mail` item, `await` on TLS and amounts from body contracts are next) | 2 |
+| 5 | Sessions, challenges, approvals, spending limits (done: `docs/policy.md`, Operations that wait; amounts from body contracts and `await` on TLS before the connection opens done too; codes read from a `mail` item are next) | 2 |
 | 6 | Connection kinds in layer 1: HTTP/2, WebSocket, streamed responses (first half done: `docs/policy.md`, HTTP versions and gRPC, WebSocket; own synchronous HTTP/2 client and HPACK, one thread per open connection, the Nitro host relay unchanged), then SSH, databases, FTP, mail, queues (second half done but for the rows left in section 7c: SSH with SFTP and local forwarding, PostgreSQL, MySQL, SMTP, IMAP, Redis, MQTT 3.1.1 and 5, AMQP 0-9-1, and the `ssh` and `mail` typed kinds; then POP3, FTP over TLS and SFTP management; then SSH remote forwarding and AMQP 1.0; tunnels as an IR relay step next) | 2 |
 | 7 | Trusted code sandbox (layer 3): WebAssembly runtime, JavaScript module, origin-pinned site code (done: `run` step, `crates/sandbox`, wasmi 1.1.0 chosen by measurement; JavaScript measured with boa in the sandbox, its shipping plan in `docs/sandbox.md`) | 2 |
 | 8 | Browser fills over CDP (done: the `browser` connection and `fill`, `engine::cdp`, `docs/policy.md` Browser fills; tested against an in-process fake CDP endpoint, never a real browser; typed `card` and `login` items with browser operations, and detaching the agent's controller, are next) | 4, 5 |

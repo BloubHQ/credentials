@@ -138,6 +138,9 @@ pub struct RequestSummary {
     /// The destination of a fixed request, when it names one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub destination: Option<Place>,
+    /// The body contract of the caller's request, when it has one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body: Option<super::BodyContract>,
 }
 
 /// A `run` step: code that computes on secret values in the sandbox.
@@ -336,6 +339,9 @@ pub enum FlagCode {
     /// A loop sends requests again: one that is not idempotent can take effect more than
     /// once, up to the operation's most requests.
     Repeat,
+    /// The caller chooses the amount of a payment (in the query, the input or the body),
+    /// within the bounds of the contract; the owner's spending limits and approvals apply.
+    CallerAmount,
 }
 
 /// A risk flag.
@@ -646,6 +652,7 @@ fn request_summary(step: usize, send: &Send, connection: Connection) -> Option<R
             query: c.query.clone(),
             injects,
             destination: None,
+            body: c.body.clone(),
         }),
         StepRequest::Fixed {
             method,
@@ -660,6 +667,7 @@ fn request_summary(step: usize, send: &Send, connection: Connection) -> Option<R
             query: Vec::new(),
             injects,
             destination: destination.as_ref().map(|d| place(connection, d)),
+            body: None,
         }),
     }
 }
@@ -981,6 +989,23 @@ fn risk_flags(policy: &Policy, origin: Option<&Origin>, flags: &mut Vec<Flag>) {
     }
     for operation in &policy.operations {
         let at = format!("operation {}", operation.name);
+        let chosen = operation.payment.as_ref().and_then(|p| match &p.amount {
+            super::AmountSource::Query { name } => Some(format!("the query parameter {name}")),
+            super::AmountSource::Input { pointer } => Some(format!("the input member {pointer}")),
+            super::AmountSource::Body { pointer, .. } => Some(format!("the body member {pointer}")),
+            super::AmountSource::Form { name, .. } => Some(format!("the form field {name}")),
+            super::AmountSource::Fixed { .. } => None,
+        });
+        if let Some(source) = chosen {
+            flag(
+                flags,
+                FlagCode::CallerAmount,
+                &at,
+                format!(
+                    "the caller chooses the amount it pays, in {source}, within the contract's bounds"
+                ),
+            );
+        }
         if let Some(vend) = &operation.vend {
             flag(
                 flags,
@@ -1495,6 +1520,13 @@ fn diff_send(at: &str, a: &Send, b: &Send, wider: &mut Vec<String>) {
             }
             if y.override_params && !x.override_params {
                 wider.push(format!("{at}: the caller may now send method overrides"));
+            }
+            // A body contract added narrows what the caller sends; one removed or changed
+            // counts as wider (the diff does not rank schemas).
+            if x.body.is_some() && x.body != y.body {
+                wider.push(format!(
+                    "{at}: the body contract of the caller's request changed or was removed"
+                ));
             }
         }
         (x, y) if x != y => wider.push(format!("{at}: the request changed")),

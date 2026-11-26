@@ -117,8 +117,10 @@ Rules for every operation:
 - On HTTPS, a `receive` follows the `send` whose response it reads; at most 8 sends.
 - `compute` may appear anywhere after `open`.
 - `run` needs an HTTPS connection and may appear anywhere after `open`.
-- `await` may appear in an HTTPS operation or one with no connection, at most 4 times; not
-  on TLS or a WebSocket, whose connection would stay open while it waits.
+- `await` may appear in an HTTPS operation or one with no connection, at most 4 times; on
+  TLS only for a code and only directly after `open`, before any other step (the node
+  connects after it: see [`await`](#await)); not on UDP, a WebSocket or a protocol
+  connection, whose connection would stay open while it waits.
 - `run` and `await` are refused on a WebSocket and a browser; `receive` on a browser.
 - `repeat` and `if` hold `send`, `receive`, `compute` and nested loops or branches (2 deep),
   in an HTTPS operation or (only `if`) one with no connection (see
@@ -157,6 +159,7 @@ placeholder in it is a whole segment.
 | `query` | Query parameters the caller may send (none by default), at most 32. |
 | `encoded_percent` | `true` allows `%25` in the caller's path. Off by default (strict). |
 | `override_params` | `true` allows the method-override parameter names in the query and the body. Off by default. |
+| `body` | What the body may hold: `{"json": {"members": [...]}}` or `{"form": {"fields": [...]}}` (see [The body contract](#the-body-contract)). Without it any body of at most 8 MiB is sent as the caller wrote it. |
 
 A path template is segments separated by `/`:
 
@@ -209,6 +212,38 @@ The method-override names are `_method`, `__method`, `_httpmethod`,
 `Host`, `Content-Length`, `Transfer-Encoding`, `Connection`, `Upgrade`, `TE`, `Trailer`,
 `Expect`, `Accept-Encoding`, `Range`, `If-Range`, `Keep-Alive` or the method-override
 headers; the engine sends `Accept-Encoding: identity` and `Connection: close`.
+
+#### The body contract
+
+```json
+{"do": "send",
+ "request": {"from": "caller", "methods": ["POST"], "paths": ["/v1/charges"],
+             "body": {"json": {"members": [
+               {"pointer": "/amount", "type": "number", "min": "1", "max": "500000"},
+               {"pointer": "/currency", "equals": "EUR"},
+               {"pointer": "/description", "type": "string", "optional": true}]}}},
+ "inject": [{"target": {"kind": "header", "name": "Authorization"}, "template": "Bearer {{key}}"}]}
+```
+
+| `body` | The caller's body |
+| --- | --- |
+| `{"json": {"members": [...]}}` | A JSON value, checked like a [JSON input](#input-schemas): closed (a member that is not declared is refused), duplicate member names refused (also when one is written with escapes), the same member rules, `set` members written by the node. |
+| `{"form": {"fields": [...]}}` | `application/x-www-form-urlencoded`: 1 to 32 fields with the rules of [query parameters](#the-caller-contract) (`required`, `equals`, `one_of`, `pattern`, `min`, `max`). Every field the caller sends is listed, once (names compared in any case); empty fields and malformed escapes are refused; `+` reads as a space. |
+
+The node does not send the caller's bytes: it sends the body **it wrote again** from what it
+checked (JSON compact, numbers as written; every form byte but `A–Z a–z 0–9 - . _ ~`
+percent-encoded), with `Content-Type: application/json` or
+`application/x-www-form-urlencoded`. So a server reads the values the node checked, whatever
+its parser does with duplicates, `;`, `+` or whitespace, and a signature over `$body` covers
+those bytes. A body the contract checks is at most 1 MiB. When signing, a `send` with a body
+contract:
+
+- is an HTTPS request, not gRPC, and injects no body;
+- names `Content-Type` and `Content-Encoding` neither as a caller header nor as an injected
+  one (another content type would make the server read the body as another format: a JSON
+  body read as a form can hold any field);
+- shares it: every `send` of the operation that takes the caller's request declares the same
+  body contract, or none does.
 
 #### Injections
 
@@ -1034,6 +1069,31 @@ values of at most 256 bytes, exactly.
 | `poll` | `external` only, required. |
 | `timeout_ms` | How long the operation waits: 1000 to 300000 (the default, five minutes). |
 
+**On TLS** an operation waits only before its connection opens:
+
+```json
+{"name": "login",
+ "steps": [
+   {"do": "open", "connection": "tls", "destinations": [{"host": "mail.example.com", "port": 993}]},
+   {"do": "await", "challenge": {"kind": "app", "hint": "The code of your authenticator", "into": "otp"}},
+   {"do": "send", "template": "a1 LOGIN alice {{password}}{{otp}}\r\n"},
+   {"do": "receive", "until": ["\r\n"]},
+   {"do": "return", "relay": {"sends": ["a[0-9]{1,4} NOOP\\r\\n"]}}
+ ]}
+```
+
+The `await` steps of a TLS operation come directly after `open`, before any other step, and
+wait for a code (`external` polls over HTTPS and is refused). The node connects only once the
+last of them is answered: until then nothing is logged as a stream, no template is rendered,
+no client certificate is read and no connection is open. The caller's exchanges are checked
+against the relay when it calls; the node keeps them with the waiting operation and runs
+them, as signed, after the steps once it goes on (a resume carries none). An `await` after
+anything that touches the connection is refused when the policy is signed: the operation
+would hold an open connection while it waits, and closing it and connecting again on resume
+would send the steps before the `await` (the password) a second time, to a server whose
+challenge was for the first connection. An operation that needs the owner's approval
+(`"approval": true`) waits before it connects too, on TLS as on HTTPS.
+
 ### `return`
 
 #### HTTPS: the response projection
@@ -1254,6 +1314,9 @@ one that gives the caller less:
 | Old prefixes convert to templates that match the same paths (`/v1/` → `/v1/**`; `/v1` → `/v1` and `/v1/**`; `/` → `/**`). | The conversion neither widens nor silently narrows paths. |
 | A stream relays nothing until `relay` lists the sends, and a send must match a pattern whole. | After the login, a caller's command runs under the owner's session. |
 | An operation that reads `$input` must declare `input`; JSON and RLP schemas are closed; duplicate JSON keys are refused; the checked JSON is written back. | A key signs what the owner bounded, not what a parser disagreement lets through. |
+| A body under a body contract is written again by the node and sent with the contract's content type; the amount of a payment is read from those bytes. | Two parsers that disagree on duplicates, separators or number forms cannot make the server charge another amount than the one counted. |
+| An amount is a canonical decimal, at most 2^53 − 1 as a JSON number, and a decimal amount is never a JSON number. | A server that reads JSON numbers as doubles rounds bigger integers and fractions. |
+| On TLS, `await` only before the connection opens; never after a step that touches it. | A parked operation holds no connection, and resuming never replays a login to a server whose challenge was for another connection. |
 | One `open` per operation, first; an HTTPS `receive` directly follows its `send`. | Every response read is the one of the request before it, and every step runs on the connection the log names. |
 | A loop or branch tests only a value no secret influences, a MAC or length of a secret and an authenticated answer included (its status excepted). | Which body runs is seen in the requests, the log and the timing; a test that is not tainted can still tell a bit of a secret. |
 | `await` and `run` are refused inside a loop or branch; a loop is capped at 8 runs and counts against the 8 requests of an operation; an operation that pays has no loop or branch. | A parked operation resumes at a top-level step; a module fetch and its confinement stay straight-line; a payment request goes out once. |
@@ -1444,7 +1507,8 @@ crate, which checks the policy first) gives the owner, in JSON:
 | `frame_origin` | A fill puts values into a frame of another origin than the page's. |
 | `vend` | An operation hands back a credential minted from the secret ([Vending](#vending)): the caller holds it until it expires. |
 | `repeat` | A loop sends requests again, up to the operation's `most_requests`: a request that is not idempotent can take effect more than once. |
-| `wider` | Against `previous`: a new destination, method, path, header, query rule, injection, operation, caller or caller key; more of the response; a looser limit; a new sign-in, host key, TLS mode, command or mail rule; a browser fill changed; a field made public or not guessable; a payment changed or an approval dropped; a session rule changed; a vended lifetime made longer or its expiry read elsewhere; open limits or a protocol changed; the item unbound or its pins and sign-offs changed; a loop that may run more times, the test of a loop or branch changed, a body that gains a step, or more requests in one use. |
+| `caller_amount` | The caller chooses the amount of a payment (a query parameter, an input member, a body member or a form field), within the contract's bounds; the spending limits and approvals apply. |
+| `wider` | Against `previous`: a new destination, method, path, header, query rule, injection, operation, caller or caller key; a body contract changed or removed (one added narrows); more of the response; a looser limit; a new sign-in, host key, TLS mode, command or mail rule; a browser fill changed; a field made public or not guessable; a payment changed or an approval dropped; a session rule changed; a vended lifetime made longer or its expiry read elsewhere; open limits or a protocol changed; the item unbound or its pins and sign-offs changed; a loop that may run more times, the test of a loop or branch changed, a body that gains a step, or more requests in one use. |
 | `new_destination` | Against `previous`: a destination it did not have. |
 
 What changed without widening (an operation or a caller removed) is listed in `changes`.
@@ -1546,10 +1610,31 @@ fixes). The amount comes only from a value the contract checked:
 | --- | --- |
 | `{"from": "query", "name": "amount"}` | A query parameter of the caller's request whose rule is `required` with `min` (at least 0) and `max` (at most 10^18). |
 | `{"from": "input", "pointer": "/amount"}` | A member of the checked JSON input that is a required `number` with `min` and `max`, not `set`. |
+| `{"from": "body", "pointer": "/amount"}` | A member of the caller's JSON body under its [body contract](#the-body-contract): required, not `set`; a `number` (`max` at most 2^53 − 1) or `string` with `min` (at least 0) and `max` (at most 10^18). |
+| `{"from": "form", "name": "amount"}` | A field of the caller's form body under its body contract: `required`, with `min` (at least 0) and `max` (at most 10^18). |
 | `{"from": "fixed", "value": "500"}` | A decimal integer the policy states. |
 
 At run time a value that is not a decimal integer (`12.5`, `1e3`), or a parameter given twice,
-is refused before anything happens.
+is refused before anything happens. A query that carries the amount holds no `;` (some
+servers split a query there too, so `amount=1&note=x;amount=9` would carry a second amount);
+write `%3B`.
+
+**Amounts in a body.** The node reads the amount from the body it wrote again and sends, by
+the parser that wrote it, so the amount the limits count and the approval shows is the one
+the site receives. `"format": "decimal"` (body and form) reads major units with exactly
+`exponent` digits after a point (`"12.50"` for EUR, `"500"` for JPY) from a JSON `string` or
+a form field with no other value rule; a JSON number is never read as a decimal (many servers
+read it as binary floating point). An amount is written `0` or `[1-9][0-9]*` (with the point
+and digits for a decimal) and nothing else: no sign, exponent, leading zero, space or other
+digits; at most 10^18 minor units, and 2^53 − 1 for a JSON number, the largest integer a
+server that reads JSON numbers as doubles reads exactly. The currency is the policy's: a body
+member or form field that holds it is named with `"currency_at"` (a pointer for `body`, a
+field for `form`), and that member, and every member, field or query parameter whose name
+holds `currency` (any case), must be required and `equals` the payment's currency, or the
+policy is refused. An operation that pays from the caller's request has exactly one `send`
+that takes it (a second would send the same payment twice for one count), and a paying JSON
+body declares every member with a scalar type, a value rule or `set`: a member with neither
+leaves the caller room for a second amount the node does not read.
 
 The owner's device signs **spending limits** for one record on one node
 (`DeviceKey::sign_limits`, `sign_limits` in the `client` crate; `POST /limits`):
@@ -1660,8 +1745,9 @@ sealed to this node, so the owner delegates again on the new one.
 
 ### Next
 
-Reading a code from a `mail` item of the owner, `await` on TLS, and amounts read from a
-request body contract are not done yet.
+Reading a code from a `mail` item of the owner is not done yet. Amounts in multipart or XML
+bodies are not read (a body contract is JSON or a form), and an `await` on a TLS connection
+that is already open stays refused (see [`await`](#await)).
 
 ## Worked examples: signing and encryption schemes
 

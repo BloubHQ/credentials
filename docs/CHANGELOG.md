@@ -7,6 +7,13 @@ before 1.0, minor versions may break formats and APIs.
 
 ### Changed
 
+- An operation that pays from the caller's request (query, body or form) has exactly one
+  `send` that takes the request, and a query that carries the amount holds no `;` (some
+  servers split a query there, which carried a second amount past the one counted). A query
+  parameter named for a currency in a paying operation must equal the payment's currency.
+- A TLS operation that waits for the owner's approval now runs the caller's exchanges when it
+  goes on; before, they were not kept with the waiting operation and the resume failed.
+
 - The request variables of an HTTPS injection read the request **as it is sent**, not the
   caller's request before injection (`docs/policy.md`, Injection order; `engine::request`
   `order`): `$path`, `$pathname`, `$query`, `$target_uri` and `$query_param` with the path
@@ -58,6 +65,29 @@ before 1.0, minor versions may break formats and APIs.
 
 ### Added
 
+- Body contracts and payment amounts read from them (`docs/policy.md`, The body contract and
+  Payments and spending limits; `engine::policy::BodyContract`): a caller request may declare
+  `body: {"json": {"members": [...]}}` (checked like a JSON input) or
+  `body: {"form": {"fields": [...]}}` (fields allowed by name like query parameters). The node
+  sends the body it wrote again (JSON compact; form bytes percent-encoded but the unreserved
+  ones) with the contract's content type; signing refuses a body contract with a caller or
+  injected `Content-Type` or `Content-Encoding`, an injected body, gRPC, a non-HTTPS
+  connection, or differing contracts on the sends of one caller request. A payment's amount
+  may come `{"from": "body", "pointer"}` or `{"from": "form", "name"}`, in minor units or
+  (`"format": "decimal"`, strings and form fields only) as a decimal with exactly the
+  currency's digits; it is read from the bytes the node sends, by the parser that wrote them,
+  canonical only, at most 10^18 minor units and 2^53 − 1 as a JSON number. A currency in the
+  body (`currency_at`, or any member, field or query parameter named for a currency) must be
+  fixed to the payment's. A new risk flag `caller_amount` names every amount the caller
+  chooses; a body contract changed or removed counts as wider. `Request::checked` gives the
+  request the node sends. `crates/engine/tests/amounts_await.rs`; the `caller_request` and
+  `decimal_amount` fuzz targets cover the new parsers.
+- `await` on TLS, before the connection opens (`docs/policy.md`, `await`): code challenges
+  directly after `open`; the node logs, renders and connects only once the code came, and
+  keeps the caller's exchanges with the waiting operation. Closing the connection at the park
+  and reconnecting on resume was rejected (it replays the login, and a site's challenge is
+  tied to its connection); an `await` anywhere else on TLS, and on UDP, WebSocket and protocol
+  connections, stays refused.
 - SSH remote port forwarding and AMQP 1.0 (`docs/policy.md`, Protocol connections;
   `docs/design.md` section 7c), the two protocol rows left in section 7c:
   - SSH `channel: "tcpip-forward"` (RFC 4254 section 7.1): the server listens on the

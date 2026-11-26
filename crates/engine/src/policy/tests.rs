@@ -427,11 +427,19 @@ fn awaits_are_checked_at_signing() {
             .then(Return::status())
     ));
 
-    // Not on TLS; at most four per operation.
-    assert!(refused(
+    // On TLS only before the connection opens (directly after open); at most four per
+    // operation.
+    assert!(!refused(
         Operation::tls("op", Destination::new("imap.example.com", 993))
             .then(sms())
             .then(Send::write("a1 {{otp}}\r\n"))
+            .then(Return::status())
+    ));
+    assert!(refused(
+        Operation::tls("op", Destination::new("imap.example.com", 993))
+            .then(Send::write("a1 LOGIN\r\n"))
+            .then(sms())
+            .then(Send::write("a2 {{otp}}\r\n"))
             .then(Return::status())
     ));
     let mut many = Operation::https("op", api()).then(Send::fixed(Method::Get, "/a"));

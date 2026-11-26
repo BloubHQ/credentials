@@ -7,8 +7,10 @@ use zeroize::Zeroizing;
 
 use super::Captured;
 use crate::approval::ApprovalSummary;
+use crate::caller::CallerExchange;
 use crate::fields::Fields;
 use crate::limits::Spend;
+use crate::policy::Destination;
 use crate::record::Record;
 use crate::request::Request;
 use crate::response::Http;
@@ -47,7 +49,16 @@ pub(super) enum Wait {
 /// What the caller gave when it started the operation.
 pub(super) enum Given {
     Http(Option<Request>),
-    Derive { given: Vec<u8>, input: Vec<u8> },
+    Derive {
+        given: Vec<u8>,
+        input: Vec<u8>,
+    },
+    /// A TLS operation: the destination and the caller's exchanges, checked against the relay
+    /// before it waited, run as they were signed when it goes on.
+    Stream {
+        destination: Destination,
+        exchanges: Vec<CallerExchange>,
+    },
 }
 
 /// The values of an operation that waits at an `await`.
@@ -112,6 +123,16 @@ impl Parked {
                         .sum::<usize>()
             }
             Given::Derive { given, input } => given.len() + input.len(),
+            Given::Stream {
+                destination,
+                exchanges,
+            } => {
+                destination.host.len()
+                    + exchanges
+                        .iter()
+                        .map(|e| e.send.len() + e.until.iter().map(Vec::len).sum::<usize>())
+                        .sum::<usize>()
+            }
         };
         // A fixed part for the record and the bookkeeping.
         4096 + given + self.saved.as_ref().map_or(0, Saved::bytes)

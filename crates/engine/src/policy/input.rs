@@ -173,7 +173,7 @@ impl Member {
         }
     }
 
-    fn allowed(&self) -> Allowed<'_> {
+    pub(crate) fn allowed(&self) -> Allowed<'_> {
         Allowed {
             equals: self.equals.as_deref(),
             one_of: &self.one_of,
@@ -317,35 +317,7 @@ impl Input {
                     .filter(|p| crate::extract::compile_whole(p).is_none())
                     .map(|_| "pattern must be a regular expression of at most 256 bytes within the size limits")
             }
-            Input::Json(json) => {
-                if let Some(rule) = bounded(json.members.len()) {
-                    return Some(rule);
-                }
-                if !unique_pointers(json.members.iter().map(|m| m.pointer.as_str())) {
-                    return Some("member pointers must be unique");
-                }
-                for member in &json.members {
-                    if tokens(&member.pointer).is_none() {
-                        return Some("a member pointer is empty or starts with /");
-                    }
-                    let allowed = member.allowed();
-                    if let Some(rule) = allowed.fault() {
-                        return Some(rule);
-                    }
-                    if member.set.is_some()
-                        && (!allowed.is_any() || member.kind.is_some() || member.optional)
-                    {
-                        return Some("a member the node sets has no other rule");
-                    }
-                    if member.offset.is_some() && member.set.is_none() {
-                        return Some("offset needs set");
-                    }
-                    if member.set.is_some() && member.pointer.is_empty() {
-                        return Some("the node sets a member, not the whole value");
-                    }
-                }
-                None
-            }
+            Input::Json(json) => json.fault(),
             Input::Rlp(rlp) => {
                 if let Some(rule) = bounded(rlp.items.len()) {
                     return Some(rule);
@@ -412,7 +384,7 @@ impl Input {
                 }
                 Ok(input.to_vec())
             }
-            Input::Json(schema) => json::apply(schema, input, now_ms),
+            Input::Json(schema) => schema.apply(input, now_ms),
             Input::Rlp(schema) => rlp::apply(schema, input),
         }
     }
@@ -477,6 +449,71 @@ impl Input {
                     .join(", ")
             ),
         }
+    }
+}
+
+impl JsonInput {
+    /// Why the schema is invalid, if it is.
+    pub fn fault(&self) -> Option<&'static str> {
+        if let Some(rule) = bounded(self.members.len()) {
+            return Some(rule);
+        }
+        if !unique_pointers(self.members.iter().map(|m| m.pointer.as_str())) {
+            return Some("member pointers must be unique");
+        }
+        for member in &self.members {
+            if tokens(&member.pointer).is_none() {
+                return Some("a member pointer is empty or starts with /");
+            }
+            let allowed = member.allowed();
+            if let Some(rule) = allowed.fault() {
+                return Some(rule);
+            }
+            if member.set.is_some()
+                && (!allowed.is_any() || member.kind.is_some() || member.optional)
+            {
+                return Some("a member the node sets has no other rule");
+            }
+            if member.offset.is_some() && member.set.is_none() {
+                return Some("offset needs set");
+            }
+            if member.set.is_some() && member.pointer.is_empty() {
+                return Some("the node sets a member, not the whole value");
+            }
+        }
+        None
+    }
+
+    /// Checks a JSON value against the schema and gives it written again (compact, members
+    /// in the order given, numbers as written, the members the node sets filled in).
+    pub fn apply(&self, input: &[u8], now_ms: u64) -> Result<Vec<u8>> {
+        json::apply(self, input, now_ms)
+    }
+
+    /// The text of the scalar at `pointer` of a JSON value, read by the parser [`Self::apply`]
+    /// uses (duplicate member names refused): a string unescaped, a number as written; with
+    /// whether it is a number. `None` when the value is not JSON, holds a duplicate member,
+    /// or has no scalar there.
+    pub(crate) fn scalar(value: &[u8], pointer: &str) -> Option<(String, bool)> {
+        json::scalar(value, pointer)
+    }
+
+    /// The member of `pointer`, when the schema declares it.
+    pub(crate) fn member(&self, pointer: &str) -> Option<&Member> {
+        self.members.iter().find(|m| m.pointer == pointer)
+    }
+}
+
+impl Member {
+    /// True when the member leaves the caller free to put any structure under it: no value
+    /// rule, no node clock and no scalar type.
+    pub(crate) fn is_open(&self) -> bool {
+        self.set.is_none()
+            && self.allowed().is_any()
+            && !matches!(
+                self.kind,
+                Some(JsonType::String | JsonType::Number | JsonType::Boolean | JsonType::Null)
+            )
     }
 }
 
@@ -695,6 +732,14 @@ mod json {
             Json::Str(s) => s,
             Json::Arr(_) | Json::Obj(_) => return None,
         })
+    }
+
+    pub(super) fn scalar(input: &[u8], pointer: &str) -> Option<(String, bool)> {
+        let raw: &RawValue = serde_json::from_slice(input).ok()?;
+        let value = parse(raw, 0).ok()?;
+        let found = get(&value, &tokens(pointer)?)?;
+        let number = matches!(found, Json::Num(_));
+        text(found).map(|t| (t.to_string(), number))
     }
 
     pub(super) fn apply(schema: &JsonInput, input: &[u8], now_ms: u64) -> Result<Vec<u8>> {
