@@ -1127,6 +1127,27 @@ impl Operation {
         self.awaits().next().is_some()
     }
 
+    /// True when the operation runs on a streaming call: a WebSocket, an SSH shell or
+    /// forward, a live MQTT relay, or HTTPS whose `return` streams the body. Such an
+    /// operation holds the caller's connection for the call, so it never waits.
+    pub fn streams(&self) -> bool {
+        match self.connection() {
+            Some(Connection::Websocket) => true,
+            // An SSH shell or forward: the relay takes the caller's frames. MQTT: the relay
+            // hands back the messages of the subscriptions the policy keeps.
+            Some(Connection::Ssh | Connection::Mqtt) => self
+                .returns()
+                .and_then(|r| r.relay.as_ref())
+                .is_some_and(|r| !r.frames.is_empty() || r.server),
+            Some(Connection::Https) => self.returns().is_some_and(|r| {
+                r.response
+                    .as_ref()
+                    .is_some_and(|p| p.body == Some(BodyProjection::Stream))
+            }),
+            _ => false,
+        }
+    }
+
     /// The names of fields the templates of the operation read.
     pub(crate) fn field_reads(&self, policy: &Policy) -> Vec<String> {
         let mut out: Vec<String> = Vec::new();
@@ -2521,6 +2542,20 @@ impl Policy {
             || format!("{at}.steps"),
             "the sends that take the caller's request declare the same body contract, or none",
         )?;
+        if operation.streams() {
+            // A waiting operation is resumed by a call of its own, after the streaming call
+            // that started it ended: there is no caller connection left to relay on.
+            let kind_waits = self
+                .item
+                .as_ref()
+                .and_then(|b| b.schema().ok())
+                .is_some_and(|k| k.shape.approval);
+            ensure(
+                !operation.approval && operation.payment.is_none() && !kind_waits,
+                || at.to_string(),
+                "an operation that streams does not wait for the owner's approval: no approval, no payment, no item kind that waits for approval",
+            )?;
+        }
         if let Some(payment) = &operation.payment {
             self.check_payment(&format!("{at}.payment"), operation, payment)?;
         }

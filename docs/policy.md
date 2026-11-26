@@ -1676,6 +1676,23 @@ An operation waits for approval before it sends anything when:
   whatever the policy or the spending limits say;
 - it declares a `payment` that no spending limit of the record covers, or that is above one.
 
+The caller's payload waits with the operation, exactly as it was signed and checked: the
+request (as the body contract wrote it again), the input, the TLS or UDP exchanges, the
+commands and SMTP messages of a protocol connection (SSH and SFTP, PostgreSQL, MySQL, Redis,
+SMTP, IMAP, POP3, FTP, MQTT, AMQP 0-9-1 and 1.0). Nothing is sent, and no connection is
+opened, before the approval; once approved, the resume (which carries no payload) runs what
+was signed. It counts against the 128 MiB of waiting values and is wiped when the operation
+goes on, lapses or is dropped. A resumed protocol or browser operation takes a connection
+slot like any call that opens one.
+
+An operation that runs on a **streaming call** (a WebSocket, an SSH shell or forward, a live
+MQTT relay, an HTTPS response whose body streams) cannot wait: the stream is the caller's
+call, and the resume is another call. Such an operation with `"approval": true`, a
+`payment`, or an item whose kind waits for approval is refused when the policy is signed
+(`policy_invalid`: "an operation that streams does not wait for the owner's approval"). A
+protocol operation that runs commands and ends (no `frames`, no `server` relay) waits like
+any other.
+
 The node builds the summary: the destination of the first request, the origin (the
 merchant: `https://host[:port]` of that destination, else the item's origin), the amount and
 currency of the payment, the item's `describe` view, and lines the node writes itself (why it

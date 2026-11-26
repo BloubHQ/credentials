@@ -370,3 +370,36 @@ fn a_secret_in_a_mail_body_never_goes_back() {
     assert!(out.results.is_empty());
     assert!(matches!(out.error, Some(engine::Error::Reflection)));
 }
+
+#[test]
+fn an_approved_smtp_session_sends_the_messages_it_was_signed_with() {
+    same_after_approval(
+        &smtp_setup("starttls", "plain"),
+        "send",
+        session(
+            "mail.example.com",
+            587,
+            Vec::new(),
+            vec![mail("me@example.com", &["you@example.org"], MESSAGE)],
+        ),
+        || starttls(SmtpServer::new(false, b"me@example.com", PASSWORD)),
+    );
+}
+
+#[test]
+fn an_approved_imap_session_runs_the_commands_it_was_signed_with() {
+    same_after_approval(
+        &imap_setup(login(), "implicit"),
+        "inbox",
+        session(
+            "mail.example.com",
+            993,
+            vec![
+                command("search", &["Your \"code\""]),
+                command("confirm", &[]),
+            ],
+            Vec::new(),
+        ),
+        || Fake::new(imap_server(true)),
+    );
+}

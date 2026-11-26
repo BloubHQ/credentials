@@ -610,3 +610,18 @@ fn open_connections_count_against_the_callers_slots() {
     let out = session_output(run_session(&s, &mut fake, vec![command("id", &[])]));
     assert!(out.error.is_none());
 }
+
+#[test]
+fn an_approved_session_runs_the_commands_it_was_signed_with() {
+    same_after_approval(
+        &basic(json!({})),
+        "ssh",
+        session(
+            "box.example.com",
+            22,
+            vec![command("id", &[]), command("echo", &["hello world"])],
+            Vec::new(),
+        ),
+        || Fake::new(server()),
+    );
+}

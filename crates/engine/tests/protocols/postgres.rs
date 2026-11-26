@@ -220,3 +220,18 @@ fn the_byte_limit_ends_the_connection() {
     };
     assert!(budget, "bytes limit");
 }
+
+#[test]
+fn an_approved_session_runs_the_commands_it_was_signed_with() {
+    same_after_approval(
+        &pg_setup(json!({})),
+        "db",
+        session(
+            "db.example.com",
+            5432,
+            vec![command("order", &["42"])],
+            Vec::new(),
+        ),
+        || fake(pg_server()),
+    );
+}
