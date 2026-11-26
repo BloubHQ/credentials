@@ -510,8 +510,8 @@ the tree). Choices, and the more secure option taken:
   overwrite); a listing shows links as `link`.
 
 Measured on this host (Windows, `cargo test --workspace --locked --no-fail-fast`): tests
-659 before, TESTS_AFTER after, 0 failed; the release `credentials.exe` 12,968,448 bytes
-before, SIZE_AFTER after (SIZE_DELTA). The new tests run against an FTP and a POP3 server
+659 before, 697 after, 0 failed; the release `credentials.exe` 12,968,448 bytes
+before, 13,082,624 after (+114,176; the two builds ran in different worktrees). The new tests run against an FTP and a POP3 server
 written in the test process (data connections as pipes through the test transport) and the
 SFTP test server's new requests; a transport test checks against local TLS servers that the
 data connection reaches the control connection's address and resumes its session
