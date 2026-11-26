@@ -7,6 +7,8 @@ before 1.0, minor versions may break formats and APIs.
 
 ### Changed
 
+- CI fuzzes each target for 10 seconds on a pull request, 60 on main and 300 in a new daily
+  scheduled run (previously 60 everywhere).
 - A protocol line that arrives whole is held to the line bound too (`proto::io::Io::line`):
   before, a line longer than the bound passed when its end was already buffered.
 
