@@ -195,5 +195,5 @@ fn the_examples_of_the_reference_are_valid_policies() {
         policy.validate().unwrap();
         count += 1;
     }
-    assert_eq!(count, 11);
+    assert_eq!(count, 13);
 }

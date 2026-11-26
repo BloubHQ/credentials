@@ -573,7 +573,9 @@ The two protocol rows left above, done (`docs/policy.md`, Protocol connections).
   scrubbed of the user name and the secret.
 
 Measured on this host (Windows, `cargo test --workspace --locked --no-fail-fast`): tests
-MEASURE_BEFORE before, MEASURE_AFTER after, 0 failed. The new tests run against an AMQP 1.0
+753 before (0 failed), 786 after: 785 passed and 1 failed, the count of examples in
+the protocol section of `docs/policy.md` (11, now 13), fixed and run again alone (passed).
+The new tests run against an AMQP 1.0
 broker and the SSH test server's remote forwarding, both in the test process (the broker
 encodes with the engine's codec); the fuzz targets `amqp1_frames` and `protocol_servers` were
 checked to build (clippy), not run. Not measured: real SSH servers forwarding remotely, real
