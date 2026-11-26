@@ -113,13 +113,20 @@ fn the_policy_reference_parses() {
                     "mqtt_password",
                     "amqp_password",
                     "last_code",
+                    "refresh_token",
+                    "card_number",
+                    "web_session",
+                    "client_id",
+                    "server_key",
+                    "recipient",
                 ];
                 let policy = Policy {
                     item: None,
                     fields: names
                         .iter()
                         .map(|n| match *n {
-                            "cert" | "user" | "repo_id" => FieldSpec::public(n),
+                            "cert" | "user" | "repo_id" | "client_id" | "server_key"
+                            | "recipient" => FieldSpec::public(n),
                             _ => FieldSpec::secret(n),
                         })
                         .collect(),

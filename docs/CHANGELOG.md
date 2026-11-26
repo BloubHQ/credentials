@@ -36,6 +36,18 @@ before 1.0, minor versions may break formats and APIs.
 
 ### Added
 
+- Worked examples of signing and encryption schemes as policies, with no engine change
+  (`docs/policy.md`, Worked examples; results in `docs/design.md` section 11): DPoP with `ath`
+  and a server nonce, HTTP Message Signatures (ed25519, ecdsa-p256-sha256, rsa-pss-sha512,
+  hmac-sha256 over `@method`, `@authority`, `@path`, `@query` and `content-digest`), Hawk,
+  ACME with `jwk`, `kid` and chained nonces, JWE (RSA-OAEP-256, ECDH-ES+A128KW, `dir`),
+  `private_key_jwt` and `client_secret_jwt`, and a SAML login through forms. New test file
+  `crates/engine/tests/schemes.rs` (16 tests) reads the operations from `docs/policy.md` and
+  checks them against RFC 9421 B.2.6, RFC 7515 A.1, RFC 8037 A.4, RFC 7518 appendix C and the
+  Hawk specification's examples, or a verifier in the test. Gaps found, each a generic
+  capability: a template variable for the caller's request headers, a detached AEAD output,
+  an Ed25519 public key from its private key, DEFLATE, Exclusive XML Canonicalization, and
+  IR `if` for nonce retries.
 - Owner controls (`docs/design.md` section 11, part 11): delegation, emergency access and
   credential vending.
   - New module `engine::delegation`: `DeviceKey::delegate` signs a `Delegation` of one record
