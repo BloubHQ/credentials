@@ -31,8 +31,8 @@ Policy
         ├── run      site code or a reviewed library in the sandbox; output only to its origin
         ├── await    a challenge: a code from the owner's device, or a site the node polls
         ├── return   https: response projection;  tls: relay;  browser: nothing;  none: template
-        ├── repeat   (syntax only, refused)
-        └── if       (syntax only, refused)
+        ├── repeat   steps run 1–8 times, until a test of a value no secret influences
+        └── if       then | else, on a test of a value no secret influences
 ```
 
 Names (fields, callers, operations, temporaries, computed values, path parameters) are
@@ -120,7 +120,9 @@ Rules for every operation:
 - `await` may appear in an HTTPS operation or one with no connection, at most 4 times; not
   on TLS or a WebSocket, whose connection would stay open while it waits.
 - `run` and `await` are refused on a WebSocket and a browser; `receive` on a browser.
-- `repeat` and `if` are refused for now (see [Loops and branches](#loops-and-branches)).
+- `repeat` and `if` hold `send`, `receive`, `compute` and nested loops or branches (2 deep),
+  in an HTTPS operation or (only `if`) one with no connection (see
+  [Loops and branches](#loops-and-branches)).
 
 Protocol connections (SSH, PostgreSQL, SMTP, IMAP, Redis) fit the same steps: each kind says
 what its `send`, `receive` and `return` carry, and the template analysis stays the same (see
@@ -975,15 +977,84 @@ yet; an `eip712` schema and hash are next.
 ### Loops and branches
 
 ```json
-{"do": "repeat", "times": 3, "until": "done", "steps": [ ... ]}
-{"do": "if", "name": "status", "equals": "OK", "then": [ ... ], "else": [ ... ]}
+{"do": "repeat", "times": 2, "until": {"name": "status", "none_of": ["401"]}, "steps": [ ... ]}
+{"do": "if", "when": {"name": "status", "one_of": ["401"]}, "then": [ ... ], "else": [ ... ]}
 ```
 
-This is the syntax of the next part of the language: a loop with a fixed bound and a branch
-on a public captured value. A policy that uses them is refused (`loops and branches are part
-of the syntax but not run yet; write the steps out`) until the analysis covers them: each
-path through the steps must keep the properties above, and a branch on a value must not tell
-the caller anything about a secret.
+`repeat` runs its `steps`, then tests `until`; it ends when the test holds or after `times`
+runs (1 to 8, fixed by the signed policy). Without `until` the steps run exactly `times`
+times. `if` runs `then` when its test holds and `else` otherwise. A test reads one name and
+holds when its value is one of `one_of`, or when it has a value that is none of `none_of`
+(exactly one of the two, 1 to 16 values of at most 256 bytes, compared exactly). A name with
+no value (an optional capture that found nothing) never makes a test hold.
+
+A server that answers a stale nonce with `401` and a fresh one, retried once:
+
+```json
+{"name": "post", "steps": [
+  {"do": "open", "connection": "https", "destinations": [{"host": "api.example.com", "port": 443}]},
+  {"do": "send", "request": {"from": "fixed", "method": "GET", "path": "/nonce"}},
+  {"do": "receive", "capture": [{"source": {"from": "header", "name": "Replay-Nonce"},
+                                 "into": {"kind": "temp", "name": "nonce", "secret": false}}]},
+  {"do": "repeat", "times": 2, "until": {"name": "status", "none_of": ["401"]}, "steps": [
+    {"do": "compute", "into": "mac", "template": "{{ hex(hmac_sha256(secret, nonce)) }}"},
+    {"do": "send", "request": {"from": "fixed", "method": "POST", "path": "/resource"},
+     "inject": [{"target": {"kind": "header", "name": "Authorization"},
+                 "template": "Mac nonce={{nonce}}, mac={{mac}}"}]},
+    {"do": "receive", "capture": [
+      {"source": {"from": "status"}, "into": {"kind": "temp", "name": "status", "secret": false}},
+      {"source": {"from": "header", "name": "Replay-Nonce"},
+       "into": {"kind": "temp", "name": "nonce", "secret": false}, "optional": true}]}]},
+  {"do": "return", "response": {"body": {"json": ["/id"]}}}
+]}
+```
+
+The same retry as a branch: capture the fresh nonce into another name after the first try,
+then `{"do": "if", "when": {"name": "status", "one_of": ["401"]}, "then": [...]}` with the
+second try inside.
+
+What the analysis holds them to before the policy is signed (`policy/flow.rs`):
+
+- **A test reads nothing a secret influences.** Whether a body runs, and so how many requests
+  go out and when, is seen by whoever watches the requests, the log or the timing; a test on
+  a secret would hand its bits out one call at a time. Influence is wider than taint: a
+  secret field, a secret capture, a `run` output or a challenge code, any value computed from
+  one (a MAC or a length of a secret too, though neither is tainted), and every capture into
+  a public name from the answer to a request that carried such a value or went over a client
+  certificate, except the status. What a test may read: a public field, a status, a public
+  capture from an unauthenticated answer, and values computed from those or from a
+  derivation's checked `$input`. The analysis is flow-insensitive and runs to a fixed point:
+  a name captured again inside a loop from an authenticated answer is influenced everywhere,
+  though its first capture was not.
+- **Requests are bounded statically.** A loop's requests count as often as it may run, a
+  branch as its larger side, and the operation stays within 8 requests in all; every run of a
+  loop sends at least one request (a loop of computes alone, or of requests only inside a
+  branch, is refused). Each request of each run is logged like a straight-line one, and the
+  budgets of an operation cover all its runs. `most_requests` in the summary is the bound.
+- **Bodies are straight-line steps.** A body holds only `send`, `receive`, `compute`,
+  `repeat` and `if`, nested at most 2 deep; a `receive` follows its `send` in the same body.
+  `await` is refused inside a body: a parked operation resumes at a step of the top level,
+  and a loop around it would ask the owner several times. `run` is refused inside a body: its
+  module fetch and the confinement of its output stay straight-line. Loops and branches are
+  for HTTPS operations and operations with no connection (only `if` there: a loop has nothing
+  to repeat); not for an operation that pays (its payment goes out once, to the merchant the
+  approval names) or whose response streams.
+- **Names follow every path.** Both bodies of a branch are checked like straight-line steps;
+  after the branch a name is readable only when both define it, and then it carries the
+  properties of both (a value tainted in one body is tainted after the branch, rule 5 and the
+  other rules hold on it). Two definitions of a name must agree on what it is: computed both
+  times, or captured with the same secrecy. Inside a loop, a capture may give a new value to
+  a name captured before the loop with the same secrecy (the fresh nonce above); a missing
+  optional capture clears the old value, so a later run never reads a stale one.
+- **Confinement follows loops and branches.** The output of a `run` step, and what the
+  answer to a request that carried it gives, may reach only requests fixed to the module's
+  origin in either body of a branch, and across the runs of a loop (the body is followed
+  until nothing new is confined).
+- **The summary and its diff see inside.** Requests in a body are listed at the step of the
+  loop or branch, `control` describes each loop and branch, a loop is flagged `repeat`, and a
+  larger cap, a changed test, a body that gains a step or a request in a body that changes is
+  `wider`. A session renewal must fill its field on every path (a loop's body counts, one
+  body of a branch does not).
 
 ## Secure defaults
 
@@ -1007,7 +1078,8 @@ one that gives the caller less:
 | A stream relays nothing until `relay` lists the sends, and a send must match a pattern whole. | After the login, a caller's command runs under the owner's session. |
 | An operation that reads `$input` must declare `input`; JSON and RLP schemas are closed; duplicate JSON keys are refused; the checked JSON is written back. | A key signs what the owner bounded, not what a parser disagreement lets through. |
 | One `open` per operation, first; an HTTPS `receive` directly follows its `send`. | Every response read is the one of the request before it, and every step runs on the connection the log names. |
-| Loops and branches are refused. | The analysis does not cover them yet. |
+| A loop or branch tests only a value no secret influences, a MAC or length of a secret and an authenticated answer included (its status excepted). | Which body runs is seen in the requests, the log and the timing; a test that is not tainted can still tell a bit of a secret. |
+| `await` and `run` are refused inside a loop or branch; a loop is capped at 8 runs and counts against the 8 requests of an operation; an operation that pays has no loop or branch. | A parked operation resumes at a top-level step; a module fetch and its confinement stay straight-line; a payment request goes out once. |
 | A field the kind marks secret or masked must be `secret: true` in the policy. | Masked values are still secrets in transit: the taint analysis and the reflection search must track them. Only `describe` shows the masked projection. |
 | A public field of the kind that the policy keeps secret is not described. | The owner chose to hide it; `describe` follows the policy, not the kind. |
 | Card number, expiry and code are `guessable`. | Each has few enough values (a code has 1,000 to 10,000) that a hash or MAC of it is a lookup table. |
@@ -1153,7 +1225,9 @@ crate, which checks the policy first) gives the owner, in JSON:
   projection or relay patterns, the input schema, and each `run` step (`runs`: the module's
   URL or library, its origin, its pin or `unpinned`, the entry, the inputs and the output
   name); a secret read by a module's input is listed as going in `module_input` to the
-  module's origin;
+  module's origin; `most_requests`, the most requests one use makes, and `control`, its
+  loops and branches in words (a request inside one is listed at the step of the loop or
+  branch);
 - the callers with their operations and limits, and the item with its pins and sign-offs;
 - `lines`, the text of `Policy::summary()`;
 - the risk flags, each with a code, a place and words:
@@ -1184,7 +1258,8 @@ crate, which checks the policy first) gives the owner, in JSON:
 | `browser_fill` | The node types secrets into a page in a browser over CDP: the page and the browser behind the endpoint get them, and the node cannot check the page's TLS through CDP. |
 | `frame_origin` | A fill puts values into a frame of another origin than the page's. |
 | `vend` | An operation hands back a credential minted from the secret ([Vending](#vending)): the caller holds it until it expires. |
-| `wider` | Against `previous`: a new destination, method, path, header, query rule, injection, operation, caller or caller key; more of the response; a looser limit; a new sign-in, host key, TLS mode, command or mail rule; a browser fill changed; a field made public or not guessable; a payment changed or an approval dropped; a session rule changed; a vended lifetime made longer or its expiry read elsewhere; open limits or a protocol changed; the item unbound or its pins and sign-offs changed. |
+| `repeat` | A loop sends requests again, up to the operation's `most_requests`: a request that is not idempotent can take effect more than once. |
+| `wider` | Against `previous`: a new destination, method, path, header, query rule, injection, operation, caller or caller key; more of the response; a looser limit; a new sign-in, host key, TLS mode, command or mail rule; a browser fill changed; a field made public or not guessable; a payment changed or an approval dropped; a session rule changed; a vended lifetime made longer or its expiry read elsewhere; open limits or a protocol changed; the item unbound or its pins and sign-offs changed; a loop that may run more times, the test of a loop or branch changed, a body that gains a step, or more requests in one use. |
 | `new_destination` | Against `previous`: a destination it did not have. |
 
 What changed without widening (an operation or a caller removed) is listed in `changes`.

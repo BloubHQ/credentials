@@ -726,8 +726,9 @@ decryption and CMS signatures); software passkeys; HOTP and the Steam alphabet; 
 without the owner (reading a code from another record, like the `mail` item of part 5);
 OpenPGP; ssh-agent (`credentials tunnel --agent`); BIP-340 Schnorr; incoming webhook
 `verify`; `decrypt`; `generate` and rotation; egress through a proxy; SNMPv3 (RFC 3414 key
-localization and AES-CFB over the UDP relay); OAUTHBEARER; executing IR `repeat` and `if`
-(parsed and refused, section 8c).
+localization and AES-CFB over the UDP relay); OAUTHBEARER. IR `repeat` and `if` run on HTTPS
+and derivations, with tests on values no secret influences, static request bounds and the
+other limits of `docs/policy.md` (Loops and branches; `engine::policy::flow`).
 
 Each part adds its rows to `docs/threat-model.md`, fuzz targets for any new parser, and
 measured results in its pull request.

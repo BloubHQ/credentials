@@ -596,6 +596,20 @@ impl Props {
     pub fn tainted(self) -> bool {
         self.0.tainted
     }
+
+    /// What a name is when either of two definitions may have set it (the two bodies of a
+    /// branch): whatever either can be, and a secret key only when both are.
+    #[must_use]
+    pub fn join(self, other: Props) -> Props {
+        let (a, b) = (self.0, other.0);
+        Props(Info {
+            tainted: a.tainted || b.tainted,
+            controlled: a.controlled || b.controlled,
+            caller: a.caller || b.caller,
+            secret_key: a.secret_key && b.secret_key,
+            guessable: a.guessable || b.guessable,
+        })
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

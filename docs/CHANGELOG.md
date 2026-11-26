@@ -7,6 +7,27 @@ before 1.0, minor versions may break formats and APIs.
 
 ### Changed
 
+- Policy IR `repeat` and `if` run (`engine::policy::flow`; `docs/policy.md`, Loops and
+  branches). A loop has `times` (1 to 8, fixed by the signed policy), `steps` and an optional
+  `until`; a branch has `when`, `then` and `else`. A test is `{"name", "one_of" | "none_of"}`
+  (1 to 16 values) and may read only a value no secret influences: a secret field or capture,
+  a `run` output, a challenge code, anything computed from one (a MAC or length included) and
+  a public capture from the answer to a request that carried one or went over a client
+  certificate (except the status) are refused at signing. Bodies hold `send`, `receive`,
+  `compute`, `repeat` and `if`, nested at most 2 deep; `await` and `run` are refused in a
+  body. HTTPS operations and (only `if`) derivations; not in an operation that pays or whose
+  response streams. A loop's requests count as often as it may run against the 8 requests of
+  an operation, and every run sends one. A name is readable after a branch only when both
+  bodies define it, with the properties of both; inside a loop a capture may give a new value
+  to a name captured before it, and a missing optional capture clears the old value.
+  Confinement of `run` outputs follows bodies to a fixed point. The old syntax (`until` as a
+  string, `if` with `name`/`equals`) is refused.
+- Summaries: `most_requests` and `control` per operation, requests and uses inside bodies at
+  the step of the loop or branch, the `repeat` flag; the diff ranks a larger cap, a changed
+  test, a body that gains a step and more requests per use `wider`. `Operation::most_requests`
+  is public. The JSON Schema has the new `Test`, `until` and `when`.
+- The policy fuzz target checks that a signed operation never exceeds the request bound.
+
 - The compiled Sigstore trust root (`crates/continuity/trust/trusted_root.json`) is the public
   instance's, from its TUF repository (`gh attestation trusted-root`, 2026-11-26); release
   signing pins Fulcio and Rekor v1 (`--use-signing-config=false`) and checks the bundle has a

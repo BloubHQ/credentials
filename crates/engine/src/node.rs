@@ -37,13 +37,13 @@ use crate::keys::{DevicePublicKey, Endorsement, NodeKey, NodePublicKey, Retireme
 use crate::log::{Detail, Event, Log, LogSink, SignedEntry, SignedHead};
 use crate::policy::{
     Capture, Compute, Connection, Destination, Identity, Kinds, MAX_DELIMITER, MAX_DELIMITERS,
-    Method, ModuleRef, Open, Operation, Policy, RunModule, Send, Step, StepRequest, Store,
+    Method, ModuleRef, Open, Operation, Policy, RunModule, Send, Step, StepRequest, Store, Test,
 };
 use crate::record::{Pin, Record, check_name};
 use crate::reflection::{self, MIN_NEEDLE, Secrets};
 use crate::request::{self, Inputs, MAX_BODY, Outbound, Request};
 use crate::response::{Http, MAX_RESPONSE};
-use crate::template::{Budget, Context, Template, Temps, Var};
+use crate::template::{Budget, Context, NameKind, Template, Temps, Var};
 use crate::{Error, Result};
 
 mod browser;
@@ -150,11 +150,15 @@ impl Captured {
         now: u64,
     ) -> Result<()> {
         let Some(value) = value else {
-            return if capture.optional {
-                Ok(())
-            } else {
-                Err(Error::CaptureMissing)
-            };
+            if !capture.optional {
+                return Err(Error::CaptureMissing);
+            }
+            // In a loop, a name an earlier run captured holds nothing once this answer lacks
+            // it: a test or a send reads this answer's value, never a stale one.
+            if let Store::Temp { name, .. } = &capture.into {
+                self.temps.remove(name);
+            }
+            return Ok(());
         };
         match &capture.into {
             Store::Field { name } => {
@@ -1542,31 +1546,13 @@ impl<S: LogSink, C: Clock> Node<S, C> {
         for (i, step) in operation.steps.iter().enumerate().skip(run.start) {
             let result: Result<Option<Flow<Response>>> = match step {
                 Step::Open(_) => Ok(None),
-                Step::Send(send) => {
-                    if let Some((seq, status)) = pending.take() {
-                        self.done(now, who, seq, Some(status), true);
-                    }
-                    self.https_send(run, open, send, request, transport, updated)
-                        .map(|(seq, http)| {
-                            run.log_seqs.push(seq);
-                            pending = Some((seq, http.status));
-                            run.last = Some(http);
-                            None
-                        })
-                }
-                Step::Receive(receive) => {
-                    let stored = match &run.last {
-                        Some(http) => receive.capture.iter().try_for_each(|capture| {
-                            let value = http.capture(&capture.source)?;
-                            run.captured
-                                .store(run.policy, &mut run.fields, capture, value, now)
-                        }),
-                        None => Err(operation.unknown()),
-                    };
-                    let persisted = self.persist(run, updated);
-                    stored.and(persisted).map(|()| None)
-                }
-                Step::Compute(compute) => run.compute(compute, compute_vars(now)).map(|()| None),
+                Step::Send(_)
+                | Step::Receive(_)
+                | Step::Compute(_)
+                | Step::Repeat(_)
+                | Step::If(_) => self
+                    .https_step(run, open, step, request, transport, updated, &mut pending)
+                    .map(|()| None),
                 Step::Run(step) => {
                     // A module fetch is a request of its own: the one before it is done.
                     if let Some((seq, status)) = pending.take() {
@@ -1614,7 +1600,6 @@ impl<S: LogSink, C: Clock> Node<S, C> {
                     }
                     response.map(|r| Some(Flow::Done(r)))
                 }
-                Step::Repeat(_) | Step::If(_) => Err(operation.unknown()),
             };
             match result {
                 Ok(Some(flow)) => return Ok(flow),
@@ -1628,6 +1613,78 @@ impl<S: LogSink, C: Clock> Node<S, C> {
             }
         }
         Err(operation.unknown())
+    }
+
+    /// Runs a `send`, `receive` or `compute` step of an HTTPS operation, or a loop or a
+    /// branch of them. `pending` is the log entry of the last request, until its outcome is
+    /// known: each request of each run of a loop has its own entry, as straight-line ones do.
+    #[allow(clippy::too_many_arguments)]
+    fn https_step<T: Transport>(
+        &self,
+        run: &mut Run<'_>,
+        open: &Open,
+        step: &Step,
+        request: Option<&Request>,
+        transport: &mut T,
+        updated: &mut Option<Record>,
+        pending: &mut Option<(u64, u16)>,
+    ) -> Result<()> {
+        let operation = run.operation;
+        let (now, who) = (run.now, run.who);
+        match step {
+            Step::Send(send) => {
+                if let Some((seq, status)) = pending.take() {
+                    self.done(now, who, seq, Some(status), true);
+                }
+                let (seq, http) = self.https_send(run, open, send, request, transport, updated)?;
+                run.log_seqs.push(seq);
+                *pending = Some((seq, http.status));
+                run.last = Some(http);
+                Ok(())
+            }
+            Step::Receive(receive) => {
+                let stored = match &run.last {
+                    Some(http) => receive.capture.iter().try_for_each(|capture| {
+                        let value = http.capture(&capture.source)?;
+                        run.captured
+                            .store(run.policy, &mut run.fields, capture, value, now)
+                    }),
+                    None => Err(operation.unknown()),
+                };
+                let persisted = self.persist(run, updated);
+                stored.and(persisted)
+            }
+            Step::Compute(compute) => run.compute(compute, compute_vars(now)),
+            // The policy check bounded `times`, the nesting and the requests of the loop, and
+            // made sure no secret influences its test.
+            Step::Repeat(repeat) => {
+                for _ in 0..repeat.times {
+                    for step in &repeat.steps {
+                        self.https_step(run, open, step, request, transport, updated, pending)?;
+                    }
+                    if let Some(test) = &repeat.until
+                        && run.holds(test)?
+                    {
+                        break;
+                    }
+                }
+                Ok(())
+            }
+            Step::If(branch) => {
+                let steps = if run.holds(&branch.when)? {
+                    &branch.then
+                } else {
+                    &branch.otherwise
+                };
+                for step in steps {
+                    self.https_step(run, open, step, request, transport, updated, pending)?;
+                }
+                Ok(())
+            }
+            Step::Open(_) | Step::Run(_) | Step::Await(_) | Step::Return(_) => {
+                Err(operation.unknown())
+            }
+        }
     }
 
     /// A `run` step: gets the module (a reviewed library, or `GET` on the module's origin
@@ -1966,7 +2023,7 @@ impl<S: LogSink, C: Clock> Node<S, C> {
         vars.insert(Var::Input, input.to_vec());
         for (i, step) in operation.steps.iter().enumerate().skip(run.start) {
             match step {
-                Step::Compute(compute) => run.compute(compute, vars.clone())?,
+                Step::Compute(_) | Step::If(_) => run.local_step(step, &vars)?,
                 Step::Await(_) => return Ok(Flow::Park(i)),
                 Step::Return(ret) => {
                     let template = ret.template.as_deref().ok_or_else(|| operation.unknown())?;
@@ -2005,8 +2062,7 @@ impl<S: LogSink, C: Clock> Node<S, C> {
                 | Step::Send(_)
                 | Step::Receive(_)
                 | Step::Run(_)
-                | Step::Repeat(_)
-                | Step::If(_) => return Err(operation.unknown()),
+                | Step::Repeat(_) => return Err(operation.unknown()),
             }
         }
         Err(operation.unknown())
@@ -2221,6 +2277,41 @@ enum Flow<T> {
 }
 
 impl Run<'_> {
+    /// The test of a loop or a branch, on the value its name has now. The policy check made
+    /// sure no secret influences the name; one the analysis calls secret is refused all the
+    /// same, before its value is read.
+    fn holds(&self, test: &Test) -> Result<bool> {
+        let secret = match self.kinds.kind(&test.name) {
+            NameKind::SecretField | NameKind::GuessableField | NameKind::SecretTemp => true,
+            NameKind::Computed(props) => props.tainted(),
+            NameKind::PublicField | NameKind::PublicTemp => false,
+        };
+        if secret {
+            return Err(self.operation.unknown());
+        }
+        let value = match self.captured.temps.get(&test.name) {
+            Some(value) => Some(value.as_slice()),
+            None => self.fields.get(&test.name),
+        };
+        Ok(test.holds(value))
+    }
+
+    /// A `compute` step of an operation with no connection, or a branch of them.
+    fn local_step(&mut self, step: &Step, vars: &HashMap<Var, Vec<u8>>) -> Result<()> {
+        match step {
+            Step::Compute(compute) => self.compute(compute, vars.clone()),
+            Step::If(branch) => {
+                let steps = if self.holds(&branch.when)? {
+                    &branch.then
+                } else {
+                    &branch.otherwise
+                };
+                steps.iter().try_for_each(|s| self.local_step(s, vars))
+            }
+            _ => Err(self.operation.unknown()),
+        }
+    }
+
     /// Renders a `compute` step into a temporary value.
     fn compute(&mut self, compute: &Compute, vars: HashMap<Var, Vec<u8>>) -> Result<()> {
         let template = Template::parse(&compute.template)?;
