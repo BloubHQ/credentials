@@ -20,8 +20,8 @@
 //!   response ([`Projection`]), the caller's exchanges on the stream within the patterns of
 //!   a [`Relay`], or the output of a template that must hand no secret back.
 //!
-//! Loops and branches ([`Step::Repeat`], [`Step::If`]) are part of the syntax and refused
-//! when a policy is checked: they are the next part of the language.
+//! - [`Step::Repeat`] runs steps a bounded number of times and [`Step::If`] one of two lists
+//!   of steps, on a [`Test`] of a value no secret influences ([`flow`]).
 //!
 //! Every template of every step is checked by the same analysis before the policy is
 //! signed. Every call names a [`Caller`] of the policy and carries its signature; a caller may
@@ -40,6 +40,7 @@ use crate::{Error, Result};
 
 mod browser;
 mod contract;
+pub mod flow;
 mod input;
 pub mod legacy;
 mod proto;
@@ -61,6 +62,7 @@ pub use contract::{
     template_matches,
 };
 pub(crate) use contract::{parse_query, placeholders};
+pub use flow::{Branch, MAX_NESTING, MAX_REPEAT, MAX_TEST_VALUE, MAX_TEST_VALUES, Repeat, Test};
 pub use input::{Input, JsonInput, JsonType, Member, NodeTime, RawInput, RlpInput, RlpItem};
 pub use proto::{
     Answer, Command, CommandRule, DEFAULT_MESSAGES, Login, MAX_COMMANDS, MAX_HOST_KEYS, MAX_MAIL,
@@ -971,37 +973,6 @@ pub struct Return {
     pub template: Option<String>,
 }
 
-/// A bounded loop: the syntax of the next part of the language. Refused by
-/// [`Policy::validate`] for now.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Repeat {
-    /// Most iterations.
-    pub times: u32,
-    /// The steps repeated.
-    pub steps: Vec<Step>,
-    /// A public value whose presence ends the loop.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub until: Option<String>,
-}
-
-/// A branch on a captured public value: the syntax of the next part of the language. Refused
-/// by [`Policy::validate`] for now.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Branch {
-    /// The value tested (a public temporary value).
-    pub name: String,
-    /// The value it is compared with.
-    pub equals: String,
-    /// The steps when it is equal.
-    #[serde(default)]
-    pub then: Vec<Step>,
-    /// The steps otherwise.
-    #[serde(default, rename = "else")]
-    pub otherwise: Vec<Step>,
-}
-
 /// One step of an operation.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "do", rename_all = "snake_case")]
@@ -1018,9 +989,9 @@ pub enum Step {
     Run(RunModule),
     /// Says what goes back to the caller; the last step.
     Return(Return),
-    /// A bounded loop (refused for now).
+    /// A bounded loop.
     Repeat(Repeat),
-    /// A branch (refused for now).
+    /// A branch.
     If(Branch),
     /// Parks the operation until a challenge is answered.
     Await(Box<Await>),
@@ -1085,9 +1056,10 @@ impl Operation {
         }
     }
 
-    /// The contracts of the `send` steps that send the caller's request, with their steps.
+    /// The contracts of the `send` steps that send the caller's request, with their steps
+    /// (inside loops and branches too).
     pub fn caller_sends(&self) -> impl Iterator<Item = (&CallerRequest, &Send)> {
-        self.steps.iter().filter_map(|s| match s {
+        flow::walk(&self.steps).into_iter().filter_map(|s| match s {
             Step::Send(send) => match &send.request {
                 Some(StepRequest::Caller(contract)) => Some((contract, send)),
                 _ => None,
@@ -1100,8 +1072,8 @@ impl Operation {
     /// steps (secret: the code may copy its inputs) and the code of a challenge are secret
     /// temporary values.
     fn temps(&self) -> Vec<(&str, bool)> {
-        let mut out: Vec<(&str, bool)> = self
-            .steps
+        let steps = flow::walk(&self.steps);
+        let mut out: Vec<(&str, bool)> = steps
             .iter()
             .flat_map(|s| match s {
                 Step::Receive(r) => r.capture.as_slice(),
@@ -1112,7 +1084,7 @@ impl Operation {
                 Store::Field { .. } => None,
             })
             .collect();
-        out.extend(self.steps.iter().filter_map(|s| match s {
+        out.extend(steps.iter().filter_map(|s| match s {
             Step::Run(run) => Some((run.into.as_str(), true)),
             _ => None,
         }));
@@ -1126,7 +1098,7 @@ impl Operation {
 
     /// The `await` steps.
     pub fn awaits(&self) -> impl Iterator<Item = &Await> {
-        self.steps.iter().filter_map(|s| match s {
+        flow::walk(&self.steps).into_iter().filter_map(|s| match s {
             Step::Await(a) => Some(a.as_ref()),
             _ => None,
         })
@@ -1152,10 +1124,10 @@ impl Operation {
         out
     }
 
-    /// The fields a response fills (captures into fields).
+    /// The fields a response may fill (captures into fields, inside loops and branches too).
     pub(crate) fn field_captures(&self) -> Vec<&str> {
-        self.steps
-            .iter()
+        flow::walk(&self.steps)
+            .into_iter()
             .flat_map(|s| match s {
                 Step::Receive(r) => r.capture.as_slice(),
                 _ => &[],
@@ -1180,7 +1152,7 @@ impl Operation {
 
     fn templates(&self) -> Vec<&str> {
         let mut out = Vec::new();
-        for step in &self.steps {
+        for step in flow::walk(&self.steps) {
             match step {
                 Step::Open(open) => {
                     if let Some(identity) = &open.identity {
@@ -1241,14 +1213,16 @@ impl<'p> Kinds<'p> {
             temps: operation.temps(),
             computed: Vec::new(),
         };
-        for step in &operation.steps {
+        for step in flow::walk(&operation.steps) {
             if let Step::Compute(c) = step {
                 let props = Template::parse(&c.template)
                     .ok()
                     .and_then(|t| t.props(&|n| kinds.kind(n)).ok())
                     .unwrap_or_else(Props::unknown);
-                if kinds.computed.iter().all(|(n, _)| *n != c.into) {
-                    kinds.computed.push((&c.into, props));
+                // A name both bodies of a branch compute is whatever either makes it.
+                match kinds.computed.iter_mut().find(|(n, _)| *n == c.into) {
+                    Some((_, known)) => *known = known.join(props),
+                    None => kinds.computed.push((&c.into, props)),
                 }
             }
         }
@@ -1260,8 +1234,11 @@ impl<'p> Kinds<'p> {
         if let Some((_, props)) = self.computed.iter().find(|(n, _)| *n == name) {
             return NameKind::Computed(*props);
         }
-        if let Some((_, secret)) = self.temps.iter().find(|(n, _)| *n == name) {
-            return if *secret {
+        if self.temps.iter().any(|(n, _)| *n == name) {
+            // A name captured in both bodies of a branch, or again in a loop, is secret when
+            // any capture makes it so (the check refuses captures that disagree).
+            let secret = self.temps.iter().any(|(n, s)| *n == name && *s);
+            return if secret {
                 NameKind::SecretTemp
             } else {
                 NameKind::PublicTemp
@@ -1536,6 +1513,20 @@ impl Policy {
         fixed: bool,
         known: &mut Vec<&'a str>,
     ) -> Checked {
+        self.check_captures_in(at, captures, stream, fixed, known, &[])
+    }
+
+    /// [`Self::check_captures`] inside a loop, where a capture may give a new value to a name
+    /// of `rebind` (captured before the loop) with the same secrecy.
+    fn check_captures_in<'a>(
+        &self,
+        at: &str,
+        captures: &'a [Capture],
+        stream: bool,
+        fixed: bool,
+        known: &mut Vec<&'a str>,
+        rebind: &[(&str, bool)],
+    ) -> Checked {
         ensure(
             captures.len() <= MAX_CAPTURES,
             || format!("{at}.capture"),
@@ -1564,7 +1555,10 @@ impl Policy {
                         "capture into a field from a request of the caller",
                     )?;
                 }
-                Store::Temp { name, .. } => {
+                Store::Temp { name, secret } => {
+                    if rebind.iter().any(|(n, s)| n == name && s == secret) {
+                        continue;
+                    }
                     ensure(
                         is_token(name) && !self.is_field(name) && !known.contains(&name.as_str()),
                         || at.clone(),
@@ -2015,8 +2009,16 @@ impl Policy {
             }
         }
         let kinds = self.kinds(operation);
+        let scope = flow::Scope::new(self, &kinds, operation, open);
+        let streamed = operation.returns().is_some_and(|r| {
+            r.response
+                .as_ref()
+                .is_some_and(|p| p.body == Some(BodyProjection::Stream))
+        });
         let mut known: Vec<&str> = Vec::new();
         let mut sends = 0usize;
+        // The HTTPS requests every run makes before `return` (a branch may skip some).
+        let mut surely = 0usize;
         let mut polls = 0usize;
         let mut awaits = 0usize;
         let mut fills = 0usize;
@@ -2104,6 +2106,7 @@ impl Policy {
                 (Step::Send(send), Some(open)) => match open.connection {
                     Connection::Https => {
                         sends += 1;
+                        surely += 1;
                         ensure(
                             sends + polls <= MAX_REQUESTS,
                             || at.clone(),
@@ -2340,10 +2343,10 @@ impl Policy {
                 }
                 (Step::Return(ret), _) => {
                     ensure(i + 1 == count, || at.clone(), "return is the last step")?;
-                    let sent = if connection == Some(Connection::Browser) {
-                        fills > 0
-                    } else {
-                        sends > 0
+                    let sent = match connection {
+                        Some(Connection::Browser) => fills > 0,
+                        Some(Connection::Https) => surely > 0,
+                        _ => sends > 0,
                     };
                     self.check_return(&at, &kinds, connection, ret, &known, sent)?;
                     let streamed = ret
@@ -2360,10 +2363,31 @@ impl Policy {
                     }
                 }
                 (Step::Repeat(_) | Step::If(_), _) => {
-                    return fail(
-                        at,
-                        "loops and branches are part of the syntax but not run yet; write the steps out",
-                    );
+                    ensure(
+                        matches!(connection, None | Some(Connection::Https)),
+                        || at.clone(),
+                        "loops and branches are for HTTPS and operations with no connection",
+                    )?;
+                    ensure(
+                        operation.payment.is_none(),
+                        || at.clone(),
+                        "an operation that pays has no loop or branch: its payment goes out once, to the merchant the approval names",
+                    )?;
+                    ensure(
+                        !streamed,
+                        || at.clone(),
+                        "an operation whose response streams has no loop or branch",
+                    )?;
+                    let requests = self.check_flow(&at, &scope, step, &mut known, &[], 1)?;
+                    let most = usize::try_from(requests.most).unwrap_or(usize::MAX);
+                    let least = usize::try_from(requests.least).unwrap_or(usize::MAX);
+                    sends = sends.saturating_add(most);
+                    surely = surely.saturating_add(least);
+                    ensure(
+                        sends.saturating_add(polls) <= MAX_REQUESTS,
+                        || at.clone(),
+                        "at most 8 requests, a loop's counted as often as it may run",
+                    )?;
                 }
                 (Step::Await(wait), _) => {
                     awaits += 1;
@@ -2397,6 +2421,7 @@ impl Policy {
             || format!("{at}.steps"),
             "an operation ends with return",
         )?;
+        flow::check_definitions(at, operation)?;
         run::check_confined(at, operation)?;
         // A protocol parameter over the caller's value reads that value as `$input`, not the
         // operation's input.
@@ -2589,7 +2614,7 @@ impl Policy {
                     "a renewal is an HTTPS operation of fixed requests, without await, payment or approval",
                 )?;
                 ensure(
-                    operation.field_captures().contains(&field.name.as_str())
+                    flow::sure_field_captures(&operation.steps).contains(&field.name.as_str())
                         && !operation.field_reads(self).contains(&field.name),
                     || at.clone(),
                     "a renewal fills the session field from a response and does not read it",
@@ -2932,9 +2957,36 @@ fn summarize_operation(operation: &Operation, out: &mut Vec<String>) {
     if let Some(open) = operation.open() {
         proto::open_lines(open, out);
     }
-    for step in &operation.steps {
+    summarize_steps(operation, &operation.steps, out);
+}
+
+/// The summary lines of `steps` of `operation`; a loop or branch encloses the lines of its
+/// bodies.
+fn summarize_steps(operation: &Operation, steps: &[Step], out: &mut Vec<String>) {
+    for step in steps {
         match step {
-            Step::Open(_) | Step::Repeat(_) | Step::If(_) => {}
+            Step::Open(_) => {}
+            Step::Repeat(r) => {
+                out.push(format!(
+                    "  repeat up to {} times{}:",
+                    r.times,
+                    r.until
+                        .as_ref()
+                        .map(|t| format!(", until {}", t.describe()))
+                        .unwrap_or_default()
+                ));
+                summarize_steps(operation, &r.steps, out);
+                out.push("  end of repeat".into());
+            }
+            Step::If(b) => {
+                out.push(format!("  if {}:", b.when.describe()));
+                summarize_steps(operation, &b.then, out);
+                if !b.otherwise.is_empty() {
+                    out.push("  else:".into());
+                    summarize_steps(operation, &b.otherwise, out);
+                }
+                out.push("  end of if".into());
+            }
             Step::Await(wait) => {
                 let c = &wait.challenge;
                 match (&c.into, &c.poll) {

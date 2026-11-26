@@ -1065,7 +1065,7 @@ fn check_operation(
     {
         check_login(&format!("{at}.steps[0]"), open, kind, pins)?;
     }
-    for (i, step) in operation.steps.iter().enumerate() {
+    for (i, step) in crate::policy::flow::walk_indexed(&operation.steps) {
         let at = format!("{at}.steps[{i}]");
         match step {
             Step::Open(open) => {

@@ -193,7 +193,8 @@ Policies of the format before steps (`"kind": "http" | "stream" | "derive"`) con
 signed again.
 
 Values go in through **templates**: `{{ hex(hmac_sha256(secret, $query)) }}`. The language
-has names, variables, string literals, function calls and `+`; no branches or loops. Before a
+has names, variables, string literals, function calls and `+`; no branches or loops (steps
+have bounded `repeat` and `if`, testing only values no secret influences). Before a
 policy is signed, every template is analysed:
 
 - **Taint.** A value that holds a secret in reversible form is *tainted*. Encodings keep taint;

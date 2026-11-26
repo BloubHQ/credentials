@@ -219,6 +219,14 @@ pub struct OperationSummary {
     /// True when every use waits for the owner's approval.
     #[serde(default, skip_serializing_if = "core::ops::Not::not")]
     pub approval: bool,
+    /// The most requests one use makes, a loop's counted as often as it may run.
+    #[serde(default)]
+    pub most_requests: u64,
+    /// Its loops and branches, in words (`step 2: repeat up to 3 times, until status is one
+    /// of ["200"]`). The requests inside them are listed in `requests` with the step of the
+    /// loop or branch.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub control: Vec<String>,
 }
 
 /// A caller.
@@ -315,6 +323,9 @@ pub enum FlagCode {
     /// An operation hands the caller a credential minted from the secret (bounded in time
     /// and scope by the policy).
     Vend,
+    /// A loop sends requests again: one that is not idempotent can take effect more than
+    /// once, up to the operation's most requests.
+    Repeat,
 }
 
 /// A risk flag.
@@ -490,22 +501,38 @@ impl Reads {
         let mut reads = Reads {
             computed: Vec::new(),
         };
-        for step in &operation.steps {
+        for step in super::flow::walk(&operation.steps) {
             match step {
                 Step::Compute(c) => {
                     let fields = reads.fields_of(&c.template);
                     let rev = reads.reversible_in(&c.template);
-                    reads.computed.push((c.into.clone(), fields, rev));
+                    reads.define(&c.into, fields, rev);
                 }
                 Step::Run(run) => {
                     // The code's output may hold its inputs in any form.
                     let fields = reads.fields_of(&run.inputs.concat());
-                    reads.computed.push((run.into.clone(), fields, true));
+                    reads.define(&run.into, fields, true);
                 }
                 _ => {}
             }
         }
         reads
+    }
+
+    /// Adds a computed name; one both bodies of a branch compute stands for the fields of
+    /// both.
+    fn define(&mut self, name: &str, fields: Vec<String>, rev: bool) {
+        match self.computed.iter_mut().find(|(n, _, _)| n == name) {
+            Some((_, known, known_rev)) => {
+                for f in fields {
+                    if !known.contains(&f) {
+                        known.push(f);
+                    }
+                }
+                *known_rev |= rev;
+            }
+            None => self.computed.push((name.to_string(), fields, rev)),
+        }
     }
 
     fn fields_of(&self, template: &str) -> Vec<String> {
@@ -623,8 +650,10 @@ fn operation_summary(operation: &Operation) -> OperationSummary {
         payment: operation.payment.clone(),
         vend: operation.vend.clone(),
         approval: operation.approval,
+        most_requests: operation.most_requests(),
+        control: Vec::new(),
     };
-    for (i, step) in operation.steps.iter().enumerate() {
+    for (i, step) in super::flow::walk_indexed(&operation.steps) {
         match step {
             Step::Send(send) => {
                 if let Some(c) = connection {
@@ -632,14 +661,28 @@ fn operation_summary(operation: &Operation) -> OperationSummary {
                 }
             }
             Step::Receive(receive) => {
-                out.captures
-                    .extend(receive.capture.iter().map(|c| match &c.into {
-                        Store::Field { name } => format!("field {name}"),
-                        Store::Temp { name, secret } => {
-                            format!("{} temp {name}", if *secret { "secret" } else { "public" })
-                        }
-                    }));
+                for capture in receive.capture.iter().map(|c| match &c.into {
+                    Store::Field { name } => format!("field {name}"),
+                    Store::Temp { name, secret } => {
+                        format!("{} temp {name}", if *secret { "secret" } else { "public" })
+                    }
+                }) {
+                    if !out.captures.contains(&capture) {
+                        out.captures.push(capture);
+                    }
+                }
             }
+            Step::Repeat(r) => out.control.push(format!(
+                "step {i}: repeat up to {} times{}",
+                r.times,
+                r.until
+                    .as_ref()
+                    .map(|t| format!(", until {}", t.describe()))
+                    .unwrap_or_default()
+            )),
+            Step::If(b) => out
+                .control
+                .push(format!("step {i}: if {}", b.when.describe())),
             Step::Return(ret) => out.returns = return_summary(ret, connection),
             Step::Run(run) => out.runs.push(run_summary(i, run, operation)),
             Step::Await(wait) => {
@@ -661,7 +704,7 @@ fn operation_summary(operation: &Operation) -> OperationSummary {
                     (None, None) => out.challenges.push(c.kind.as_str().into()),
                 }
             }
-            Step::Open(_) | Step::Compute(_) | Step::Repeat(_) | Step::If(_) => {}
+            Step::Open(_) | Step::Compute(_) => {}
         }
     }
     out
@@ -694,7 +737,7 @@ fn uses_in(operation: &Operation) -> Vec<(String, SecretUse)> {
             ));
         }
     };
-    for (i, step) in operation.steps.iter().enumerate() {
+    for (i, step) in super::flow::walk_indexed(&operation.steps) {
         match step {
             Step::Open(open) => {
                 if let Some(identity) = &open.identity {
@@ -951,7 +994,7 @@ fn risk_flags(policy: &Policy, origin: Option<&Origin>, flags: &mut Vec<Flag>) {
         for (c, _) in operation.caller_sends() {
             caller_flags(c, &at, flags);
         }
-        for step in &operation.steps {
+        for step in super::flow::walk(&operation.steps) {
             if let Step::Send(send) = step
                 && let Some(fill) = &send.fill
             {
@@ -1010,6 +1053,20 @@ fn risk_flags(policy: &Policy, origin: Option<&Origin>, flags: &mut Vec<Flag>) {
                 }
             }
         }
+        if super::flow::walk(&operation.steps)
+            .iter()
+            .any(|s| matches!(s, Step::Repeat(_)))
+        {
+            flag(
+                flags,
+                FlagCode::Repeat,
+                &at,
+                format!(
+                    "a loop sends requests again, up to {} in one use: a request that is not idempotent can take effect more than once",
+                    operation.most_requests()
+                ),
+            );
+        }
         if operation.connection() == Some(Connection::Udp) {
             flag(
                 flags,
@@ -1018,7 +1075,7 @@ fn risk_flags(policy: &Policy, origin: Option<&Origin>, flags: &mut Vec<Flag>) {
                 "the operation sends UDP datagrams without TLS: what they carry is readable on the path",
             );
         }
-        for step in &operation.steps {
+        for step in super::flow::walk(&operation.steps) {
             if let Step::Run(run) = step
                 && run.unpinned()
             {
@@ -1228,22 +1285,51 @@ fn diff_operation(
             "operation {name}: no longer waits for the owner's approval"
         ));
     }
-    if prev.steps.len() != cur.steps.len()
+    let (before, now) = (prev.most_requests(), cur.most_requests());
+    if now > before {
+        wider.push(format!(
+            "operation {name}: up to {now} requests in one use (was {before})"
+        ));
+    }
+    diff_steps(&format!("operation {name}"), &prev.steps, &cur.steps, wider);
+}
+
+/// Compares two lists of steps (an operation's, or the bodies of a loop or a branch).
+fn diff_steps(at: &str, prev: &[Step], cur: &[Step], wider: &mut Vec<String>) {
+    if prev.len() != cur.len()
         || prev
-            .steps
             .iter()
-            .zip(&cur.steps)
+            .zip(cur)
             .any(|(a, b)| core::mem::discriminant(a) != core::mem::discriminant(b))
     {
-        wider.push(format!("operation {name}: the steps changed"));
+        wider.push(format!("{at}: the steps changed"));
         return;
     }
-    for (i, (a, b)) in prev.steps.iter().zip(&cur.steps).enumerate() {
+    for (i, (a, b)) in prev.iter().zip(cur).enumerate() {
         if a == b {
             continue;
         }
-        let at = format!("operation {name}, step {i}");
+        let at = format!("{at}, step {i}");
         match (a, b) {
+            (Step::Repeat(a), Step::Repeat(b)) => {
+                if b.times > a.times {
+                    wider.push(format!(
+                        "{at}: the loop may now run {} times (was {})",
+                        b.times, a.times
+                    ));
+                }
+                if a.until != b.until {
+                    wider.push(format!("{at}: the test that ends the loop changed"));
+                }
+                diff_steps(&format!("{at}, loop"), &a.steps, &b.steps, wider);
+            }
+            (Step::If(a), Step::If(b)) => {
+                if a.when != b.when {
+                    wider.push(format!("{at}: the test of the branch changed"));
+                }
+                diff_steps(&format!("{at}, then"), &a.then, &b.then, wider);
+                diff_steps(&format!("{at}, else"), &a.otherwise, &b.otherwise, wider);
+            }
             (Step::Send(a), Step::Send(b)) => diff_send(&at, a, b, wider),
             (Step::Return(a), Step::Return(b)) => diff_return(&at, a, b, wider),
             (Step::Receive(a), Step::Receive(b)) => {

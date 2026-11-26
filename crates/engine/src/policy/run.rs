@@ -262,13 +262,15 @@ impl Policy {
 
 /// Checks that the output of every `run` step of the operation, and every value computed
 /// from it, goes only into requests the policy fixes to the module's origin. Run after the
-/// steps are checked one by one.
+/// steps are checked one by one. Inside a loop the body is followed until no new value is
+/// confined (a capture at its end reaches a send at its start on the next run); both bodies
+/// of a branch are followed, and what either confines stays confined.
 pub(super) fn check_confined(at: &str, operation: &Operation) -> Checked {
     let Some(open) = operation.open() else {
         return Ok(());
     };
     let mut origin: Option<Destination> = None;
-    for (i, step) in operation.steps.iter().enumerate() {
+    for (i, step) in super::flow::walk_indexed(&operation.steps) {
         if let Step::Run(run) = step {
             let here = run.origin(open);
             match (&origin, here) {
@@ -286,23 +288,43 @@ pub(super) fn check_confined(at: &str, operation: &Operation) -> Checked {
         return Ok(());
     };
     let mut confined: Vec<&str> = Vec::new();
+    confine(
+        &format!("{at}.steps"),
+        &operation.steps,
+        open,
+        &origin,
+        &mut confined,
+    )
+}
+
+fn push<'a>(confined: &mut Vec<&'a str>, name: &'a str) {
+    if !confined.contains(&name) {
+        confined.push(name);
+    }
+}
+
+/// Follows the confined values through `steps`.
+fn confine<'a>(
+    at: &str,
+    steps: &'a [Step],
+    open: &Open,
+    origin: &Destination,
+    confined: &mut Vec<&'a str>,
+) -> Checked {
     // True while the last request carried a confined value: what its response gives into
     // temporary values may echo it, so those values are confined too.
     let mut carried = false;
-    for (i, step) in operation.steps.iter().enumerate() {
-        let at = format!("{at}.steps[{i}]");
+    for (i, step) in steps.iter().enumerate() {
+        let at = format!("{at}[{i}]");
         match step {
-            Step::Run(run) => confined.push(&run.into),
+            Step::Run(run) => push(confined, &run.into),
             Step::Compute(c) => {
-                if reads_any(&c.template, &confined) {
-                    confined.push(&c.into);
+                if reads_any(&c.template, confined) {
+                    push(confined, &c.into);
                 }
             }
             Step::Send(send) => {
-                carried = send
-                    .inject
-                    .iter()
-                    .any(|j| reads_any(&j.template, &confined));
+                carried = send.inject.iter().any(|j| reads_any(&j.template, confined));
                 let fixed_to = match &send.request {
                     Some(StepRequest::Fixed {
                         destination: Some(d),
@@ -317,16 +339,16 @@ pub(super) fn check_confined(at: &str, operation: &Operation) -> Checked {
                     _ => None,
                 };
                 for (j, injection) in send.inject.iter().enumerate() {
-                    if reads_any(&injection.template, &confined) {
+                    if reads_any(&injection.template, confined) {
                         ensure(
-                            fixed_to.as_ref() == Some(&origin),
+                            fixed_to.as_ref() == Some(origin),
                             || format!("{at}.inject[{j}]"),
                             "the output of a run step goes only into a request the policy fixes to the origin of its module",
                         )?;
                     }
                 }
                 if let Some(template) = &send.template
-                    && reads_any(template, &confined)
+                    && reads_any(template, confined)
                 {
                     return fail(
                         format!("{at}.template"),
@@ -336,7 +358,7 @@ pub(super) fn check_confined(at: &str, operation: &Operation) -> Checked {
             }
             Step::Return(ret) => {
                 if let Some(template) = &ret.template
-                    && reads_any(template, &confined)
+                    && reads_any(template, confined)
                 {
                     return fail(
                         format!("{at}.template"),
@@ -346,12 +368,14 @@ pub(super) fn check_confined(at: &str, operation: &Operation) -> Checked {
             }
             Step::Receive(receive) => {
                 if carried {
-                    confined.extend(receive.capture.iter().filter_map(|c| match &c.into {
-                        Store::Temp { name, .. } => Some(name.as_str()),
-                        // A field is a secret of the record (a capture into a public field is
-                        // refused), analysed wherever it is used.
-                        Store::Field { .. } => None,
-                    }));
+                    for c in &receive.capture {
+                        match &c.into {
+                            Store::Temp { name, .. } => push(confined, name),
+                            // A field is a secret of the record (a capture into a public field
+                            // is refused), analysed wherever it is used.
+                            Store::Field { .. } => {}
+                        }
+                    }
                 }
             }
             // A status request the node polls while it waits is not a request the confined
@@ -359,7 +383,7 @@ pub(super) fn check_confined(at: &str, operation: &Operation) -> Checked {
             Step::Await(wait) => {
                 if let Some(poll) = &wait.challenge.poll {
                     for (j, injection) in poll.send.inject.iter().enumerate() {
-                        if reads_any(&injection.template, &confined) {
+                        if reads_any(&injection.template, confined) {
                             return fail(
                                 format!("{at}.challenge.poll.send.inject[{j}]"),
                                 "the output of a run step goes only into a request the policy fixes to the origin of its module",
@@ -368,7 +392,18 @@ pub(super) fn check_confined(at: &str, operation: &Operation) -> Checked {
                     }
                 }
             }
-            Step::Open(_) | Step::Repeat(_) | Step::If(_) => {}
+            Step::Repeat(r) => loop {
+                let before = confined.len();
+                confine(&format!("{at}.steps"), &r.steps, open, origin, confined)?;
+                if confined.len() == before {
+                    break;
+                }
+            },
+            Step::If(b) => {
+                confine(&format!("{at}.then"), &b.then, open, origin, confined)?;
+                confine(&format!("{at}.else"), &b.otherwise, open, origin, confined)?;
+            }
+            Step::Open(_) => {}
         }
     }
     Ok(())
