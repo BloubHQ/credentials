@@ -226,7 +226,7 @@ let outcome = node.run(&call, &mut TlsTransport::new());
 | Telegram ボット | パステンプレート `/{token}/getMe` で `path_param` `token` = `bot{{token}}` |
 | 取引所の HMAC 署名 | クエリ `signature` = `{{ hex(hmac_sha256(secret, $query)) }}` |
 | AWS SigV4 | ヘッダーテンプレート 2 つ (`time`、`canonical_query`、ネストした `hmac_sha256`)。テストが公式ベクターを再現する |
-| HTTP Message Signatures、Hawk | `$method`、`$target_uri`、`$authority`、`$query_param("page")` と呼び出し元のヘッダー (`$header("content-type")`、契約に書かれたものだけ) を `ed25519_sign` か `hmac_sha256` で署名。RFC 9421 B.2.5・B.2.6 と Hawk の例を再現 |
+| HTTP Message Signatures、Hawk | `$method`、`$target_uri`、`$authority`、`$query_param("page")` と呼び出し元のヘッダー (`$header("content-type")`、契約に書かれたものだけ)、さらにポリシー自身が注入したもの (各テンプレートは送信されるままのリクエストを読む: 埋めたパス、注入したクエリ・ヘッダー・本文) を `ed25519_sign` か `hmac_sha256` で署名。RFC 9421 B.2.5・B.2.6 と Hawk の例を再現 |
 | レコードのカード番号を入れた呼び出し元 JSON の JWE | 1 つの `aes_gcm_encrypt(cek, iv, json_set($body, "card", card_number), head)` の `aead_ciphertext(...)` と `aead_tag(...)`、鍵は `rsa_encrypt_oaep` で。RFC 7516 A.3 を再現 |
 | HTTP Digest | ステップ 1 で `header_param` により `realm`/`nonce` をキャプチャし、ステップ 2 で `md5` により応答する。RFC 2617 のベクター |
 | OAuth リフレッシュ | `fixed` POST、`json` キャプチャでフィールドへ: ノードは新しいレコードを返す |

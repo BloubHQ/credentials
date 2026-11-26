@@ -7,6 +7,23 @@ before 1.0, minor versions may break formats and APIs.
 
 ### Changed
 
+- The request variables of an HTTPS injection read the request **as it is sent**, not the
+  caller's request before injection (`docs/policy.md`, Injection order; `engine::request`
+  `order`): `$path`, `$pathname`, `$query`, `$target_uri` and `$query_param` with the path
+  parameters filled and the injected query parameters appended, `$header` also for a header
+  the `send` injects (in a fixed request too), `$body` the injected body; never what the
+  reading injection sets itself (in a query injection `$query` lacks it, a path parameter keeps
+  its own `{name}`, the body's injection reads the caller's body). The injections render in
+  dependency order, ties by listed order; the wire order stays the listed order. Signing
+  refuses injections that read each other in a cycle and a template that names the header or
+  query parameter it sets. A request variable carries the analysis properties of everything
+  injected into it, so a secret injected into the path taints `$path` exactly as written there;
+  the runtime taint list (the reflection check) and the summary's uses follow the same edges.
+  A policy whose templates read a variable that an injection of the same `send` fills now
+  renders over the filled value, and one signed before whose injections read each other in a
+  cycle (two query injections that both read `$query`) no longer runs. Closes the open question of `docs/design.md` section 13
+  left by the request components: RFC 9421, SigV4, OAuth 1.0a and Hawk now cover what the
+  policy fills (`crates/engine/tests/final_request.rs`).
 - CI fuzzes each target for 10 seconds on a pull request, 60 on main and 300 in a new daily
   scheduled run (previously 60 everywhere).
 - A protocol line that arrives whole is held to the line bound too (`proto::io::Io::line`):
