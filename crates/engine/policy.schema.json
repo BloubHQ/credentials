@@ -199,7 +199,7 @@
       "required": ["do", "connection", "destinations"],
       "properties": {
         "do": {"const": "open"},
-        "connection": {"enum": ["https", "tls", "websocket", "ssh", "postgres", "smtp", "imap", "redis", "mysql", "mqtt", "amqp", "udp", "browser"]},
+        "connection": {"enum": ["https", "tls", "websocket", "ssh", "postgres", "smtp", "imap", "redis", "mysql", "mqtt", "amqp", "ftp", "pop3", "udp", "browser"]},
         "destinations": {"type": "array", "minItems": 1, "maxItems": 32, "items": {"$ref": "#/$defs/Destination"}},
         "identity": {
           "type": "object",
@@ -248,7 +248,7 @@
         "database": {"type": "string", "minLength": 1, "maxLength": 63},
         "client_id": {"type": "string", "minLength": 1, "maxLength": 64},
         "vhost": {"type": "string", "minLength": 1, "maxLength": 255},
-        "mechanism": {"enum": ["password", "publickey", "keyboard-interactive", "scram-sha-256", "plain", "login", "xoauth2", "auth", "caching-sha2-password", "token"]}
+        "mechanism": {"enum": ["password", "publickey", "keyboard-interactive", "scram-sha-256", "plain", "login", "xoauth2", "auth", "caching-sha2-password", "token", "user", "apop"]}
       }
     },
     "Command": {
@@ -716,7 +716,7 @@
       "additionalProperties": false,
       "required": ["connections", "destinations", "returns"],
       "properties": {
-        "connections": {"type": "array", "maxItems": 6, "items": {"enum": ["https", "tls", "ssh", "smtp", "imap", "none"]}},
+        "connections": {"type": "array", "maxItems": 8, "items": {"enum": ["https", "tls", "ssh", "smtp", "imap", "pop3", "ftp", "none"]}},
         "destinations": {
           "oneOf": [
             {"type": "object", "additionalProperties": false, "required": ["from"],
@@ -726,9 +726,9 @@
             {"type": "object", "additionalProperties": false, "required": ["from", "host", "port"],
              "properties": {"from": {"const": "host"}, "host": {"$ref": "#/$defs/Token"}, "port": {"$ref": "#/$defs/Token"}}},
             {"type": "object", "additionalProperties": false, "required": ["from", "hosts"],
-             "properties": {"from": {"const": "hosts"}, "hosts": {"type": "array", "minItems": 1, "maxItems": 6, "items": {
+             "properties": {"from": {"const": "hosts"}, "hosts": {"type": "array", "minItems": 1, "maxItems": 8, "items": {
                "type": "object", "additionalProperties": false, "required": ["connection", "host", "port"],
-               "properties": {"connection": {"enum": ["https", "tls", "ssh", "smtp", "imap", "none"]},
+               "properties": {"connection": {"enum": ["https", "tls", "ssh", "smtp", "imap", "pop3", "ftp", "none"]},
                               "host": {"$ref": "#/$defs/Token"}, "port": {"$ref": "#/$defs/Token"}}}}}}
           ]
         },
@@ -738,6 +738,7 @@
                          "key": {"$ref": "#/$defs/Token"}, "token": {"$ref": "#/$defs/Token"}}
         },
         "host_key": {"$ref": "#/$defs/Token"},
+        "tls": {"$ref": "#/$defs/Token"},
         "wildcards": {"type": "boolean"},
         "returns": {"enum": ["status", "json", "all"]},
         "relay": {"type": "boolean"},

@@ -1078,6 +1078,8 @@ impl<S: LogSink, C: Clock> Node<S, C> {
                                     | Connection::Mysql
                                     | Connection::Mqtt
                                     | Connection::Amqp
+                                    | Connection::Ftp
+                                    | Connection::Pop3
                             ),
                             Payload::Session { .. }
                         )

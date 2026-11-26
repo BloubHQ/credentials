@@ -204,7 +204,10 @@ fn a_secret_in_a_file_never_goes_back() {
 #[test]
 fn sftp_rules_are_checked_when_the_policy_is_signed() {
     let bad = [
-        json!({"name": "x", "text": "delete", "channel": "sftp", "params": [{"pattern": "/a"}]}),
+        json!({"name": "x", "text": "chmod", "channel": "sftp", "params": [{"pattern": "/a"}]}),
+        json!({"name": "x", "text": "rename", "channel": "sftp", "params": [{"pattern": "/a"}]}),
+        json!({"name": "x", "text": "rmdir", "channel": "sftp", "params": [{"template": "/"}]}),
+        json!({"name": "x", "text": "stat", "channel": "sftp", "params": [{"template": "/a"}, {"template": "/b"}]}),
         json!({"name": "x", "text": "read", "channel": "sftp", "params": [{"template": "/srv/../etc/shadow"}]}),
         json!({"name": "x", "text": "read", "channel": "sftp", "params": [{"template": "relative/path"}]}),
         json!({"name": "x", "text": "write", "channel": "sftp", "params": [{"pattern": "/a"}]}),
@@ -222,6 +225,138 @@ fn sftp_rules_are_checked_when_the_policy_is_signed() {
             operations: vec![op],
         };
         assert!(policy.validate().is_err());
+    }
+}
+
+fn manage_operation() -> Operation {
+    operation(json!({"name": "manage", "steps": [
+        open_step(host().line(), password_login()),
+        {"do": "return", "relay": {"commands": [
+            {"name": "ls", "text": "list", "channel": "sftp",
+             "params": [{"pattern": "/srv/[a-z]{1,16}"}]},
+            {"name": "stat", "text": "stat", "channel": "sftp",
+             "params": [{"pattern": "/srv/[a-z0-9_./-]{1,64}"}]},
+            {"name": "mv", "text": "rename", "channel": "sftp",
+             "params": [{"pattern": "/srv/reports/[a-z0-9_.-]{1,32}"},
+                        {"pattern": "/srv/archive/[a-z0-9_.-]{1,32}"}]},
+            {"name": "rm", "text": "delete", "channel": "sftp",
+             "params": [{"pattern": "/srv/[a-z0-9_./-]{1,64}"}]},
+            {"name": "mk", "text": "mkdir", "channel": "sftp",
+             "params": [{"pattern": "/srv/[a-z]{1,16}"}]},
+            {"name": "rd", "text": "rmdir", "channel": "sftp",
+             "params": [{"pattern": "/srv/[a-z]{1,16}"}]}
+        ]}}
+    ]}))
+}
+
+fn manage_setup() -> Setup {
+    setup(
+        &[(FieldSpec::secret("password"), PASSWORD)],
+        vec![manage_operation()],
+    )
+}
+
+#[test]
+fn sftp_lists_stats_renames_deletes_and_makes_directories() {
+    let s = manage_setup();
+    let mut fake = Fake::new(files_server());
+    let out = session_output(Ok(run(
+        &s,
+        &mut fake,
+        "manage",
+        vec![
+            command("ls", &["/srv/reports"]),
+            command("stat", &["/srv/reports/may.csv"]),
+            command("mk", &["/srv/archive"]),
+            command("mv", &["/srv/reports/may.csv", "/srv/archive/may.csv"]),
+            command("rm", &["/srv/inbox/keep.txt"]),
+            command("mk", &["/srv/tmp"]),
+            command("rd", &["/srv/tmp"]),
+        ],
+    )));
+    assert!(out.error.is_none(), "{:?}", out.error);
+    let listing: Value = serde_json::from_slice(&out.results[0].data).unwrap();
+    let names: Vec<&str> = listing
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["name"].as_str().unwrap())
+        .collect();
+    // No . or .., links shown as links and never followed.
+    assert_eq!(names, ["may.csv", "leak.csv"]);
+    assert_eq!(listing[0]["type"], "file");
+    assert_eq!(listing[0]["size"], 15);
+    assert_eq!(listing[1]["type"], "link");
+    let stat: Value = serde_json::from_slice(&out.results[1].data).unwrap();
+    assert_eq!(stat["type"], "file");
+    assert_eq!(stat["size"], 15);
+    assert!(out.results.iter().all(|r| r.status == Some(0)));
+    assert!(fake.peer.files.contains_key("/srv/archive/may.csv"));
+    assert!(!fake.peer.files.contains_key("/srv/reports/may.csv"));
+    assert!(!fake.peer.files.contains_key("/srv/inbox/keep.txt"));
+    assert!(!fake.peer.dirs.contains("/srv/tmp"));
+}
+
+#[test]
+fn sftp_management_never_acts_through_a_link() {
+    let s = manage_setup();
+    for (commands, kind) in [
+        // A link is not a file to delete, rename or stat, nor is its target.
+        (vec![command("rm", &["/srv/reports/leak.csv"])], 13u8),
+        (
+            vec![command("mv", &["/srv/reports/leak.csv", "/srv/archive/x"])],
+            18,
+        ),
+        (vec![command("stat", &["/srv/reports/leak.csv"])], 0),
+    ] {
+        let mut server = files_server();
+        server.dirs.insert("/srv/archive".into());
+        let mut fake = Fake::new(server);
+        let out = session_output(Ok(run(&s, &mut fake, "manage", commands)));
+        assert!(out.results.is_empty());
+        assert!(
+            matches!(out.error, Some(engine::Error::RequestInvalid { .. })),
+            "{:?}",
+            out.error
+        );
+        assert!(!fake.peer.sftp_seen.iter().any(|(k, _)| *k == kind));
+        assert!(fake.peer.files.contains_key("/etc/shadow"));
+    }
+    // A rename onto an existing file is refused: nothing is overwritten.
+    let mut server = files_server();
+    server
+        .files
+        .insert("/srv/archive/may.csv".into(), b"keep".to_vec());
+    let mut fake = Fake::new(server);
+    let out = session_output(Ok(run(
+        &s,
+        &mut fake,
+        "manage",
+        vec![command(
+            "mv",
+            &["/srv/reports/may.csv", "/srv/archive/may.csv"],
+        )],
+    )));
+    assert!(out.error.is_some());
+    assert_eq!(fake.peer.files["/srv/archive/may.csv"], b"keep");
+    // Traversal in either path never reaches the server.
+    for commands in [
+        vec![command("mv", &["/srv/reports/../x", "/srv/archive/y"])],
+        vec![command("rm", &["/srv/../etc/shadow"])],
+        vec![command("rd", &["/srv/.."])],
+    ] {
+        let mut fake = Fake::new(files_server());
+        let call = sign(
+            &s,
+            "manage",
+            session("box.example.com", 22, commands, Vec::new()),
+        );
+        let result = s.node.run(&call, &mut fake).result;
+        assert!(
+            matches!(result, Err(engine::Error::RequestInvalid { .. })),
+            "{result:?}"
+        );
+        assert!(fake.opened.is_empty());
     }
 }
 

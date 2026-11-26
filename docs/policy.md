@@ -429,8 +429,9 @@ yet.
 
 ### Protocol connections
 
-`ssh` (with SFTP and local port forwarding), `postgres`, `mysql`, `smtp`, `imap`, `redis`,
-`mqtt` and `amqp` are standard protocol families, never a site's:
+`ssh` (with SFTP and local port forwarding), `postgres`, `mysql`, `smtp`, `imap`, `pop3`,
+`ftp` (over TLS only), `redis`, `mqtt` and `amqp` are standard protocol families, never a
+site's:
 the node signs in with the item's secret, runs the commands the policy fixes or shapes, and
 hands back results after the reflection search. Each is its own client in the engine
 (`engine::proto`), synchronous, with only modern algorithms.
@@ -458,9 +459,9 @@ The `open` of a protocol connection:
 | Member | Meaning |
 | --- | --- |
 | `login` | Required. `user` and one credential, each a template: `password`; `key` (SSH: an Ed25519 or ECDSA P-256/P-384 key in PKCS#8, or an unencrypted OpenSSH key; RSA in PKCS#8 or PKCS#1); `token` (an OAuth 2.0 bearer token for `xoauth2`, or the MQTT `token` mechanism); or `answers` (SSH keyboard-interactive: up to 8 `{"prompt": <regular expression the whole prompt must match>, "template"}`). Literals: `database` (PostgreSQL, MySQL), `client_id` (MQTT, 1 to 64 visible ASCII bytes; without it a random `credentials-...` one, so two connections never take over each other's session) and `vhost` (AMQP, default `/`). `mechanism` is optional. The credential must be the one its mechanism uses. `user` may be empty for Redis and MQTT. |
-| `mechanism` | SSH `password`, `publickey`, `keyboard-interactive`; PostgreSQL `scram-sha-256`; MySQL `caching-sha2-password`; SMTP `plain`, `login`, `xoauth2`; IMAP `login`, `plain`, `xoauth2`; Redis `auth`; MQTT `password`, `token`; AMQP `plain`. Without it, the kind's default for the credential given. The node uses this mechanism or none: a server that does not offer it is refused, never answered with another. |
+| `mechanism` | SSH `password`, `publickey`, `keyboard-interactive`; PostgreSQL `scram-sha-256`; MySQL `caching-sha2-password`; SMTP `plain`, `login`, `xoauth2`; IMAP `login`, `plain`, `xoauth2`; POP3 `user` (default for a password), `apop`, `plain`, `login`, `xoauth2` (default for a token); FTP `user`; Redis `auth`; MQTT `password`, `token`; AMQP `plain`. Without it, the kind's default for the credential given. The node uses this mechanism or none: a server that does not offer it is refused, never answered with another. |
 | `host_keys` | SSH only, required: 1 to 16 pinned host keys, `type base64` as in `known_hosts` (`ssh-ed25519`, `ecdsa-sha2-nistp256/384/521`, `ssh-rsa` for an RSA key verified with `rsa-sha2-256/512` only). The node offers only the algorithms of the pinned keys and refuses a key that is not pinned before it sends any credential. |
-| `tls` | SMTP and IMAP: `implicit` (default; ports 465 and 993) or `starttls` (587 and 143). A server that does not offer STARTTLS, or sends anything after its go-ahead before the handshake, is refused. PostgreSQL and MySQL always ask for TLS (`SSLRequest`) before anything else and refuse a server that does not take it; Redis, MQTT and AMQP are TLS from the first byte; SSH encrypts itself. |
+| `tls` | SMTP, IMAP, POP3 and FTP: `implicit` (default; ports 465, 993, 995 and 990) or `starttls` (587 and 143; POP3 `STLS` on 110, RFC 2595; FTP `AUTH TLS` on 21, RFC 4217). A server that does not offer STARTTLS, or sends anything after its go-ahead before the handshake, is refused. There is no plain mode: no kind sends a credential over a plain connection, so FTP and POP3 do not either, whatever the address. PostgreSQL and MySQL always ask for TLS (`SSLRequest`) before anything else and refuse a server that does not take it; Redis, MQTT and AMQP are TLS from the first byte; SSH encrypts itself. |
 | `version` | MQTT only: `3.1.1` (default) or `5`. |
 | `limits` | As for a WebSocket: idle, duration and bytes (both ways). Reaching one ends the connection. |
 
@@ -556,8 +557,41 @@ What each kind does with them:
   acknowledging each, as `[{"exchange", "routing_key", "redelivered", "payload"}]`. The
   exchange, routing key and queue of a caller's command are templates of the policy, never the
   caller's.
+- **POP3** (RFC 1939): `CAPA`, then the named mechanism and no other: `USER`/`PASS` (refused
+  when `CAPA` answers without `USER`), `APOP` (MD5 over the greeting's timestamp and the
+  password; refused without a timestamp, flagged `weak_mechanism`), or `AUTH` (RFC 5034) with
+  `PLAIN`, `LOGIN` or `XOAUTH2`, which `CAPA` must list under `SASL`. Commands are `STAT`,
+  `LIST` and `UIDL` (no parameter or a message number), `RETR`, `DELE` (a message number),
+  `TOP` (a message number and a line count), `NOOP` and `RSET`; a parameter is 1 to 10
+  digits, nothing else. The result is the status line (with the user name and the password
+  replaced by `[redacted]` if the server echoes them) and, for a multi-line answer, the lines
+  dot-unstuffed, at most the connection's byte limit; status 0 for `+OK`, 1 for `-ERR`. A
+  status line is at most 4 KiB, a line of a message 64 KiB.
+- **FTP** over TLS (RFC 959, 4217): implicit or `AUTH TLS`, then `USER`/`PASS`, `PBSZ 0`,
+  `PROT P` (a server that refuses private data connections is refused before any is opened),
+  `TYPE I`, `FEAT`. The commands are verbs, each parameter a path: `list` (a directory: `MLSD`
+  when `FEAT` lists `MLST`, else `NLST`; `/` allowed), `retrieve` (`RETR`), `store` (the path,
+  the bytes: `STOR`), `delete` (`DELE`), `mkdir` (`MKD`) and `rename` (from, to: `RNFR`,
+  `RNTO`). Data connections are passive only (`EPSV`, then `PASV`), never active (`PORT`):
+  each goes to the address the control connection reached (a `PASV` reply naming any other
+  address, the classic FTP bounce, is refused before anything connects), to a port of at
+  least 1024, over TLS to the same name, resuming the control connection's TLS session (RFC
+  4217 section 10, which servers that require it check), and must end with a TLS
+  `close_notify`: a cut is an error, never the end of a file. A path is absolute UTF-8 of at
+  most 4096 bytes with no control byte (so no CR, LF or NUL), DEL or `0xFF`, and no empty,
+  `.` or `..` segment, checked as for SFTP. The result of `retrieve` is the file; of `list`
+  the entries as `[{"name", "type", "size", "modify"}]` (MLSD facts; `name_base64` for a name
+  that is not UTF-8; at most 10,000 entries, lines of at most 8 KiB, without `.` and `..`);
+  of the others `{"code", "text"}` with the user name and password scrubbed, status 1 when
+  the code is not a completion. A reply is at most 256 lines of 4 KiB.
 - **SFTP** (SSH, `channel: "sftp"`, version 3): `read` (the path) returns the whole file;
-  `write` (the path, the bytes) creates or truncates it. A path is absolute with no empty, `.`
+  `write` (the path, the bytes) creates or truncates it; `list` (a directory, `/` allowed)
+  returns `[{"name", "type", "size", "mode", "mtime"}]` (at most 10,000 entries, without `.`
+  and `..`; a link is listed as `link`, never followed); `stat` (the path, not a link) returns the same
+  object from `LSTAT`; `rename` (from, to) moves a file or directory to a name that does not
+  exist; `delete` (a regular file), `mkdir` (an absent path) and `rmdir` (a directory) return
+  nothing. Each path is checked as for `read`, and no operation acts through a link.
+ A path is absolute with no empty, `.`
   or `..` segment, no trailing `/`, backslash or NUL, checked when the policy is signed (a
   literal path), before anything is logged (the caller's value) and again before it is sent.
   The node follows no symbolic link: the server's canonical form of the path (`REALPATH`), or
@@ -1108,7 +1142,9 @@ it.
 ```
 
 `pins` holds the value of each `pinned` field of the kind (an origin, a host, a port, a host
-key): the policy fixes it, and the sealed record must hold the same value. `signoff` lists
+key): the policy fixes it, and the sealed record must hold the same value. A pinned field is
+public; it may be optional (the mail kind's `pop3_host`), and a policy that does not declare
+it has no pin for it, so nothing routes to it. `signoff` lists
 the flags the owner signs off (`plain_http` for an `http://` origin, `plain` for an
 unencrypted database, FTP or broker connection).
 
@@ -1124,8 +1160,8 @@ The reviewed kinds ship in the node (`crates/engine/src/items.json`, or `item_ki
 | `totp` | seed (≥128 bits) · account · digits, period, issuer | derivations only |
 | `ssh` | password, private_key · — · host, port, host_key (pinned), user | SSH to the pinned host and port, pinning exactly the item's host key (a whole key); signs in with exactly `{{user}}` and `{{password}}` or `{{private_key}}`; relay allowed (commands, shell, SFTP, forwards) |
 | `database` | password · — · engine, host, port, tls (pinned), database, user, ca | TLS to the pinned host and port; relay allowed |
-| `ftp` | password · — · host, port, mode (pinned), user | TLS to the pinned host and port; relay allowed |
-| `mail` | password, token · user (email) · smtp_host, smtp_port, imap_host, imap_port (pinned) | SMTP to the pinned SMTP server, IMAP to the pinned IMAP server; signs in with exactly `{{user}}` and `{{password}}` or `{{token}}`; relay allowed |
+| `ftp` | password · — · host, port, mode (pinned), user | FTP over TLS to the pinned host and port, `tls` as the pinned mode (`implicit`, `explicit` = `starttls`; any other mode, `plain` included, allows no operation); signs in with exactly `{{user}}` and `{{password}}`; relay allowed |
+| `mail` | password, token · user (email) · smtp_host, smtp_port, imap_host, imap_port, pop3_host, pop3_port (optional) (pinned) | SMTP to the pinned SMTP server, IMAP to the pinned IMAP server, POP3 to the pinned POP3 server (none when not declared); signs in with exactly `{{user}}` and `{{password}}` or `{{token}}`; relay allowed |
 | `queue` | password, sasl_secret, nkey_seed, client_key · — · protocol, host, port, tls (pinned), user, client_id | TLS to the pinned host and port; relay allowed |
 | `vpn` | private_key, psk · — · protocol, host, port (pinned), peer_public_key, identity | none yet |
 | `api` | free fields, as an untyped record | anything an untyped policy may do; nothing is described |
@@ -1162,16 +1198,19 @@ A policy of a kind must, beyond every rule of an untyped policy:
   off only flags the kind's checks name;
 - use only the connections of the shape; send only to the pinned origin (`login`) or the
   pinned host and port (`ssh`, `database`, `ftp`, `queue`), or the pinned server of its
-  connection (`mail`: SMTP and IMAP each to their own), with no wildcard unless the
+  connection (`mail`: SMTP, IMAP and POP3 each to their own), with no wildcard unless the
   shape allows one; use no client certificate, relay or capture the shape does not allow;
 - return no more than the shape: `status` < `json` (JSON members) < `all` (the whole body);
-- on a protocol connection (`ssh`, `smtp`, `imap`), sign in with each `login` member exactly
+- on a protocol connection (`ssh`, `smtp`, `imap`, `pop3`, `ftp`), sign in with each `login`
+  member exactly
   `{{field}}` of the field the shape's `login` names for it (`user`, `password`, `key`,
   `token`), and nothing else (no answers, no literals around the secret); for SSH, pin exactly
   the item's `host_key`, which must be a whole key: a `SHA256:` fingerprint passes the field's
   check but not this rule, since the node compares keys, not fingerprints. A shape with a
   protocol connection must name its `login` (and `host_key` for SSH) and route to pinned
-  hosts only. The database, queue and VPN kinds allow no protocol connection yet.
+  hosts only. A shape's `tls` names a pinned field whose value fixes the `tls` of every
+  `open`: `implicit` or `explicit` (`starttls`); any other value allows none.
+ The database, queue and VPN kinds allow no protocol connection yet.
 
 ### Custom kinds
 
@@ -1250,7 +1289,8 @@ crate, which checks the policy first) gives the owner, in JSON:
 | `run_unpinned` | A `run` step fetches its module without a `sha256` pin: the site can change the code that reads the secrets. |
 | `frames_unpinned` | A WebSocket relays the caller's frames of a kind with no shape (or a `raw` shape with no pattern). |
 | `server_frames` | A WebSocket hands the server's messages back to the caller, or an SSH shell what it prints. |
-| `password_to_server` | A protocol connection signs in with a mechanism that hands the server the password itself: SSH `password`, `plain`, `login`, Redis `auth` (not `scram-sha-256`, `publickey` or `xoauth2`). |
+| `password_to_server` | A protocol connection signs in with a mechanism that hands the server the password itself: SSH `password`, `plain`, `login`, Redis `auth`, FTP and POP3 `user` (not `scram-sha-256`, `publickey`, `xoauth2` or `apop`). |
+| `weak_mechanism` | A protocol connection signs in with POP3 `apop`: MD5 over the server's timestamp and the password, so whoever reads the exchange can test guesses of the password offline. |
 | `param_unpinned` | A command parameter of the caller has no pattern (only its length bounds it). |
 | `mail_relay` | The caller sends mail over SMTP as the item's account. |
 | `shell_relay` | The caller types into an SSH shell. |

@@ -146,7 +146,14 @@ impl<'s> Io<'s> {
         let mut searched = 0;
         loop {
             if let Some(at) = memchr::memchr(b'\n', self.buf.get(searched..).unwrap_or_default()) {
-                return self.take(searched + at + 1);
+                let end = searched + at + 1;
+                // A line that arrived whole is held to the bound as one that did not.
+                if end > max {
+                    return Err(Error::ResponseInvalid {
+                        rule: "line too long",
+                    });
+                }
+                return self.take(end);
             }
             searched = self.buf.len();
             if searched > max {
@@ -173,5 +180,82 @@ impl<'s> Io<'s> {
     /// Ends the connection.
     pub fn close(&mut self) {
         let _ = self.stream.close();
+    }
+
+    /// The address of the server, when the transport knows it.
+    pub fn peer_ip(&self) -> Option<std::net::IpAddr> {
+        self.stream.peer_ip()
+    }
+
+    /// Opens a data connection to `port` on the same server ([`Stream::open_data`]). Its
+    /// bytes count against this connection's bounds through [`Io::tally`].
+    pub fn open_data(&mut self, port: u16) -> Result<Box<dyn Stream>> {
+        self.check()?;
+        self.stream.open_data(port)
+    }
+
+    /// Counts bytes moved on a data connection of this one, and checks the bounds.
+    pub fn tally(&mut self, read: usize, written: usize) -> Result<()> {
+        self.read = self.read.saturating_add(read as u64);
+        self.written = self.written.saturating_add(written as u64);
+        if read > 0 || written > 0 {
+            self.last = Instant::now();
+        }
+        self.check()
+    }
+
+    /// The idle bound of the connection.
+    pub fn idle_wait(&self) -> Duration {
+        self.bounds.idle
+    }
+}
+
+/// The values of a sign-in (the user name and the secret) that a server may echo in a reply,
+/// replaced before a reply goes back: a server that answers `530 bad password hunter2` or
+/// `+OK alice@example.com has 3 messages` hands back the text without them. Values shorter
+/// than [`crate::reflection::MIN_NEEDLE`] are not searched, as the reflection search does
+/// not search them either.
+#[derive(Default)]
+pub struct Scrub {
+    needles: Vec<Zeroizing<Vec<u8>>>,
+}
+
+impl Scrub {
+    /// Scrubs `values`, each raw and in base64 (a SASL exchange carries them so).
+    pub fn new(values: &[&[u8]]) -> Self {
+        use base64::Engine as _;
+        let mut needles = Vec::new();
+        for value in values {
+            if value.len() < crate::reflection::MIN_NEEDLE {
+                continue;
+            }
+            needles.push(Zeroizing::new(value.to_vec()));
+            needles.push(Zeroizing::new(
+                base64::engine::general_purpose::STANDARD
+                    .encode(value)
+                    .into_bytes(),
+            ));
+        }
+        // Longest first, so a value inside another is not replaced first.
+        needles.sort_by_key(|n| core::cmp::Reverse(n.len()));
+        Self { needles }
+    }
+
+    /// `text` with every needle replaced by [`crate::reflection::REDACTED`].
+    pub fn apply(&self, text: &[u8]) -> Zeroizing<Vec<u8>> {
+        let mut out = Zeroizing::new(text.to_vec());
+        for needle in &self.needles {
+            let mut next = Zeroizing::new(Vec::with_capacity(out.len()));
+            let mut at = 0;
+            while let Some(found) = memchr::memmem::find(out.get(at..).unwrap_or_default(), needle)
+            {
+                next.extend_from_slice(out.get(at..at + found).unwrap_or_default());
+                next.extend_from_slice(crate::reflection::REDACTED);
+                at += found + needle.len();
+            }
+            next.extend_from_slice(out.get(at..).unwrap_or_default());
+            out = next;
+        }
+        out
     }
 }

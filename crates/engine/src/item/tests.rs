@@ -458,11 +458,7 @@ fn a_custom_kind_follows_the_rules_of_kinds() {
             Box::new(|k| k.fields[2].mask = None),
         ),
         (
-            "a pinned field is public and required",
-            Box::new(|k| k.fields[0].optional = true),
-        ),
-        (
-            "a pinned field is public and required",
+            "a pinned field is public",
             Box::new(|k| k.fields[1].pinned = true),
         ),
         (
@@ -1428,4 +1424,97 @@ fn a_kind_with_a_protocol_connection_names_its_login_and_host_key() {
     let mut anywhere = ssh;
     anywhere.shape.destinations = DestinationRule::Owner {};
     assert!(anywhere.validate().is_err());
+}
+
+fn ftp_item(mode: &str, tls: Option<&str>, signoff: bool) -> Policy {
+    let mut open = serde_json::json!({"do": "open", "connection": "ftp",
+        "destinations": [{"host": "files.example", "port": 990}],
+        "login": {"user": "{{user}}", "password": "{{password}}"}});
+    if let Some(tls) = tls {
+        open["tls"] = tls.into();
+    }
+    let mut binding = ItemBinding::reviewed("ftp")
+        .pin("host", "files.example")
+        .pin("port", "990")
+        .pin("mode", mode);
+    if signoff {
+        binding = binding.sign_off("plain");
+    }
+    Policy::new()
+        .with_item(binding)
+        .with_field(FieldSpec::public("host"))
+        .with_field(FieldSpec::public("port"))
+        .with_field(FieldSpec::public("mode"))
+        .with_field(FieldSpec::public("user"))
+        .with_field(FieldSpec::guessable("password"))
+        .with_operation(op(serde_json::json!({"name": "pay", "steps": [open,
+            {"do": "return", "relay": {"commands": [
+                {"name": "get", "text": "retrieve", "params": [{"pattern": "/in/[a-z]{1,8}"}]}]}}]})))
+        .with_caller(caller())
+}
+
+#[test]
+fn an_ftp_item_reaches_tls_as_its_pinned_mode_says_and_never_plain() {
+    assert_eq!(rule_of(&ftp_item("implicit", None, false)), None);
+    assert_eq!(
+        rule_of(&ftp_item("implicit", Some("implicit"), false)),
+        None
+    );
+    assert_eq!(
+        rule_of(&ftp_item("explicit", Some("starttls"), false)),
+        None
+    );
+    for (mode, tls, signoff) in [
+        ("implicit", Some("starttls"), false),
+        ("explicit", None, false),
+        ("plain", None, true),
+        ("plain", Some("starttls"), true),
+    ] {
+        assert_eq!(
+            rule_of(&ftp_item(mode, tls, signoff)).map(|(_, r)| r),
+            Some(
+                "the operation reaches TLS as the item's pinned mode says (implicit or explicit); a plain mode allows none"
+            ),
+            "{mode} {tls:?}"
+        );
+    }
+    // A pinned plain mode without the owner's sign-off is refused before that.
+    assert!(rule_of(&ftp_item("plain", None, false)).is_some());
+    // Another host.
+    let mut elsewhere = ftp_item("implicit", None, false);
+    open_of(&mut elsewhere).destinations[0].host = "evil.example".into();
+    assert_eq!(
+        rule_of(&elsewhere).map(|(_, r)| r),
+        Some("a destination outside the item's pinned origin or host")
+    );
+}
+
+#[test]
+fn a_mailbox_reads_pop3_only_on_its_pinned_pop3_server() {
+    let pop3 = |host: &str| {
+        let mut policy = mail_item(vec![
+            serde_json::json!({"do": "open", "connection": "pop3",
+                "destinations": [{"host": host, "port": 995}],
+                "login": {"user": "{{user}}", "password": "{{password}}"}}),
+            serde_json::json!({"do": "return", "relay": {"commands": [
+                {"name": "stat", "text": "STAT"}]}}),
+        ]);
+        let item = policy.item.as_mut().unwrap();
+        item.pins.insert("pop3_host".into(), "pop.example".into());
+        item.pins.insert("pop3_port".into(), "995".into());
+        policy
+            .fields
+            .push(FieldSpec::public("pop3_host").optional());
+        policy
+            .fields
+            .push(FieldSpec::public("pop3_port").optional());
+        policy
+    };
+    assert_eq!(rule_of(&pop3("pop.example")), None);
+    for host in ["imap.example", "evil.example"] {
+        assert_eq!(
+            rule_of(&pop3(host)).map(|(_, r)| r),
+            Some("a destination outside the item's pinned origin or host")
+        );
+    }
 }

@@ -1,5 +1,5 @@
 //! The protocol connections of layer 1: SSH (with SFTP and port forwarding), PostgreSQL,
-//! MySQL, SMTP, IMAP, Redis, MQTT and AMQP.
+//! MySQL, SMTP, IMAP, POP3, Redis, MQTT, AMQP and FTP over TLS.
 //!
 //! Each is a standard family with one meaning for the steps:
 //!
@@ -11,8 +11,9 @@
 //!   exactly its caller parameters, each matching the rule's pattern. A caller parameter never
 //!   becomes part of a command's text: it is a bound parameter (PostgreSQL, MySQL), a bulk
 //!   string (Redis), a quoted string (IMAP), a single-quoted shell word (SSH), a path checked
-//!   for traversal (SFTP), a topic with no wildcard or a payload (MQTT), or a message body
-//!   (AMQP). SMTP relays messages within a [`MailRule`] instead, an SSH shell or forward
+//!   for traversal (SFTP, FTP), a message number (POP3), a topic with no wildcard or a
+//!   payload (MQTT), or a message body (AMQP). SMTP relays messages within a [`MailRule`]
+//!   instead, an SSH shell or forward
 //!   relays signed frames, and an MQTT live relay hands back the messages of its
 //!   subscriptions.
 
@@ -68,6 +69,12 @@ pub enum Mechanism {
     CachingSha2Password,
     /// A bearer token in the password of an MQTT `CONNECT`.
     Token,
+    /// `USER` and `PASS` (FTP, POP3): the password itself goes to the server.
+    User,
+    /// POP3 `APOP` (RFC 1939 section 7): MD5 over the server's timestamp and the password.
+    /// The password does not cross the connection, but MD5 is weak and a captured exchange
+    /// can be guessed against offline; a summary flags it.
+    Apop,
 }
 
 impl Mechanism {
@@ -84,6 +91,8 @@ impl Mechanism {
             Mechanism::Auth => "auth",
             Mechanism::CachingSha2Password => "caching-sha2-password",
             Mechanism::Token => "token",
+            Mechanism::User => "user",
+            Mechanism::Apop => "apop",
         }
     }
 }
@@ -107,8 +116,9 @@ pub enum SshChannel {
     /// A command line (`exec`).
     #[default]
     Exec,
-    /// The SFTP subsystem: `text` is `read` (one parameter, the path) or `write` (the path and
-    /// the bytes).
+    /// The SFTP subsystem: `text` is `read` (the path), `write` (the path and the bytes),
+    /// `list` (a directory), `stat` (a path), `rename` (two paths), `delete` (a file),
+    /// `mkdir` or `rmdir` (a directory).
     Sftp,
     /// Local port forwarding: `text` is the `host:port` the server connects to, fixed by the
     /// policy; the caller's frames go there on a streaming call.
@@ -178,6 +188,9 @@ impl Login {
             Connection::Mqtt if self.token.is_some() => Mechanism::Token,
             Connection::Mqtt => Mechanism::Password,
             Connection::Amqp => Mechanism::Plain,
+            Connection::Ftp => Mechanism::User,
+            Connection::Pop3 if self.token.is_some() => Mechanism::Xoauth2,
+            Connection::Pop3 => Mechanism::User,
             Connection::Https
             | Connection::Tls
             | Connection::Websocket
@@ -199,15 +212,16 @@ impl Login {
     }
 }
 
-/// How SMTP and IMAP reach TLS.
+/// How SMTP, IMAP, POP3 and FTP reach TLS.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TlsMode {
-    /// TLS from the first byte (ports 465 and 993).
+    /// TLS from the first byte (ports 465, 993, 995 and 990).
     #[default]
     Implicit,
-    /// A plain connection upgraded with `STARTTLS` before anything else (ports 587 and
-    /// 143). A server that does not offer it is refused.
+    /// A plain connection upgraded before anything else: `STARTTLS` (SMTP, IMAP; ports 587
+    /// and 143), `STLS` (POP3, port 110) or `AUTH TLS` (FTP, port 21). A server that does
+    /// not take it is refused.
     Starttls,
 }
 
@@ -328,6 +342,8 @@ impl Connection {
                 | Connection::Mysql
                 | Connection::Mqtt
                 | Connection::Amqp
+                | Connection::Ftp
+                | Connection::Pop3
         )
     }
 
@@ -345,6 +361,8 @@ impl Connection {
             Connection::Mysql => "mysql",
             Connection::Mqtt => "mqtt",
             Connection::Amqp => "amqp",
+            Connection::Ftp => "ftp",
+            Connection::Pop3 => "pop3",
             Connection::Udp => "udp",
         }
     }
@@ -364,6 +382,14 @@ fn mechanisms(connection: Connection) -> &'static [Mechanism] {
         Connection::Redis => &[Mechanism::Auth],
         Connection::Mqtt => &[Mechanism::Password, Mechanism::Token],
         Connection::Amqp => &[Mechanism::Plain],
+        Connection::Ftp => &[Mechanism::User],
+        Connection::Pop3 => &[
+            Mechanism::User,
+            Mechanism::Apop,
+            Mechanism::Plain,
+            Mechanism::Login,
+            Mechanism::Xoauth2,
+        ],
         Connection::Https
         | Connection::Tls
         | Connection::Websocket
@@ -409,6 +435,91 @@ fn is_literal(text: &str) -> bool {
     !text.contains("{{")
 }
 
+/// The shape of a verb of FTP, POP3 or SFTP: how many parameters it takes, which of them are
+/// paths, and whether they are message numbers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VerbShape {
+    /// Fewest parameters.
+    pub min: usize,
+    /// Most parameters.
+    pub max: usize,
+    /// The parameters that are paths.
+    pub paths: &'static [usize],
+    /// True when a path may be the root `/` (a listing, a status).
+    pub root: bool,
+    /// True when every parameter is a message number (POP3).
+    pub numbers: bool,
+}
+
+const fn verb(min: usize, max: usize, paths: &'static [usize], root: bool) -> VerbShape {
+    VerbShape {
+        min,
+        max,
+        paths,
+        root,
+        numbers: false,
+    }
+}
+
+const fn numbers(min: usize, max: usize) -> VerbShape {
+    VerbShape {
+        min,
+        max,
+        paths: &[],
+        root: false,
+        numbers: true,
+    }
+}
+
+/// The shape of `text` as a verb of FTP, POP3 or SFTP (`channel` for SSH), or `None` when
+/// the kind has no such verb or takes free commands.
+pub fn verb_shape(connection: Connection, channel: SshChannel, text: &str) -> Option<VerbShape> {
+    match (connection, channel, text) {
+        (Connection::Ssh, SshChannel::Sftp, "read" | "delete" | "mkdir" | "rmdir")
+        | (Connection::Ftp, _, "retrieve" | "delete" | "mkdir") => Some(verb(1, 1, &[0], false)),
+        (Connection::Ssh, SshChannel::Sftp, "write") | (Connection::Ftp, _, "store") => {
+            Some(verb(2, 2, &[0], false))
+        }
+        (Connection::Ssh, SshChannel::Sftp, "list" | "stat") | (Connection::Ftp, _, "list") => {
+            Some(verb(1, 1, &[0], true))
+        }
+        (Connection::Ssh, SshChannel::Sftp, "rename") | (Connection::Ftp, _, "rename") => {
+            Some(verb(2, 2, &[0, 1], false))
+        }
+        (Connection::Pop3, _, "STAT" | "NOOP" | "RSET") => Some(numbers(0, 0)),
+        (Connection::Pop3, _, "LIST" | "UIDL") => Some(numbers(0, 1)),
+        (Connection::Pop3, _, "RETR" | "DELE") => Some(numbers(1, 1)),
+        (Connection::Pop3, _, "TOP") => Some(numbers(2, 2)),
+        _ => None,
+    }
+}
+
+/// True when `path` may go in a command of `connection` as a path: `/` where the verb allows
+/// the root, else an absolute path with no empty, `.` or `..` segment, backslash or NUL (and
+/// for FTP, whose commands are lines, no control byte, `0xFF` or invalid UTF-8).
+pub fn path_ok(connection: Connection, path: &[u8], root: bool) -> bool {
+    (root && path == b"/")
+        || match connection {
+            Connection::Ftp => crate::proto::ftp::check_path(path).is_ok(),
+            _ => crate::proto::sftp::normalize(path).is_ok(),
+        }
+}
+
+/// The words of the verbs of `connection` and `channel`, for messages.
+fn verbs_of(connection: Connection) -> &'static str {
+    match connection {
+        Connection::Ftp => {
+            "an FTP command is list, retrieve, store, delete, rename or mkdir, with its paths"
+        }
+        Connection::Pop3 => {
+            "a POP3 command is STAT, LIST, UIDL, RETR, TOP, DELE, NOOP or RSET, with message numbers"
+        }
+        _ => {
+            "an SFTP rule is read, write, list, stat, rename, delete, mkdir or rmdir, with its paths"
+        }
+    }
+}
+
 /// How many parameters a verb of MQTT or AMQP takes, or `None` for a verb the kind lacks.
 fn verb_params(connection: Connection, verb: &str) -> Option<usize> {
     match (connection, verb) {
@@ -435,9 +546,13 @@ impl Policy {
             "an SSH connection signs in with login.key, not a TLS identity",
         )?;
         ensure(
-            open.tls.is_none() || matches!(connection, Connection::Smtp | Connection::Imap),
+            open.tls.is_none()
+                || matches!(
+                    connection,
+                    Connection::Smtp | Connection::Imap | Connection::Pop3 | Connection::Ftp
+                ),
             || format!("{at}.tls"),
-            "tls (implicit or starttls) is for SMTP and IMAP; the others fix how they reach TLS",
+            "tls (implicit or starttls) is for SMTP, IMAP, POP3 and FTP; the others fix how they reach TLS",
         )?;
         ensure(
             open.version.is_none() || connection == Connection::Mqtt,
@@ -480,7 +595,9 @@ impl Policy {
                 | Mechanism::Plain
                 | Mechanism::Login
                 | Mechanism::Auth
-                | Mechanism::CachingSha2Password,
+                | Mechanism::CachingSha2Password
+                | Mechanism::User
+                | Mechanism::Apop,
             ) => given == (true, false, false, false),
             Some(Mechanism::Publickey) => given == (false, true, false, false),
             Some(Mechanism::KeyboardInteractive) => given == (false, false, false, true),
@@ -569,6 +686,17 @@ impl Policy {
             || format!("{at}.params"),
             "at most 32 parameters",
         )?;
+        if matches!(connection, Connection::Ftp | Connection::Pop3) {
+            let Some(shape) = verb_shape(connection, SshChannel::Exec, &command.text) else {
+                return fail(format!("{at}.text"), verbs_of(connection));
+            };
+            ensure(
+                (shape.min..=shape.max).contains(&command.params.len()),
+                || format!("{at}.params"),
+                verbs_of(connection),
+            )?;
+            check_verb_literals(&at, connection, shape, command.params.iter().map(Some))?;
+        }
         if let Some(n) = verb_params(connection, &command.text) {
             ensure(
                 command.params.len() == n,
@@ -654,6 +782,13 @@ impl Policy {
                     "an MQTT command is publish or subscribe; an AMQP command publish or get",
                 );
             }
+            Connection::Ftp | Connection::Pop3 => {
+                return ensure(
+                    verb_shape(connection, SshChannel::Exec, text).is_some(),
+                    || at.clone(),
+                    verbs_of(connection),
+                );
+            }
             _ => {}
         }
         self.check_template(&at, kinds, text, known, Var::in_stream)?;
@@ -712,27 +847,23 @@ impl Policy {
         )?;
         let params = rule.params.len();
         match (connection, rule.ssh_channel()) {
-            (Connection::Ssh, crate::policy::SshChannel::Sftp) => {
-                let n = match verb {
-                    "read" => 1,
-                    "write" => 2,
-                    _ => return fail(format!("{at}.text"), "an SFTP rule is read or write"),
+            (Connection::Ssh, SshChannel::Sftp) | (Connection::Ftp | Connection::Pop3, _) => {
+                let Some(shape) = verb_shape(connection, rule.ssh_channel(), verb) else {
+                    return fail(format!("{at}.text"), verbs_of(connection));
                 };
                 ensure(
-                    params == n,
+                    (shape.min..=shape.max).contains(&params),
                     || format!("{at}.params"),
-                    "SFTP read takes the path, write the path and the bytes",
+                    verbs_of(connection),
                 )?;
-                if let Some(path) = rule.params.first().and_then(|p| p.template.as_deref())
-                    && is_literal(path)
-                {
-                    ensure(
-                        crate::proto::sftp::normalize(path.as_bytes()).is_ok(),
-                        || format!("{at}.params[0]"),
-                        "an SFTP path: absolute, no empty, . or .. segment, no \\ or NUL",
-                    )?;
-                }
-                Ok(())
+                check_verb_literals(
+                    at,
+                    connection,
+                    shape,
+                    rule.params
+                        .iter()
+                        .map(|p| p.template.as_ref().filter(|_| p.pattern.is_none())),
+                )
             }
             (Connection::Ssh, crate::policy::SshChannel::DirectTcpip) => ensure(
                 forward_target(verb).is_some() && params == 0,
@@ -928,6 +1059,35 @@ impl Policy {
     }
 }
 
+/// Checks the parameters of a verb whose value is known now (a template with no placeholder,
+/// given as `Some`): paths and message numbers that cannot be sent are refused when the
+/// policy is signed.
+fn check_verb_literals<'p>(
+    at: &str,
+    connection: Connection,
+    shape: VerbShape,
+    params: impl IntoIterator<Item = Option<&'p String>>,
+) -> Checked {
+    for (i, p) in params.into_iter().enumerate() {
+        let Some(p) = p.filter(|p| is_literal(p)) else {
+            continue;
+        };
+        let ok = if shape.numbers {
+            crate::proto::pop3::number_ok(p.as_bytes())
+        } else if shape.paths.contains(&i) {
+            path_ok(connection, p.as_bytes(), shape.root)
+        } else {
+            true
+        };
+        ensure(
+            ok,
+            || format!("{at}.params[{i}]"),
+            "a path: absolute, no empty, . or .. segment, no \\, NUL or (FTP) control byte; or a POP3 message number of 1 to 10 digits",
+        )?;
+    }
+    Ok(())
+}
+
 /// The summary lines of an `open` on a protocol connection.
 pub(super) fn open_lines(open: &Open, out: &mut Vec<String>) {
     if let Some(login) = &open.login {
@@ -959,7 +1119,16 @@ pub(super) fn open_lines(open: &Open, out: &mut Vec<String>) {
         out.push(format!("  host key pinned: {short}"));
     }
     if open.tls == Some(TlsMode::Starttls) {
-        out.push("  TLS by STARTTLS before anything else".into());
+        out.push(match open.connection {
+            Connection::Ftp => "  TLS by AUTH TLS before anything else".into(),
+            Connection::Pop3 => "  TLS by STLS before anything else".into(),
+            _ => "  TLS by STARTTLS before anything else".into(),
+        });
+    }
+    if open.connection == Connection::Ftp {
+        out.push(
+            "  data connections only to the same server, passive, each over TLS (PROT P)".into(),
+        );
     }
 }
 
