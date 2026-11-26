@@ -41,6 +41,47 @@ before 1.0, minor versions may break formats and APIs.
 
 ### Added
 
+- SRP-6a and OpenPGP framing as template families (`docs/policy.md`, SRP-6a and OpenPGP;
+  `docs/design.md` section 11), two rows of the list of schemes not done:
+  - `srp_public`, `srp_x`, `srp_u`, `srp_premaster`, `srp_m1` and `srp_verify` (RFC 2945,
+    RFC 5054) over the seven groups of RFC 5054 appendix A with SHA-1 or SHA-2, on
+    `crypto-bigint` 0.7.11 (already a dependency of `rsa`): constant-time Montgomery
+    arithmetic at precisions set by the group and the input lengths. RFC 5054 appendix B
+    (`k`, `x`, `v`, `A`, `u`, the premaster secret) byte for byte; the seven groups checked
+    to be safe primes. A `B` of zero or not below `N` and a `u` of zero are refused;
+    `srp_verify` fails the operation when the server's `M2` does not match. A premaster
+    secret counts 3 against the 32 signatures of an operation.
+  - New rule 11: the SRP private value is neither caller-chosen nor captured; `B` and the
+    arguments of `srp_verify` are not caller-chosen. Rule 10 now also refuses a tainted input
+    to `pgp_mpi`.
+  - `pgp_packet`, `pgp_subpacket`, `pgp_mpi` and `pgp_armor` (RFC 9580, CRC-24 on request for
+    RFC 4880 readers). Detached signatures are policies over them and the existing signature
+    functions: version 4 with RSA and with EdDSALegacy, version 6 with Ed25519 and a salt.
+  - A two-request SRP login (`srp-login`) against a server on `num-bigint`, and the three
+    signing policies, verified by ring, `rsa` and GnuPG 2.4.9 (v4 only, by hand).
+  - Dev-dependencies `num-bigint` 0.4.8 and `crypto-primes` 0.7.2, both already in
+    `Cargo.lock`.
+- Parameter lists, derived EC keys and binary-message helpers as template families
+  (`docs/policy.md`, Parameter lists, derived EC keys and binary messages; `docs/design.md`
+  section 11), for OAuth 1.0a, the SigV4A key and NTLMv2 over HTTP:
+  - `sorted_params(list, ...)`: 1 to 8 form-encoded lists, decoded, encoded again as RFC 3986
+    says, sorted by name and value and joined (RFC 5849 section 3.4.1.3.2). A secret and a
+    chosen value may not meet in it (rule 2); a malformed `%` fails.
+  - `kbkdf_ec_key(curve, hash, key, fixed_prefix, fixed_suffix)`: an EC private key on
+    `p256`, `p384` or `k256` from NIST SP 800-108 counter-mode candidates (HMAC-SHA-2, the
+    candidate byte 1 to 254 between prefix and suffix), the first with `c <= n - 2` giving
+    `c + 1` (FIPS 186-5 appendix A.2.2). Curve and hash are fixed by the policy (rule 6); the
+    key is a secret (rule 8). `kbkdf_counter` shares its counter-mode code.
+  - `utf16le`, `utf16be` (UTF-8 to UTF-16, no BOM), `uint_be`, `uint_le` (1 to 8 bytes as a
+    decimal number; refused on a secret, rule 9).
+  - The summary flags `weak_mechanism` on every operation whose templates compute `md4`.
+- Worked policies `oauth1-hmac-sha1`, `oauth1-rsa-sha1`, `sigv4a` and `ntlm-http` (NTLMv2 with
+  the server's timestamp, `MsvAvFlags` and the MIC, on one TLS connection with hand-written
+  HTTP/1.1, then a relay), tested in `crates/engine/tests/schemes_primitives.rs` against RFC
+  5849 sections 1.2 and 3.4.1 and MS-NLMP section 4.2.4, and by verifiers written in the test.
+- Fuzz target `parameter_lists`: `sorted_params` never panics, stays within its bound and
+  is idempotent.
+
 - DEFLATE and XML canonicalization as template families (`docs/policy.md`, Compression and
   XML; `docs/design.md` section 11), the two gaps of the scheme table:
   - `deflate`, `inflate`, `zlib_deflate`, `zlib_inflate`, `gzip_deflate` and `gzip_inflate`

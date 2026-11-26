@@ -127,7 +127,16 @@ pub(super) fn concat_kdf(hash: Sha2, z: &[u8], other: &[u8], len: &[u8]) -> Resu
 /// fixed input, usually `label || 0x00 || context || [L]32` (`be32` of the length in bits);
 /// Kerberos (RFC 8009) uses `label || 0x00 || [L]32`.
 pub(super) fn kbkdf_counter(hash: Sha2, key: &[u8], fixed: &[u8], len: &[u8]) -> Result<Bytes> {
-    let len = length(len, MAX_DERIVED)?;
+    kbkdf_counter_bytes(hash, key, fixed, length(len, MAX_DERIVED)?)
+}
+
+/// [`kbkdf_counter`] with the length as a number of octets.
+pub(super) fn kbkdf_counter_bytes(
+    hash: Sha2,
+    key: &[u8],
+    fixed: &[u8],
+    len: usize,
+) -> Result<Bytes> {
     fn run<M: Mac + hmac::KeyInit>(key: &[u8], fixed: &[u8], len: usize) -> Result<Bytes> {
         let mut out = Zeroizing::new(Vec::with_capacity(len + 64));
         let mut counter = 1u32;
