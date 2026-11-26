@@ -1,11 +1,14 @@
 //! An SSH server for the tests, written apart from the node's client: AES-GCM from the
-//! RustCrypto crate (the client uses ring), host keys from ed25519-dalek and p256. It speaks
-//! enough of RFC 4253, 4252 and 4254 to sign in, run commands and a shell, and can be told to
-//! misbehave.
+//! RustCrypto crate (the client uses ring), host keys from ed25519-dalek, p256 and an RSA key
+//! the test generates, key exchange over X25519 and the NIST curves of the RustCrypto crates.
+//! It speaks enough of RFC 4253, 4252 and 4254 to sign in, run commands and a shell, forward
+//! a port, and serve SFTP from memory, and can be told to misbehave.
+
+use std::collections::BTreeMap;
 
 use aes_gcm::aead::{Aead, KeyInit, Payload};
 use p256::elliptic_curve::sec1::ToSec1Point as _;
-use sha2::{Digest, Sha256};
+use sha2::{Digest, Sha256, Sha384, Sha512};
 
 use super::Peer;
 
@@ -16,6 +19,26 @@ pub const KEXINIT: u8 = 20;
 pub enum HostKind {
     Ed25519([u8; 32]),
     P256([u8; 32]),
+    /// A PKCS#1 DER private key: signs `rsa-sha2-256` or `rsa-sha2-512`, as agreed.
+    Rsa(Vec<u8>),
+}
+
+/// A 2048-bit RSA key in PKCS#1 DER, generated now.
+pub fn rsa_key() -> Vec<u8> {
+    use rsa::Generate as _;
+    use rsa::pkcs1::EncodeRsaPrivateKey as _;
+    let key = rsa::PrivateKey::generate();
+    key.to_pkcs1_der().unwrap().as_bytes().to_vec()
+}
+
+/// `ssh-rsa` blob of a PKCS#1 DER private key.
+pub fn rsa_blob(der: &[u8]) -> Vec<u8> {
+    let pair = ring::rsa::KeyPair::from_der(der).unwrap();
+    let parts: ring::rsa::PublicKeyComponents<Vec<u8>> = pair.public().into();
+    let mut out = string(b"ssh-rsa");
+    out.extend(mpint(&parts.e));
+    out.extend(mpint(&parts.n));
+    out
 }
 
 impl HostKind {
@@ -23,11 +46,13 @@ impl HostKind {
         match self {
             HostKind::Ed25519(_) => "ssh-ed25519",
             HostKind::P256(_) => "ecdsa-sha2-nistp256",
+            HostKind::Rsa(_) => "ssh-rsa",
         }
     }
 
     pub fn blob(&self) -> Vec<u8> {
         match self {
+            HostKind::Rsa(der) => rsa_blob(der),
             HostKind::Ed25519(seed) => {
                 let key = ed25519_dalek::SigningKey::from_bytes(seed);
                 let mut out = string(b"ssh-ed25519");
@@ -55,8 +80,21 @@ impl HostKind {
         )
     }
 
-    fn sign(&self, data: &[u8]) -> Vec<u8> {
+    fn sign(&self, data: &[u8], alg: &str) -> Vec<u8> {
         match self {
+            HostKind::Rsa(der) => {
+                let pair = ring::rsa::KeyPair::from_der(der).unwrap();
+                let padding: &dyn ring::signature::RsaEncoding = match alg {
+                    "rsa-sha2-512" => &ring::signature::RSA_PKCS1_SHA512,
+                    _ => &ring::signature::RSA_PKCS1_SHA256,
+                };
+                let mut sig = vec![0u8; pair.public().modulus_len()];
+                pair.sign(padding, &ring::rand::SystemRandom::new(), data, &mut sig)
+                    .unwrap();
+                let mut out = string(alg.as_bytes());
+                out.extend(string(&sig));
+                out
+            }
             HostKind::Ed25519(seed) => {
                 use ed25519_dalek::Signer as _;
                 let key = ed25519_dalek::SigningKey::from_bytes(seed);
@@ -169,6 +207,20 @@ pub struct SshServer {
     pub shell_input: Vec<u8>,
     pub agreed_cipher: String,
     pub agreed_kex: String,
+    pub agreed_host: String,
+    /// The SFTP files, by path, and its symbolic links, by path to target.
+    pub files: BTreeMap<String, Vec<u8>>,
+    pub links: BTreeMap<String, String>,
+    /// SFTP requests it got, by type and path.
+    pub sftp_seen: Vec<(u8, String)>,
+    /// `host:port` it forwards to; what it saw asked, and what came through.
+    pub reachable: Vec<String>,
+    pub forwards: Vec<String>,
+    pub forwarded: Vec<u8>,
+    sftp: bool,
+    sftp_in: Vec<u8>,
+    forwarding: bool,
+    sent_close: bool,
     inbuf: Vec<u8>,
     outbuf: Vec<u8>,
     client_version: Option<Vec<u8>>,
@@ -207,6 +259,17 @@ impl SshServer {
             shell_input: Vec::new(),
             agreed_cipher: String::new(),
             agreed_kex: String::new(),
+            agreed_host: String::new(),
+            files: BTreeMap::new(),
+            links: BTreeMap::new(),
+            sftp_seen: Vec::new(),
+            reachable: Vec::new(),
+            forwards: Vec::new(),
+            forwarded: Vec::new(),
+            sftp: false,
+            sftp_in: Vec::new(),
+            forwarding: false,
+            sent_close: false,
             inbuf: Vec::new(),
             outbuf: b"SSH-2.0-TestServer_1.0\r\n".to_vec(),
             client_version: None,
@@ -345,8 +408,13 @@ impl SshServer {
                 self.client_kexinit = payload.clone();
                 let mut r = Reader(&payload[17..]);
                 let client_kex: Vec<String> = text_list(r.string());
-                let _host = r.string();
+                let client_hosts = text_list(r.string());
                 let client_ciphers = text_list(r.string());
+                self.agreed_host = client_hosts
+                    .iter()
+                    .find(|h| self.host_algs.contains(&h.as_str()))
+                    .cloned()
+                    .unwrap_or_default();
                 let kex = client_kex
                     .iter()
                     .find(|k| self.kex.contains(&k.as_str()))
@@ -365,35 +433,64 @@ impl SshServer {
             30 => {
                 // KEX_ECDH_INIT.
                 let q_c = r.string().to_vec();
-                let (q_s, k) = if self.agreed_kex.starts_with("curve25519") {
-                    let secret = [0x41u8; 32];
-                    let public = x25519_dalek::x25519(secret, x25519_dalek::X25519_BASEPOINT_BYTES);
-                    let shared = x25519_dalek::x25519(secret, q_c.clone().try_into().unwrap());
-                    (public.to_vec(), shared.to_vec())
-                } else {
-                    let secret = p256::SecretKey::from_slice(&[0x42u8; 32]).unwrap();
-                    let public = secret.public_key().to_sec1_point(false).as_bytes().to_vec();
-                    let peer = p256::PublicKey::from_sec1_bytes(&q_c).unwrap();
-                    let shared =
-                        p256::ecdh::diffie_hellman(secret.to_nonzero_scalar(), peer.as_affine());
-                    (public, shared.raw_secret_bytes().to_vec())
+                let (q_s, k) = match self.agreed_kex.as_str() {
+                    k if k.starts_with("curve25519") => {
+                        let secret = [0x41u8; 32];
+                        let public =
+                            x25519_dalek::x25519(secret, x25519_dalek::X25519_BASEPOINT_BYTES);
+                        let shared = x25519_dalek::x25519(secret, q_c.clone().try_into().unwrap());
+                        (public.to_vec(), shared.to_vec())
+                    }
+                    "ecdh-sha2-nistp384" => {
+                        use p384::elliptic_curve::sec1::ToSec1Point as _;
+                        let secret = p384::SecretKey::from_slice(&[0x43u8; 48]).unwrap();
+                        let public = secret.public_key().to_sec1_point(false).as_bytes().to_vec();
+                        let peer = p384::PublicKey::from_sec1_bytes(&q_c).unwrap();
+                        let shared = p384::ecdh::diffie_hellman(
+                            secret.to_nonzero_scalar(),
+                            peer.as_affine(),
+                        );
+                        (public, shared.raw_secret_bytes().to_vec())
+                    }
+                    "ecdh-sha2-nistp521" => {
+                        use p521::elliptic_curve::sec1::ToSec1Point as _;
+                        let mut scalar = [0x44u8; 66];
+                        scalar[0] = 0x01;
+                        let secret = p521::SecretKey::from_slice(&scalar).unwrap();
+                        let public = secret.public_key().to_sec1_point(false).as_bytes().to_vec();
+                        let peer = p521::PublicKey::from_sec1_bytes(&q_c).unwrap();
+                        let shared = p521::ecdh::diffie_hellman(
+                            secret.to_nonzero_scalar(),
+                            peer.as_affine(),
+                        );
+                        (public, shared.raw_secret_bytes().to_vec())
+                    }
+                    _ => {
+                        let secret = p256::SecretKey::from_slice(&[0x42u8; 32]).unwrap();
+                        let public = secret.public_key().to_sec1_point(false).as_bytes().to_vec();
+                        let peer = p256::PublicKey::from_sec1_bytes(&q_c).unwrap();
+                        let shared = p256::ecdh::diffie_hellman(
+                            secret.to_nonzero_scalar(),
+                            peer.as_affine(),
+                        );
+                        (public, shared.raw_secret_bytes().to_vec())
+                    }
                 };
                 let blob = self.host.blob();
                 let k_mpint = mpint(&k);
-                let mut hash = Sha256::new();
-                hash.update(string(self.client_version.as_deref().unwrap_or_default()));
-                hash.update(string(b"SSH-2.0-TestServer_1.0"));
-                hash.update(string(&self.client_kexinit));
-                hash.update(string(&self.server_kexinit));
-                hash.update(string(&blob));
-                hash.update(string(&q_c));
-                hash.update(string(&q_s));
-                hash.update(&k_mpint);
-                let h = hash.finalize().to_vec();
+                let mut exchange = string(self.client_version.as_deref().unwrap_or_default());
+                exchange.extend(string(b"SSH-2.0-TestServer_1.0"));
+                exchange.extend(string(&self.client_kexinit));
+                exchange.extend(string(&self.server_kexinit));
+                exchange.extend(string(&blob));
+                exchange.extend(string(&q_c));
+                exchange.extend(string(&q_s));
+                exchange.extend(&k_mpint);
+                let h = self.hash(&[&exchange]);
                 let signature = if self.misbehave == Misbehave::WrongSignature {
-                    HostKind::Ed25519([3; 32]).sign(&h)
+                    HostKind::Ed25519([3; 32]).sign(&h, "ssh-ed25519")
                 } else {
-                    self.host.sign(&h)
+                    self.host.sign(&h, &self.agreed_host)
                 };
                 let mut reply = vec![31];
                 reply.extend(string(&blob));
@@ -440,8 +537,30 @@ impl SshServer {
                 }
             }
             90 => {
-                let _kind = r.string();
+                let kind = r.string().to_vec();
                 let theirs = r.u32();
+                self.sftp = false;
+                self.sftp_in.clear();
+                self.forwarding = false;
+                self.sent_close = false;
+                if kind == b"direct-tcpip" {
+                    let (_window, _packet) = (r.u32(), r.u32());
+                    let host = String::from_utf8(r.string().to_vec()).unwrap();
+                    let port = r.u32();
+                    let target = format!("{host}:{port}");
+                    self.forwards.push(target.clone());
+                    if !self.reachable.contains(&target) {
+                        // 1: SSH_OPEN_ADMINISTRATIVELY_PROHIBITED.
+                        let mut refuse = vec![92];
+                        refuse.extend(theirs.to_be_bytes());
+                        refuse.extend(1u32.to_be_bytes());
+                        refuse.extend(string(b"prohibited"));
+                        refuse.extend(string(b""));
+                        self.send(&refuse);
+                        return;
+                    }
+                    self.forwarding = true;
+                }
                 self.channel = Some(theirs);
                 let mut reply = vec![91];
                 reply.extend(theirs.to_be_bytes());
@@ -482,13 +601,40 @@ impl SshServer {
                         let mut close = vec![97];
                         close.extend(channel.to_be_bytes());
                         self.send(&close);
+                        self.sent_close = true;
                     }
                     b"shell" => {
                         self.shell = true;
                         self.data(b"$ ", false);
                     }
+                    b"subsystem" => {
+                        assert_eq!(r.string(), b"sftp");
+                        self.sftp = true;
+                    }
                     _ => {}
                 }
+            }
+            94 if self.sftp => {
+                let _recipient = r.u32();
+                let data = r.string().to_vec();
+                self.sftp_in.extend_from_slice(&data);
+                while self.sftp_in.len() >= 4 {
+                    let len = u32::from_be_bytes(self.sftp_in[..4].try_into().unwrap()) as usize;
+                    if self.sftp_in.len() < 4 + len {
+                        break;
+                    }
+                    let packet: Vec<u8> = self.sftp_in.drain(..4 + len).skip(4).collect();
+                    let answer = self.sftp_answer(&packet);
+                    self.data(&string(&answer), false);
+                }
+            }
+            94 if self.forwarding => {
+                let _recipient = r.u32();
+                let data = r.string().to_vec();
+                self.forwarded.extend_from_slice(&data);
+                let mut echo = b"echo:".to_vec();
+                echo.extend_from_slice(&data);
+                self.data(&echo, false);
             }
             94 => {
                 let _recipient = r.u32();
@@ -500,6 +646,7 @@ impl SshServer {
                         let mut close = vec![97];
                         close.extend(channel.to_be_bytes());
                         self.send(&close);
+                        self.sent_close = true;
                     } else {
                         let (stdout, _, _) = (self.exec)(&data);
                         self.data(&stdout, false);
@@ -507,6 +654,14 @@ impl SshServer {
                 }
             }
             97 => {
+                // A close it did not start gets its own close back (RFC 4254, 5.3).
+                if let Some(channel) = self.channel
+                    && !self.sent_close
+                {
+                    let mut close = vec![97];
+                    close.extend(channel.to_be_bytes());
+                    self.send(&close);
+                }
                 self.channel = None;
             }
             1 => self.closed = true,
@@ -514,22 +669,146 @@ impl SshServer {
         }
     }
 
+    /// The hash of the agreed key exchange (RFC 5656, 6.2.1: by curve size).
+    fn hash(&self, parts: &[&[u8]]) -> Vec<u8> {
+        fn run<D: Digest>(parts: &[&[u8]]) -> Vec<u8> {
+            let mut d = D::new();
+            for p in parts {
+                d.update(p);
+            }
+            d.finalize().to_vec()
+        }
+        match self.agreed_kex.as_str() {
+            "ecdh-sha2-nistp384" => run::<Sha384>(parts),
+            "ecdh-sha2-nistp521" => run::<Sha512>(parts),
+            _ => run::<Sha256>(parts),
+        }
+    }
+
     fn derive(&self, letter: u8, len: usize) -> Vec<u8> {
-        let mut hash = Sha256::new();
-        hash.update(&self.k);
-        hash.update(&self.h);
-        hash.update([letter]);
-        hash.update(&self.session_id);
-        let mut out = hash.finalize().to_vec();
+        let mut out = self.hash(&[&self.k, &self.h, &[letter], &self.session_id]);
         while out.len() < len {
-            let mut more = Sha256::new();
-            more.update(&self.k);
-            more.update(&self.h);
-            more.update(&out);
-            out.extend(more.finalize());
+            let more = self.hash(&[&self.k, &self.h, &out]);
+            out.extend(more);
         }
         out.truncate(len);
         out
+    }
+
+    /// Answers one SFTP request from the files in memory: links resolve in REALPATH and show
+    /// as links in LSTAT.
+    fn sftp_answer(&mut self, packet: &[u8]) -> Vec<u8> {
+        const STATUS: u8 = 101;
+        let mut r = Reader(packet);
+        let kind = r.u8();
+        if kind == 1 {
+            let mut version = vec![2];
+            version.extend(3u32.to_be_bytes());
+            return version;
+        }
+        let id = r.u32();
+        let status = |code: u32| {
+            let mut out = vec![STATUS];
+            out.extend(id.to_be_bytes());
+            out.extend(code.to_be_bytes());
+            out.extend(string(b""));
+            out.extend(string(b""));
+            out
+        };
+        let path_of = |bytes: &[u8]| String::from_utf8(bytes.to_vec()).unwrap();
+        match kind {
+            // REALPATH.
+            16 => {
+                let path = path_of(r.string());
+                self.sftp_seen.push((16, path.clone()));
+                let mut real = path.clone();
+                for (link, target) in &self.links {
+                    if real == *link {
+                        real = target.clone();
+                    } else if let Some(rest) = real.strip_prefix(&format!("{link}/")) {
+                        real = format!("{target}/{rest}");
+                    }
+                }
+                let known = self.files.contains_key(&real)
+                    || self
+                        .files
+                        .keys()
+                        .any(|f| f.starts_with(&format!("{real}/")))
+                    || real == "/";
+                if !known {
+                    return status(2);
+                }
+                let mut out = vec![104];
+                out.extend(id.to_be_bytes());
+                out.extend(1u32.to_be_bytes());
+                out.extend(string(real.as_bytes()));
+                out.extend(string(real.as_bytes()));
+                out.extend(0u32.to_be_bytes());
+                out
+            }
+            // LSTAT.
+            7 => {
+                let path = path_of(r.string());
+                self.sftp_seen.push((7, path.clone()));
+                let mode: u32 = if self.links.contains_key(&path) {
+                    0o120_777
+                } else if self.files.contains_key(&path) {
+                    0o100_644
+                } else {
+                    return status(2);
+                };
+                let mut out = vec![105];
+                out.extend(id.to_be_bytes());
+                out.extend(4u32.to_be_bytes());
+                out.extend(mode.to_be_bytes());
+                out
+            }
+            // OPEN: the handle is the path.
+            3 => {
+                let path = path_of(r.string());
+                let flags = r.u32();
+                self.sftp_seen.push((3, path.clone()));
+                if flags & 0x08 != 0 {
+                    self.files.insert(path.clone(), Vec::new());
+                } else if !self.files.contains_key(&path) {
+                    return status(2);
+                }
+                let mut out = vec![102];
+                out.extend(id.to_be_bytes());
+                out.extend(string(path.as_bytes()));
+                out
+            }
+            // READ.
+            5 => {
+                let path = path_of(r.string());
+                let offset = u64::from_be_bytes(r.0[..8].try_into().unwrap()) as usize;
+                r.0 = &r.0[8..];
+                let len = r.u32() as usize;
+                let file = self.files.get(&path).cloned().unwrap_or_default();
+                if offset >= file.len() {
+                    return status(1);
+                }
+                let end = (offset + len).min(file.len());
+                let mut out = vec![103];
+                out.extend(id.to_be_bytes());
+                out.extend(string(&file[offset..end]));
+                out
+            }
+            // WRITE.
+            6 => {
+                let path = path_of(r.string());
+                let offset = u64::from_be_bytes(r.0[..8].try_into().unwrap()) as usize;
+                r.0 = &r.0[8..];
+                let data = r.string().to_vec();
+                let file = self.files.entry(path).or_default();
+                file.truncate(offset);
+                file.extend(data);
+                status(0)
+            }
+            // CLOSE.
+            4 => status(0),
+            _ => status(8),
+        }
     }
 
     fn data(&mut self, bytes: &[u8], stderr: bool) {
@@ -621,6 +900,36 @@ fn verify_client(alg: &[u8], blob: &[u8], data: &[u8], sig: &[u8]) -> bool {
                 ed25519_dalek::VerifyingKey::from_bytes(b.string().try_into().unwrap()).unwrap();
             let sig = ed25519_dalek::Signature::from_bytes(raw.try_into().unwrap());
             key.verify(data, &sig).is_ok()
+        }
+        b"ecdsa-sha2-nistp384" => {
+            use p384::ecdsa::signature::Verifier as _;
+            let _curve = b.string();
+            let key = p384::ecdsa::VerifyingKey::from_sec1_bytes(b.string()).unwrap();
+            let mut rs = Reader(raw);
+            let (r, s) = (rs.string(), rs.string());
+            let mut fixed = [0u8; 96];
+            let r = r.strip_prefix(&[0]).unwrap_or(r);
+            let s = s.strip_prefix(&[0]).unwrap_or(s);
+            fixed[48 - r.len()..48].copy_from_slice(r);
+            fixed[96 - s.len()..].copy_from_slice(s);
+            let sig = p384::ecdsa::Signature::from_slice(&fixed).unwrap();
+            key.verify(data, &sig).is_ok()
+        }
+        b"rsa-sha2-256" | b"rsa-sha2-512" => {
+            let e = b.string();
+            let n = b.string();
+            let params = if alg == b"rsa-sha2-256" {
+                &ring::signature::RSA_PKCS1_2048_8192_SHA256
+            } else {
+                &ring::signature::RSA_PKCS1_2048_8192_SHA512
+            };
+            let strip = |v: &[u8]| v.strip_prefix(&[0]).unwrap_or(v).to_vec();
+            ring::signature::RsaPublicKeyComponents {
+                n: strip(n),
+                e: strip(e),
+            }
+            .verify(params, data, raw)
+            .is_ok()
         }
         b"ecdsa-sha2-nistp256" => {
             use p256::ecdsa::signature::Verifier as _;

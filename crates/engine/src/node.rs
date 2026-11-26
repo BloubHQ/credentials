@@ -1009,6 +1009,9 @@ impl<S: LogSink, C: Clock> Node<S, C> {
                                     | Connection::Smtp
                                     | Connection::Imap
                                     | Connection::Redis
+                                    | Connection::Mysql
+                                    | Connection::Mqtt
+                                    | Connection::Amqp
                             ),
                             Payload::Session { .. }
                         )
@@ -1273,9 +1276,9 @@ impl<S: LogSink, C: Clock> Node<S, C> {
                     rule: "a WebSocket operation runs on a streaming call",
                 });
             }
-            (None, true) if operation.connection() == Some(Connection::Ssh) => {
+            (None, true) if operation.connection().is_some_and(Connection::is_protocol) => {
                 return Err(Error::RequestInvalid {
-                    rule: "an SSH shell runs on a streaming call",
+                    rule: "an SSH shell or forward, or a live MQTT relay, runs on a streaming call",
                 });
             }
             // A protocol connection is open for the whole call: it takes a slot too.

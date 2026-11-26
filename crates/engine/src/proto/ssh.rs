@@ -1229,16 +1229,22 @@ impl<'s> Client<'s> {
 
     /// Opens a session channel.
     fn open_session(&mut self) -> Result<()> {
+        self.open_channel(b"session", &[])
+    }
+
+    /// Opens a channel of `kind`, with `extra` after the window and packet size.
+    fn open_channel(&mut self, kind: &[u8], extra: &[u8]) -> Result<()> {
         if self.channel.is_some() {
             return Err(invalid("a channel is already open"));
         }
         let ours = self.next_channel;
         self.next_channel = self.next_channel.wrapping_add(1);
         let mut put = Put::message(CHANNEL_OPEN);
-        put.string(b"session")
+        put.string(kind)
             .u32(ours)
             .u32(WINDOW)
-            .u32(CHANNEL_PACKET);
+            .u32(CHANNEL_PACKET)
+            .raw(extra);
         self.send(put.bytes())?;
         let reply = self.recv()?;
         let mut p = Parse::new(&reply);
@@ -1261,7 +1267,7 @@ impl<'s> Client<'s> {
                 });
                 Ok(())
             }
-            CHANNEL_OPEN_FAILURE => Err(invalid("the server refused a session channel")),
+            CHANNEL_OPEN_FAILURE => Err(invalid("the server refused to open a channel")),
             _ => Err(invalid("unexpected answer to a channel open")),
         }
     }
@@ -1432,16 +1438,28 @@ impl<'s> Client<'s> {
         Ok(())
     }
 
-    /// Closes the open channel and forgets it.
+    /// Closes the open channel, waits for the server to close it too, and forgets it.
     pub fn close_channel(&mut self) -> Result<()> {
+        self.end_channel(true)
+    }
+
+    /// Closes the open channel; with `wait`, after the server closes it too.
+    fn end_channel(&mut self, wait: bool) -> Result<()> {
         let Some(channel) = self.channel.as_mut() else {
             return Ok(());
         };
+        let closed = channel.closed;
         if !channel.sent_close {
             channel.sent_close = true;
             let mut put = Put::message(CHANNEL_CLOSE);
             put.u32(channel.theirs);
             self.send(put.bytes())?;
+        }
+        // The server answers with its own close (RFC 4254, 5.3); until it does, the channel
+        // number is still its, and what it sends on it belongs to this channel. The wait is
+        // within the connection's bounds.
+        if wait && !closed {
+            while !matches!(self.poll_event(WAIT)?, Some(Event::Closed)) {}
         }
         self.channel = None;
         Ok(())
@@ -1464,7 +1482,7 @@ impl<'s> Client<'s> {
                 Some(Event::Closed) => break,
             }
             if output.stdout.len().saturating_add(output.stderr.len()) > max {
-                let _ = self.close_channel();
+                let _ = self.end_channel(false);
                 return Err(Error::transport(TransportKind::TooLarge, true));
             }
         }
@@ -1487,9 +1505,30 @@ impl<'s> Client<'s> {
         self.request(b"shell", &[])
     }
 
+    /// Starts the subsystem `name` (`sftp`) on a new session channel.
+    pub fn subsystem(&mut self, name: &[u8]) -> Result<()> {
+        self.open_session()?;
+        let mut body = Put::new();
+        body.string(name);
+        self.request(b"subsystem", body.bytes())
+    }
+
+    /// Opens a `direct-tcpip` channel (RFC 4254, 7.2): the server connects to `host` and
+    /// `port` and relays that connection over the channel. The node names itself as the
+    /// originator `127.0.0.1` port 0: it forwards no local socket.
+    pub fn direct_tcpip(&mut self, host: &[u8], port: u16) -> Result<()> {
+        let mut extra = Put::new();
+        extra
+            .string(host)
+            .u32(u32::from(port))
+            .string(b"127.0.0.1")
+            .u32(0);
+        self.open_channel(b"direct-tcpip", extra.bytes())
+    }
+
     /// Ends the connection.
     pub fn disconnect(&mut self) {
-        let _ = self.close_channel();
+        let _ = self.end_channel(false);
         let mut put = Put::message(DISCONNECT);
         // 11: SSH_DISCONNECT_BY_APPLICATION.
         put.u32(11).string(b"").string(b"");

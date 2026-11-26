@@ -62,8 +62,9 @@ pub use contract::{
 pub(crate) use contract::{parse_query, placeholders};
 pub use input::{Input, JsonInput, JsonType, Member, NodeTime, RawInput, RlpInput, RlpItem};
 pub use proto::{
-    Answer, Command, CommandRule, Login, MAX_COMMANDS, MAX_HOST_KEYS, MAX_MAIL, MAX_PARAM,
-    MAX_PARAMS, MAX_RECIPIENTS, MailRule, Mechanism, ParamRule, TlsMode,
+    Answer, Command, CommandRule, DEFAULT_MESSAGES, Login, MAX_COMMANDS, MAX_HOST_KEYS, MAX_MAIL,
+    MAX_MESSAGE_WAIT_MS, MAX_MESSAGES, MAX_PARAM, MAX_PARAMS, MAX_RECIPIENTS, MailRule, Mechanism,
+    MqttVersion, ParamRule, SshChannel, TlsMode, forward_target,
 };
 pub use run::{ModuleRef, ModuleSource, RunModule};
 pub(crate) use wait::is_currency;
@@ -689,6 +690,14 @@ pub enum Connection {
     Imap,
     /// Redis over TLS: `AUTH`, then commands with bulk-string parameters.
     Redis,
+    /// MySQL: TLS before the sign-in, `caching_sha2_password`, then prepared statements with
+    /// bound parameters.
+    Mysql,
+    /// MQTT 3.1.1 or 5 over TLS: publications and subscriptions within the policy's topics.
+    Mqtt,
+    /// AMQP 0-9-1 over TLS: `PLAIN`, publications to fixed exchanges and routing keys,
+    /// messages got from fixed queues.
+    Amqp,
     /// UDP datagrams to one destination, for request and response protocols that protect
     /// their messages with a MAC (RADIUS, DNS with TSIG, STUN): `send` writes one datagram,
     /// `receive` reads one. There is no TLS, so a send may not hold a secret in reversible
@@ -730,6 +739,9 @@ pub struct Open {
     /// How SMTP and IMAP reach TLS (implicit by default).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tls: Option<TlsMode>,
+    /// The MQTT version (`3.1.1`, the default, or `5`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<MqttVersion>,
 }
 
 /// Bounds of a connection that stays open: it is closed when one is reached.
@@ -1807,7 +1819,10 @@ impl Policy {
                 | Connection::Postgres
                 | Connection::Smtp
                 | Connection::Imap
-                | Connection::Redis),
+                | Connection::Redis
+                | Connection::Mysql
+                | Connection::Mqtt
+                | Connection::Amqp),
             ) => {
                 ensure(
                     ret.response.is_none() && ret.template.is_none(),
@@ -2091,7 +2106,10 @@ impl Policy {
                     | Connection::Postgres
                     | Connection::Smtp
                     | Connection::Imap
-                    | Connection::Redis => {
+                    | Connection::Redis
+                    | Connection::Mysql
+                    | Connection::Mqtt
+                    | Connection::Amqp => {
                         return fail(at, "a send on a protocol connection takes command only");
                     }
                     Connection::Tls => {
@@ -2156,7 +2174,10 @@ impl Policy {
                     | Connection::Postgres
                     | Connection::Smtp
                     | Connection::Imap
-                    | Connection::Redis => {
+                    | Connection::Redis
+                    | Connection::Mysql
+                    | Connection::Mqtt
+                    | Connection::Amqp => {
                         return fail(at, "a protocol receive follows its send");
                     }
                     Connection::Https => {
@@ -2323,9 +2344,24 @@ impl Policy {
             "an operation ends with return",
         )?;
         run::check_confined(at, operation)?;
+        // A protocol parameter over the caller's value reads that value as `$input`, not the
+        // operation's input.
+        let per_value: Vec<&str> = operation
+            .returns()
+            .and_then(|r| r.relay.as_ref())
+            .map(|r| {
+                r.commands
+                    .iter()
+                    .flat_map(|c| c.params.iter())
+                    .filter(|p| p.pattern.is_some())
+                    .filter_map(|p| p.template.as_deref())
+                    .collect()
+            })
+            .unwrap_or_default();
         let reads_input = operation
             .templates()
             .into_iter()
+            .filter(|t| !per_value.iter().any(|v| core::ptr::eq(*v, *t)))
             .any(|t| Template::parse(t).is_ok_and(|t| t.vars().contains(&Var::Input)));
         ensure(
             !reads_input || operation.input.is_some(),
@@ -2792,6 +2828,9 @@ fn summarize_operation(operation: &Operation, out: &mut Vec<String>) {
                 Connection::Imap => "IMAP",
                 Connection::Redis => "Redis",
                 Connection::Browser => "browser (CDP)",
+                Connection::Mysql => "MySQL",
+                Connection::Mqtt => "MQTT",
+                Connection::Amqp => "AMQP",
                 Connection::Udp => "UDP datagrams (no TLS)",
             },
             destination_names(&open.destinations),

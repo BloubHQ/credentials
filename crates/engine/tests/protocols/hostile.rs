@@ -3,7 +3,7 @@
 
 use engine::policy::Mechanism;
 use engine::proto::io::{Bounds, Io};
-use engine::proto::{imap, postgres, redis, smtp, ssh};
+use engine::proto::{amqp, imap, mqtt, mysql, postgres, redis, sftp, smtp, ssh};
 use zeroize::Zeroizing;
 
 use super::*;
@@ -42,17 +42,21 @@ fn inputs() -> Vec<Vec<u8>> {
         state ^= state << 17;
         state
     };
-    let seeds: [&[u8]; 6] = [
+    let seeds: [&[u8]; 9] = [
         b"SSH-2.0-x\r\n\0\0\0\x2c\x04\x14",
         b"R\0\0\0\x17\0\0\0\x0aSCRAM-SHA-256\0\0",
         b"220 hi\r\n250-x\r\n250 AUTH PLAIN\r\n235 ok\r\n",
         b"* OK hi\r\n* CAPABILITY IMAP4rev1\r\na1 OK\r\na2 OK\r\n* 1 FETCH {9999999}\r\n",
         b"+OK\r\n*3\r\n$5\r\n",
         b"S",
+        // A MySQL greeting, a CONNACK and a SUBACK with a PUBLISH, an AMQP connection.start.
+        b"\x4a\0\0\0\x0a8.0\0\x01\0\0\0abcdefgh\0\xff\xff\xff\x02\0\xff\xdf\x15",
+        b"\x20\x02\0\0\x90\x03\0\x01\0\x30\x07\0\x03a/bxx",
+        b"\x01\0\0\0\0\0\x20\0\x0a\0\x0a\0\x09\0\0\0\0\0\0\0\0\x05PLAIN",
     ];
     let mut out = Vec::new();
-    for i in 0..3000u64 {
-        let seed = seeds[(i % 6) as usize];
+    for i in 0..4500u64 {
+        let seed = seeds[(i % 9) as usize];
         let cut = (next() as usize) % (seed.len() + 1);
         let mut bytes = seed[..cut].to_vec();
         for _ in 0..(next() % 96) {
@@ -92,16 +96,43 @@ fn clients_survive_noise_and_never_sign_in_to_it() {
                         let _ = c.command(b"NOOP", &params, 4096);
                     }
                 }
-                _ => {
+                4 => {
                     if let Ok(mut c) = redis::Client::connect(io, b"", b"pw") {
                         let _ = c.command(b"GET", &params, 4096);
                     }
                 }
+                5 => {
+                    // Over the TLS of a prelude, a sign-in needs an OK the noise must forge:
+                    // whatever happens, no statement runs on a refused one.
+                    let mut io = io;
+                    if let Ok(greeting) = mysql::prelude(&mut io, false)
+                        && let Ok(mut c) = mysql::Client::connect(io, &greeting, b"u", None, b"pw")
+                    {
+                        let _ = c.query(b"SELECT ?", &params, &[], 4096);
+                    }
+                }
+                6 => {
+                    if let Ok(mut c) =
+                        mqtt::Client::connect(io, mqtt::Version::V311, b"c", b"u", b"pw")
+                        && c.subscribe("a/+", 1).is_ok()
+                    {
+                        while let Ok(Some(m)) = c.poll_message(Duration::ZERO) {
+                            assert!(mqtt::matches("a/+", &m.topic), "only subscribed topics");
+                        }
+                    }
+                }
+                _ => {
+                    if let Ok(mut c) = amqp::Client::connect(io, b"/", b"u", b"pw") {
+                        let _ = c.get(b"q", 4, 4096);
+                    }
+                }
             }
         };
-        for kind in 0..5 {
+        for kind in 0..8 {
             run(kind);
         }
+        let _ = sftp::normalize(bytes);
+        let _ = mysql::parse_greeting(bytes);
         let _ = ssh::ClientKey::parse(bytes);
         let _ = ssh::parse_kexinit(bytes);
         let _ = postgres::Scram::with_nonce("n").last(bytes, b"pw");

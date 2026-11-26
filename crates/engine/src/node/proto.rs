@@ -1,12 +1,14 @@
-//! Operations on protocol connections: SSH, PostgreSQL, SMTP, IMAP and Redis.
+//! Operations on protocol connections: SSH (with SFTP and port forwarding), PostgreSQL,
+//! MySQL, SMTP, IMAP, Redis, MQTT and AMQP.
 //!
 //! Order, as for every act: the caller's commands and messages are checked against the
 //! policy before anything is logged ([`check_session`]); the node logs the use, opens the
 //! connection, signs in with the rendered [`Login`], runs the steps, then the caller's
 //! commands one by one, each result redacted and searched for secrets before it goes back.
-//! One more entry records how the connection ended ([`Event::Closed`]). An SSH shell runs on
-//! a streaming call instead: the caller's signed frames go in within the relay's rules, and
-//! what the server prints goes back through the stream search.
+//! One more entry records how the connection ended ([`Event::Closed`]). An SSH shell or
+//! forward runs on a streaming call instead: the caller's signed frames go in within the
+//! relay's rules, and what the server sends goes back through the stream search. So do the
+//! messages of an MQTT subscription the policy keeps open, each searched whole.
 
 use std::time::Duration;
 
@@ -19,14 +21,15 @@ use crate::egress::{ClientIdentity, Opening, Stream, Transport, open_protocol};
 use crate::error::TransportKind;
 use crate::log::{Detail, Event, LogSink};
 use crate::policy::{
-    CommandRule, Connection, Destination, FrameKind, Login, MAX_PARAM, Mechanism, Open, Operation,
-    Relay, Step, TlsMode,
+    CommandRule, Connection, Destination, FrameKind, Login, MAX_PARAM, Mechanism, MqttVersion,
+    Open, Operation, Relay, SshChannel, Step, TlsMode,
 };
 use crate::proto::io::{Bounds, Io};
-use crate::proto::{imap, postgres, redis, smtp, ssh};
+use crate::proto::{amqp, imap, mqtt, mysql, postgres, redis, sftp, smtp, ssh};
 use crate::record::Record;
 use crate::reflection::{self, Secrets};
 use crate::response::MAX_RESPONSE;
+use crate::template::Var;
 use crate::template::{Context, Template};
 use crate::{Error, Result};
 
@@ -90,6 +93,22 @@ fn param_ok(connection: Connection, rule: &crate::policy::ParamRule, value: &str
             .is_none_or(|p| crate::extract::compile_whole(p).is_some_and(|re| re.is_match(bytes)))
 }
 
+/// True when the caller's `value` for parameter `at` of `rule` keeps the command in its shape:
+/// an MQTT topic or filter of the caller holds no wildcard (only the policy's may), and an
+/// SFTP path of the caller is absolute with no `.` or `..` segment.
+fn shape_ok(connection: Connection, rule: &CommandRule, at: usize, value: &str) -> bool {
+    match connection {
+        Connection::Mqtt if at == 0 => !value.contains(['+', '#']),
+        Connection::Ssh if at == 0 && rule.ssh_channel() == SshChannel::Sftp => {
+            // The value goes in a template, or is the path; either way it may not climb.
+            !value.split('/').any(|s| s == "..")
+                && (!rule.params.first().is_some_and(|p| p.raw_caller())
+                    || sftp::normalize(value.as_bytes()).is_ok())
+        }
+        _ => true,
+    }
+}
+
 /// An e-mail address as a mailbox of SMTP can carry it: visible ASCII, no angle brackets,
 /// spaces or quotes, one `@` with something on each side.
 fn address_ok(address: &str) -> bool {
@@ -139,16 +158,22 @@ pub(super) fn check_session(
         let rule = relay
             .and_then(|r| r.commands.iter().find(|c| c.name == command.name))
             .ok_or(refused("a command the policy does not name"))?;
-        let caller_params: Vec<_> = rule.params.iter().filter(|p| p.from_caller()).collect();
-        if caller_params.len() != command.params.len() {
-            return Err(refused("the parameters of a command do not match its rule"));
+        let mismatch = refused("the parameters of a command do not match its rule");
+        let mut values = command.params.iter();
+        for (at, p) in rule.params.iter().enumerate() {
+            if !p.from_caller() {
+                continue;
+            }
+            let value = values.next().ok_or(mismatch.clone())?;
+            if !param_ok(connection, p, value) {
+                return Err(refused("a parameter is outside its rule"));
+            }
+            if !shape_ok(connection, rule, at, value) {
+                return Err(refused("a parameter outside the shape of its command"));
+            }
         }
-        if !caller_params
-            .iter()
-            .zip(&command.params)
-            .all(|(rule, value)| param_ok(connection, rule, value))
-        {
-            return Err(refused("a parameter is outside its rule"));
+        if values.next().is_some() {
+            return Err(mismatch);
         }
     }
     if !mail.is_empty() {
@@ -209,11 +234,25 @@ struct Credentials {
 /// Renders a template of the operation; a value that holds a secret in reversible form is
 /// remembered for the reflection search.
 fn render(run: &mut Run<'_>, text: &str, host: &str) -> Result<Zeroizing<Vec<u8>>> {
+    render_with(run, text, host, None)
+}
+
+/// [`render`] with the caller's value of a parameter as `$input`.
+fn render_with(
+    run: &mut Run<'_>,
+    text: &str,
+    host: &str,
+    input: Option<&[u8]>,
+) -> Result<Zeroizing<Vec<u8>>> {
     let template = Template::parse(text)?;
+    let mut vars = stream_vars(host, run.now);
+    if let Some(input) = input {
+        vars.insert(Var::Input, input.to_vec());
+    }
     let ctx = Context {
         fields: &run.fields,
         temps: &run.captured.temps,
-        vars: stream_vars(host, run.now),
+        vars,
         unix: run.now / 1000,
         budget: &run.budget,
     };
@@ -269,18 +308,88 @@ fn render_rule(
     let mut caller = given.params.iter();
     let mut params = Vec::new();
     for p in &rule.params {
-        params.push(match &p.template {
-            Some(t) => render(run, t, host)?,
-            None => Zeroizing::new(
+        let given = if p.from_caller() {
+            Some(
                 caller
                     .next()
                     .ok_or(refused("the parameters of a command do not match its rule"))?
-                    .as_bytes()
-                    .to_vec(),
-            ),
+                    .as_bytes(),
+            )
+        } else {
+            None
+        };
+        params.push(match (&p.template, given) {
+            (Some(t), input) => render_with(run, t, host, input)?,
+            (None, Some(value)) => Zeroizing::new(value.to_vec()),
+            (None, None) => return Err(run.operation.unknown()),
         });
     }
     Ok(Rendered { text, params })
+}
+
+/// How one command runs, beyond its text and parameters.
+#[derive(Clone, Copy)]
+struct Shape<'r> {
+    /// PostgreSQL and MySQL: the columns that go back.
+    columns: &'r [String],
+    /// SSH: what the command runs on.
+    channel: SshChannel,
+    /// MQTT: the QoS.
+    qos: u8,
+    /// MQTT subscribe and AMQP get: most messages.
+    max_messages: usize,
+    /// MQTT subscribe: how long it waits.
+    wait: Duration,
+    /// MQTT subscribe: keeps the subscription for what follows instead of collecting.
+    keep: bool,
+}
+
+impl<'r> Shape<'r> {
+    /// A command of the policy (`send`): an MQTT subscription stays.
+    fn fixed(command: &crate::policy::Command) -> Self {
+        Shape {
+            columns: &[],
+            channel: SshChannel::Exec,
+            qos: command.qos.unwrap_or(0),
+            max_messages: crate::policy::DEFAULT_MESSAGES.0,
+            wait: Duration::from_millis(crate::policy::DEFAULT_MESSAGES.1),
+            keep: true,
+        }
+    }
+
+    /// A command of the caller, by its rule.
+    fn of(rule: &'r CommandRule) -> Self {
+        let (messages, wait) = crate::policy::DEFAULT_MESSAGES;
+        Shape {
+            columns: &rule.columns,
+            channel: rule.ssh_channel(),
+            qos: rule.qos.unwrap_or(0),
+            max_messages: rule
+                .max_messages
+                .unwrap_or(messages)
+                .min(crate::policy::MAX_MESSAGES),
+            wait: Duration::from_millis(
+                rule.wait_ms
+                    .unwrap_or(wait)
+                    .min(crate::policy::MAX_MESSAGE_WAIT_MS),
+            ),
+            keep: false,
+        }
+    }
+}
+
+/// The parameter at `i`, or an error for a rule that names fewer.
+fn param(rendered: &Rendered, i: usize) -> Result<&[u8]> {
+    rendered
+        .params
+        .get(i)
+        .map(|p| p.as_slice())
+        .ok_or(refused("the parameters of a command do not match its rule"))
+}
+
+/// JSON of a value, as bytes.
+fn json_bytes(value: &serde_json::Value) -> Result<Vec<u8>> {
+    serde_json::to_vec(value).map_err(|_| Error::Encoding)
 }
 
 /// A signed-in client of one kind.
@@ -290,6 +399,9 @@ enum Session<'s> {
     Smtp(smtp::Client<'s>),
     Imap(imap::Client<'s>),
     Redis(redis::Client<'s>),
+    Mysql(mysql::Client<'s>),
+    Mqtt(mqtt::Client<'s>),
+    Amqp(amqp::Client<'s>),
 }
 
 /// The result of one command, and every byte the server sent for it in the form it came, for
@@ -307,6 +419,9 @@ impl<'s> Session<'s> {
             Session::Smtp(c) => c.io(),
             Session::Imap(c) => c.io(),
             Session::Redis(c) => c.io(),
+            Session::Mysql(c) => c.io(),
+            Session::Mqtt(c) => c.io(),
+            Session::Amqp(c) => c.io(),
         }
     }
 
@@ -319,9 +434,97 @@ impl<'s> Session<'s> {
     }
 
     /// Runs one command.
-    fn command(&mut self, rendered: &Rendered, columns: &[String]) -> Result<Ran> {
+    fn command(&mut self, rendered: &Rendered, shape: Shape<'_>) -> Result<Ran> {
         let status = |failed: bool| Some(i64::from(failed));
+        let columns = shape.columns;
+        let ran = |data: Vec<u8>, failed: bool, raw: Zeroizing<Vec<u8>>| Ran {
+            result: CommandResult {
+                name: String::new(),
+                status: status(failed),
+                data,
+                stderr: Vec::new(),
+            },
+            raw,
+        };
         match self {
+            Session::Ssh(client) if shape.channel == SshChannel::Sftp => {
+                let mut files = sftp::Sftp::start(client)?;
+                let path = param(rendered, 0)?;
+                let data = match rendered.text.as_slice() {
+                    b"read" => files.read_file(path, MAX_RESPONSE)?,
+                    b"write" => {
+                        files.write_file(path, param(rendered, 1)?)?;
+                        Zeroizing::new(Vec::new())
+                    }
+                    _ => return Err(refused("an SFTP command is read or write")),
+                };
+                files.finish()?;
+                Ok(ran(data.to_vec(), false, Zeroizing::new(Vec::new())))
+            }
+            Session::Ssh(_) if shape.channel == SshChannel::DirectTcpip => {
+                Err(refused("a forward runs on a streaming call"))
+            }
+            Session::Mysql(client) => {
+                let rows = client.query(&rendered.text, &rendered.params, columns, MAX_RESPONSE)?;
+                Ok(ran(rows.json.to_vec(), rows.failed, rows.raw))
+            }
+            Session::Mqtt(client) => {
+                let target = param(rendered, 0)?;
+                match rendered.text.as_slice() {
+                    b"publish" => {
+                        if !mqtt::topic_ok(target) {
+                            return Err(refused("an MQTT topic with no wildcard"));
+                        }
+                        let code = client.publish(target, param(rendered, 1)?, shape.qos)?;
+                        let json = json_bytes(&serde_json::json!({ "reason": code }))?;
+                        Ok(ran(json, code >= 0x80, Zeroizing::new(Vec::new())))
+                    }
+                    b"subscribe" => {
+                        let filter = core::str::from_utf8(target)
+                            .map_err(|_| refused("an MQTT topic filter in UTF-8"))?;
+                        let granted = client.subscribe(filter, shape.qos)?;
+                        if shape.keep {
+                            let json = json_bytes(&serde_json::json!({ "granted": granted }))?;
+                            return Ok(ran(json, false, Zeroizing::new(Vec::new())));
+                        }
+                        let messages =
+                            client.collect(shape.wait, shape.max_messages, MAX_RESPONSE)?;
+                        client.unsubscribe(filter)?;
+                        let mut raw = Zeroizing::new(Vec::new());
+                        for m in &messages {
+                            raw.extend_from_slice(m.topic.as_bytes());
+                            raw.push(0);
+                            raw.extend_from_slice(&m.payload);
+                            raw.push(0);
+                        }
+                        let json = serde_json::Value::Array(
+                            messages.iter().map(mqtt::Message::json).collect(),
+                        );
+                        Ok(ran(json_bytes(&json)?, false, raw))
+                    }
+                    _ => Err(refused("an MQTT command is publish or subscribe")),
+                }
+            }
+            Session::Amqp(client) => {
+                let (outcome, messages) = match rendered.text.as_slice() {
+                    b"publish" => (
+                        client.publish(
+                            param(rendered, 0)?,
+                            param(rendered, 1)?,
+                            param(rendered, 2)?,
+                        )?,
+                        Vec::new(),
+                    ),
+                    b"get" => client.get(param(rendered, 0)?, shape.max_messages, MAX_RESPONSE)?,
+                    _ => return Err(refused("an AMQP command is publish or get")),
+                };
+                let mut raw = Zeroizing::new(Vec::new());
+                for m in &messages {
+                    raw.extend_from_slice(&m.body);
+                    raw.push(0);
+                }
+                Ok(ran(json_bytes(&outcome.json)?, outcome.failed, raw))
+            }
             Session::Ssh(client) => {
                 let mut line = Zeroizing::new(rendered.text.to_vec());
                 for p in &rendered.params {
@@ -408,8 +611,24 @@ impl<'s> Session<'s> {
             Session::Smtp(client) => client.close(),
             Session::Imap(client) => client.close(),
             Session::Redis(client) => client.close(),
+            Session::Mysql(client) => client.close(),
+            Session::Mqtt(client) => client.close(),
+            Session::Amqp(client) => client.close(),
         }
     }
+}
+
+/// A client identifier for MQTT when the policy fixes none: random, so two connections of
+/// the node never take over each other's session.
+fn random_client_id() -> Result<Vec<u8>> {
+    let mut raw = [0u8; 12];
+    ring::rand::SecureRandom::fill(&ring::rand::SystemRandom::new(), &mut raw)
+        .map_err(|_| Error::Encoding)?;
+    let mut id = b"credentials-".to_vec();
+    for b in raw {
+        id.extend_from_slice(format!("{b:02x}").as_bytes());
+    }
+    Ok(id)
 }
 
 /// Signs in on `stream` as the operation's login says.
@@ -418,8 +637,10 @@ fn sign_in<'s>(
     open: &Open,
     credentials: &Credentials,
     bounds: Bounds,
+    greeting: Option<&mysql::Greeting>,
 ) -> Result<Session<'s>> {
     let io = Io::new(stream, bounds);
+    let login = open.login.as_ref();
     let (user, secret) = (credentials.user.as_slice(), credentials.secret.as_slice());
     let after_starttls = opening_of(open) == OpeningKind::Starttls;
     Ok(match open.connection {
@@ -461,6 +682,33 @@ fn sign_in<'s>(
             secret,
         )?),
         Connection::Redis => Session::Redis(redis::Client::connect(io, user, secret)?),
+        Connection::Mysql => {
+            // The prelude read the greeting and asked for TLS before anything else.
+            let greeting = greeting.ok_or(Error::ServerUntrusted {
+                rule: "a MySQL connection signs in after its greeting and TLS",
+            })?;
+            let database = login.and_then(|l| l.database.as_deref());
+            Session::Mysql(mysql::Client::connect(
+                io, greeting, user, database, secret,
+            )?)
+        }
+        Connection::Mqtt => {
+            let version = match open.version.unwrap_or_default() {
+                MqttVersion::V311 => mqtt::Version::V311,
+                MqttVersion::V5 => mqtt::Version::V5,
+            };
+            let client_id = match login.and_then(|l| l.client_id.as_deref()) {
+                Some(id) => id.as_bytes().to_vec(),
+                None => random_client_id()?,
+            };
+            Session::Mqtt(mqtt::Client::connect(
+                io, version, &client_id, user, secret,
+            )?)
+        }
+        Connection::Amqp => {
+            let vhost = login.and_then(|l| l.vhost.as_deref()).unwrap_or("/");
+            Session::Amqp(amqp::Client::connect(io, vhost.as_bytes(), user, secret)?)
+        }
         Connection::Https
         | Connection::Tls
         | Connection::Websocket
@@ -475,10 +723,20 @@ fn sign_in<'s>(
 fn opening_of(open: &Open) -> OpeningKind {
     match (open.connection, open.tls) {
         (Connection::Ssh, _) => OpeningKind::Plain,
-        (Connection::Postgres, _) => OpeningKind::Starttls,
+        (Connection::Postgres | Connection::Mysql, _) => OpeningKind::Starttls,
         (Connection::Smtp | Connection::Imap, Some(TlsMode::Starttls)) => OpeningKind::Starttls,
         _ => OpeningKind::Tls,
     }
+}
+
+/// A connection open, before the sign-in.
+struct Opened<'t> {
+    /// The log entry of the use.
+    seq: u64,
+    stream: Box<dyn Stream + 't>,
+    meter: Meter,
+    /// What the MySQL prelude read.
+    greeting: Option<mysql::Greeting>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -489,13 +747,21 @@ enum OpeningKind {
 }
 
 /// The plain prelude before TLS of a protocol that upgrades its connection. Nothing secret is
-/// written in it.
-fn prelude(connection: Connection, stream: &mut dyn Stream, bounds: Bounds) -> Result<()> {
+/// written in it. MySQL's greeting comes before TLS: it is kept for the sign-in.
+fn prelude(
+    open: &Open,
+    stream: &mut dyn Stream,
+    bounds: Bounds,
+) -> Result<Option<mysql::Greeting>> {
     let mut io = Io::new(stream, bounds);
-    match connection {
-        Connection::Postgres => postgres::prelude(&mut io),
-        Connection::Smtp => smtp::prelude(&mut io),
-        Connection::Imap => imap::prelude(&mut io),
+    match open.connection {
+        Connection::Postgres => postgres::prelude(&mut io).map(|()| None),
+        Connection::Smtp => smtp::prelude(&mut io).map(|()| None),
+        Connection::Imap => imap::prelude(&mut io).map(|()| None),
+        Connection::Mysql => {
+            let database = open.login.as_ref().is_some_and(|l| l.database.is_some());
+            mysql::prelude(&mut io, database).map(Some)
+        }
         _ => Err(Error::transport(TransportKind::Unsupported, false)),
     }
 }
@@ -509,7 +775,7 @@ impl<S: LogSink, C: Clock> Node<S, C> {
         destination: &Destination,
         exchanges: usize,
         transport: &'t mut T,
-    ) -> Result<(u64, Box<dyn Stream + 't>, Meter)> {
+    ) -> Result<Opened<'t>> {
         let operation = run.operation;
         let open = operation.open().ok_or_else(|| operation.unknown())?;
         let (now, who) = (run.now, run.who);
@@ -535,8 +801,11 @@ impl<S: LogSink, C: Clock> Node<S, C> {
         run.log_seqs.push(seq);
         let meter = Meter::new(open.limits.as_ref());
         let bounds = bounds_of(open);
-        let connection = open.connection;
-        let mut prelude_fn = |stream: &mut dyn Stream| prelude(connection, stream, bounds);
+        let mut greeting = None;
+        let mut prelude_fn = |stream: &mut dyn Stream| {
+            greeting = prelude(open, stream, bounds)?;
+            Ok(())
+        };
         let opening = match opening_of(open) {
             OpeningKind::Tls => Opening::Tls,
             OpeningKind::Plain => Opening::Plain,
@@ -546,7 +815,12 @@ impl<S: LogSink, C: Clock> Node<S, C> {
         let opened = open_protocol(confirmed, transport, destination, identity, opening);
         drop(client);
         match opened {
-            Ok((_, stream)) => Ok((seq, stream, meter)),
+            Ok((_, stream)) => Ok(Opened {
+                seq,
+                stream,
+                meter,
+                greeting,
+            }),
             Err(error) => {
                 let _ = self.closed(run, seq, None, &meter, Err(("error", error.clone())));
                 Err(error)
@@ -575,7 +849,7 @@ impl<S: LogSink, C: Clock> Node<S, C> {
                     for p in &command.params {
                         params.push(render(run, p, host)?);
                     }
-                    let ran = session.command(&Rendered { text, params }, &[])?;
+                    let ran = session.command(&Rendered { text, params }, Shape::fixed(command))?;
                     last = Some(Zeroizing::new(ran.result.data));
                 }
                 Step::Receive(receive) => {
@@ -615,7 +889,12 @@ impl<S: LogSink, C: Clock> Node<S, C> {
         let open = operation.open().ok_or_else(|| operation.unknown())?;
         let host = destination.host.clone();
         let credentials = credentials(run, open, &host)?;
-        let (seq, mut stream, mut meter) = self.open_session(
+        let Opened {
+            seq,
+            mut stream,
+            mut meter,
+            greeting,
+        } = self.open_session(
             run,
             payload,
             destination,
@@ -623,7 +902,8 @@ impl<S: LogSink, C: Clock> Node<S, C> {
             transport,
         )?;
         let bounds = bounds_of(open);
-        let mut session = match sign_in(&mut *stream, open, &credentials, bounds) {
+        let signed = sign_in(&mut *stream, open, &credentials, bounds, greeting.as_ref());
+        let mut session = match signed {
             Ok(session) => session,
             Err(error) => {
                 let _ = stream.close();
@@ -701,7 +981,7 @@ impl<S: LogSink, C: Clock> Node<S, C> {
                     .and_then(|r| r.commands.iter().find(|c| c.name == command.name))
                     .ok_or(refused("a command the policy does not name"))?;
                 let rendered = render_rule(run, rule, command, host)?;
-                let mut ran = session.command(&rendered, &rule.columns)?;
+                let mut ran = session.command(&rendered, Shape::of(rule))?;
                 ran.result.name = command.name.clone();
                 ran
             }
@@ -728,8 +1008,9 @@ impl<S: LogSink, C: Clock> Node<S, C> {
         Ok(result)
     }
 
-    /// An SSH shell on a streaming call: sign in, the steps, then the caller's frames in and
-    /// the server's output back through the stream search.
+    /// A protocol connection on a streaming call: sign in, the steps, then an SSH shell or
+    /// forward (the caller's frames in, the server's bytes back through the stream search) or
+    /// the messages of MQTT subscriptions (each searched whole before it goes back).
     pub(super) fn run_shell<T: Transport>(
         &self,
         run: &mut Run<'_>,
@@ -741,44 +1022,135 @@ impl<S: LogSink, C: Clock> Node<S, C> {
     ) -> Result<Closed> {
         let operation = run.operation;
         let open = operation.open().ok_or_else(|| operation.unknown())?;
-        if open.connection != Connection::Ssh {
+        if !matches!(open.connection, Connection::Ssh | Connection::Mqtt) {
             return Err(operation.unknown());
         }
+        let commands = match payload {
+            Payload::Session { commands, .. } => *commands,
+            _ => &[],
+        };
+        // A forward relay names the one forward rule this call opens; a shell or a live
+        // subscription takes no command of the caller.
+        let rules = relay_of(operation).ok_or_else(|| operation.unknown())?;
+        let forward = match commands {
+            [] if rules.commands.is_empty() => None,
+            [one] => Some(
+                rules
+                    .commands
+                    .iter()
+                    .find(|c| c.name == one.name && c.ssh_channel() == SshChannel::DirectTcpip)
+                    .ok_or(refused("a forward the policy does not name"))?,
+            ),
+            _ => return Err(refused("a streaming call names one forward, or nothing")),
+        };
         let host = destination.host.clone();
         let credentials = credentials(run, open, &host)?;
-        let (seq, mut stream, mut meter) =
-            self.open_session(run, payload, destination, 0, transport)?;
+        let Opened {
+            seq,
+            mut stream,
+            mut meter,
+            greeting,
+        } = self.open_session(run, payload, destination, commands.len(), transport)?;
         let bounds = bounds_of(open);
-        let end = match sign_in(&mut *stream, open, &credentials, bounds) {
+        let end = match sign_in(&mut *stream, open, &credentials, bounds, greeting.as_ref()) {
             Ok(mut session) => {
-                let end = self.shell(run, &mut session, &host, &mut live, &mut meter, updated);
+                drop(credentials);
+                let end = self.session_steps(run, &mut session, &host, updated);
+                let end = end.and_then(|()| match &mut session {
+                    Session::Mqtt(client) => self.messages(run, client, &mut live, &mut meter),
+                    _ => self.shell(run, &mut session, forward, &host, &mut live, &mut meter),
+                });
                 session.close();
                 end
             }
-            Err(error) => Err(error),
+            Err(error) => {
+                drop(credentials);
+                Err(error)
+            }
         };
-        drop(credentials);
         let _ = stream.close();
         let end = end.map_err(|error| (reason_of(&error), error));
         self.closed(run, seq, None, &meter, end)
+    }
+
+    /// The messages of the subscriptions the steps made, each searched for secrets whole
+    /// (its topic and payload as they came, then its JSON) before it goes back as text.
+    fn messages(
+        &self,
+        run: &mut Run<'_>,
+        client: &mut mqtt::Client<'_>,
+        live: &mut Live<'_>,
+        meter: &mut Meter,
+    ) -> Result<End> {
+        let head = crate::response::project_head(200, Vec::new(), None, run.log_seqs.clone());
+        live.relay.deliver(live::Part::Head(head))?;
+        loop {
+            let polled = match client.poll_message(POLL) {
+                Ok(polled) => polled,
+                // A bound of the connection ends the relay, as for the other relays.
+                Err(error) => match client.io().reached() {
+                    Some(reason) => return Ok(End::of(reason, false)),
+                    None => return Err(error),
+                },
+            };
+            if let Some(message) = polled {
+                let secrets = Secrets {
+                    policy: run.policy,
+                    fields: &run.fields,
+                    captured: &run.captured.secrets,
+                    rendered: &run.tainted,
+                };
+                let mut raw = Zeroizing::new(message.topic.as_bytes().to_vec());
+                raw.push(0);
+                raw.extend_from_slice(&message.payload);
+                reflection::check(&raw, &secrets)?;
+                let json = json_bytes(&message.json())?;
+                let released = Zeroizing::new(reflection::release(json, &secrets)?);
+                meter.to_caller.0 += 1;
+                meter.to_caller.1 = meter.to_caller.1.saturating_add(released.len() as u64);
+                live.relay.deliver(live::Part::Text(released))?;
+            }
+            if let Some(reason) = client.io().reached() {
+                return Ok(End::of(reason, false));
+            }
+            if self.is_handed_over() {
+                return Ok(End::of("handed_over", false));
+            }
+            match live.relay.next(Duration::ZERO)? {
+                None => {}
+                Some(live::FromCaller::Close) => return Ok(End::of("caller", true)),
+                Some(live::FromCaller::Frame(_)) => {
+                    return Err(Error::FrameRefused {
+                        rule: "an MQTT relay takes no frames",
+                    });
+                }
+            }
+        }
     }
 
     fn shell(
         &self,
         run: &mut Run<'_>,
         session: &mut Session<'_>,
+        forward: Option<&CommandRule>,
         host: &str,
         live: &mut Live<'_>,
         meter: &mut Meter,
-        updated: &mut Option<Record>,
     ) -> Result<End> {
-        self.session_steps(run, session, host, updated)?;
         let operation = run.operation;
         let rules = relay_of(operation).ok_or_else(|| operation.unknown())?;
         let Session::Ssh(client) = session else {
             return Err(operation.unknown());
         };
-        client.shell()?;
+        match forward {
+            // The destination is the policy's, never the caller's.
+            Some(rule) => {
+                let (to, port) =
+                    crate::policy::forward_target(&rule.text).ok_or_else(|| operation.unknown())?;
+                client.direct_tcpip(to.as_bytes(), port)?;
+            }
+            None => client.shell()?,
+        }
         let head = crate::response::project_head(200, Vec::new(), None, run.log_seqs.clone());
         live.relay.deliver(live::Part::Head(head))?;
         let mut scrubber = Self::scrubber(run)?;
@@ -853,7 +1225,14 @@ enum Item<'a> {
 }
 
 fn reason_of_output(output: &SessionOutput) -> &'static str {
-    output.error.as_ref().map(reason_of).unwrap_or("done")
+    match &output.error {
+        // The connection's byte limit, as the live relays name it.
+        Some(Error::Budget {
+            what: "connection bytes",
+        }) => "bytes",
+        Some(error) => reason_of(error),
+        None => "done",
+    }
 }
 
 fn limit_error(reason: &str) -> Error {

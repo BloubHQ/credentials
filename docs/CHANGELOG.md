@@ -15,6 +15,16 @@ before 1.0, minor versions may break formats and APIs.
 
 ### Added
 
+- Protocol connections, rest of part 6 (`docs/design.md` section 7c): `mysql` (TLS before
+  anything else, `caching_sha2_password` only, full auth over TLS only, no LOCAL INFILE,
+  prepared statements with string parameters), `mqtt` 3.1.1 and 5 over TLS (QoS 0 and 1, no
+  retain, will or topic alias, no `+`/`#` in caller topics), `amqp` 0-9-1 over TLS (PLAIN
+  only, mandatory publishes with confirms, exchanges, routing keys and queues from the policy);
+  SSH SFTP (absolute paths without `.`, `..` or empty segments, REALPATH and LSTAT checked
+  before opening, no symlinks followed) and local forwarding (`direct-tcpip`) to destinations
+  the policy fixes; typed items `ssh` and `mail`. Tests for P-384/P-521 key exchange, RSA host
+  keys and ECDSA, RSA and OpenSSH-format client keys. The `protocol_servers` fuzz target covers
+  the new clients.
 - Protocol connections (`docs/design.md` section 11, part 6, second half): `open` takes
   `connection` `ssh`, `postgres`, `smtp`, `imap` or `redis`, with `login` (user and one
   credential: `password`, `key`, `token` or keyboard-interactive `answers`; optional

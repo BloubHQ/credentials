@@ -26,7 +26,8 @@ use crate::encoding::{b64_array, canonical};
 use crate::fields::Fields;
 use crate::keys::{DeviceKey, DevicePublicKey};
 use crate::policy::{
-    BodyProjection, Connection, Destination, Operation, Policy, Step, Store, is_false, is_token,
+    BodyProjection, Connection, Destination, Open, Operation, Policy, Step, Store, is_false,
+    is_token,
 };
 use crate::{Error, Result};
 
@@ -187,8 +188,66 @@ pub enum ShapeConnection {
     Https,
     /// A TLS byte stream.
     Tls,
+    /// SSH: commands, a shell, SFTP and forwards, to a server whose host key is pinned.
+    Ssh,
+    /// SMTP: the caller's messages.
+    Smtp,
+    /// IMAP: commands.
+    Imap,
     /// No connection: a derivation.
     None,
+}
+
+impl ShapeConnection {
+    fn name(self) -> &'static str {
+        match self {
+            ShapeConnection::Https => "https",
+            ShapeConnection::Tls => "tls",
+            ShapeConnection::Ssh => "ssh",
+            ShapeConnection::Smtp => "smtp",
+            ShapeConnection::Imap => "imap",
+            ShapeConnection::None => "none",
+        }
+    }
+
+    /// True for a protocol connection, which signs in with the item's login.
+    fn is_protocol(self) -> bool {
+        matches!(
+            self,
+            ShapeConnection::Ssh | ShapeConnection::Smtp | ShapeConnection::Imap
+        )
+    }
+}
+
+/// Where operations of one connection of an item may connect.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostRoute {
+    /// The connection.
+    pub connection: ShapeConnection,
+    /// The pinned host field.
+    pub host: String,
+    /// The pinned port field.
+    pub port: String,
+}
+
+/// Which fields of the kind a protocol connection signs in with. Each member of the policy's
+/// `login` must be exactly `{{field}}` of the field named here, and a member named nowhere
+/// here must be absent: the item's secrets go to the sign-in and nowhere else on it.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LoginShape {
+    /// The user name field.
+    pub user: String,
+    /// The password field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub password: Option<String>,
+    /// The private key field (SSH).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
+    /// The OAuth token field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token: Option<String>,
 }
 
 /// Where the operations of an item may connect.
@@ -209,6 +268,12 @@ pub enum DestinationRule {
         host: String,
         /// The port field.
         port: String,
+    },
+    /// Per connection, exactly its pinned host and port fields (a mailbox: SMTP to one
+    /// server, IMAP to another).
+    Hosts {
+        /// One route per connection of the shape.
+        hosts: Vec<HostRoute>,
     },
 }
 
@@ -251,6 +316,13 @@ pub struct Shape {
     /// every payment), whatever the policy or the spending limits say.
     #[serde(default, skip_serializing_if = "is_false")]
     pub approval: bool,
+    /// How a protocol connection signs in; required when the shape allows one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub login: Option<LoginShape>,
+    /// The pinned field holding the SSH host key; required when the shape allows SSH. The
+    /// policy pins exactly that key, and it must be a whole key, not a fingerprint.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_key: Option<String>,
 }
 
 /// A kind of item.
@@ -421,11 +493,7 @@ impl KindSchema {
     fn check_shape(&self) -> Checked {
         let shape = &self.shape;
         kind_ensure(
-            unique(shape.connections.iter().map(|c| match c {
-                ShapeConnection::Https => "https",
-                ShapeConnection::Tls => "tls",
-                ShapeConnection::None => "none",
-            })),
+            unique(shape.connections.iter().map(|c| c.name())),
             || "shape.connections".into(),
             "each connection once",
         )?;
@@ -433,6 +501,49 @@ impl KindSchema {
             self.field(name)
                 .is_some_and(|f| f.pinned && f.checks.iter().any(check))
         };
+        let is_host = |c: &Check| matches!(c, Check::Host {});
+        let is_port =
+            |c: &Check| matches!(c, Check::Integer { min, max } if *min >= 1 && *max <= 65535);
+        let protocol = shape.connections.iter().any(|c| c.is_protocol());
+        kind_ensure(
+            !protocol
+                || (!self.free_fields && !matches!(shape.destinations, DestinationRule::Owner {})),
+            || "shape.destinations".into(),
+            "a protocol connection goes to pinned hosts only",
+        )?;
+        match &shape.login {
+            None => kind_ensure(
+                !protocol,
+                || "shape.login".into(),
+                "a kind with a protocol connection names its login fields",
+            )?,
+            Some(login) => {
+                let secret = |name: &Option<String>| {
+                    name.as_deref().is_none_or(|n| {
+                        self.field(n)
+                            .is_some_and(|f| f.disclosure == Disclosure::Secret)
+                    })
+                };
+                kind_ensure(
+                    protocol
+                        && self.field(&login.user).is_some()
+                        && secret(&login.password)
+                        && secret(&login.key)
+                        && secret(&login.token),
+                    || "shape.login".into(),
+                    "login names a field of the kind for the user and secret fields for the rest, for a protocol connection",
+                )?;
+            }
+        }
+        let ssh = shape.connections.contains(&ShapeConnection::Ssh);
+        kind_ensure(
+            match &shape.host_key {
+                None => !ssh,
+                Some(name) => ssh && pinned_with(name, |c| matches!(c, Check::SshHostKey {})),
+            },
+            || "shape.host_key".into(),
+            "an SSH connection pins its host key in a pinned field with an ssh_host_key check; other kinds name none",
+        )?;
         match &shape.destinations {
             DestinationRule::Owner {} => {}
             DestinationRule::Origin { field } => kind_ensure(
@@ -441,14 +552,25 @@ impl KindSchema {
                 "the origin is a pinned field with an origin check",
             )?,
             DestinationRule::Host { host, port } => kind_ensure(
-                !self.free_fields
-                    && pinned_with(host, |c| matches!(c, Check::Host {}))
-                    && pinned_with(
-                        port,
-                        |c| matches!(c, Check::Integer { min, max } if *min >= 1 && *max <= 65535),
-                    ),
+                !self.free_fields && pinned_with(host, is_host) && pinned_with(port, is_port),
                 || "shape.destinations".into(),
                 "the host and port are pinned fields with host and port checks",
+            )?,
+            DestinationRule::Hosts { hosts } => kind_ensure(
+                !self.free_fields
+                    && !hosts.is_empty()
+                    && unique(hosts.iter().map(|r| r.connection.name()))
+                    && shape
+                        .connections
+                        .iter()
+                        .all(|c| hosts.iter().any(|r| r.connection == *c))
+                    && hosts.iter().all(|r| {
+                        shape.connections.contains(&r.connection)
+                            && pinned_with(&r.host, is_host)
+                            && pinned_with(&r.port, is_port)
+                    }),
+                || "shape.destinations".into(),
+                "one route per connection of the shape, each to pinned fields with host and port checks",
             )?,
         }
         for (i, name) in shape.captures.iter().enumerate() {
@@ -714,23 +836,35 @@ impl ItemBinding {
         }
     }
 
-    /// The destination the shape fixes, if it fixes one.
-    fn destination(&self, kind: &KindSchema) -> Result<Option<Destination>> {
+    /// The destination the shape fixes for operations of `connection`, if it fixes one.
+    fn destination(
+        &self,
+        kind: &KindSchema,
+        connection: ShapeConnection,
+    ) -> Result<Option<Destination>> {
         let pin = |name: &str| {
             self.pins.get(name).ok_or_else(|| {
                 Error::policy(format!("item.pins.{name}"), "a pinned field has no value")
             })
+        };
+        let host_port = |host: &str, port: &str| -> Result<Option<Destination>> {
+            let port: u16 = pin(port)?
+                .parse()
+                .map_err(|_| Error::policy(format!("item.pins.{port}"), "not a port"))?;
+            Ok(Some(Destination::new(pin(host)?, port)))
         };
         match &kind.shape.destinations {
             DestinationRule::Owner {} => Ok(None),
             DestinationRule::Origin { field } => parse_origin(pin(field)?)
                 .map(|o| Some(o.destination))
                 .ok_or_else(|| Error::policy(format!("item.pins.{field}"), "not an exact origin")),
-            DestinationRule::Host { host, port } => {
-                let port: u16 = pin(port)?
-                    .parse()
-                    .map_err(|_| Error::policy(format!("item.pins.{port}"), "not a port"))?;
-                Ok(Some(Destination::new(pin(host)?, port)))
+            DestinationRule::Host { host, port } => host_port(host, port),
+            DestinationRule::Hosts { hosts } => {
+                let route = hosts
+                    .iter()
+                    .find(|r| r.connection == connection)
+                    .ok_or_else(|| Error::policy("item", "the kind routes no such connection"))?;
+                host_port(&route.host, &route.port)
             }
         }
     }
@@ -747,10 +881,16 @@ impl ItemBinding {
         {
             return Some(origin);
         }
-        self.destination(kind).ok().flatten().map(|d| Origin {
-            https: true,
-            destination: d,
-        })
+        kind.shape
+            .connections
+            .iter()
+            .copied()
+            .chain([ShapeConnection::None])
+            .find_map(|c| self.destination(kind, c).ok().flatten())
+            .map(|d| Origin {
+                https: true,
+                destination: d,
+            })
     }
 }
 
@@ -836,57 +976,95 @@ fn check_pins(policy: &Policy, binding: &ItemBinding, kind: &KindSchema) -> Chec
     )
 }
 
+/// The connection of an operation as a shape names it.
+fn shape_connection(at: &str, operation: &Operation) -> Result<ShapeConnection> {
+    let refuse = |rule| Err(Error::policy(at, rule));
+    match operation.connection() {
+        Some(Connection::Https) => Ok(ShapeConnection::Https),
+        Some(Connection::Tls) => Ok(ShapeConnection::Tls),
+        Some(Connection::Ssh) => Ok(ShapeConnection::Ssh),
+        Some(Connection::Smtp) => Ok(ShapeConnection::Smtp),
+        Some(Connection::Imap) => Ok(ShapeConnection::Imap),
+        Some(Connection::Websocket) => refuse("a typed item has no WebSocket operation"),
+        Some(
+            Connection::Postgres
+            | Connection::Redis
+            | Connection::Mysql
+            | Connection::Mqtt
+            | Connection::Amqp,
+        ) => refuse("a typed item has no database or queue connection yet"),
+        Some(Connection::Udp) => refuse("a typed item has no UDP operation"),
+        Some(Connection::Browser) => refuse("a typed item has no browser operation yet"),
+        None => Ok(ShapeConnection::None),
+    }
+}
+
+/// Checks the sign-in of a protocol operation of a typed item: each login member exactly the
+/// field the kind names for it, and for SSH exactly the pinned host key, whole.
+fn check_login(
+    at: &str,
+    open: &Open,
+    kind: &KindSchema,
+    pins: &BTreeMap<String, String>,
+) -> Checked {
+    let shape = &kind.shape;
+    let Some(rule) = &shape.login else {
+        return shape_fail(at, "the kind names no login");
+    };
+    let Some(login) = &open.login else {
+        return shape_fail(format!("{at}.login"), "a protocol connection needs login");
+    };
+    let exactly = |given: Option<&str>, field: Option<&str>| match (given, field) {
+        (None, _) => true,
+        (Some(text), Some(field)) => text == format!("{{{{{field}}}}}"),
+        (Some(_), None) => false,
+    };
+    shape_ensure(
+        exactly(Some(&login.user), Some(&rule.user))
+            && exactly(login.password.as_deref(), rule.password.as_deref())
+            && exactly(login.key.as_deref(), rule.key.as_deref())
+            && exactly(login.token.as_deref(), rule.token.as_deref())
+            && login.answers.is_empty()
+            && login.database.is_none()
+            && login.client_id.is_none()
+            && login.vhost.is_none(),
+        || format!("{at}.login"),
+        "each login member is exactly {{field}} of the field the kind names for it",
+    )?;
+    if let Some(field) = &shape.host_key {
+        let pinned = pins.get(field);
+        shape_ensure(
+            pinned.is_some_and(|key| {
+                crate::proto::ssh::HostKey::parse(key).is_some()
+                    && open.host_keys.len() == 1
+                    && open.host_keys.first() == Some(key)
+            }),
+            || format!("{at}.host_keys"),
+            "an SSH operation of an item pins exactly the item's host key, a whole key",
+        )?;
+    }
+    Ok(())
+}
+
 fn check_operation(
     at: &str,
     operation: &Operation,
     kind: &KindSchema,
     fixed: Option<&Destination>,
+    pins: &BTreeMap<String, String>,
 ) -> Checked {
     let shape = &kind.shape;
-    let connection = match operation.connection() {
-        Some(Connection::Https) => ShapeConnection::Https,
-        Some(Connection::Tls) => ShapeConnection::Tls,
-        Some(Connection::Websocket) => {
-            return shape_ensure(
-                false,
-                || at.to_string(),
-                "a typed item has no WebSocket operation",
-            );
-        }
-        Some(
-            Connection::Ssh
-            | Connection::Postgres
-            | Connection::Smtp
-            | Connection::Imap
-            | Connection::Redis,
-        ) => {
-            return shape_ensure(
-                false,
-                || at.to_string(),
-                "a typed item has no protocol connection yet",
-            );
-        }
-        Some(Connection::Udp) => {
-            return shape_ensure(
-                false,
-                || at.to_string(),
-                "a typed item has no UDP operation",
-            );
-        }
-        Some(Connection::Browser) => {
-            return shape_ensure(
-                false,
-                || at.to_string(),
-                "a typed item has no browser operation yet",
-            );
-        }
-        None => ShapeConnection::None,
-    };
+    let connection = shape_connection(at, operation)?;
     shape_ensure(
         shape.connections.contains(&connection),
         || at.to_string(),
         "the kind does not allow this connection",
     )?;
+    if connection.is_protocol()
+        && let Some(open) = operation.open()
+    {
+        check_login(&format!("{at}.steps[0]"), open, kind, pins)?;
+    }
     for (i, step) in operation.steps.iter().enumerate() {
         let at = format!("{at}.steps[{i}]");
         match step {
@@ -965,9 +1143,16 @@ pub fn check_policy(policy: &Policy, binding: &ItemBinding) -> Result<()> {
     let kind = binding.schema()?;
     check_fields(policy, kind)?;
     check_pins(policy, binding, kind)?;
-    let fixed = binding.destination(kind)?;
     for (i, operation) in policy.operations.iter().enumerate() {
-        check_operation(&format!("operations[{i}]"), operation, kind, fixed.as_ref())?;
+        let at = format!("operations[{i}]");
+        let connection = shape_connection(&at, operation)?;
+        // A connection the kind does not allow is refused below, whatever it would route to.
+        let fixed = if kind.shape.connections.contains(&connection) {
+            binding.destination(kind, connection)?
+        } else {
+            None
+        };
+        check_operation(&at, operation, kind, fixed.as_ref(), &binding.pins)?;
     }
     Ok(())
 }

@@ -178,6 +178,8 @@ fn the_examples_of_the_reference_are_valid_policies() {
             "access_token",
             "last_code",
             "redis_password",
+            "mqtt_password",
+            "amqp_password",
         ];
         let policy = Policy {
             item: None,
@@ -193,5 +195,5 @@ fn the_examples_of_the_reference_are_valid_policies() {
         policy.validate().unwrap();
         count += 1;
     }
-    assert_eq!(count, 5);
+    assert_eq!(count, 11);
 }
