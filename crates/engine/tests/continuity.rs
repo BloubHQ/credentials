@@ -297,9 +297,11 @@ fn a_hand_over_moves_the_state_and_one_chain_runs_across_both_nodes() {
     for entry in &new {
         alone.push(entry).unwrap();
     }
-    // The carried limits are sealed: no amount in the clear.
+    // The carried limits are sealed: no amount in the clear. The check looks for the quoted
+    // JSON string, because the random keys, signatures and sealed bytes in the entry are
+    // base64, which may contain the three letters but never a quote.
     let carry = serde_json::to_string(&new[1]).unwrap();
-    assert!(!carry.contains("EUR"));
+    assert!(!carry.contains("\"EUR\""));
 }
 
 #[test]
