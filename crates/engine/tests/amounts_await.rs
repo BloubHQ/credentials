@@ -96,6 +96,14 @@ impl Transport for Site {
             pending: Vec::new(),
         }))
     }
+
+    fn open_datagrams(&mut self, _: &Destination) -> engine::Result<Box<dyn Stream + '_>> {
+        self.opens += 1;
+        Ok(Box::new(Connection {
+            site: self,
+            pending: Vec::new(),
+        }))
+    }
 }
 
 impl Stream for Connection<'_> {
@@ -108,6 +116,10 @@ impl Stream for Connection<'_> {
     }
 
     fn read_until(&mut self, delimiters: &[&[u8]], _: usize) -> engine::Result<Vec<u8>> {
+        // A datagram: everything that came, at once.
+        if delimiters.is_empty() && !self.pending.is_empty() {
+            return Ok(core::mem::take(&mut self.pending));
+        }
         let end = delimiters
             .iter()
             .filter_map(|d| {
@@ -1306,5 +1318,118 @@ fn await_on_tls_is_refused_where_it_would_hold_a_connection() {
                 .then(Return::status())
         )
         .is_err()
+    );
+}
+
+// --- Approvals of every payload that waits ---------------------------------------------------
+
+fn radius() -> Destination {
+    Destination::new("radius.example", 1812)
+}
+
+/// Asks with a MAC over the password, then relays the caller's pings; waits for the owner's
+/// approval when `approval`.
+fn udp_ask(approval: bool) -> impl Fn(&CallerKey, &CallerKey) -> Policy {
+    move |agent, other| {
+        let mut operation = Operation::udp("ask", radius())
+            .then(Send::write("{{ hex(hmac_sha256(password, \"hello\")) }}"))
+            .then(Receive::until(Vec::<String>::new()))
+            .then(Return::relay(["ping [0-9]"]));
+        operation.approval = approval;
+        Policy::new()
+            .with_field(FieldSpec::secret("password"))
+            .with_operation(operation)
+            .with_caller(Caller::new("agent", agent.public(), ["ask"]))
+            .with_caller(Caller::new("other", other.public(), ["ask"]))
+    }
+}
+
+fn pings() -> Body {
+    Body::Stream {
+        destination: radius(),
+        exchanges: vec![CallerExchange {
+            send: b"ping 1".to_vec(),
+            until: Vec::new(),
+        }],
+    }
+}
+
+fn radius_site() -> Site {
+    Site {
+        lines: VecDeque::from([b"accept".to_vec(), b"pong 1".to_vec()]),
+        ..Site::default()
+    }
+}
+
+#[test]
+fn an_approved_udp_operation_sends_the_datagrams_it_was_called_with() {
+    let plain = world(udp_ask(false), &[("password", PASSWORD)]);
+    let mut site = radius_site();
+    let expected = stream_of(plain.run("ask", pings(), &mut site));
+    assert_eq!(expected.reads, vec![b"pong 1".to_vec()]);
+
+    let w = world(udp_ask(true), &[("password", PASSWORD)]);
+    let mut site = radius_site();
+    let summary = approval_of(w.run("ask", pings(), &mut site));
+    assert_eq!(site.opens, 0, "nothing is opened before the approval");
+    approval_of(w.resume("ask", summary.id, &mut site));
+    assert_eq!(site.opens, 0);
+    // Another caller does not get to run it, approved or not.
+    w.node
+        .approve(&w.device.approve(&summary, w.now()).unwrap())
+        .unwrap();
+    let call = w.call_as(&w.other, "other", "ask", Body::resume(summary.id));
+    assert_eq!(
+        w.node.run(&call, &mut site).result,
+        Err(Error::ParkedUnknown)
+    );
+    let output = stream_of(w.resume("ask", summary.id, &mut site));
+    assert_eq!(output.reads, expected.reads);
+    assert_eq!(output.error, None);
+    assert_eq!(site.opens, 1);
+    assert_eq!(site.written[1], b"ping 1");
+    assert_eq!(
+        w.resume("ask", summary.id, &mut site),
+        Err(Error::ParkedUnknown)
+    );
+}
+
+fn mac(approval: bool) -> impl Fn(&CallerKey, &CallerKey) -> Policy {
+    move |agent, other| {
+        let mut operation = Operation::derive("mac", "{{ hex(hmac_sha256(password, $input)) }}")
+            .input(engine::policy::Input::any());
+        operation.approval = approval;
+        Policy::new()
+            .with_field(FieldSpec::secret("password"))
+            .with_operation(operation)
+            .with_caller(Caller::new("agent", agent.public(), ["mac"]))
+            .with_caller(Caller::new("other", other.public(), ["mac"]))
+    }
+}
+
+fn derived(output: engine::Result<Output>) -> Vec<u8> {
+    match output {
+        Ok(Output::Derive(bytes)) => bytes,
+        other => panic!("not derived: {:?}", other.map(|_| ()).err()),
+    }
+}
+
+#[test]
+fn an_approved_derivation_runs_on_the_input_it_was_called_with() {
+    let input = || Body::derive(b"message to sign");
+    let mut site = Site::default();
+    let plain = world(mac(false), &[("password", PASSWORD)]);
+    let expected = derived(plain.run("mac", input(), &mut site));
+
+    let w = world(mac(true), &[("password", PASSWORD)]);
+    let summary = approval_of(w.run("mac", input(), &mut site));
+    approval_of(w.resume("mac", summary.id, &mut site));
+    w.node
+        .approve(&w.device.approve(&summary, w.now()).unwrap())
+        .unwrap();
+    assert_eq!(derived(w.resume("mac", summary.id, &mut site)), expected);
+    assert_eq!(
+        w.resume("mac", summary.id, &mut site),
+        Err(Error::ParkedUnknown)
     );
 }

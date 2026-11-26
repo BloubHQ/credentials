@@ -32,8 +32,8 @@ use crate::egress::{Arrived, ClientIdentity, Stream, Transport, Versions, dispat
 use crate::error::TransportKind;
 use crate::log::{Confirmed, Event, LogSink};
 use crate::policy::{
-    BodyProjection, Connection, FrameKind, Open, Operation, Policy, Projection, Relay as Rules,
-    Send, Step, StreamLimits,
+    Connection, FrameKind, Open, Operation, Policy, Projection, Relay as Rules, Send, Step,
+    StreamLimits,
 };
 use crate::record::Record;
 use crate::reflection::{self, Scrubber, Secrets};
@@ -205,21 +205,7 @@ fn release(map: &mut HashMap<String, usize>, key: &str) {
 /// True when the operation runs on a streaming call: a WebSocket, or HTTPS whose `return`
 /// streams the body.
 pub(crate) fn streams(operation: &Operation) -> bool {
-    match operation.connection() {
-        Some(Connection::Websocket) => true,
-        // An SSH shell or forward: the relay takes the caller's frames. MQTT: the relay hands
-        // back the messages of the subscriptions the policy keeps.
-        Some(Connection::Ssh | Connection::Mqtt) => operation
-            .returns()
-            .and_then(|r| r.relay.as_ref())
-            .is_some_and(|r| !r.frames.is_empty() || r.server),
-        Some(Connection::Https) => operation.returns().is_some_and(|r| {
-            r.response
-                .as_ref()
-                .is_some_and(|p| p.body == Some(BodyProjection::Stream))
-        }),
-        _ => false,
-    }
+    operation.streams()
 }
 
 /// The answer of a unary gRPC call: its message unframed, when the answer is gRPC.

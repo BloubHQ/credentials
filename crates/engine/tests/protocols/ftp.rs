@@ -393,3 +393,21 @@ fn ftp_rules_are_checked_when_the_policy_is_signed() {
         assert!(policy.validate().is_err(), "{login}");
     }
 }
+
+#[test]
+fn an_approved_session_runs_the_commands_it_was_signed_with() {
+    same_after_approval(
+        &ftp_setup("implicit"),
+        "files",
+        session(
+            "files.example.com",
+            990,
+            vec![
+                command("ls", &["/srv/reports"]),
+                command("put", &["notes", "hello"]),
+            ],
+            Vec::new(),
+        ),
+        || Fake::new(server(true)),
+    );
+}

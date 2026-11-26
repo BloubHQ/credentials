@@ -3,11 +3,11 @@
 
 use std::collections::HashMap;
 
-use zeroize::Zeroizing;
+use zeroize::{Zeroize as _, Zeroizing};
 
 use super::Captured;
 use crate::approval::ApprovalSummary;
-use crate::caller::CallerExchange;
+use crate::caller::{CallerCommand, CallerExchange, CallerMail};
 use crate::fields::Fields;
 use crate::limits::Spend;
 use crate::policy::Destination;
@@ -59,6 +59,100 @@ pub(super) enum Given {
         destination: Destination,
         exchanges: Vec<CallerExchange>,
     },
+    /// An operation on a protocol connection: the destination, the caller's commands and
+    /// messages, checked against the relay before it waited, run as they were signed when it
+    /// goes on.
+    Session {
+        destination: Destination,
+        commands: Vec<CallerCommand>,
+        mail: Vec<CallerMail>,
+    },
+}
+
+impl Given {
+    /// The bytes of what the caller gave, counted against the limits of waiting operations.
+    fn bytes(&self) -> usize {
+        match self {
+            Given::Http(None) => 0,
+            Given::Http(Some(r)) => {
+                r.path.len()
+                    + r.body.len()
+                    + r.headers
+                        .iter()
+                        .map(|(n, v)| n.len() + v.len())
+                        .sum::<usize>()
+            }
+            Given::Derive { given, input } => given.len() + input.len(),
+            Given::Stream {
+                destination,
+                exchanges,
+            } => {
+                destination.host.len()
+                    + exchanges
+                        .iter()
+                        .map(|e| e.send.len() + e.until.iter().map(Vec::len).sum::<usize>())
+                        .sum::<usize>()
+            }
+            Given::Session {
+                destination,
+                commands,
+                mail,
+            } => {
+                destination.host.len()
+                    + commands
+                        .iter()
+                        .map(|c| c.name.len() + c.params.iter().map(String::len).sum::<usize>())
+                        .sum::<usize>()
+                    + mail
+                        .iter()
+                        .map(|m| {
+                            m.from.len()
+                                + m.to.iter().map(String::len).sum::<usize>()
+                                + m.data.len()
+                        })
+                        .sum::<usize>()
+            }
+        }
+    }
+}
+
+/// What the caller gave may carry values the caller holds (a body, a parameter, a message):
+/// wiped when the waiting operation goes on, lapses or is dropped.
+impl Drop for Given {
+    fn drop(&mut self) {
+        match self {
+            Given::Http(None) => {}
+            Given::Http(Some(r)) => {
+                r.path.zeroize();
+                r.body.zeroize();
+                for (name, value) in &mut r.headers {
+                    name.zeroize();
+                    value.zeroize();
+                }
+            }
+            Given::Derive { given, input } => {
+                given.zeroize();
+                input.zeroize();
+            }
+            Given::Stream { exchanges, .. } => {
+                for exchange in exchanges {
+                    exchange.send.zeroize();
+                    exchange.until.zeroize();
+                }
+            }
+            Given::Session { commands, mail, .. } => {
+                for command in commands {
+                    command.name.zeroize();
+                    command.params.zeroize();
+                }
+                for message in mail {
+                    message.from.zeroize();
+                    message.to.zeroize();
+                    message.data.zeroize();
+                }
+            }
+        }
+    }
 }
 
 /// The values of an operation that waits at an `await`.
@@ -112,30 +206,8 @@ pub(super) struct Parked {
 
 impl Parked {
     pub fn bytes(&self) -> usize {
-        let given = match &self.given {
-            Given::Http(None) => 0,
-            Given::Http(Some(r)) => {
-                r.path.len()
-                    + r.body.len()
-                    + r.headers
-                        .iter()
-                        .map(|(n, v)| n.len() + v.len())
-                        .sum::<usize>()
-            }
-            Given::Derive { given, input } => given.len() + input.len(),
-            Given::Stream {
-                destination,
-                exchanges,
-            } => {
-                destination.host.len()
-                    + exchanges
-                        .iter()
-                        .map(|e| e.send.len() + e.until.iter().map(Vec::len).sum::<usize>())
-                        .sum::<usize>()
-            }
-        };
         // A fixed part for the record and the bookkeeping.
-        4096 + given + self.saved.as_ref().map_or(0, Saved::bytes)
+        4096 + self.given.bytes() + self.saved.as_ref().map_or(0, Saved::bytes)
     }
 }
 

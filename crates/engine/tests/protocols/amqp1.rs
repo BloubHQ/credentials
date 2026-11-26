@@ -612,3 +612,22 @@ fn a_send_step_of_the_policy_runs_before_the_callers_commands() {
         ]
     );
 }
+
+#[test]
+fn an_approved_session_runs_the_commands_it_was_signed_with() {
+    same_after_approval(
+        &plain_setup(),
+        "queue",
+        session(
+            "mq.example.com",
+            5671,
+            vec![command("put", &["1234"]), command("take", &[])],
+            Vec::new(),
+        ),
+        || {
+            let mut broker = Amqp1Broker::new(PASSWORD);
+            broker.queues = vec![("replies".into(), vec![message(b"one")])];
+            Fake::new(broker)
+        },
+    );
+}
