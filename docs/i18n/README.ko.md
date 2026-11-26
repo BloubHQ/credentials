@@ -480,9 +480,10 @@ credentials verify old.jsonl <이전 노드 키> --next new.jsonl --head new.jso
 - **이전 노드가 사라졌다면** 앱이 다시 grant합니다. `client::verify_successor`가 소유자가
   grant했던 릴리스의 진술로 새 노드를 확인하고, `client::regrant`가 소유자 정책에 따라
   grant합니다.
-- **아직 비활성.** 노드에 컴파일되는 Sigstore 신뢰 루트
-  (`crates/continuity/trust/trusted_root.json`)는 커밋되기 전까지 비어 있어, 그동안 모든
-  진술이 거부됩니다. 넘겨주기는 테스트 루트로만 시험했습니다(테스트에 Nitro 하드웨어나
+- **신뢰 루트.** 노드에 컴파일되는 Sigstore 신뢰 루트
+  (`crates/continuity/trust/trusted_root.json`)는 공개 인스턴스의 것으로, 2026-11-26에
+  Sigstore TUF 저장소가 제공한 그대로입니다(릴리스 워크플로가 TUF와 다시 대조). Rekor v1
+  로그(ECDSA P-256)만 읽으므로 릴리스는 Rekor v1로 서명합니다. 넘겨주기는 테스트 루트로만 시험했습니다(테스트에 Nitro 하드웨어나
   Sigstore 서비스 없음).
 
 ## 보장하는 것

@@ -228,8 +228,16 @@ jobs:
           test "$(jq -er .to.release dist/successor.json)" = "$GITHUB_REF_NAME"
           test "$(jq -er .from.release dist/successor.json)" = "$previous"
           cat dist/successor.json
-          cosign sign-blob --yes --new-bundle-format \
+          # The nodes verify Rekor v1 entries of the public instance (a signed entry timestamp
+          # and an inclusion proof; crates/continuity reads only its ECDSA P-256 logs), so the
+          # signing config, which may pick a Rekor v2 log, is not used.
+          cosign sign-blob --yes --new-bundle-format --use-signing-config=false \
+            --fulcio-url https://fulcio.sigstore.dev --rekor-url https://rekor.sigstore.dev \
             --bundle dist/successor.sigstore.json dist/successor.json
+          jq -e '.verificationMaterial.tlogEntries | length == 1
+            and (.[0].inclusionPromise.signedEntryTimestamp | length > 0)
+            and (.[0].inclusionProof.checkpoint.envelope | length > 0)' \
+            dist/successor.sigstore.json
           # Verified the way the nodes verify it: this workflow at this tag, from GitHub's
           # token issuer.
           cosign verify-blob --new-bundle-format --bundle dist/successor.sigstore.json \

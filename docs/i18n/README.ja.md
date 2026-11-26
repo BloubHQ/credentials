@@ -487,9 +487,10 @@ credentials verify old.jsonl <旧ノードの鍵> --next new.jsonl --head new.js
 - **旧ノードが失われた場合**はアプリが再グラントします。`client::verify_successor` が所有者が
   グラントしたリリースのステートメントで新ノードを確認し、`client::regrant` が所有者の
   ポリシーに従ってグラントします。
-- **まだ無効。** ノードに組み込まれる Sigstore トラストルート
-  （`crates/continuity/trust/trusted_root.json`）はコミットされるまで空で、それまでは
-  すべてのステートメントが拒否されます。引き継ぎはテスト用ルートでのみ試験しています
+- **トラストルート。** ノードに組み込まれる Sigstore トラストルート
+  （`crates/continuity/trust/trusted_root.json`）は公開インスタンスのもので、2026-11-26 に
+  Sigstore の TUF リポジトリが配布したものです（リリースワークフローが TUF と再照合します）。
+  Rekor v1 ログ（ECDSA P-256）だけを読むため、リリースは Rekor v1 で署名します。引き継ぎはテスト用ルートでのみ試験しています
   （テストに Nitro ハードウェアや Sigstore サービスは使いません）。
 
 ## 保証すること
