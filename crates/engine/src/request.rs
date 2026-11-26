@@ -143,9 +143,19 @@ impl<'a> Outbound<'a> {
         UnwrapErr(SysRng).fill_bytes(&mut random);
         let boundary = format!("boundary-{}", String::from_utf8_lossy(&hex(&random)));
         let (pathname, query) = self.path.split_once('?').unwrap_or((self.path, ""));
+        let host = self.destination.host.to_ascii_lowercase();
+        let authority = match self.destination.port {
+            443 => host,
+            port => format!("{host}:{port}"),
+        };
+        let target_uri = format!("https://{authority}{}", self.path);
         HashMap::from([
             (Var::Method, self.method.as_str().as_bytes().to_vec()),
             (Var::Host, self.destination.host.as_bytes().to_vec()),
+            (Var::Port, self.destination.port.to_string().into_bytes()),
+            (Var::Scheme, b"https".to_vec()),
+            (Var::Authority, authority.into_bytes()),
+            (Var::TargetUri, target_uri.into_bytes()),
             (Var::Path, self.path.as_bytes().to_vec()),
             (Var::PathName, pathname.as_bytes().to_vec()),
             (Var::Query, query.as_bytes().to_vec()),
@@ -196,6 +206,7 @@ pub(crate) fn build(
         fields: inputs.fields,
         temps: inputs.temps,
         vars: request.vars(inputs.unix_ms),
+        headers: request.headers,
         unix: inputs.unix_ms / 1000,
         budget: inputs.budget,
     };

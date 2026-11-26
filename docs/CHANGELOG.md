@@ -36,6 +36,30 @@ before 1.0, minor versions may break formats and APIs.
 
 ### Added
 
+- Template capabilities for the gaps the scheme tests found, each a family (`docs/policy.md`,
+  Request components, AEAD parts and public keys; `docs/design.md` section 11):
+  - Request components: `$header("name")` reads a header of the caller's request (only one
+    the `send`'s contract lists; combined as RFC 9110 section 5.3 says, without surrounding
+    whitespace), `$query_param("name")` a query parameter as RFC 9421 `@query-param`
+    normalizes it, and `$port`, `$scheme`, `$authority` and `$target_uri` the RFC 9421 derived
+    components. Names are string literals; signing refuses a component the contract does not
+    list, any in a fixed request, a `compute` step or a derivation. Values are controlled and
+    caller-chosen like `$body`; no rule of the analysis changed.
+  - AEAD parts: `aead_ciphertext(...)` and `aead_tag(...)` around an AEAD call written in
+    place (`aes_gcm_encrypt`, `chacha20_poly1305_encrypt`, `aes_cbc_hmac_encrypt`,
+    `aes_ccm_encrypt`, `aes_eax_encrypt`), cut at the algorithm's tag length; each part has the
+    properties of the encryption. A JWE whose plaintext mixes the caller's bytes and a secret
+    now signs; `slice` of such a value is still refused.
+  - Public keys: `ed25519_public(key)`, `ed448_public(key)`, `ecdsa_public(curve, key)` (P-256,
+    P-384, P-521, secp256k1, brainpool P-256 and P-384, SM2) and `rsa_public(form, key)`
+    (`n`, `e`, `spki`, `pkcs1`), one-way and a signature each in the budget.
+  - New test file `crates/engine/tests/schemes_more.rs` (19 tests): RFC 9421 B.2.6 and B.2.5
+    with the caller's headers, the Hawk specification's examples with the caller's content
+    type and `$port`, RFC 7516 A.3 and A.1, a JWE of the caller's JSON with a card number
+    opened by `rsa` and `aes-gcm`, public keys against RFC 8032, RFC 8037, RFC 9421 B.1.4 and
+    RFC 6979, and the attacks: headers outside the contract, repeated, folded or with control
+    bytes; components the contract does not list; caller headers meeting secrets; AEAD parts
+    of anything but an AEAD call; taint of the parts; rule 9.
 - Worked examples of signing and encryption schemes as policies, with no engine change
   (`docs/policy.md`, Worked examples; results in `docs/design.md` section 11): DPoP with `ath`
   and a server nonce, HTTP Message Signatures (ed25519, ecdsa-p256-sha256, rsa-pss-sha512,

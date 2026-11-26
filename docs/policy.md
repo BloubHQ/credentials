@@ -1587,14 +1587,16 @@ The other algorithms change the function and `alg`: `ecdsa-p256-sha256` is
 `p256_sign(key, ...)` (`r || s`, as RFC 9421 section 3.3.4 asks), `rsa-pss-sha512` is
 `rsa_sign_pss("sha512", pem(key), ...)` (salt of 64 bytes), `hmac-sha256` is
 `hmac_sha256(secret, ...)`. `@authority` is `$host` because the destination's port is 443;
-another port is written after it. A header field the policy injects can be covered
-(`content-digest` here, or a `Date` from `time($unix, ...)`); a header the **caller** sets
-cannot, since no template variable reads the caller's headers.
+`$authority` adds any other port. A header field the policy injects can be covered
+(`content-digest` here, or a `Date` from `time($unix, ...)`), and so can a header the
+**caller** sets, with `$header("name")` for a header the contract lists
+([Request components, AEAD parts and public keys](#request-components-aead-parts-and-public-keys)).
 
 ### Hawk
 
 The `Authorization: Hawk` header over the request and a payload hash. The policy fixes the
-content type, which the payload hash covers, and the port (`443`), which no variable gives:
+content type, which the payload hash covers, and the port (`443`); `hawk-call-headers` below
+reads both from the request instead (`$header("content-type")`, `$port`):
 
 ```json
 {"name": "hawk-call",
@@ -1657,8 +1659,8 @@ request takes the nonce of the response before it:
 
 `eyJvbmx5UmV0dXJuRXhpc3RpbmciOnRydWV9` is `{"onlyReturnExisting":true}`; an empty caller
 body is a POST-as-GET (an empty `payload`). Other JWS algorithms change the signature
-function: `p384_sign` (ES384), `ed25519_sign` (EdDSA, with the public key as a public field,
-since no function gives an Ed25519 public key), `rsa_sign_pkcs1("sha256", ...)` (RS256),
+function: `p384_sign` (ES384), `ed25519_sign` (EdDSA, its JWK `x` from
+`ed25519_public(key)`), `rsa_sign_pkcs1("sha256", ...)` (RS256),
 `rsa_sign_pss` (PS256 to PS512), `hmac_sha256` (HS256).
 
 ### JWE (RFC 7516)
@@ -1724,9 +1726,9 @@ IV is the request's `$nonce`, the same in every place of one request):
 
 A plaintext that mixes the caller's bytes with a secret (`json_set($body, "number",
 card_number)`) is refused: the ciphertext is then both tainted and controlled, and `slice`
-cuts no such value (rule 2), so the ciphertext and the tag cannot be separated. Such a JWE
-needs an AEAD whose ciphertext and tag come out as separate values (a detached form), which
-no function offers yet.
+cuts no such value (rule 2), so the ciphertext and the tag cannot be separated by it. Such a
+JWE takes `aead_ciphertext` and `aead_tag` instead (`jwe-mixed` in
+[Request components, AEAD parts and public keys](#request-components-aead-parts-and-public-keys)).
 
 ### Client authentication by JWT (RFC 7523)
 
@@ -1827,6 +1829,9 @@ with nested braces work. A template is at most 8 KiB, 512 nodes and 24 levels de
 | `$nonce` | 32 random hex characters, the same throughout one request (or TLS send, or operation with no connection) | everywhere |
 | `$boundary` | A random multipart boundary | HTTPS `send` injections |
 | `$input` | The caller's input, after its schema | operations with no connection |
+| `$port` `$scheme` `$authority` `$target_uri` | The destination port in decimal; `https`; the host in lowercase, then `:` and the port unless it is 443 (RFC 9421 `@authority`); `https://` + `$authority` + `$path` (`@target-uri`) | HTTPS `send` injections |
+| `$header("name")` | The caller's header of that name (case does not matter), as RFC 9110 section 5.3 combines field lines: each value without the spaces and tabs around it, joined by `, `; empty when the caller sent none | HTTPS `send` injections of a `send` that takes the caller's request, for a header its contract lists |
+| `$query_param("name")` | The caller's query parameter as RFC 9421 section 2.2.8 (`@query-param`) normalizes it: parsed as `application/x-www-form-urlencoded` (`+` is a space) and percent-encoded again, so a space is `%20`; the name is written encoded the same way; empty when absent | as `$header`, for a parameter its contract lists |
 
 TLS sends and identities can read `$host`, `$unix`, `$unix_ms` and `$nonce`; `compute` on a
 connection reads `$unix`, `$unix_ms` and `$nonce`, and with no connection what the `return`
@@ -1846,6 +1851,8 @@ reads.
 | TLS channel binding | `tls_exporter(label, context, length)` (only in a TLS `send`) |
 | Encryption | `aes_gcm_encrypt(key, nonce12, msg[, aad])` `aes_cbc_encrypt(key, iv16, msg)` `aes_cbc_hmac_encrypt(key, iv16, msg[, aad])` `aes_ccm_encrypt(key, nonce, tag_length, msg[, aad])` `aes_eax_encrypt(key, nonce16, msg[, aad])` `aes_cts_encrypt(key, iv16, msg)` `chacha20_poly1305_encrypt(key32, nonce12, msg[, aad])` `rsa_encrypt_oaep(hash, public_key, msg)` `rsa_encrypt_pkcs1(public_key, msg)` |
 | Key wrapping | `aes_kw_wrap(kek, key)` `aes_kwp_wrap(kek, key)` |
+| AEAD parts | `aead_ciphertext(encryption)` `aead_tag(encryption)`, around an AEAD call written in place |
+| Public keys | `ed25519_public(key)` `ed448_public(key)` `ecdsa_public(curve, key)` `rsa_public(form, key)` |
 | CBOR | `cbor_int(n)` `cbor_bytes(value)` `cbor_text(value)` `cbor_array(item, ...)` `cbor_map(key, value, ...)` `cbor_tag(number, item)` |
 
 Keys are raw bytes or PKCS#8 DER (PKCS#1 DER for RSA); use `pem(...)` to read a PEM field.
@@ -2009,6 +2016,94 @@ not expose, it is undefined for TLS 1.3, and RFC 9266 replaces it with the expor
 `tls-server-end-point` and an exporter inside an HTTPS request are not offered yet: the
 request is rendered before its connection exists (`docs/design.md`, Appendix A).
 
+#### Request components, AEAD parts and public keys
+
+A signature can cover what the caller sends. `$header("name")` and `$query_param("name")`
+read the caller's request; the name is a string literal, so the analysis knows each value a
+template reads, and signing refuses a name the `send`'s contract does not list (a caller
+cannot send a header outside its contract, so it cannot put one into a signature base
+either) and any use outside the injections of a `send` that takes the caller's request.
+Their values are chosen by the caller, like `$body`: *controlled* and not secret. The RFC 9421
+derived components are `$method` (`@method`), `$target_uri` (`@target-uri`), `$authority`
+(`@authority`), `$scheme` (`@scheme`), `$path` (`@request-target`), `$pathname` (`@path`),
+`"?" + $query` (`@query`) and `$query_param("name")` (`@query-param`); a header field is
+`$header("name")`. `$path` and `$pathname` are the path before path parameters are filled.
+
+The caller's request signed over its method, target URI, authority (port 8443 here), one
+query parameter, two of its headers and the digest of its body:
+
+```json
+{"name": "signed-call-headers",
+ "steps": [
+  {"do": "open", "connection": "https", "destinations": [{"host": "api.example.com", "port": 8443}]},
+  {"do": "compute", "into": "sig_params", "template": "(\"@method\" \"@target-uri\" \"@authority\" \"@query-param\";name=\"page\" \"content-type\" \"content-digest\" \"idempotency-key\");created={{ $unix }};keyid=\"client-1\";alg=\"ed25519\""},
+  {"do": "send", "request": {"from": "caller", "methods": ["GET", "POST"], "paths": ["/v1/**"], "headers": ["Content-Type", "Idempotency-Key"], "query": [{"name": "page", "pattern": "[0-9]{1,4}"}]},
+   "inject": [
+    {"target": {"kind": "header", "name": "Content-Digest"}, "template": "sha-256=:{{ b64(sha256($body)) }}:"},
+    {"target": {"kind": "header", "name": "Signature-Input"}, "template": "sig1={{ sig_params }}"},
+    {"target": {"kind": "header", "name": "Signature"}, "template": "sig1=:{{ b64(ed25519_sign(key, \"\\\"@method\\\": \" + $method + \"\\n\\\"@target-uri\\\": \" + $target_uri + \"\\n\\\"@authority\\\": \" + $authority + \"\\n\\\"@query-param\\\";name=\\\"page\\\": \" + $query_param(\"page\") + \"\\n\\\"content-type\\\": \" + $header(\"content-type\") + \"\\n\\\"content-digest\\\": sha-256=:\" + b64(sha256($body)) + \":\\n\\\"idempotency-key\\\": \" + $header(\"idempotency-key\") + \"\\n\\\"@signature-params\\\": \" + sig_params)) }}:"}]},
+  {"do": "return", "response": {"body": "all"}}
+ ]}
+```
+
+Hawk over the caller's content type (its media type without parameters, in lowercase, as
+Hawk normalizes it) and the port from `$port`:
+
+```json
+{"name": "hawk-call-headers",
+ "steps": [
+  {"do": "open", "connection": "https", "destinations": [{"host": "api.example.com", "port": 8000}]},
+  {"do": "send", "request": {"from": "caller", "methods": ["GET", "POST"], "paths": ["/v1/**"], "headers": ["Content-Type"]},
+   "inject": [
+    {"target": {"kind": "header", "name": "Authorization"}, "template": "Hawk id=\"{{ user }}\", ts=\"{{ $unix }}\", nonce=\"{{ $nonce }}\", hash=\"{{ b64(sha256(\"hawk.1.payload\\n\" + lower(trim(between($header(\"content-type\") + \";\", \"\", \";\"))) + \"\\n\" + $body + \"\\n\")) }}\", mac=\"{{ b64(hmac_sha256(secret, \"hawk.1.header\\n\" + $unix + \"\\n\" + $nonce + \"\\n\" + $method + \"\\n\" + $path + \"\\n\" + $host + \"\\n\" + $port + \"\\n\" + b64(sha256(\"hawk.1.payload\\n\" + lower(trim(between($header(\"content-type\") + \";\", \"\", \";\"))) + \"\\n\" + $body + \"\\n\")) + \"\\n\\n\")) }}\""}]},
+  {"do": "return", "response": {"body": "all"}}
+ ]}
+```
+
+`aead_ciphertext(...)` and `aead_tag(...)` take an AEAD call written in place
+(`aes_gcm_encrypt`, `chacha20_poly1305_encrypt`, `aes_cbc_hmac_encrypt`, `aes_ccm_encrypt`,
+`aes_eax_encrypt`; anything else is refused) and give its ciphertext and its tag: the tag is
+the last 16 bytes, the CCM tag length, or half the AES-CBC-HMAC key. Each part has exactly the
+properties of the encryption. The encryption is deterministic, so the two calls agree when
+the key and nonce are computed once (a `compute` name, or `$nonce`). This is what a JWE
+whose plaintext mixes the caller's bytes with a secret needs: `slice` cannot cut such a value
+(rule 2), and should not, since a cut at a length the caller chooses would select a piece of
+the secret; the parts cut where the algorithm puts the tag, and each covers the whole
+message. A card number added to the caller's JSON, sealed for the server's RSA key
+(RSA-OAEP-256, A256GCM):
+
+```json
+{"name": "jwe-mixed",
+ "steps": [
+  {"do": "open", "connection": "https", "destinations": [{"host": "api.example.com", "port": 443}]},
+  {"do": "compute", "into": "cek", "template": "{{ random(\"32\") }}"},
+  {"do": "compute", "into": "iv", "template": "{{ random(\"12\") }}"},
+  {"do": "compute", "into": "head", "template": "{{ b64urlraw(json_set(json_set(\"{}\", \"alg\", \"RSA-OAEP-256\"), \"enc\", \"A256GCM\")) }}"},
+  {"do": "send", "request": {"from": "caller", "methods": ["POST"], "paths": ["/v1/payments"]},
+   "inject": [
+    {"target": {"kind": "header", "name": "Content-Type"}, "template": "application/jose"},
+    {"target": {"kind": "body"}, "template": "{{ head + \".\" + b64urlraw(rsa_encrypt_oaep(\"sha256\", pem(server_key), cek)) + \".\" + b64urlraw(iv) + \".\" + b64urlraw(aead_ciphertext(aes_gcm_encrypt(cek, iv, json_set($body, \"card\", card_number), head))) + \".\" + b64urlraw(aead_tag(aes_gcm_encrypt(cek, iv, json_set($body, \"card\", card_number), head))) }}"}]},
+  {"do": "return", "response": {"body": "all"}}
+ ]}
+```
+
+The public key of a signing key comes from the private key, so a JWK needs no separate
+field: `ed25519_public(key)` (32 bytes) and `ed448_public(key)` (57) for raw or PKCS#8 keys,
+`ecdsa_public(curve, key)` (SEC1 uncompressed; `x` and `y` are the two halves after the first
+byte) on `p256`, `p384`, `p521`, `k256`, `bp256`, `bp384` and `sm2`, and `rsa_public(form,
+key)` with `form` `n` or `e` (the JWK members, big-endian without leading zeros), `spki` or
+`pkcs1` (DER). Each is one-way, like `hpke_public`, and counts as a signature in the budget.
+A JWS whose header carries the Ed25519 key that signs it:
+
+```json
+{"name": "jws-eddsa-jwk", "input": {"raw": {}},
+ "steps": [
+  {"do": "compute", "into": "header", "template": "{\"alg\":\"EdDSA\",\"jwk\":{\"kty\":\"OKP\",\"crv\":\"Ed25519\",\"x\":\"{{ b64urlraw(ed25519_public(key)) }}\"}}"},
+  {"do": "compute", "into": "head", "template": "{{ b64urlraw(header) }}"},
+  {"do": "return", "template": "{{ head + \".\" + b64urlraw($input) + \".\" + b64urlraw(ed25519_sign(key, head + \".\" + b64urlraw($input))) }}"}
+ ]}
+```
+
 ### The analysis
 
 Every template is analysed before the policy is signed. Each expression has four properties:
@@ -2049,6 +2144,8 @@ Rules:
    | `ecdh(curve, peer_public, private)` | the peer key and the private key |
    | `cbor_int` `cbor_text` | the input |
    | `cbor_array` `cbor_map` `cbor_tag` | every argument (each is checked to be one item) |
+   | `ed25519_public` `ed448_public` | the key |
+   | `ecdsa_public(curve, key)` `rsa_public(form, key)` | the key |
 
    A tainted value in one sensitive argument of `time`, `totp`, `pbkdf2_sha256` or `pbkdf2` and
    a controlled value in another are refused too: `time(secret, $input)` lets the caller pick
@@ -2083,6 +2180,7 @@ Rules:
    `kbkdf_counter`, `ecdsa_sign_prehash`, `dsa_sign`, `dsa_sign_der`, the suite and mode of
    the `hpke_*` functions, the KEM of `hpke_public` and `hpke_derive_key`, the domain byte of
    `turboshake*`, the parameter set of `mldsa_sign` and `mldsa_public`) must be neither tainted nor controlled: the policy fixes the algorithm, so no caller can downgrade it.
+   So must the curve of `ecdsa_public` and the form of `rsa_public`.
 7. The public key of `rsa_encrypt_oaep`, `rsa_encrypt_pkcs1`, `hpke_seal` and `hpke_export`,
    and the PSK, PSK id and sender key of every `hpke_*` function, must not be caller-chosen: it
    comes from the policy (a literal or a field) or from a capture of the destination's
@@ -2103,6 +2201,18 @@ Rules:
    the start and length of `slice`, the delimiters of `between`, and the text `replace` looks
    for. The length of the output, or whether the call fails, would give the secret back
    through `len`. The value being cut or searched may be a secret (`slice(key, "0", "4")`).
+   `aead_ciphertext` and `aead_tag` take no length: they cut at the tag length the algorithm
+   fixes (the CCM tag length is the argument above), counted from the end, so a secret in the
+   message changes neither where the cut falls nor which bytes each part covers.
+
+The request components (`$header`, `$query_param`, `$target_uri`) are controlled and
+caller-chosen like `$body`, so every rule above applies to them unchanged: a header value
+signed with a secret key is the normal signing case, and a header value that meets a secret in
+`slice`, a decoder or a key argument is refused like `$body` would be. `$port`, `$scheme` and
+`$authority` come from the destination, like `$host`. `aead_ciphertext` and `aead_tag` have the
+properties of the encryption they split (never a *secret key*). `ed25519_public`,
+`ed448_public`, `ecdsa_public` and `rsa_public` remove the taint, like `hpke_public`, and keep
+*guessable*.
 
 A template that breaks rule 1, 2, 6, 7 or 9 is refused wherever it appears; rule 5 applies to the
 `return` of an operation with no connection. A computed name carries the properties of its

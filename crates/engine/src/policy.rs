@@ -1275,6 +1275,48 @@ pub struct Policy {
     pub operations: Vec<Operation>,
 }
 
+/// The headers and query parameters of the caller's request a template of a `send` reads:
+/// only a send that takes the caller's request has them, and only those its contract lets
+/// the caller set, so the analysis knows each value a template reads and a caller cannot put
+/// a header the contract refuses into a signature.
+fn check_components(at: &str, template: &Template, request: &StepRequest) -> Checked {
+    let headers = template.headers();
+    let params = template.query_params();
+    if headers.is_empty() && params.is_empty() {
+        return Ok(());
+    }
+    let StepRequest::Caller(contract) = request else {
+        return fail(
+            at,
+            "a fixed request has no caller headers or query parameters to read",
+        );
+    };
+    for name in headers {
+        ensure(
+            contract
+                .headers
+                .iter()
+                .any(|h| h.eq_ignore_ascii_case(name)),
+            || format!("{at} ({name})"),
+            "a template reads a header the caller contract does not allow",
+        )?;
+    }
+    for name in params {
+        let decoded = crate::primitives::pct_decode(name.as_bytes()).ok();
+        ensure(
+            decoded.is_some_and(|d| {
+                contract
+                    .query
+                    .iter()
+                    .any(|r| r.name.as_bytes() == d.as_slice())
+            }),
+            || format!("{at} ({name})"),
+            "a template reads a query parameter the caller contract does not allow",
+        )?;
+    }
+    Ok(())
+}
+
 pub(crate) fn is_token(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= 64
@@ -1785,7 +1827,9 @@ impl Policy {
                 }
                 Target::Body => bodies += 1,
             }
-            self.check_template(&at, kinds, &injection.template, known, Var::in_request)?;
+            let (template, _) =
+                self.check_template(&at, kinds, &injection.template, known, Var::in_request)?;
+            check_components(&at, &template, request)?;
         }
         ensure(bodies <= 1, || format!("{at}.inject"), "at most one body")
     }

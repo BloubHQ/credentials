@@ -238,6 +238,7 @@ fn render_identity(
         fields,
         temps: &temps,
         vars: stream_vars(host, now),
+        headers: &[],
         unix: now / 1000,
         budget,
     };
@@ -1721,6 +1722,7 @@ impl<S: LogSink, C: Clock> Node<S, C> {
             fields: &run.fields,
             temps: &run.captured.temps,
             vars: compute_vars(run.now),
+            headers: &[],
             unix: run.now / 1000,
             budget: &run.budget,
         };
@@ -2032,6 +2034,7 @@ impl<S: LogSink, C: Clock> Node<S, C> {
                         fields: &run.fields,
                         temps: &run.captured.temps,
                         vars,
+                        headers: &[],
                         unix: run.now / 1000,
                         budget: &run.budget,
                     };
@@ -2319,6 +2322,7 @@ impl Run<'_> {
             fields: &self.fields,
             temps: &self.captured.temps,
             vars,
+            headers: &[],
             unix: self.now / 1000,
             budget: &self.budget,
         };
@@ -2347,6 +2351,7 @@ impl Run<'_> {
             fields: &self.fields,
             temps: &self.captured.temps,
             vars: stream_vars(host, self.now),
+            headers: &[],
             unix: self.now / 1000,
             budget: &self.budget,
         };

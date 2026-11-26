@@ -31,6 +31,54 @@ pub(super) fn ed448(key: &[u8], message: &[u8], context: &[u8]) -> Result<Bytes>
     Ok(Zeroizing::new(signature.to_bytes().to_vec()))
 }
 
+/// `ed448_public(key)`: the 57-byte Ed448 public key (RFC 8032 section 5.2.5) of the 57-byte
+/// secret or PKCS#8 DER.
+pub(super) fn ed448_public(key: &[u8]) -> Result<Bytes> {
+    use ed448_goldilocks::SigningKey;
+    use ed448_goldilocks::elliptic_curve::pkcs8::DecodePrivateKey as _;
+    let key = if key.len() == 57 {
+        SigningKey::try_from(key).map_err(|_| Error::KeyInvalid)?
+    } else {
+        SigningKey::from_pkcs8_der(key).map_err(|_| Error::KeyInvalid)?
+    };
+    Ok(Zeroizing::new(key.verifying_key().to_bytes().to_vec()))
+}
+
+/// `ecdsa_public(curve, key)`: the SEC1 uncompressed public key of a private key on `p256`,
+/// `p384`, `p521`, `k256`, `bp256`, `bp384` or `sm2`; the key is the raw scalar or PKCS#8 DER,
+/// as the signatures on the curve read it.
+pub(super) fn ecdsa_public(curve: &[u8], key: &[u8]) -> Result<Bytes> {
+    macro_rules! public {
+        ($secret:ty, $len:literal) => {{
+            use ecdsa::elliptic_curve::pkcs8::DecodePrivateKey as _;
+            use ecdsa::elliptic_curve::sec1::ToSec1Point as _;
+            let secret = if key.len() == $len {
+                <$secret>::from_slice(key).map_err(|_| Error::KeyInvalid)?
+            } else {
+                <$secret>::from_pkcs8_der(key).map_err(|_| Error::KeyInvalid)?
+            };
+            Zeroizing::new(
+                secret
+                    .public_key()
+                    .as_affine()
+                    .to_sec1_point(false)
+                    .as_bytes()
+                    .to_vec(),
+            )
+        }};
+    }
+    Ok(match curve {
+        b"p256" => public!(p256::SecretKey, 32),
+        b"p384" => public!(p384::SecretKey, 48),
+        b"p521" => public!(p521::SecretKey, 66),
+        b"k256" => public!(k256::SecretKey, 32),
+        b"bp256" => public!(bp256::r1::SecretKey, 32),
+        b"bp384" => public!(bp384::r1::SecretKey, 48),
+        b"sm2" => public!(sm2::SecretKey, 32),
+        _ => return Err(bad("unknown curve name")),
+    })
+}
+
 /// `ecdsa_sign_prehash(curve, key, digest)`: ECDSA over a digest computed elsewhere (RFC 6979
 /// deterministic nonce), `r || s`, on `p256`, `p384`, `p521` or `k256` (low s). The digest
 /// is taken as the hash output the curve's standard would have produced, truncated or

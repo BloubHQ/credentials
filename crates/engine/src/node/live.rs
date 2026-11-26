@@ -848,6 +848,7 @@ impl<S: LogSink, C: Clock> Node<S, C> {
             fields: &run.fields,
             temps: &run.captured.temps,
             vars: stream_vars(host, run.now),
+            headers: &[],
             unix: run.now / 1000,
             budget: &run.budget,
         };
@@ -1068,6 +1069,7 @@ pub(super) fn frame_bytes(
             fields: &run.fields,
             temps: &run.captured.temps,
             vars,
+            headers: &[],
             unix: run.now / 1000,
             budget: &run.budget,
         };

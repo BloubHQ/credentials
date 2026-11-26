@@ -216,6 +216,8 @@ step 이전 형식(`"kind": "http" | "stream" | "derive"`)의 정책은 `credent
 | Telegram 봇 | path 템플릿 `/{token}/getMe`에서 `path_param` `token` = `bot{{token}}` |
 | 거래소 HMAC 서명 | 쿼리 `signature` = `{{ hex(hmac_sha256(secret, $query)) }}` |
 | AWS SigV4 | 헤더 템플릿 두 개(`time`, `canonical_query`, 중첩 `hmac_sha256`). 공식 벡터를 재현하는 테스트 있음 |
+| HTTP Message Signatures, Hawk | `$method`, `$target_uri`, `$authority`, `$query_param("page")`와 호출자가 보낸 헤더(`$header("content-type")`, 계약에 적힌 것만)를 `ed25519_sign`이나 `hmac_sha256`으로 서명. RFC 9421 B.2.5·B.2.6과 Hawk 예제 재현 |
+| 레코드의 카드 번호를 넣은 호출자 JSON의 JWE | `aes_gcm_encrypt(cek, iv, json_set($body, "card", card_number), head)` 하나의 `aead_ciphertext(...)`와 `aead_tag(...)`, 키는 `rsa_encrypt_oaep`로. RFC 7516 A.3 재현 |
 | HTTP Digest | step 1에서 `header_param`으로 `realm`/`nonce`를 캡처, step 2에서 `md5`로 응답. RFC 2617 벡터 |
 | OAuth 갱신 | `fixed` POST, `json` 캡처를 필드로: 노드가 새 레코드를 돌려줌 |
 | 세션 로그인 | `fixed` POST /login, `cookie` 캡처를 임시 값으로, 호출자 요청에 `Cookie` |
