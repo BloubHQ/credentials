@@ -79,10 +79,14 @@ pub fn sorted(lists: &[&[u8]]) -> Result<Bytes> {
 }
 
 /// The most octets [`sorted`] writes for lists of `total` octets in `count` arguments.
+///
+/// A list of `b` octets holding `p` pairs writes at most `3 * (b - (p - 1))` encoded octets,
+/// `p` `=` and `p - 1` `&`, so at most `3 * b + 1`; joining `count` lists adds `count - 1`
+/// `&` more.
 pub fn bound(total: usize, count: usize) -> usize {
     total
         .saturating_mul(3)
-        .saturating_add(count)
+        .saturating_add(count.saturating_mul(2))
         .saturating_add(2)
 }
 
@@ -90,6 +94,16 @@ pub fn bound(total: usize, count: usize) -> usize {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn one_octet_lists_stay_within_the_bound() {
+        // Found by the fuzz target: eight lists of one octet that needs encoding each write
+        // `%XX=`, joined by seven `&` the lists did not hold.
+        let lists: Vec<&[u8]> = vec![b" "; MAX_LISTS];
+        let out = sorted(&lists).unwrap();
+        assert_eq!(out.len(), 8 * 4 + 7);
+        assert!(out.len() <= bound(MAX_LISTS, MAX_LISTS));
+    }
 
     #[test]
     fn rfc5849_section_3_4_1_3_2() {
