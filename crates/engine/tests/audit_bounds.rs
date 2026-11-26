@@ -96,6 +96,19 @@ impl Stream for FakeStream<'_> {
             .pop_front()
             .ok_or(Error::transport(TransportKind::Closed, false))
     }
+
+    /// The caller's exchanges read with `read_some`: each reply is what one read finds.
+    fn read_some(
+        &mut self,
+        _: usize,
+        _: std::time::Duration,
+    ) -> engine::Result<engine::egress::Arrived> {
+        Ok(self
+            .0
+            .replies
+            .pop_front()
+            .map_or(engine::egress::Arrived::End, engine::egress::Arrived::Bytes))
+    }
 }
 
 type TestNode<'c> = Node<MemorySink, &'c TestClock>;

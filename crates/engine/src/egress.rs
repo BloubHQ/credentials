@@ -106,7 +106,9 @@ pub trait Stream {
     fn read_until(&mut self, delimiters: &[&[u8]], max: usize) -> Result<Vec<u8>>;
 
     /// Reads at most `max` bytes of what arrives within `wait`. Bytes a [`Stream::read_until`]
-    /// read past its delimiter come first. The default refuses.
+    /// read past its delimiter come first. The engine reads a caller's delimited TLS exchanges
+    /// with it (it decides itself where a read ends, so no match over a secret ends one); a
+    /// transport for those must implement it. The default refuses.
     fn read_some(&mut self, max: usize, wait: Duration) -> Result<Arrived> {
         let _ = (max, wait);
         Err(Error::transport(TransportKind::Unsupported, true))

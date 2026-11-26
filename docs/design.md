@@ -310,7 +310,10 @@ relay over the existing vsock egress.
 
 Reflection scrubbing on a stream keeps the last `n - 1` bytes of each chunk back, where `n` is
 the longest encoded form of any secret, so a secret split across two chunks or frames is still
-caught. Streams have their own limits apart from the 10-second request deadline of plain calls:
+caught. On a TLS stream the caller's exchanges end at the caller's delimiters, which would make
+read boundaries an oracle on an echoed secret; there the reader (`reflection::delimit`) skips
+any match that a secret's form overlaps, looking ahead as far as one could reach, and keeps the
+bytes read ahead for the next read. Streams have their own limits apart from the 10-second request deadline of plain calls:
 an idle timeout, a total duration, byte counts and a cap on open streams per caller, owner and
 node; each stream writes one log entry when it opens and one when it closes.
 

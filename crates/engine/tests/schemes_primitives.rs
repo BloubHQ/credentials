@@ -19,12 +19,13 @@
 
 use std::cell::Cell;
 use std::collections::VecDeque;
+use std::time::Duration;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use engine::Error;
 use engine::caller::Payload;
-use engine::egress::{ClientIdentity, Stream, Transport};
+use engine::egress::{Arrived, ClientIdentity, Stream, Transport};
 use engine::error::TransportKind;
 use engine::fields::Fields;
 use engine::grant::{GrantTerms, RecordPin};
@@ -122,6 +123,18 @@ impl Stream for FakeStream<'_> {
             .reads
             .pop_front()
             .ok_or(Error::transport(TransportKind::Closed, false))
+    }
+
+    // Caller exchanges with delimiters are read this way: the engine finds the delimiter.
+    fn read_some(&mut self, max: usize, _: Duration) -> engine::Result<Arrived> {
+        let Some(mut chunk) = self.0.reads.pop_front() else {
+            return Ok(Arrived::End);
+        };
+        if chunk.len() > max.max(1) {
+            let rest = chunk.split_off(max.max(1));
+            self.0.reads.push_front(rest);
+        }
+        Ok(Arrived::Bytes(chunk))
     }
 }
 
