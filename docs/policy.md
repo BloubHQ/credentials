@@ -1403,6 +1403,323 @@ sealed to this node, so the owner delegates again on the new one.
 Reading a code from a `mail` item of the owner, `await` on TLS, and amounts read from a
 request body contract are not done yet.
 
+## Worked examples: signing and encryption schemes
+
+The schemes below are policies over the existing functions and steps, with no code for any
+scheme. Each operation here is the one `crates/engine/tests/schemes.rs` reads from this file,
+signs, runs in-process against a fake server and checks against the scheme's published
+examples or a verifier written in the test (results and test names: `docs/design.md`,
+section 11). Field names: `key` is a private key (a raw P-256 scalar for ES256, a PEM block for
+RSA), `secret` a shared key, `access_token`, `refresh_token`, `card_number` and
+`web_session` secrets, `client_id`, `user`, `server_key` (an RSA public key, PEM) and `recipient`
+(a P-256 public key, SEC1) public.
+
+A public key a header must carry (a JWK) comes from the private key: `hpke_public("p256",
+key)` is the SEC1 point of a raw P-256 scalar, so `x` and `y` are its bytes 1 to 32 and 33 to
+64. A JSON header is written as text around `{{ }}` in a `compute`, which needs one level of
+escaping in JSON instead of three.
+
+### DPoP (RFC 9449)
+
+A refresh at the token endpoint with a DPoP proof, retried with the server's nonce. The proof
+is an ES256 JWT over `jti` (`$nonce`, new for every request), `htm`, `htu`, `iat` and, on the
+retry, `nonce`; the new tokens are sealed into the record.
+
+```json
+{"name": "dpop-token",
+ "steps": [
+  {"do": "open", "connection": "https", "destinations": [{"host": "auth.example.com", "port": 443}]},
+  {"do": "compute", "into": "dpop_header", "template": "{\"typ\":\"dpop+jwt\",\"alg\":\"ES256\",\"jwk\":{\"kty\":\"EC\",\"crv\":\"P-256\",\"x\":\"{{ b64urlraw(slice(hpke_public(\"p256\", key), \"1\", \"32\")) }}\",\"y\":\"{{ b64urlraw(slice(hpke_public(\"p256\", key), \"33\", \"32\")) }}\"}}"},
+  {"do": "compute", "into": "dpop_head", "template": "{{ b64urlraw(dpop_header) }}"},
+  {"do": "send", "request": {"from": "fixed", "method": "POST", "path": "/token"},
+   "inject": [
+    {"target": {"kind": "header", "name": "Content-Type"}, "template": "application/x-www-form-urlencoded"},
+    {"target": {"kind": "header", "name": "DPoP"}, "template": "{{ dpop_head + \".\" + b64urlraw(json_set_number(json_set(json_set(json_set(\"{}\", \"jti\", $nonce), \"htm\", $method), \"htu\", \"https://\" + $host + $pathname), \"iat\", $unix)) + \".\" + b64urlraw(p256_sign(key, dpop_head + \".\" + b64urlraw(json_set_number(json_set(json_set(json_set(\"{}\", \"jti\", $nonce), \"htm\", $method), \"htu\", \"https://\" + $host + $pathname), \"iat\", $unix)))) }}"},
+    {"target": {"kind": "body"}, "template": "grant_type=refresh_token&client_id={{ pct(client_id) }}&refresh_token={{ pct(refresh_token) }}"}]},
+  {"do": "receive", "capture": [{"source": {"from": "header", "name": "DPoP-Nonce"}, "into": {"kind": "temp", "name": "dpop_nonce", "secret": false}}]},
+  {"do": "send", "request": {"from": "fixed", "method": "POST", "path": "/token"},
+   "inject": [
+    {"target": {"kind": "header", "name": "Content-Type"}, "template": "application/x-www-form-urlencoded"},
+    {"target": {"kind": "header", "name": "DPoP"}, "template": "{{ dpop_head + \".\" + b64urlraw(json_set(json_set_number(json_set(json_set(json_set(\"{}\", \"jti\", $nonce), \"htm\", $method), \"htu\", \"https://\" + $host + $pathname), \"iat\", $unix), \"nonce\", dpop_nonce)) + \".\" + b64urlraw(p256_sign(key, dpop_head + \".\" + b64urlraw(json_set(json_set_number(json_set(json_set(json_set(\"{}\", \"jti\", $nonce), \"htm\", $method), \"htu\", \"https://\" + $host + $pathname), \"iat\", $unix), \"nonce\", dpop_nonce)))) }}"},
+    {"target": {"kind": "body"}, "template": "grant_type=refresh_token&client_id={{ pct(client_id) }}&refresh_token={{ pct(refresh_token) }}"}]},
+  {"do": "receive", "capture": [
+    {"source": {"from": "json", "pointer": "/access_token"}, "into": {"kind": "field", "name": "access_token"}},
+    {"source": {"from": "json", "pointer": "/refresh_token"}, "into": {"kind": "field", "name": "refresh_token"}}]},
+  {"do": "return", "response": {"body": {"json": ["/token_type", "/expires_in"]}}}
+ ]}
+```
+
+A resource request with the bound token adds `ath`, the SHA-256 of the token. `ath` is a
+hash of a secret alone, so it stays *tainted* (rule 3): it is the **last** member, because
+`json_set` refuses a tainted object meeting a controlled value (rule 2), and the server's
+`nonce` is controlled. The caller's request (GET only, so the retry repeats nothing that
+changes state) goes once without a nonce and once with the one the server answered:
+
+```json
+{"name": "dpop-call",
+ "steps": [
+  {"do": "open", "connection": "https", "destinations": [{"host": "api.example.com", "port": 443}]},
+  {"do": "compute", "into": "dpop_header", "template": "{\"typ\":\"dpop+jwt\",\"alg\":\"ES256\",\"jwk\":{\"kty\":\"EC\",\"crv\":\"P-256\",\"x\":\"{{ b64urlraw(slice(hpke_public(\"p256\", key), \"1\", \"32\")) }}\",\"y\":\"{{ b64urlraw(slice(hpke_public(\"p256\", key), \"33\", \"32\")) }}\"}}"},
+  {"do": "compute", "into": "dpop_head", "template": "{{ b64urlraw(dpop_header) }}"},
+  {"do": "send", "request": {"from": "caller", "methods": ["GET"], "paths": ["/v1/**"]},
+   "inject": [
+    {"target": {"kind": "header", "name": "Authorization"}, "template": "DPoP {{ access_token }}"},
+    {"target": {"kind": "header", "name": "DPoP"}, "template": "{{ dpop_head + \".\" + b64urlraw(json_set(json_set_number(json_set(json_set(json_set(\"{}\", \"jti\", $nonce), \"htm\", $method), \"htu\", \"https://\" + $host + $pathname), \"iat\", $unix), \"ath\", b64urlraw(sha256(access_token)))) + \".\" + b64urlraw(p256_sign(key, dpop_head + \".\" + b64urlraw(json_set(json_set_number(json_set(json_set(json_set(\"{}\", \"jti\", $nonce), \"htm\", $method), \"htu\", \"https://\" + $host + $pathname), \"iat\", $unix), \"ath\", b64urlraw(sha256(access_token)))))) }}"}]},
+  {"do": "receive", "capture": [{"source": {"from": "header", "name": "DPoP-Nonce"}, "into": {"kind": "temp", "name": "dpop_nonce", "secret": false}}]},
+  {"do": "send", "request": {"from": "caller", "methods": ["GET"], "paths": ["/v1/**"]},
+   "inject": [
+    {"target": {"kind": "header", "name": "Authorization"}, "template": "DPoP {{ access_token }}"},
+    {"target": {"kind": "header", "name": "DPoP"}, "template": "{{ dpop_head + \".\" + b64urlraw(json_set(json_set(json_set_number(json_set(json_set(json_set(\"{}\", \"jti\", $nonce), \"htm\", $method), \"htu\", \"https://\" + $host + $pathname), \"iat\", $unix), \"nonce\", dpop_nonce), \"ath\", b64urlraw(sha256(access_token)))) + \".\" + b64urlraw(p256_sign(key, dpop_head + \".\" + b64urlraw(json_set(json_set(json_set_number(json_set(json_set(json_set(\"{}\", \"jti\", $nonce), \"htm\", $method), \"htu\", \"https://\" + $host + $pathname), \"iat\", $unix), \"nonce\", dpop_nonce), \"ath\", b64urlraw(sha256(access_token)))))) }}"}]},
+  {"do": "return", "response": {"body": "all"}}
+ ]}
+```
+
+Without `if` the retry is unconditional: it is right for a server that always asks for a
+nonce first. A server that accepts the first proof sends no `DPoP-Nonce`, the capture
+fails, and the call fails; a retry only on `use_dpop_nonce` waits for `if`
+([Loops and branches](#loops-and-branches)).
+
+### HTTP Message Signatures (RFC 9421)
+
+The caller's request signed over `@method`, `@authority`, `@path`, `@query` and
+`Content-Digest` (RFC 9530) of its body. The signature base, unescaped:
+
+```text
+"@method": {{$method}}
+"@authority": {{$host}}
+"@path": {{$pathname}}
+"@query": ?{{$query}}
+"content-digest": sha-256=:{{ b64(sha256($body)) }}:
+"@signature-params": {{sig_params}}
+```
+
+```json
+{"name": "signed-call",
+ "steps": [
+  {"do": "open", "connection": "https", "destinations": [{"host": "api.example.com", "port": 443}]},
+  {"do": "compute", "into": "sig_params", "template": "(\"@method\" \"@authority\" \"@path\" \"@query\" \"content-digest\");created={{ $unix }};keyid=\"client-1\";alg=\"ed25519\""},
+  {"do": "send", "request": {"from": "caller", "methods": ["GET", "POST"], "paths": ["/v1/**"],
+                             "query": [{"name": "page", "pattern": "[0-9]{1,4}"}]},
+   "inject": [
+    {"target": {"kind": "header", "name": "Content-Digest"}, "template": "sha-256=:{{ b64(sha256($body)) }}:"},
+    {"target": {"kind": "header", "name": "Signature-Input"}, "template": "sig1={{ sig_params }}"},
+    {"target": {"kind": "header", "name": "Signature"}, "template": "sig1=:{{ b64(ed25519_sign(key, \"\\\"@method\\\": \" + $method + \"\\n\\\"@authority\\\": \" + $host + \"\\n\\\"@path\\\": \" + $pathname + \"\\n\\\"@query\\\": ?\" + $query + \"\\n\\\"content-digest\\\": sha-256=:\" + b64(sha256($body)) + \":\\n\\\"@signature-params\\\": \" + sig_params)) }}:"}]},
+  {"do": "return", "response": {"body": "all"}}
+ ]}
+```
+
+The other algorithms change the function and `alg`: `ecdsa-p256-sha256` is
+`p256_sign(key, ...)` (`r || s`, as RFC 9421 section 3.3.4 asks), `rsa-pss-sha512` is
+`rsa_sign_pss("sha512", pem(key), ...)` (salt of 64 bytes), `hmac-sha256` is
+`hmac_sha256(secret, ...)`. `@authority` is `$host` because the destination's port is 443;
+another port is written after it. A header field the policy injects can be covered
+(`content-digest` here, or a `Date` from `time($unix, ...)`); a header the **caller** sets
+cannot, since no template variable reads the caller's headers.
+
+### Hawk
+
+The `Authorization: Hawk` header over the request and a payload hash. The policy fixes the
+content type, which the payload hash covers, and the port (`443`), which no variable gives:
+
+```json
+{"name": "hawk-call",
+ "steps": [
+  {"do": "open", "connection": "https", "destinations": [{"host": "api.example.com", "port": 443}]},
+  {"do": "send", "request": {"from": "caller", "methods": ["GET", "POST"], "paths": ["/v1/**"]},
+   "inject": [
+    {"target": {"kind": "header", "name": "Content-Type"}, "template": "application/json"},
+    {"target": {"kind": "header", "name": "Authorization"}, "template": "Hawk id=\"{{ user }}\", ts=\"{{ $unix }}\", nonce=\"{{ $nonce }}\", hash=\"{{ b64(sha256(\"hawk.1.payload\\napplication/json\\n\" + $body + \"\\n\")) }}\", mac=\"{{ b64(hmac_sha256(secret, \"hawk.1.header\\n\" + $unix + \"\\n\" + $nonce + \"\\n\" + $method + \"\\n\" + $path + \"\\n\" + $host + \"\\n443\\n\" + b64(sha256(\"hawk.1.payload\\napplication/json\\n\" + $body + \"\\n\")) + \"\\n\\n\")) }}\""}]},
+  {"do": "return", "response": {"body": "all"}}
+ ]}
+```
+
+### ACME (RFC 8555) and JWS
+
+A new account: a nonce from `newNonce`, then the caller's payload in a flattened JWS with the
+account key as `jwk`:
+
+```json
+{"name": "acme-new-account",
+ "steps": [
+  {"do": "open", "connection": "https", "destinations": [{"host": "acme.example.com", "port": 443}]},
+  {"do": "compute", "into": "acme_jwk", "template": "{\"alg\":\"ES256\",\"jwk\":{\"kty\":\"EC\",\"crv\":\"P-256\",\"x\":\"{{ b64urlraw(slice(hpke_public(\"p256\", key), \"1\", \"32\")) }}\",\"y\":\"{{ b64urlraw(slice(hpke_public(\"p256\", key), \"33\", \"32\")) }}\"}}"},
+  {"do": "send", "request": {"from": "fixed", "method": "HEAD", "path": "/acme/new-nonce"}},
+  {"do": "receive", "capture": [{"source": {"from": "header", "name": "Replay-Nonce"}, "into": {"kind": "temp", "name": "nonce1", "secret": false}}]},
+  {"do": "send", "request": {"from": "caller", "methods": ["POST"], "paths": ["/acme/new-account"]},
+   "inject": [
+    {"target": {"kind": "header", "name": "Content-Type"}, "template": "application/jose+json"},
+    {"target": {"kind": "body"}, "template": "{\"protected\":\"{{ b64urlraw(json_set(json_set(acme_jwk, \"nonce\", nonce1), \"url\", \"https://\" + $host + $pathname)) }}\",\"payload\":\"{{ b64urlraw($body) }}\",\"signature\":\"{{ b64urlraw(p256_sign(key, b64urlraw(json_set(json_set(acme_jwk, \"nonce\", nonce1), \"url\", \"https://\" + $host + $pathname)) + \".\" + b64urlraw($body))) }}\"}"}]},
+  {"do": "return", "response": {"headers": ["Location", "Replay-Nonce"], "body": "all"}}
+ ]}
+```
+
+Every later request is signed with `kid`, the account URL. The operation finds it by key
+(`onlyReturnExisting`, RFC 8555 section 7.3.1), so nothing is stored between calls; each
+request takes the nonce of the response before it:
+
+```json
+{"name": "acme-call",
+ "steps": [
+  {"do": "open", "connection": "https", "destinations": [{"host": "acme.example.com", "port": 443}]},
+  {"do": "compute", "into": "acme_jwk", "template": "{\"alg\":\"ES256\",\"jwk\":{\"kty\":\"EC\",\"crv\":\"P-256\",\"x\":\"{{ b64urlraw(slice(hpke_public(\"p256\", key), \"1\", \"32\")) }}\",\"y\":\"{{ b64urlraw(slice(hpke_public(\"p256\", key), \"33\", \"32\")) }}\"}}"},
+  {"do": "send", "request": {"from": "fixed", "method": "HEAD", "path": "/acme/new-nonce"}},
+  {"do": "receive", "capture": [{"source": {"from": "header", "name": "Replay-Nonce"}, "into": {"kind": "temp", "name": "nonce1", "secret": false}}]},
+  {"do": "send", "request": {"from": "fixed", "method": "POST", "path": "/acme/new-account"},
+   "inject": [
+    {"target": {"kind": "header", "name": "Content-Type"}, "template": "application/jose+json"},
+    {"target": {"kind": "body"}, "template": "{\"protected\":\"{{ b64urlraw(json_set(json_set(acme_jwk, \"nonce\", nonce1), \"url\", \"https://\" + $host + $pathname)) }}\",\"payload\":\"eyJvbmx5UmV0dXJuRXhpc3RpbmciOnRydWV9\",\"signature\":\"{{ b64urlraw(p256_sign(key, b64urlraw(json_set(json_set(acme_jwk, \"nonce\", nonce1), \"url\", \"https://\" + $host + $pathname)) + \".eyJvbmx5UmV0dXJuRXhpc3RpbmciOnRydWV9\")) }}\"}"}]},
+  {"do": "receive", "capture": [
+    {"source": {"from": "header", "name": "Location"}, "into": {"kind": "temp", "name": "kid", "secret": false}},
+    {"source": {"from": "header", "name": "Replay-Nonce"}, "into": {"kind": "temp", "name": "nonce2", "secret": false}}]},
+  {"do": "send", "request": {"from": "caller", "methods": ["POST"],
+                             "paths": ["/acme/new-order", "/acme/order/*", "/acme/authz/*", "/acme/chall/*", "/acme/finalize/*", "/acme/cert/*"]},
+   "inject": [
+    {"target": {"kind": "header", "name": "Content-Type"}, "template": "application/jose+json"},
+    {"target": {"kind": "body"}, "template": "{\"protected\":\"{{ b64urlraw(json_set(json_set(json_set(json_set(\"{}\", \"alg\", \"ES256\"), \"kid\", kid), \"nonce\", nonce2), \"url\", \"https://\" + $host + $pathname)) }}\",\"payload\":\"{{ b64urlraw($body) }}\",\"signature\":\"{{ b64urlraw(p256_sign(key, b64urlraw(json_set(json_set(json_set(json_set(\"{}\", \"alg\", \"ES256\"), \"kid\", kid), \"nonce\", nonce2), \"url\", \"https://\" + $host + $pathname)) + \".\" + b64urlraw($body))) }}\"}"}]},
+  {"do": "return", "response": {"headers": ["Location", "Replay-Nonce"], "body": "all"}}
+ ]}
+```
+
+`eyJvbmx5UmV0dXJuRXhpc3RpbmciOnRydWV9` is `{"onlyReturnExisting":true}`; an empty caller
+body is a POST-as-GET (an empty `payload`). Other JWS algorithms change the signature
+function: `p384_sign` (ES384), `ed25519_sign` (EdDSA, with the public key as a public field,
+since no function gives an Ed25519 public key), `rsa_sign_pkcs1("sha256", ...)` (RS256),
+`rsa_sign_pss` (PS256 to PS512), `hmac_sha256` (HS256).
+
+### JWE (RFC 7516)
+
+A card number sealed into a compact JWE for the server's RSA key, RSA-OAEP-256 with
+A256GCM. The content key and IV are computed once, so the key the server unwraps is the one
+that encrypted; the AAD is the encoded header (RFC 7516 section 5.1, step 14):
+
+```json
+{"name": "jwe-rsa",
+ "steps": [
+  {"do": "open", "connection": "https", "destinations": [{"host": "api.example.com", "port": 443}]},
+  {"do": "compute", "into": "cek", "template": "{{ random(\"32\") }}"},
+  {"do": "compute", "into": "iv", "template": "{{ random(\"12\") }}"},
+  {"do": "compute", "into": "head", "template": "{{ b64urlraw(json_set(json_set(\"{}\", \"alg\", \"RSA-OAEP-256\"), \"enc\", \"A256GCM\")) }}"},
+  {"do": "compute", "into": "plaintext", "template": "{{ json_set(\"{}\", \"number\", card_number) }}"},
+  {"do": "compute", "into": "sealed", "template": "{{ aes_gcm_encrypt(cek, iv, plaintext, head) }}"},
+  {"do": "send", "request": {"from": "fixed", "method": "POST", "path": "/v1/cards"},
+   "inject": [
+    {"target": {"kind": "header", "name": "Content-Type"}, "template": "application/json"},
+    {"target": {"kind": "body"}, "template": "{\"card\":\"{{ head + \".\" + b64urlraw(rsa_encrypt_oaep(\"sha256\", pem(server_key), cek)) + \".\" + b64urlraw(iv) + \".\" + b64urlraw(slice(sealed, \"0\", len(plaintext))) + \".\" + b64urlraw(slice(sealed, len(plaintext), \"16\")) }}\"}"}]},
+  {"do": "return", "response": {"body": {"json": ["/token"]}}}
+ ]}
+```
+
+ECDH-ES+A128KW with A128GCM: the operation's ephemeral P-256 key is the `epk`, Concat KDF
+(RFC 7518 section 4.6.2, no `apu` or `apv`) gives the key that wraps the content key:
+
+```json
+{"name": "jwe-ecdh",
+ "steps": [
+  {"do": "open", "connection": "https", "destinations": [{"host": "api.example.com", "port": 443}]},
+  {"do": "compute", "into": "cek", "template": "{{ random(\"16\") }}"},
+  {"do": "compute", "into": "iv", "template": "{{ random(\"12\") }}"},
+  {"do": "compute", "into": "header", "template": "{\"alg\":\"ECDH-ES+A128KW\",\"enc\":\"A128GCM\",\"epk\":{\"kty\":\"EC\",\"crv\":\"P-256\",\"x\":\"{{ b64urlraw(slice(ecdh_public(\"p256\"), \"1\", \"32\")) }}\",\"y\":\"{{ b64urlraw(slice(ecdh_public(\"p256\"), \"33\", \"32\")) }}\"}}"},
+  {"do": "compute", "into": "head", "template": "{{ b64urlraw(header) }}"},
+  {"do": "compute", "into": "kek", "template": "{{ concat_kdf(\"sha256\", ecdh(\"p256\", recipient), be32(len(\"ECDH-ES+A128KW\")) + \"ECDH-ES+A128KW\" + be32(\"0\") + be32(\"0\") + be32(\"128\"), \"16\") }}"},
+  {"do": "compute", "into": "plaintext", "template": "{{ json_set(\"{}\", \"number\", card_number) }}"},
+  {"do": "compute", "into": "sealed", "template": "{{ aes_gcm_encrypt(cek, iv, plaintext, head) }}"},
+  {"do": "send", "request": {"from": "fixed", "method": "POST", "path": "/v1/cards"},
+   "inject": [
+    {"target": {"kind": "header", "name": "Content-Type"}, "template": "application/json"},
+    {"target": {"kind": "body"}, "template": "{\"card\":\"{{ head + \".\" + b64urlraw(aes_kw_wrap(kek, cek)) + \".\" + b64urlraw(iv) + \".\" + b64urlraw(slice(sealed, \"0\", len(plaintext))) + \".\" + b64urlraw(slice(sealed, len(plaintext), \"16\")) }}\"}"}]},
+  {"do": "return", "response": {"body": {"json": ["/token"]}}}
+ ]}
+```
+
+`dir` with A256GCM under a shared key the caller never sees, over the caller's own body (the
+IV is the request's `$nonce`, the same in every place of one request):
+
+```json
+{"name": "jwe-dir",
+ "steps": [
+  {"do": "open", "connection": "https", "destinations": [{"host": "api.example.com", "port": 443}]},
+  {"do": "compute", "into": "head", "template": "{{ b64urlraw(json_set(json_set(\"{}\", \"alg\", \"dir\"), \"enc\", \"A256GCM\")) }}"},
+  {"do": "send", "request": {"from": "caller", "methods": ["POST"], "paths": ["/v1/messages"]},
+   "inject": [
+    {"target": {"kind": "header", "name": "Content-Type"}, "template": "application/jose"},
+    {"target": {"kind": "body"}, "template": "{{ head + \"..\" + b64urlraw(slice(hexdecode($nonce), \"0\", \"12\")) + \".\" + b64urlraw(slice(aes_gcm_encrypt(secret, slice(hexdecode($nonce), \"0\", \"12\"), $body, head), \"0\", len($body))) + \".\" + b64urlraw(slice(aes_gcm_encrypt(secret, slice(hexdecode($nonce), \"0\", \"12\"), $body, head), len($body), \"16\")) }}"}]},
+  {"do": "return", "response": {"body": "all"}}
+ ]}
+```
+
+A plaintext that mixes the caller's bytes with a secret (`json_set($body, "number",
+card_number)`) is refused: the ciphertext is then both tainted and controlled, and `slice`
+cuts no such value (rule 2), so the ciphertext and the tag cannot be separated. Such a JWE
+needs an AEAD whose ciphertext and tag come out as separate values (a detached form), which
+no function offers yet.
+
+### Client authentication by JWT (RFC 7523)
+
+`private_key_jwt`: a client credentials grant with an RS256 assertion; the access token is
+sealed into the record and never returned:
+
+```json
+{"name": "client-assertion",
+ "steps": [
+  {"do": "open", "connection": "https", "destinations": [{"host": "auth.example.com", "port": 443}]},
+  {"do": "compute", "into": "assertion_head", "template": "{{ b64urlraw(json_set(json_set(\"{}\", \"alg\", \"RS256\"), \"typ\", \"JWT\")) }}"},
+  {"do": "compute", "into": "assertion_claims", "template": "{{ b64urlraw(json_set_number(json_set_number(json_set(json_set(json_set(json_set(\"{}\", \"iss\", client_id), \"sub\", client_id), \"aud\", \"https://auth.example.com/oauth2/token\"), \"jti\", $nonce), \"iat\", $unix), \"exp\", add($unix, \"300\"))) }}"},
+  {"do": "send", "request": {"from": "fixed", "method": "POST", "path": "/oauth2/token"},
+   "inject": [
+    {"target": {"kind": "header", "name": "Content-Type"}, "template": "application/x-www-form-urlencoded"},
+    {"target": {"kind": "body"}, "template": "grant_type=client_credentials&client_assertion_type=urn%3Aietf%3Aparams%3Aoauth%3Aclient-assertion-type%3Ajwt-bearer&client_assertion={{ assertion_head + \".\" + assertion_claims + \".\" + b64urlraw(rsa_sign_pkcs1(\"sha256\", pem(key), assertion_head + \".\" + assertion_claims)) }}"}]},
+  {"do": "receive", "capture": [{"source": {"from": "json", "pointer": "/access_token"}, "into": {"kind": "field", "name": "access_token"}}]},
+  {"do": "return", "response": {"body": {"json": ["/token_type", "/expires_in"]}}}
+ ]}
+```
+
+`client_secret_jwt` is the same operation with `"alg"` `HS256` and
+`hmac_sha256(secret, assertion_head + "." + assertion_claims)` as the signature.
+
+### SAML login through the identity provider's form
+
+The node as the user's browser: the service provider's redirect, the identity provider's
+login form (its CSRF token read by `html`), the auto-posting form that carries the
+`SAMLResponse` (captured as a secret temporary), and the service provider's session cookie
+sealed into the record. `regex` reads bodies only, so the parameters of the redirect's
+`Location` are cut with `between`, in the order the service provider writes them:
+
+```json
+{"name": "saml-login",
+ "steps": [
+  {"do": "open", "connection": "https", "destinations": [{"host": "sp.example.com", "port": 443}, {"host": "idp.example.com", "port": 443}]},
+  {"do": "send", "request": {"from": "fixed", "method": "GET", "path": "/login", "destination": {"host": "sp.example.com", "port": 443}}},
+  {"do": "receive", "capture": [{"source": {"from": "header", "name": "Location"}, "into": {"kind": "temp", "name": "sso_url", "secret": false}}]},
+  {"do": "send", "request": {"from": "fixed", "method": "GET", "path": "/sso", "destination": {"host": "idp.example.com", "port": 443}},
+   "inject": [
+    {"target": {"kind": "query", "name": "SAMLRequest"}, "template": "{{ pctdecode(between(sso_url, \"SAMLRequest=\", \"&\")) }}"},
+    {"target": {"kind": "query", "name": "RelayState"}, "template": "{{ pctdecode(between(sso_url, \"RelayState=\", \"\")) }}"}]},
+  {"do": "receive", "capture": [
+    {"source": {"from": "html", "selector": "input[name=csrf]", "attribute": "value"}, "into": {"kind": "temp", "name": "csrf", "secret": false}},
+    {"source": {"from": "cookie", "name": "idp"}, "into": {"kind": "temp", "name": "idp_cookie", "secret": true}}]},
+  {"do": "send", "request": {"from": "fixed", "method": "POST", "path": "/login", "destination": {"host": "idp.example.com", "port": 443}},
+   "inject": [
+    {"target": {"kind": "header", "name": "Cookie"}, "template": "idp={{ idp_cookie }}"},
+    {"target": {"kind": "header", "name": "Content-Type"}, "template": "application/x-www-form-urlencoded"},
+    {"target": {"kind": "body"}, "template": "username={{ pct(user) }}&password={{ pct(password) }}&csrf={{ pct(csrf) }}"}]},
+  {"do": "receive", "capture": [
+    {"source": {"from": "html", "selector": "input[name=SAMLResponse]", "attribute": "value"}, "into": {"kind": "temp", "name": "saml_response", "secret": true}},
+    {"source": {"from": "html", "selector": "input[name=RelayState]", "attribute": "value"}, "into": {"kind": "temp", "name": "relay_back", "secret": false}}]},
+  {"do": "send", "request": {"from": "fixed", "method": "POST", "path": "/acs", "destination": {"host": "sp.example.com", "port": 443}},
+   "inject": [
+    {"target": {"kind": "header", "name": "Content-Type"}, "template": "application/x-www-form-urlencoded"},
+    {"target": {"kind": "body"}, "template": "SAMLResponse={{ pct(saml_response) }}&RelayState={{ pct(relay_back) }}"}]},
+  {"do": "receive", "capture": [{"source": {"from": "cookie", "name": "sp_session"}, "into": {"kind": "field", "name": "web_session"}}]},
+  {"do": "return"}
+ ]}
+```
+
+An OpenID Connect login through a form is the same steps, with the authorization code
+captured from the redirect and redeemed by `client-assertion`'s request. Signing a SAML
+message as a service provider is not covered: the HTTP-Redirect binding DEFLATEs the message
+and the POST binding signs XML after Exclusive XML Canonicalization, and neither family is a
+function.
+
 ## Converting a policy
 
 `credentials policy upgrade old.json --out new.json` (or
