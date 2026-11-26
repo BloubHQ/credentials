@@ -159,6 +159,8 @@ pub enum Output {
     Pending(Pending),
     /// A connection that stayed open ended (its parts went to the caller as they came).
     Closed(crate::node::Closed),
+    /// A browser fill ended: its outcome and the page's final origin, nothing of the page.
+    Fill(crate::node::Filled),
 }
 
 impl CallerKey {

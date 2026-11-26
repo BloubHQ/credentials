@@ -87,6 +87,7 @@ pub mod approval;
 pub mod build;
 pub mod call;
 pub mod caller;
+pub mod cdp;
 pub mod egress;
 pub mod encoding;
 pub mod error;

@@ -231,8 +231,30 @@ What this cannot stop: the site's own page sees the values (as it would for a pe
 Kernel, which runs the browser, can read its memory. Section 9 states both; Kernel's PCI DSS
 status must be confirmed before cards go live.
 
-**Implementation.** `transport::cdp` (a minimal CDP client over the existing TLS
-`Connector`), `engine` operation kind `fill`, item kinds `card` and `login`.
+**Implementation.** Done as the `browser` connection kind and the `fill` member of `send`
+(`docs/policy.md`, Browser fills), with the CDP client in `engine::cdp` and
+`engine::node` over the existing transport (`Transport::exchange_streamed`, as a WebSocket),
+so the transport crate did not change. Choices made where this section left them open,
+each the more secure one:
+
+- **The node connects; the caller never relays CDP.** CDP carries the typed value in the
+  clear inside its WebSocket, so a caller relay would read it, and could answer for the
+  browser. The endpoint is a destination of the signed policy, reached over TLS; the caller
+  chooses at most the handshake request within its contract (which session).
+- **Values are set on the element found, not typed into the focus.** `Input.insertText`
+  goes to whatever has the focus when it arrives, which the page can move (into a
+  cross-origin frame, too); the node calls a fixed function on the element it resolved, in
+  an isolated world, which checks `location.origin` and `location.ancestorOrigins` in the
+  same task that sets the value.
+- **The submit is required and the fields are blanked** when the page stays, so the values
+  do not wait in the page for the controller to read them.
+- **A frame is used only when the policy names its origin**, and only as a direct child of
+  the top frame; the page and frame origins are `https` and concrete (no `*.`).
+- **A page another client is attached to is refused**, as is a second tab at the origin.
+
+Not done here: the node cannot tell scripts an earlier client injected (it does not see
+that session); `navigate` reloads the page at a fixed path instead. The item kinds `card`
+and `login` do not take browser operations yet.
 
 ## 7. Protocol tunnels
 
@@ -596,7 +618,7 @@ As built (part 10):
 | 5 | Sessions, challenges, approvals, spending limits (done: `docs/policy.md`, Operations that wait; codes read from a `mail` item, `await` on TLS and amounts from body contracts are next) | 2 |
 | 6 | Connection kinds in layer 1: HTTP/2, WebSocket, streamed responses (first half done: `docs/policy.md`, HTTP versions and gRPC, WebSocket; own synchronous HTTP/2 client and HPACK, one thread per open connection, the Nitro host relay unchanged), then SSH, databases, FTP, mail, queues (second half started: SSH, PostgreSQL, SMTP, IMAP and Redis done, section 7c; MySQL, MQTT, AMQP, FTP and tunnels as an IR relay step next) | 2 |
 | 7 | Trusted code sandbox (layer 3): WebAssembly runtime, JavaScript module, origin-pinned site code (done: `run` step, `crates/sandbox`, wasmi 1.1.0 chosen by measurement; JavaScript measured with boa in the sandbox, its shipping plan in `docs/sandbox.md`) | 2 |
-| 8 | Browser fills over CDP | 4, 5 |
+| 8 | Browser fills over CDP (done: the `browser` connection and `fill`, `engine::cdp`, `docs/policy.md` Browser fills; tested against an in-process fake CDP endpoint, never a real browser; typed `card` and `login` items with browser operations, and detaching the agent's controller, are next) | 4, 5 |
 | 9 | Remaining primitive families (Appendices A, B), UDP relay and its protocols (done: HPKE, TurboSHAKE, KangarooTwelve, ML-DSA, SM2, brainpool ECDSA, `tls_exporter` in TLS sends, the `udp` connection and the datagram relay; `docs/policy.md` and section 7b; the rows still open and why are listed under Appendix A, Part 9) | 1 |
 | 10 | Node hand-over; key backup and device transfer in `client` (done: `crates/continuity`, `Node::hand_over`/`take_over`, `credentials hand-over`, `credentials verify --next`, `client` continuity, backup and transfer; real Nitro hardware and the real Sigstore root are not exercised by the tests, and the compiled Sigstore trust root is empty until it is committed, so nodes refuse every statement until then) | 3 |
 | 11 | Section 8a and 8b schemes as IR policies and reviewed modules | 6, 7 |

@@ -124,7 +124,11 @@ impl Login {
             Connection::Smtp => Mechanism::Plain,
             Connection::Imap => Mechanism::Login,
             Connection::Redis => Mechanism::Auth,
-            Connection::Https | Connection::Tls | Connection::Websocket | Connection::Udp => {
+            Connection::Https
+            | Connection::Tls
+            | Connection::Websocket
+            | Connection::Udp
+            | Connection::Browser => {
                 return None;
             }
         })
@@ -243,7 +247,7 @@ impl Connection {
         match self {
             Connection::Https => "https",
             Connection::Tls => "tls",
-            Connection::Websocket => "wss",
+            Connection::Websocket | Connection::Browser => "wss",
             Connection::Ssh => "ssh",
             Connection::Postgres => "postgres",
             Connection::Smtp => "smtp",
@@ -265,7 +269,11 @@ fn mechanisms(connection: Connection) -> &'static [Mechanism] {
         Connection::Smtp => &[Mechanism::Plain, Mechanism::Login, Mechanism::Xoauth2],
         Connection::Imap => &[Mechanism::Plain, Mechanism::Login, Mechanism::Xoauth2],
         Connection::Redis => &[Mechanism::Auth],
-        Connection::Https | Connection::Tls | Connection::Websocket | Connection::Udp => &[],
+        Connection::Https
+        | Connection::Tls
+        | Connection::Websocket
+        | Connection::Udp
+        | Connection::Browser => &[],
     }
 }
 

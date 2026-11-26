@@ -55,9 +55,9 @@ const MAX_MESSAGE: usize = crate::response::MAX_RESPONSE;
 /// Longest frame from the caller, in bytes.
 const MAX_FRAME: usize = super::MAX_INPUT;
 /// Most bytes read at once.
-const READ: usize = 64 * 1024;
+pub(super) const READ: usize = 64 * 1024;
 /// How long one wait on the server lasts before the caller's side is looked at.
-const POLL: Duration = Duration::from_millis(10);
+pub(super) const POLL: Duration = Duration::from_millis(10);
 
 /// A part of what goes back to the caller.
 #[derive(Debug, PartialEq, Eq)]
@@ -276,7 +276,7 @@ impl Meter {
         }
     }
 
-    fn received(&mut self, raw: usize) {
+    pub(super) fn received(&mut self, raw: usize) {
         self.bytes = self.bytes.saturating_add(raw as u64);
         self.last = Instant::now();
     }
@@ -294,7 +294,7 @@ impl Meter {
     }
 
     /// The limit reached, if any.
-    fn reached(&self) -> Option<&'static str> {
+    pub(super) fn reached(&self) -> Option<&'static str> {
         if self.bytes > self.max_bytes {
             Some("bytes")
         } else if self.started.elapsed() >= self.duration {
@@ -307,7 +307,7 @@ impl Meter {
     }
 
     /// A limit reached before the relay, as an error.
-    fn check(&self) -> Result<()> {
+    pub(super) fn check(&self) -> Result<()> {
         match self.reached() {
             None => Ok(()),
             Some("bytes") => Err(Error::Budget {
@@ -349,7 +349,7 @@ pub(super) fn reason_of(error: &Error) -> &'static str {
     }
 }
 
-fn ws_error(error: FrameError) -> Error {
+pub(super) fn ws_error(error: FrameError) -> Error {
     match error {
         FrameError::Protocol(rule) => Error::ResponseInvalid { rule },
         FrameError::TooLarge => Error::transport(TransportKind::TooLarge, true),
@@ -365,7 +365,7 @@ fn has(headers: &Fields, name: &str, test: impl Fn(&[u8]) -> bool) -> bool {
 /// Checks the answer to a WebSocket handshake (RFC 6455, 4.1): `101`, the upgrade, the
 /// accept value of the key, no extension (the node offered none), and a subprotocol only
 /// when the request offered one.
-fn check_upgrade(status: u16, headers: &Fields, key: &str, offered: bool) -> Result<()> {
+pub(super) fn check_upgrade(status: u16, headers: &Fields, key: &str, offered: bool) -> Result<()> {
     let invalid = |rule| Err(Error::ResponseInvalid { rule });
     if status != 101 {
         return invalid("WebSocket handshake refused (status other than 101)");
@@ -416,7 +416,8 @@ impl<S: LogSink, C: Clock> Node<S, C> {
             | Connection::Postgres
             | Connection::Smtp
             | Connection::Imap
-            | Connection::Redis => Err(operation.unknown()),
+            | Connection::Redis
+            | Connection::Browser => Err(operation.unknown()),
         }
     }
 
@@ -999,7 +1000,7 @@ struct Session<'a> {
     at: usize,
 }
 
-fn write_message(
+pub(super) fn write_message(
     stream: &mut dyn Stream,
     kind: FrameKind,
     bytes: &[u8],
@@ -1022,7 +1023,7 @@ fn write_message(
     Ok(())
 }
 
-fn pong(stream: &mut dyn Stream, payload: &[u8], meter: &mut Meter) -> Result<()> {
+pub(super) fn pong(stream: &mut dyn Stream, payload: &[u8], meter: &mut Meter) -> Result<()> {
     let frame = websocket::encode(websocket::OP_PONG, payload);
     stream.write(&frame)?;
     meter.received(0);

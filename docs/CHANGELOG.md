@@ -40,6 +40,20 @@ before 1.0, minor versions may break formats and APIs.
   `command`, flags `password_to_server`, `param_unpinned`, `mail_relay`, `shell_relay`, and
   widening on a new sign-in, host key, TLS mode, command or mail rule. JSON Schema, fuzz
   target `protocol_servers`. MySQL, MQTT and AMQP are not done.
+- Browser fills (`docs/design.md` sections 6 and 11, part 8): the `browser` connection kind
+  and the `fill` member of `send` (origin, 1 to 16 fields with selector, optional frame
+  origin and template, submit, optional `navigate` path, `wait_ms`). The node connects to
+  the CDP endpoint the policy fixes through its own transport (the caller never relays
+  CDP), picks the one tab at the origin with no other client attached, checks the top
+  frame's and the field frame's origin and loader before and after each value, sets each
+  value with fixed functions in an isolated world (`engine::cdp::FIND`, `FILL`, `SUBMIT`,
+  `CLEAR`; never `Runtime.evaluate`), submits, and blanks the fields when the page stays.
+  The caller gets `Output::Fill` (`{"kind": "fill"}` from `/call`): the outcome and the
+  final origin. `Error::FillRefused`; limits of 4 MiB per CDP message, 10,000 events and
+  2,000 commands, idle/duration (at most 5 minutes)/bytes, an open-connection slot; `use`
+  and `closed` log entries. Summary flags `browser_fill` and `frame_origin`, secret form
+  `browser_field`; JSON Schema; fuzz target `cdp_message`. New module `engine::cdp` (the
+  strict CDP reader). A typed item has no browser operation yet.
 - Primitive families of part 9 (`docs/design.md` section 11 and Appendix A, Part 9), checked
   against official vectors where a crate ships them (`crates/engine/tests/fixtures/vectors/README.md`;
   SM2 signing and brainpool by verification only):

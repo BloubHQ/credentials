@@ -71,6 +71,15 @@ pub enum Form {
         /// The module: its URL, or `library <name>`.
         module: String,
     },
+    /// A field of a page in a browser, typed by the node over CDP: the page (or the frame)
+    /// gets it, and so does the browser behind the endpoint.
+    BrowserField {
+        /// The selector of the field.
+        selector: String,
+        /// The origin of the frame it is in, when not the top frame.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        frame: Option<String>,
+    },
     /// The output of a derivation, handed to the caller.
     Output {
         /// False when the output is an encryption (or another reversible function) of the
@@ -294,6 +303,12 @@ pub enum FlagCode {
     /// An operation sends UDP datagrams, without TLS: what they carry is readable on the
     /// path (and by the host of an enclave).
     PlainDatagram,
+    /// The node types secrets into a page in a browser over CDP: the page and the browser
+    /// get them, and the node cannot see the page's TLS through CDP, so the browser is
+    /// trusted.
+    BrowserFill,
+    /// A fill puts values into a frame of another origin than the page's.
+    FrameOrigin,
 }
 
 /// A risk flag.
@@ -343,6 +358,7 @@ fn connection_name(connection: Option<Connection>) -> &'static str {
         Some(Connection::Https) => "https",
         Some(Connection::Tls) => "tls",
         Some(Connection::Websocket) => "websocket",
+        Some(Connection::Browser) => "browser",
         Some(c) => c.scheme(),
         None => "none",
     }
@@ -732,6 +748,25 @@ fn uses_in(operation: &Operation) -> Vec<(String, SecretUse)> {
                         add(i, p, form.clone(), &to);
                     }
                 }
+                if let Some(fill) = &send.fill {
+                    for field in &fill.fields {
+                        let origin = field.frame.as_deref().unwrap_or(&fill.origin);
+                        let mut to: Vec<Place> = crate::cdp::WebOrigin::parse(origin)
+                            .map(|o| Place {
+                                scheme: "https".into(),
+                                host: o.host,
+                                port: o.port,
+                            })
+                            .into_iter()
+                            .collect();
+                        to.extend(places.iter().cloned());
+                        let form = Form::BrowserField {
+                            selector: field.selector.clone(),
+                            frame: field.frame.clone(),
+                        };
+                        add(i, &field.template, form, &to);
+                    }
+                }
             }
             Step::Return(ret) => {
                 if let Some(template) = &ret.template {
@@ -897,6 +932,65 @@ fn risk_flags(policy: &Policy, origin: Option<&Origin>, flags: &mut Vec<Flag>) {
         }
         for (c, _) in operation.caller_sends() {
             caller_flags(c, &at, flags);
+        }
+        for step in &operation.steps {
+            if let Step::Send(send) = step
+                && let Some(fill) = &send.fill
+            {
+                let endpoints = operation
+                    .open()
+                    .map(|o| {
+                        o.destinations
+                            .iter()
+                            .map(|d| format!("{}:{}", d.host, d.port))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    })
+                    .unwrap_or_default();
+                flag(
+                    flags,
+                    FlagCode::BrowserFill,
+                    &at,
+                    format!(
+                        "values are typed into the page at {} in the browser behind {endpoints}: the browser sees them and the node cannot check the page's TLS through CDP",
+                        fill.origin
+                    ),
+                );
+                for frame in fill.other_frames() {
+                    flag(
+                        flags,
+                        FlagCode::FrameOrigin,
+                        &at,
+                        format!(
+                            "values go into a frame of {frame}, inside the page at {}",
+                            fill.origin
+                        ),
+                    );
+                }
+                if let Some(origin) = origin {
+                    for page in core::iter::once(&fill.origin)
+                        .chain(fill.fields.iter().filter_map(|f| f.frame.as_ref()))
+                    {
+                        let inside = crate::cdp::WebOrigin::parse(page).is_some_and(|o| {
+                            under(
+                                origin,
+                                &Destination {
+                                    host: o.host,
+                                    port: o.port,
+                                },
+                            )
+                        });
+                        if !inside {
+                            flag(
+                                flags,
+                                FlagCode::OutsideOrigin,
+                                &at,
+                                format!("{page} is not under {}", origin.text()),
+                            );
+                        }
+                    }
+                }
+            }
         }
         if operation.connection() == Some(Connection::Udp) {
             flag(
@@ -1163,6 +1257,11 @@ fn diff_send(at: &str, a: &Send, b: &Send, wider: &mut Vec<String>) {
     }
     if a.command != b.command {
         wider.push(format!("{at}: the command changed"));
+    }
+    if a.fill != b.fill {
+        // Any change of a fill (origin, frames, selectors, values, submit, wait) counts as
+        // wider: it decides which page gets which value.
+        wider.push(format!("{at}: the browser fill changed"));
     }
     match (&a.request, &b.request) {
         (Some(StepRequest::Caller(x)), Some(StepRequest::Caller(y))) => {

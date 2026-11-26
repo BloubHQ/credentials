@@ -174,7 +174,7 @@ reference is in [docs/policy.md](docs/policy.md).
 ```
 
 An operation is a list of **steps** over one connection: `open` (HTTPS, a TLS stream, a WebSocket, a
-protocol connection, UDP datagrams, or none), `send`, `receive` (with captures), `compute` (a template into a name later steps
+protocol connection, UDP datagrams, a browser over CDP, or none), `send`, `receive` (with captures), `compute` (a template into a name later steps
 read), `run` (the site's own code in a sandbox, below), and `return`, which says what goes
 back to the caller.
 
@@ -185,6 +185,7 @@ back to the caller.
 | `tls` | A send/receive script on one TLS connection (line protocols); then the caller's exchanges whose sends match the patterns `return` relays. |
 | `ssh`, `postgres`, `smtp`, `imap`, `redis` | The node signs in with the item's secret (SSH password, key or keyboard-interactive against pinned host keys; PostgreSQL SCRAM-SHA-256 over TLS; SMTP and IMAP over implicit TLS or STARTTLS with the mechanism the policy names; Redis `AUTH` over TLS), runs the commands the policy fixes, then the caller's named commands whose parameters match their patterns (bound, quoted or one argument each, never spliced), or the caller's mail within sender and recipient rules. Results are searched for secrets; an SSH shell runs on `/stream`. Only modern algorithms, no downgrade. |
 | `udp` | One datagram per `send` and per `receive` to the destination the policy fixes (RADIUS, DNS with TSIG, STUN), resent while unanswered; then the caller's datagrams that match the patterns `return` relays. No TLS, so a datagram may carry a secret only through a one-way function (an HMAC, a signature): anything else is refused at signing. |
+| `browser` | A fill of a login or card form in a browser the agent drives elsewhere: the node connects to the CDP endpoint the policy fixes (over TLS; the caller never relays CDP), finds the one tab at the policy's `https` origin, checks the origin of the top frame and of the field's frame (a cross-origin frame only when the policy names it) before and after each value, types the values itself with fixed functions in an isolated world (never `Runtime.evaluate`), submits, and blanks the fields if the page stays. The caller gets the outcome and the final origin, nothing of the page, and cannot send CDP commands. |
 | none | `return` renders a template for the caller: signatures, HMACs, TOTP codes, JWTs. The caller's `$input` is checked first against the operation's `input` schema (raw bytes, JSON or RLP: fixed members, allowed values, numeric bounds, times the node sets). |
 
 Policies of the format before steps (`"kind": "http" | "stream" | "derive"`) convert with
@@ -345,6 +346,7 @@ credentials verify old.jsonl <old-node-key> --next new.jsonl     # one chain acr
   signs for operations that wait; operations waiting when the node restarts are gone.
   `POST /stream` runs a WebSocket, a streamed response or an SSH shell as framed messages
   both ways (`server::stream`), one thread per open connection.
+  A browser fill is a plain `POST /call` and answers `{"kind": "fill", ...}`.
 - **Concurrency.** Every method takes `&self`; share one node between threads. Transport I/O
   runs outside the node's lock.
 
@@ -589,7 +591,12 @@ explains each.
   except through one-way functions. DTLS is not offered.
 - **Site code is trusted as the site.** A `run` module computes on the secret; it can fail
   or take time depending on it, and an unpinned module is whatever the origin serves.
-- **Browser logins and hardware keys** need a person or a device and cannot be delegated.
+- **Browser fills trust the browser.** The node cannot see the page's TLS through CDP; a
+  browser that lies, or whoever runs it, can show any page at any origin and read what is
+  typed. The page reads the values (as it would from a person) and its scripts can keep
+  them; a client that attaches to the page after the node's check is not seen. Flagged
+  `browser_fill`. Tested against a fake CDP endpoint only, never a real browser.
+- **Hardware keys and logins that need a person** (a captcha, a passkey) cannot be delegated.
   One-time codes and approvals in another app come from the owner (an `await` step), not from
   the node or the caller.
 - **A web page is weaker than an app.** The [`client`](crates/client) package runs in a page

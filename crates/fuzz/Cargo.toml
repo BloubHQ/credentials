@@ -183,3 +183,10 @@ path = "fuzz_targets/relay_datagrams.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "cdp_message"
+path = "fuzz_targets/cdp_message.rs"
+test = false
+doc = false
+bench = false
