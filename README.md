@@ -219,6 +219,8 @@ policy is signed, every template is analysed:
 | Telegram bot | `path_param` `token` = `bot{{token}}` in the path template `/{token}/getMe` |
 | Exchange HMAC signature | query `signature` = `{{ hex(hmac_sha256(secret, $query)) }}` |
 | AWS SigV4 | two header templates (`time`, `canonical_query`, nested `hmac_sha256`); a test reproduces the official vector |
+| HTTP Message Signatures, Hawk | `$method`, `$target_uri`, `$authority`, `$query_param("page")` and the caller's own headers (`$header("content-type")`, only those its contract lists) under `ed25519_sign` or `hmac_sha256`; RFC 9421 B.2.5 and B.2.6 and the Hawk examples reproduced |
+| JWE of the caller's JSON with a card number from the record | `aead_ciphertext(...)` and `aead_tag(...)` of one `aes_gcm_encrypt(cek, iv, json_set($body, "card", card_number), head)`, the key under `rsa_encrypt_oaep`; RFC 7516 A.3 reproduced |
 | HTTP Digest | step 1 captures `realm`/`nonce` with `header_param`; step 2 answers with `md5`; RFC 2617 vector |
 | OAuth refresh | `fixed` POST, `json` capture into a field: the node returns a new record |
 | Session login | `fixed` POST /login, `cookie` capture into a temp, `Cookie` on the caller's request |

@@ -721,14 +721,54 @@ measured where a scheme would need the rules loosened.
 | Scheme | Result | Tests | Checked against | Caveat, or the missing generic capability |
 | --- | --- | --- | --- | --- |
 | DPoP (RFC 9449), `ath`, server nonce | works with caveat | `dpop_token_refresh_and_resource_request`, `dpop_retry_needs_a_server_nonce`, `dpop_ath_before_the_nonce_is_refused` | 4 ES256 proofs verified by ring (the JWK derived by `hpke_public("p256", key)`); `jti`, `htm`, `htu`, `iat`, `nonce`, `ath`; the refreshed token sealed and used by the next proof | The retry on `use_dpop_nonce` is unconditional: a server that sends no nonce fails the call after one request (measured); a conditional retry needs IR `if`. `ath` is tainted (hash of a secret alone), so it must be the last `json_set` member: before the controlled `nonce` it is refused by rule 2 (measured). No RFC example is deterministic. |
-| HTTP Message Signatures (RFC 9421) | works with caveat | `http_message_signatures_four_algorithms`, `http_message_signatures_rfc9421_vectors` | Appendix B.2.6 (Ed25519) byte for byte; 8 signatures (ed25519, ecdsa-p256-sha256, rsa-pss-sha512, hmac-sha256, each on a POST with query and body and a GET) verified over a base rebuilt from the wire (ring, `rsa`, `hmac`), with `content-digest` (RFC 9530) | A header field the caller sets cannot be covered: no template variable reads the caller's request headers (missing: a request-header variable). `@authority` needs the port written in the policy for a port other than 443. B.2.5 (HMAC) not reproduced: its key could not be checked against the RFC text offline (unmeasured). `@query-param` and response signatures untested. |
-| Hawk | works with caveat | `hawk_header_verifies`, `hawk_specification_examples` | The specification's two request examples: 2 MACs and the payload hash byte for byte (its fixed nonce in place of `$nonce`); 2 requests verified by a recomputed MAC | No variable gives the port (written in the policy); the payload hash covers a content type the policy fixes, since the caller's is unreadable (same missing variable as above). Checking the server's `Server-Authorization` is not done (untested). |
+| HTTP Message Signatures (RFC 9421) | works with caveat | `http_message_signatures_four_algorithms`, `http_message_signatures_rfc9421_vectors` | Appendix B.2.6 (Ed25519) byte for byte; 8 signatures (ed25519, ecdsa-p256-sha256, rsa-pss-sha512, hmac-sha256, each on a POST with query and body and a GET) verified over a base rebuilt from the wire (ring, `rsa`, `hmac`), with `content-digest` (RFC 9530) | Closed by the request components (next table): a header the caller sets is covered with `$header`, `@authority` is `$authority` with any port, `@query-param` is `$query_param`, and B.2.5 (HMAC) is reproduced. Response signatures untested. |
+| Hawk | works with caveat | `hawk_header_verifies`, `hawk_specification_examples` | The specification's two request examples: 2 MACs and the payload hash byte for byte (its fixed nonce in place of `$nonce`); 2 requests verified by a recomputed MAC | Closed by `$port` and `$header("content-type")` (next table). Checking the server's `Server-Authorization` is not done (untested). |
 | ACME (RFC 8555) | works as-is | `acme_jws_with_jwk_kid_and_chained_nonces` | 5 flattened JWS verified by ring: `jwk` on new-account, `kid` (found by `onlyReturnExisting`, one extra request per call) on new-order and on a POST-as-GET, each with the nonce of the response before it, `url` from the request | Retrying on `badNonce` needs IR `if`. |
-| JWS in general | works as-is | `jws_rfc7515_and_rfc8037_vectors` | RFC 7515 appendix A.1 (HS256) and RFC 8037 appendix A.4 (EdDSA): 2 whole compact serializations byte for byte | An Ed25519 JWK needs the public key as a field: no function derives it (P-256 has `hpke_public`). |
-| JWE (RFC 7516): RSA-OAEP-256 + A256GCM, ECDH-ES+A128KW + A128GCM, `dir` + A256GCM | works with caveat | `jwe_rsa_oaep_256_a256gcm`, `jwe_ecdh_es_a128kw_a128gcm`, `jwe_ecdh_es_rfc7518_appendix_c`, `jwe_dir_a256gcm_over_the_callers_body`, `jwe_of_caller_bytes_and_a_secret_is_refused` | 6 JWEs decrypted by the test (`rsa` OAEP, `p256` ECDH, Concat KDF over `sha2`, `aes-kw`, `aes-gcm`), fresh content keys, IVs and ephemeral keys each call; RFC 7518 appendix C: the content opens under the published key `VqqN6vgjbSBcIijNcacQGg` | A plaintext that mixes the caller's bytes with a secret is refused (rule 2: `slice` cannot separate ciphertext and tag of a tainted and controlled value; measured). Missing: an AEAD with ciphertext and tag as separate outputs (detached form). Decrypting a JWE response is the `decrypt` row. |
+| JWS in general | works as-is | `jws_rfc7515_and_rfc8037_vectors` | RFC 7515 appendix A.1 (HS256) and RFC 8037 appendix A.4 (EdDSA): 2 whole compact serializations byte for byte | Closed by `ed25519_public`, `ed448_public`, `ecdsa_public` and `rsa_public` (next table). |
+| JWE (RFC 7516): RSA-OAEP-256 + A256GCM, ECDH-ES+A128KW + A128GCM, `dir` + A256GCM | works with caveat | `jwe_rsa_oaep_256_a256gcm`, `jwe_ecdh_es_a128kw_a128gcm`, `jwe_ecdh_es_rfc7518_appendix_c`, `jwe_dir_a256gcm_over_the_callers_body`, `jwe_of_caller_bytes_and_a_secret_is_refused` | 6 JWEs decrypted by the test (`rsa` OAEP, `p256` ECDH, Concat KDF over `sha2`, `aes-kw`, `aes-gcm`), fresh content keys, IVs and ephemeral keys each call; RFC 7518 appendix C: the content opens under the published key `VqqN6vgjbSBcIijNcacQGg` | A plaintext that mixes the caller's bytes with a secret: `slice` still cannot separate ciphertext and tag (rule 2, measured); `aead_ciphertext` and `aead_tag` do (next table). Decrypting a JWE response is the `decrypt` row. |
 | `private_key_jwt`, `client_secret_jwt` (RFC 7523) | works as-is | `client_assertions_private_key_jwt_and_client_secret_jwt` | RS256 verified by ring, HS256 by `hmac`; claims `iss`, `sub`, `aud`, `jti`, `iat`, `exp`; the access token sealed, only its type and lifetime returned | |
 | SAML login through forms (`html` capture) | works with caveat | `saml_login_through_forms` | Redirect parameters, CSRF token and cookie, `SAMLResponse` (with an entity) and `RelayState` reach the right hosts unchanged; the session cookie sealed | `regex` reads bodies only, so the `Location` parameters are cut with `between`, in the order the service provider writes them. An OpenID Connect form login is the same steps (untested). |
 | SAML messages signed by a service provider | not shown | — | — | Not tested. The HTTP-Redirect binding needs DEFLATE (RFC 1951) and the POST binding XML signatures over Exclusive XML Canonicalization; neither family is small, so neither was added. |
+
+The gaps of that table that are generic template capabilities were then added, each as a
+family (tests in `crates/engine/tests/schemes_more.rs`, which reads its policies from
+`docs/policy.md`, Request components, AEAD parts and public keys):
+
+- **Request components**: `$header("name")` (a caller header the `send`'s contract lists,
+  combined as RFC 9110 section 5.3 says), `$query_param("name")` (RFC 9421 `@query-param`),
+  `$port`, `$scheme`, `$authority` and `$target_uri`. The name is a literal, so the analysis
+  knows each component a template reads; values are controlled and caller-chosen like `$body`,
+  and no rule changed.
+- **AEAD parts**: `aead_ciphertext(...)` and `aead_tag(...)` around an AEAD call written in
+  place (AES-GCM, ChaCha20-Poly1305, AES-CBC-HMAC, AES-CCM, AES-EAX; the engine has no
+  XChaCha, AES-GCM-SIV or OCB function to split). Chosen over a `slice` at `len - 16` allowed
+  when the length is public: the problem is not the length but who chooses where the cut falls
+  relative to the secret. With `secret + $input`, a suffix of fixed length is a piece of the
+  secret of a size the caller picks, and a plain hash of a mixed value is untainted, so it
+  would be guessed a byte at a time. A cut that only an AEAD call can feed falls where the
+  algorithm puts the tag, and each part covers the whole message, so each part keeps exactly
+  the properties of the encryption and rule 2 and rule 9 stay as they were.
+- **Public keys**: `ed25519_public`, `ed448_public`, `ecdsa_public(curve, key)` (P-256,
+  P-384, P-521, secp256k1, brainpool P-256 and P-384, SM2) and `rsa_public(form, key)` (`n`,
+  `e`, `spki`, `pkcs1`), one-way like `hpke_public`.
+
+| Scheme | Result | Tests | Checked against |
+| --- | --- | --- | --- |
+| HTTP Message Signatures over the caller's headers | works as-is | `rfc9421_b26_and_b25_cover_the_callers_headers`, `signed_call_headers_verifies`, `query_param_follows_rfc9421_section_2_2_8` | RFC 9421 B.2.6 (Ed25519) and B.2.5 (HMAC-SHA256) byte for byte with `date` and `content-type` sent by the caller; 2 signatures over `@method`, `@target-uri`, `@authority` (port 8443), `@query-param`, two caller headers (one with whitespace around it, one absent) and `content-digest` verified by ring over a base rebuilt from the wire; 4 of the 5 values of section 2.2.8 (its fifth name cannot be listed in a contract, which takes visible ASCII names) |
+| Hawk over the caller's content type and port | works as-is | `hawk_specification_examples_with_the_callers_content_type_and_port`, `hawk_call_headers_verifies` | The specification's POST hash and MAC and its GET MAC byte for byte, the content type sent by the caller as `Text/Plain; charset=utf-8` (normalized by the template), the port from `$port`; 2 requests verified by a recomputed MAC |
+| JWE of the caller's bytes and a secret | works as-is | `jwe_of_caller_bytes_and_a_secret_opens`, `jwe_rfc7516_vectors_split_by_aead_parts`, `aead_parts_of_every_family` | 2 JWEs (RSA-OAEP-256, A256GCM) opened by `rsa` and `aes-gcm` with the card number inside the caller's JSON; RFC 7516 A.3 (A128KW, A128CBC-HS256) whole compact form and A.1 content (A256GCM) byte for byte; 30 splits over 10 parameter sets of the 5 families, AES-GCM against `aes-gcm`'s detached output |
+| JWS with the JWK of its own key | works as-is | `jws_with_the_jwk_of_its_own_ed25519_key`, `jws_with_the_jwk_of_its_own_rsa_key`, `public_keys_match_published_key_pairs`, `public_keys_verify_signatures_on_every_curve` | `x` equals RFC 8037 A.2; EdDSA and RS256 verified by ring from the header's JWK alone; public keys equal RFC 8032 (Ed25519, Ed448), RFC 9421 B.1.4, RFC 6979 A.2.5 and A.2.6 and the secp256k1 generator; P-521, brainpool and SM2 verify the engine's signatures (`p521`, `ecdsa`, `sm2` verifiers) |
+
+Attacks measured with them: a header outside the contract, the same header twice (in one
+case or two), a folded value, a bare line feed, a NUL and a non-ASCII byte are refused before
+anything is sent (10 requests, none sent); a template reading a header or parameter the
+contract does not list, any in a fixed request, a `compute` step or a derivation is refused at
+signing; a caller header meeting a secret in `slice`, `between`, a decoder, `random`, an
+encryption key or a hash name is refused by rules 2, 1, 7 and 6; `aead_ciphertext` and
+`aead_tag` refuse anything but an AEAD call in place (10 forms); their parts keep the
+encryption's taint (5 derivations refused as tainted, one of them over a guessable field; 3
+signed), a part of a mixed message cannot be cut or decoded, and rule 9 still refuses a cut, a
+CCM tag length or a `random` length that depends on a secret.
 
 
 Not done; each needs a primitive or a feature, not a site name: OAuth 1.0a normalization in
@@ -740,9 +780,9 @@ without the owner (reading a code from another record, like the `mail` item of p
 OpenPGP; ssh-agent (`credentials tunnel --agent`); BIP-340 Schnorr; incoming webhook
 `verify`; `decrypt`; `generate` and rotation; egress through a proxy; SNMPv3 (RFC 3414 key
 localization and AES-CFB over the UDP relay); OAUTHBEARER; executing IR `repeat` and `if`
-(parsed and refused, section 8c); found by the table above: a template variable for the
-caller's request headers, a detached AEAD output, an Ed25519 public key from its private key,
-DEFLATE and Exclusive XML Canonicalization.
+(parsed and refused, section 8c); found by the table above: DEFLATE and Exclusive XML
+Canonicalization (the request components, the AEAD parts and the public keys it found are
+done).
 
 Each part adds its rows to `docs/threat-model.md`, fuzz targets for any new parser, and
 measured results in its pull request.
@@ -773,9 +813,11 @@ approvals inside another company's app (KakaoTalk, a bank's app push).
 - Delegations and requests of emergency access are restored from the log, like spending
   limits. A node restarted from a cut log without `restore_anchored` can bring back a
   revoked delegation or forget a cancellation; the anchor is the defence, as for limits.
-- Covering the caller's own header fields in a signature (RFC 9421, Hawk's content type)
-  needs a template variable that reads them; such a value would be caller-chosen like
-  `$body`. Whether to add it, and for which headers, is open (section 11, part 11 table).
+- Covering the caller's own header fields in a signature (RFC 9421, Hawk's content type):
+  settled as `$header("name")`, only for headers the `send`'s contract lists, caller-chosen
+  like `$body` (section 11). Still open: the path parameters a policy fills are not in `$path`
+  or `$pathname`, which are read before they are filled, so a signature cannot cover a
+  path that holds one.
 - Nonce retries (DPoP `use_dpop_nonce`, ACME `badNonce`) are written unconditionally until IR
   `if` runs; until then a policy fits only servers that always ask for a nonce first.
 - Vending checks the expiry the service states. A service that states a shorter expiry than

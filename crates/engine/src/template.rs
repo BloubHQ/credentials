@@ -9,9 +9,10 @@
 //! ```
 //!
 //! An expression is a name (a field of the record, or a value captured by an earlier step), a
-//! variable (`$method`, `$host`, `$path`, `$pathname`, `$query`, `$body`, `$unix`, `$unix_ms`,
-//! `$boundary`, `$nonce`, `$input`), a string literal, a call of a function of [`Func`], or
-//! several of them joined by `+`. There is no branch and no loop: a policy reads as what it
+//! variable (`$method`, `$host`, `$port`, `$scheme`, `$authority`, `$target_uri`, `$path`,
+//! `$pathname`, `$query`, `$body`, `$unix`, `$unix_ms`, `$boundary`, `$nonce`, `$input`), a
+//! request component named by a literal (`$header("content-type")`, `$query_param("page")`),
+//! a string literal, a call of a function of [`Func`], or several of them joined by `+`. There is no branch and no loop: a policy reads as what it
 //! does. Text outside `{{ }}` is copied as it is, `}}` included.
 //!
 //! # Analysis
@@ -46,6 +47,8 @@ pub use crate::primitives::MAX_PBKDF2_ROUNDS;
 /// Longest template, in bytes.
 pub const MAX_TEMPLATE: usize = 8192;
 const MAX_DEPTH: usize = 24;
+/// Longest name of a query parameter a template reads.
+const MAX_COMPONENT_NAME: usize = 256;
 const MAX_NODES: usize = 512;
 /// Most bytes all renderings of one operation may produce.
 pub const MAX_RENDER_BYTES: usize = 128 * 1024 * 1024;
@@ -61,6 +64,21 @@ pub enum Var {
     Method,
     /// Destination host.
     Host,
+    /// Destination port, in decimal.
+    Port,
+    /// The scheme of the request: `https`.
+    Scheme,
+    /// The authority of the request: the host in lowercase, then `:` and the port unless it
+    /// is 443 (RFC 9421 section 2.2.3).
+    Authority,
+    /// The target URI: scheme, authority, path and query (RFC 9421 section 2.2.2).
+    TargetUri,
+    /// A header of the caller's request, named by a literal: `$header("content-type")`. The
+    /// name is not stored here; [`Template::headers`] lists the names a template reads.
+    Header,
+    /// A query parameter of the caller's request, named by a literal:
+    /// `$query_param("page")`. [`Template::query_params`] lists the names.
+    QueryParam,
     /// Path and query of the request, before path parameters are filled.
     Path,
     /// The path without its query.
@@ -86,6 +104,10 @@ impl Var {
         Some(match name {
             "method" => Var::Method,
             "host" => Var::Host,
+            "port" => Var::Port,
+            "scheme" => Var::Scheme,
+            "authority" => Var::Authority,
+            "target_uri" => Var::TargetUri,
             "path" => Var::Path,
             "pathname" => Var::PathName,
             "query" => Var::Query,
@@ -130,7 +152,15 @@ impl Var {
     fn controlled(self) -> bool {
         matches!(
             self,
-            Var::Method | Var::Path | Var::PathName | Var::Query | Var::Body | Var::Input
+            Var::Method
+                | Var::Path
+                | Var::PathName
+                | Var::Query
+                | Var::Body
+                | Var::Input
+                | Var::TargetUri
+                | Var::Header
+                | Var::QueryParam
         )
     }
 }
@@ -266,6 +296,12 @@ funcs! {
     MldsaSign = "mldsa_sign"(3, 4): "`mldsa_sign(level, seed, message[, context])`: ML-DSA (FIPS 204) with the parameter set `44`, `65` or `87`, hedged; the key is the 32-byte seed.",
     MldsaPublic = "mldsa_public"(2, 2): "`mldsa_public(level, seed)`: the encoded ML-DSA public key of a 32-byte seed (one-way).",
     Sm2Sign = "sm2_sign"(2, 3): "`sm2_sign(key, message[, id])`: SM2 with SM3 (GB/T 32918.2, RFC 8998), `r || s`; the identifier defaults to `1234567812345678`.",
+    AeadCiphertext = "aead_ciphertext"(1, 1): "`aead_ciphertext(encryption)`: the ciphertext of an AEAD encryption call written in place (`aes_gcm_encrypt`, `chacha20_poly1305_encrypt`, `aes_cbc_hmac_encrypt`, `aes_ccm_encrypt`, `aes_eax_encrypt`), without its tag.",
+    AeadTag = "aead_tag"(1, 1): "`aead_tag(encryption)`: the tag alone of an AEAD encryption call written in place; its length is the algorithm's (16 bytes, the CCM tag length, half the AES-CBC-HMAC key).",
+    Ed25519Public = "ed25519_public"(1, 1): "`ed25519_public(key)`: the 32-byte Ed25519 public key of a private key (raw 32 bytes or PKCS#8 DER; one-way).",
+    Ed448Public = "ed448_public"(1, 1): "`ed448_public(key)`: the 57-byte Ed448 public key of a private key (raw 57 bytes or PKCS#8 DER; one-way).",
+    EcdsaPublic = "ecdsa_public"(2, 2): "`ecdsa_public(curve, key)`: the SEC1 uncompressed public key of a private key on `p256`, `p384`, `p521`, `k256`, `bp256`, `bp384` or `sm2` (raw scalar or PKCS#8 DER; one-way).",
+    RsaPublic = "rsa_public"(2, 2): "`rsa_public(form, key)`: the public key of an RSA private key (PKCS#8 or PKCS#1 DER) as `spki` or `pkcs1` DER, or its modulus `n` or exponent `e` as big-endian bytes without leading zeros (one-way).",
     TlsExporter = "tls_exporter"(3, 3): "`tls_exporter(label, context, length)`: keying material exported from the TLS 1.3 connection of the operation (RFC 8446 section 7.5), 1 to 8192 bytes; only in a TLS send, after the handshake; a secret.",
 }
 
@@ -306,7 +342,24 @@ impl Func {
                 | Func::Kt256
                 | Func::HpkePublic
                 | Func::MldsaPublic
+                | Func::Ed25519Public
+                | Func::Ed448Public
+                | Func::EcdsaPublic
+                | Func::RsaPublic
         ) || self.signs()
+    }
+
+    /// An authenticated encryption whose output is the ciphertext then a tag of a length the
+    /// algorithm fixes: what `aead_ciphertext` and `aead_tag` split.
+    pub(crate) fn aead(self) -> bool {
+        matches!(
+            self,
+            Func::AesGcmEncrypt
+                | Func::ChaCha20Poly1305Encrypt
+                | Func::AesCbcHmacEncrypt
+                | Func::AesCcmEncrypt
+                | Func::AesEaxEncrypt
+        )
     }
 
     /// A plain hash: one-way, but a hash of secret bytes alone stays tainted (rule 3).
@@ -442,7 +495,12 @@ impl Func {
                 &[0, 1]
             }
             Func::Turboshake128 | Func::Turboshake256 => &[1],
-            Func::HpkePublic | Func::HpkeDeriveKey | Func::MldsaSign | Func::MldsaPublic => &[0],
+            Func::HpkePublic
+            | Func::HpkeDeriveKey
+            | Func::MldsaSign
+            | Func::MldsaPublic
+            | Func::EcdsaPublic
+            | Func::RsaPublic => &[0],
             f => match f.algorithm_arg() {
                 Some(0) => &[0],
                 _ => &[],
@@ -525,8 +583,13 @@ impl Func {
             Func::Shake128 | Func::Shake256 | Func::Nfold => 1..2,
             Func::Turboshake128 | Func::Turboshake256 => 1..3,
             Func::Kt128 | Func::Kt256 | Func::TlsExporter => 2..3,
-            Func::HpkePublic | Func::HpkeDeriveKey | Func::MldsaSign | Func::MldsaPublic => 1..2,
-            Func::Sm2Sign => 0..1,
+            Func::HpkePublic
+            | Func::HpkeDeriveKey
+            | Func::MldsaSign
+            | Func::MldsaPublic
+            | Func::EcdsaPublic
+            | Func::RsaPublic => 1..2,
+            Func::Sm2Sign | Func::Ed25519Public | Func::Ed448Public => 0..1,
             // The HPKE functions name their key arguments in `key_args`.
             Func::HpkeExport => 5..6,
             Func::HpkeReceiverExport => 6..7,
@@ -619,6 +682,10 @@ enum Expr {
     Lit(Vec<u8>),
     Name(String),
     Var(Var),
+    /// `$header("name")`: the name in lowercase.
+    Header(String),
+    /// `$query_param("name")`: the name as RFC 9421 section 2.2.8 writes it (encoded).
+    QueryParam(String),
     Call(Func, Vec<Expr>),
     Concat(Vec<Expr>),
 }
@@ -742,6 +809,27 @@ impl Parser {
         }
         match self.next()? {
             Tok::Str(s) => Some(Expr::Lit(s)),
+            Tok::Var(name) if self.peek() == Some(&Tok::LParen) => {
+                // A request component named by a literal, so the analysis knows exactly which
+                // header or parameter a template reads.
+                self.pos += 1;
+                let Some(Tok::Str(arg)) = self.next() else {
+                    return None;
+                };
+                if self.next()? != Tok::RParen {
+                    return None;
+                }
+                let arg = String::from_utf8(arg).ok()?;
+                match name.as_str() {
+                    "header" if crate::policy::is_token(&arg) => {
+                        Some(Expr::Header(arg.to_ascii_lowercase()))
+                    }
+                    "query_param" if !arg.is_empty() && arg.len() <= MAX_COMPONENT_NAME => {
+                        Some(Expr::QueryParam(arg))
+                    }
+                    _ => None,
+                }
+            }
             Tok::Var(name) => Var::parse(&name).map(Expr::Var),
             Tok::Ident(name) if self.peek() == Some(&Tok::LParen) => {
                 let func = Func::parse(&name)?;
@@ -777,6 +865,9 @@ fn walk<'e>(expr: &'e Expr, visit: &mut dyn FnMut(&'e Expr)) {
 
 type Rule = &'static str;
 
+const AEAD_IN_PLACE: Rule =
+    "aead_ciphertext and aead_tag take an AEAD encryption call written in place";
+
 fn analyze(expr: &Expr, kind: &dyn Fn(&str) -> NameKind) -> core::result::Result<Info, Rule> {
     Ok(match expr {
         Expr::Lit(_) => Info::default(),
@@ -807,6 +898,24 @@ fn analyze(expr: &Expr, kind: &dyn Fn(&str) -> NameKind) -> core::result::Result
             controlled: v.controlled(),
             caller: v.controlled(),
             ..Info::default()
+        },
+        // The caller chooses a header's value and a query parameter's, as it does `$body`.
+        Expr::Header(_) | Expr::QueryParam(_) => Info {
+            controlled: true,
+            caller: true,
+            ..Info::default()
+        },
+        Expr::Call(Func::AeadCiphertext | Func::AeadTag, args) => match args.as_slice() {
+            // The cut falls where the algorithm puts it, at the tag length from the end; the
+            // caller's bytes set only how long the whole is. Each part covers the whole
+            // message (the ciphertext is the message under the keystream, the tag depends on
+            // every byte), so neither lets a chosen length pick a piece of a secret, as a
+            // `slice` of a mixed value would: each part has the properties of the encryption.
+            [inner @ Expr::Call(f, _)] if f.aead() => Info {
+                secret_key: false,
+                ..analyze(inner, kind)?
+            },
+            _ => return Err(AEAD_IN_PLACE),
         },
         Expr::Concat(parts) => {
             let infos = parts
@@ -1028,13 +1137,42 @@ impl Template {
         out
     }
 
-    /// The variables the template reads.
+    /// The variables the template reads; a header or a query parameter is
+    /// [`Var::Header`] or [`Var::QueryParam`].
     pub fn vars(&self) -> Vec<Var> {
         let mut out = Vec::new();
         for expr in self.exprs() {
+            walk(expr, &mut |e| match e {
+                Expr::Var(v) => out.push(*v),
+                Expr::Header(_) => out.push(Var::Header),
+                Expr::QueryParam(_) => out.push(Var::QueryParam),
+                _ => {}
+            });
+        }
+        out
+    }
+
+    /// The headers of the caller's request the template reads, in lowercase.
+    pub fn headers(&self) -> Vec<&str> {
+        let mut out = Vec::new();
+        for expr in self.exprs() {
             walk(expr, &mut |e| {
-                if let Expr::Var(v) = e {
-                    out.push(*v);
+                if let Expr::Header(name) = e {
+                    out.push(name.as_str());
+                }
+            });
+        }
+        out
+    }
+
+    /// The query parameters of the caller's request the template reads, as written in the
+    /// template (encoded as RFC 9421 section 2.2.8 writes them).
+    pub fn query_params(&self) -> Vec<&str> {
+        let mut out = Vec::new();
+        for expr in self.exprs() {
+            walk(expr, &mut |e| {
+                if let Expr::QueryParam(name) = e {
+                    out.push(name.as_str());
                 }
             });
         }
@@ -1200,6 +1338,8 @@ pub(crate) struct Context<'a> {
     pub fields: &'a Fields,
     pub temps: &'a Temps,
     pub vars: HashMap<Var, Vec<u8>>,
+    /// The headers of the caller's request (none where a template reads no request).
+    pub headers: &'a [(String, String)],
     pub unix: u64,
     pub budget: &'a Budget,
 }
@@ -1230,6 +1370,19 @@ fn eval(expr: &Expr, ctx: &Context<'_>, connection: Option<&dyn Stream>) -> Resu
             ctx.budget.bytes(value.len())?;
             Zeroizing::new(value.clone())
         }
+        Expr::Header(name) => {
+            let value = header_value(ctx.headers, name);
+            ctx.budget.bytes(value.len())?;
+            value
+        }
+        Expr::QueryParam(name) => {
+            let query = ctx.vars.get(&Var::Query).ok_or(Error::TemplateInvalid {
+                rule: "variable not available here",
+            })?;
+            let value = primitives::query_param(query, name.as_bytes())?;
+            ctx.budget.bytes(value.len())?;
+            value
+        }
         Expr::Concat(parts) => {
             let values = parts
                 .iter()
@@ -1237,22 +1390,69 @@ fn eval(expr: &Expr, ctx: &Context<'_>, connection: Option<&dyn Stream>) -> Resu
                 .collect::<Result<Vec<_>>>()?;
             concat(&values, ctx.budget)?
         }
-        Expr::Call(func, args) => {
-            let args = args
-                .iter()
-                .map(|a| eval(a, ctx, connection))
-                .collect::<Result<Vec<_>>>()?;
-            ctx.budget.room(primitives::output_bound(*func, &args))?;
-            let out = match (*func, connection) {
-                (Func::TlsExporter, Some(connection)) => {
-                    primitives::tls_exporter(connection, &args)?
+        Expr::Call(func @ (Func::AeadCiphertext | Func::AeadTag), args) => {
+            let (inner, inner_args) = match args.as_slice() {
+                [Expr::Call(inner, inner_args)] if inner.aead() => (*inner, inner_args),
+                _ => {
+                    return Err(Error::TemplateInvalid {
+                        rule: AEAD_IN_PLACE,
+                    });
                 }
-                _ => primitives::call(*func, &args, ctx.unix, ctx.budget)?,
             };
-            ctx.budget.bytes(out.len())?;
-            out
+            let (values, sealed) = call(inner, inner_args, ctx, connection)?;
+            let tag = primitives::aead_tag_len(inner, &values)?;
+            let cut = sealed
+                .len()
+                .checked_sub(tag)
+                .ok_or(Error::TemplateInvalid {
+                    rule: "an AEAD output shorter than its tag",
+                })?;
+            let part = if *func == Func::AeadCiphertext {
+                sealed.get(..cut)
+            } else {
+                sealed.get(cut..)
+            };
+            let part = Zeroizing::new(part.unwrap_or_default().to_vec());
+            ctx.budget.bytes(part.len())?;
+            part
         }
+        Expr::Call(func, args) => call(*func, args, ctx, connection)?.1,
     })
+}
+
+/// Evaluates the arguments of a call, then the call: the argument values and the output.
+fn call(
+    func: Func,
+    args: &[Expr],
+    ctx: &Context<'_>,
+    connection: Option<&dyn Stream>,
+) -> Result<(Vec<Bytes>, Bytes)> {
+    let args = args
+        .iter()
+        .map(|a| eval(a, ctx, connection))
+        .collect::<Result<Vec<_>>>()?;
+    ctx.budget.room(primitives::output_bound(func, &args))?;
+    let out = match (func, connection) {
+        (Func::TlsExporter, Some(connection)) => primitives::tls_exporter(connection, &args)?,
+        _ => primitives::call(func, &args, ctx.unix, ctx.budget)?,
+    };
+    ctx.budget.bytes(out.len())?;
+    Ok((args, out))
+}
+
+/// The value of a header of the caller's request as RFC 9110 section 5.3 combines it: every
+/// field line of that name (case does not matter), each without the whitespace around it,
+/// joined by `, `; empty when the request has none. (A caller contract refuses a header sent
+/// twice, under any case, so a checked request holds one line at most.)
+pub(crate) fn header_value(headers: &[(String, String)], name: &str) -> Bytes {
+    let mut out = Zeroizing::new(Vec::new());
+    for (_, value) in headers.iter().filter(|(n, _)| n.eq_ignore_ascii_case(name)) {
+        if !out.is_empty() {
+            out.extend_from_slice(b", ");
+        }
+        out.extend_from_slice(value.trim_matches([' ', '\t']).as_bytes());
+    }
+    out
 }
 
 #[cfg(test)]
@@ -1267,6 +1467,7 @@ mod tests {
             fields,
             temps: &temps,
             vars: HashMap::from([(Var::Input, b"in".to_vec())]),
+            headers: &[],
             unix: 59,
             budget: &budget,
         };
@@ -1364,6 +1565,7 @@ mod tests {
             fields: &fields,
             temps: &temps,
             vars: HashMap::new(),
+            headers: &[],
             unix: 0,
             budget: &budget,
         };
@@ -1472,6 +1674,7 @@ mod tests {
             fields: &fields,
             temps: &temps,
             vars: HashMap::from([(Var::Input, b"in".to_vec())]),
+            headers: &[],
             unix: 59,
             budget: &budget,
         };
@@ -1737,5 +1940,171 @@ mod tests {
         ] {
             assert_eq!(analyze(template), expected, "{template}");
         }
+    }
+
+    #[test]
+    fn request_components_parse_as_literals() {
+        let t = Template::parse(
+            r#"{{ $header("Content-Type") + $query_param("fa%C3%A7ade") + $port + $authority }}"#,
+        )
+        .unwrap();
+        assert_eq!(t.headers(), ["content-type"]);
+        assert_eq!(t.query_params(), ["fa%C3%A7ade"]);
+        assert_eq!(
+            t.vars(),
+            [Var::Header, Var::QueryParam, Var::Port, Var::Authority]
+        );
+        for text in [
+            "{{ $header }}",
+            "{{ $header(x) }}",
+            r#"{{ $header("a b") }}"#,
+            r#"{{ $header("") }}"#,
+            r#"{{ $header("a", "b") }}"#,
+            r#"{{ $header("a" + "b") }}"#,
+            r#"{{ $query_param("") }}"#,
+            r#"{{ $nope("a") }}"#,
+            r#"{{ $method("a") }}"#,
+        ] {
+            assert!(
+                matches!(Template::parse(text), Err(Error::TemplateSyntax { .. })),
+                "{text}"
+            );
+        }
+        // Only the injections of a request may read them.
+        for var in [Var::Header, Var::QueryParam, Var::Port, Var::TargetUri] {
+            assert!(var.in_request());
+            assert!(!var.in_stream() && !var.in_derive() && !var.in_compute() && !var.in_frame());
+        }
+    }
+
+    #[test]
+    fn request_components_are_chosen_by_the_caller() {
+        let analyze = |t: &str| Template::parse(t).unwrap().analyze(&kind);
+        const MEET: Rule =
+            "a secret and a chosen value meet in a function that compares or cuts them";
+        assert_eq!(analyze(r#"{{ $header("date") }}"#), Ok(false));
+        assert_eq!(
+            analyze(r#"{{ hex(hmac_sha256(key, $header("date") + $query_param("a"))) }}"#),
+            Ok(false)
+        );
+        assert_eq!(analyze(r#"{{ slice(key, $header("a"), "1") }}"#), Err(MEET));
+        assert_eq!(
+            analyze(r#"{{ slice(key, $query_param("a"), "1") }}"#),
+            Err(MEET)
+        );
+        assert_eq!(analyze(r#"{{ slice(key, $target_uri, "1") }}"#), Err(MEET));
+        // The destination's port and authority are not chosen, like `$host`.
+        assert_eq!(analyze(r#"{{ slice(key, $port, "1") }}"#), Ok(true));
+        assert_eq!(analyze(r#"{{ hex(sha256(key + $authority)) }}"#), Ok(true));
+        assert_eq!(
+            analyze(r#"{{ hex(sha256(key + $header("a"))) }}"#),
+            Ok(false)
+        );
+    }
+
+    #[test]
+    fn header_values_combine_as_rfc_9110_says() {
+        let headers = vec![
+            ("Accept".to_string(), " a/b ".to_string()),
+            ("X-Other".to_string(), "x".to_string()),
+            ("accept".to_string(), "\tc/d".to_string()),
+        ];
+        assert_eq!(header_value(&headers, "accept").as_slice(), b"a/b, c/d");
+        assert_eq!(header_value(&headers, "x-other").as_slice(), b"x");
+        assert!(header_value(&headers, "missing").is_empty());
+        let fields = Fields::new();
+        let temps = Temps::new();
+        let budget = Budget::default();
+        let ctx = Context {
+            fields: &fields,
+            temps: &temps,
+            vars: HashMap::from([(Var::Query, b"a=1+2&b=%7e&c".to_vec())]),
+            headers: &headers,
+            unix: 0,
+            budget: &budget,
+        };
+        let render = |t: &str| Template::parse(t).unwrap().render(&ctx).unwrap().to_vec();
+        assert_eq!(
+            render(
+                r#"{{ $header("ACCEPT") + "|" + $query_param("a") + "|" + $query_param("b") + "|" + $query_param("c") + "|" + $query_param("d") }}"#
+            ),
+            b"a/b, c/d|1%202|%7E||"
+        );
+        let ctx = Context {
+            vars: HashMap::from([(Var::Query, b"a=1&a=2".to_vec())]),
+            ..ctx
+        };
+        assert!(
+            Template::parse(r#"{{ $query_param("a") }}"#)
+                .unwrap()
+                .render(&ctx)
+                .is_err(),
+            "a parameter sent twice is not combined"
+        );
+    }
+
+    #[test]
+    fn aead_parts_split_where_the_algorithm_puts_the_tag() {
+        let fields = Fields::new();
+        let temps = Temps::new();
+        let budget = Budget::default();
+        let ctx = Context {
+            fields: &fields,
+            temps: &temps,
+            vars: HashMap::new(),
+            headers: &[],
+            unix: 0,
+            budget: &budget,
+        };
+        let render = |t: &str| Template::parse(t).unwrap().render(&ctx).unwrap().to_vec();
+        for (call, tag) in [
+            (
+                r#"aes_gcm_encrypt("0123456789abcdef", "000000000000", "message")"#,
+                16,
+            ),
+            (
+                r#"aes_ccm_encrypt("0123456789abcdef", "0123456", "6", "message", "a")"#,
+                6,
+            ),
+            (
+                r#"aes_cbc_hmac_encrypt("0123456789abcdef0123456789abcdef0123456789abcdef", "0123456789abcdef", "m")"#,
+                24,
+            ),
+        ] {
+            let whole = render(&format!("{{{{ {call} }}}}"));
+            let ciphertext = render(&format!("{{{{ aead_ciphertext({call}) }}}}"));
+            let tag_part = render(&format!("{{{{ aead_tag({call}) }}}}"));
+            assert_eq!(tag_part.len(), tag, "{call}");
+            assert_eq!([ciphertext, tag_part].concat(), whole, "{call}");
+        }
+        let analyze = |t: &str| Template::parse(t).unwrap().analyze(&kind);
+        assert_eq!(analyze(r#"{{ aead_tag(key) }}"#), Err(AEAD_IN_PLACE));
+        assert_eq!(
+            analyze(r#"{{ aead_tag(aes_cbc_encrypt(key, "0123456789abcdef", "m")) }}"#),
+            Err(AEAD_IN_PLACE)
+        );
+        // The properties of the encryption, exactly.
+        assert_eq!(
+            analyze(r#"{{ aead_tag(aes_gcm_encrypt(key, "000000000000", $input)) }}"#),
+            Ok(false)
+        );
+        assert_eq!(
+            analyze(r#"{{ aead_ciphertext(aes_gcm_encrypt(key, "000000000000", msg)) }}"#),
+            Ok(true)
+        );
+        let props = |t: &str| Template::parse(t).unwrap().props(&kind).unwrap();
+        let mixed = props(
+            r#"{{ aead_tag(aes_gcm_encrypt("0123456789abcdef", "000000000000", key + $input)) }}"#,
+        );
+        assert_eq!(
+            mixed,
+            props(r#"{{ aes_gcm_encrypt("0123456789abcdef", "000000000000", key + $input) }}"#)
+        );
+        assert!(mixed.0.mixed());
+        assert!(
+            !props(r#"{{ aead_tag(aes_gcm_encrypt(key, "000000000000", "m")) }}"#)
+                .0
+                .secret_key
+        );
     }
 }

@@ -903,11 +903,122 @@ pub(crate) fn output_bound(func: Func, args: &[Bytes]) -> usize {
         // ML-DSA-87: 4627-byte signatures, 2592-byte public keys.
         Func::MldsaSign => 4627,
         Func::MldsaPublic => 2592,
+        Func::EcdsaPublic => 160,
+        Func::RsaPublic => len(1) + 64,
         Func::Sm2Sign => 64,
         Func::CborArray | Func::CborMap => args.iter().map(|a| a.len()).sum::<usize>() + 9,
         Func::CborTag => len(1) + 9,
         _ => len(0) + 128,
     }
+}
+
+/// The length of the tag at the end of the output of the AEAD `func` called with `args`:
+/// fixed by the algorithm (the CCM tag length is an argument the analysis keeps free of
+/// secrets, rule 9; the AES-CBC-HMAC tag is half the key, whose length `len` gives anyway).
+pub(crate) fn aead_tag_len(func: Func, args: &[Bytes]) -> Result<usize> {
+    match func {
+        Func::AesGcmEncrypt | Func::ChaCha20Poly1305Encrypt | Func::AesEaxEncrypt => Ok(16),
+        Func::AesCcmEncrypt => kdf::length(arg(args, 2)?, 16),
+        Func::AesCbcHmacEncrypt => Ok(arg(args, 0)?.len() / 2),
+        _ => Err(bad("not an AEAD encryption")),
+    }
+}
+
+/// True for the bytes the `application/x-www-form-urlencoded` percent-encode set leaves as
+/// they are (WHATWG URL): ASCII letters and digits, `*`, `-`, `.` and `_`.
+fn form_safe(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || matches!(b, b'*' | b'-' | b'.' | b'_')
+}
+
+/// Parses one name or value of a form-encoded query (WHATWG URL): `+` is a space, `%XX` a
+/// byte, any other `%` itself; then encodes it again as RFC 9421 section 2.2.8 asks, every
+/// byte outside [`form_safe`] as `%XX` (so a space is `%20`).
+fn form_reencode(raw: &[u8]) -> Vec<u8> {
+    let mut decoded = Vec::with_capacity(raw.len());
+    let mut i = 0;
+    while let Some(&b) = raw.get(i) {
+        let pair = raw.get(i + 1..i + 3).and_then(|h| match h {
+            [hi, lo] => Some((hex_digit(*hi).ok()? << 4) | hex_digit(*lo).ok()?),
+            _ => None,
+        });
+        match (b, pair) {
+            (b'%', Some(byte)) => {
+                decoded.push(byte);
+                i += 3;
+            }
+            (b'+', _) => {
+                decoded.push(b' ');
+                i += 1;
+            }
+            (other, _) => {
+                decoded.push(other);
+                i += 1;
+            }
+        }
+    }
+    let mut out = Vec::with_capacity(decoded.len() * 3);
+    for b in decoded {
+        if form_safe(b) {
+            out.push(b);
+        } else {
+            out.push(b'%');
+            out.extend(HEX_UPPER.get(usize::from(b >> 4)));
+            out.extend(HEX_UPPER.get(usize::from(b & 0x0f)));
+        }
+    }
+    out
+}
+
+/// The value of the query parameter `name` as RFC 9421 section 2.2.8 (`@query-param`)
+/// normalizes it: names and values parsed as `application/x-www-form-urlencoded` and encoded
+/// again, the value of the pair whose encoded name is `name`. Empty when no pair has that name;
+/// a name sent twice fails (a caller contract refuses it before).
+pub(crate) fn query_param(query: &[u8], name: &[u8]) -> Result<Bytes> {
+    let mut found: Option<Vec<u8>> = None;
+    for pair in query.split(|b| *b == b'&').filter(|p| !p.is_empty()) {
+        let (raw_name, raw_value) = match pair.iter().position(|b| *b == b'=') {
+            Some(at) => (
+                pair.get(..at).unwrap_or_default(),
+                pair.get(at + 1..).unwrap_or_default(),
+            ),
+            None => (pair, &[][..]),
+        };
+        if form_reencode(raw_name) == name {
+            if found.is_some() {
+                return Err(bad("query parameter repeated"));
+            }
+            found = Some(form_reencode(raw_value));
+        }
+    }
+    Ok(Zeroizing::new(found.unwrap_or_default()))
+}
+
+/// `rsa_public(form, key)`: the public key of an RSA private key, read by ring (as
+/// `rsa_sign` reads it): `pkcs1` and `spki` DER, or `n` and `e` as big-endian bytes without
+/// leading zeros, the form of a JWK (RFC 7518 section 6.3.1).
+fn rsa_public_of(form: &[u8], key: &[u8]) -> Result<Bytes> {
+    use ring::rsa::PublicKeyComponents;
+    use ring::signature::{KeyPair as _, RsaKeyPair};
+    use rsa::pkcs1::DecodeRsaPublicKey as _;
+    use rsa::pkcs8::EncodePublicKey as _;
+    let pair = RsaKeyPair::from_pkcs8(key)
+        .or_else(|_| RsaKeyPair::from_der(key))
+        .map_err(|_| Error::KeyInvalid)?;
+    let public = pair.public_key();
+    Ok(Zeroizing::new(match form {
+        b"pkcs1" => public.as_ref().to_vec(),
+        b"spki" => rsa::PublicKey::from_pkcs1_der(public.as_ref())
+            .and_then(|k| {
+                k.to_public_key_der()
+                    .map_err(|_| rsa::pkcs1::Error::KeyMalformed)
+            })
+            .map_err(|_| Error::KeyInvalid)?
+            .as_bytes()
+            .to_vec(),
+        b"n" => PublicKeyComponents::<Vec<u8>>::from(public).n,
+        b"e" => PublicKeyComponents::<Vec<u8>>::from(public).e,
+        _ => return Err(bad("rsa_public form spki, pkcs1, n or e")),
+    }))
 }
 
 /// The functions of the families added with the second group of section 8d.
@@ -989,6 +1100,24 @@ fn call_family(func: Func, args: &[Bytes], budget: &Budget) -> Result<Option<Byt
             hpke::public(at(0)?, at(1)?)?
         }
         Func::HpkeDeriveKey => hpke::derive_key(at(0)?, at(1)?)?,
+        // A public key from a private one is a scalar multiplication (or an RSA key parse):
+        // a signature in the budget, like `hpke_public`.
+        Func::Ed25519Public => {
+            budget.signature()?;
+            Zeroizing::new(ed25519_key(at(0)?)?.verifying_key().to_bytes().to_vec())
+        }
+        Func::Ed448Public => {
+            budget.signature()?;
+            sign::ed448_public(at(0)?)?
+        }
+        Func::EcdsaPublic => {
+            budget.signature()?;
+            sign::ecdsa_public(at(0)?, at(1)?)?
+        }
+        Func::RsaPublic => {
+            budget.signature()?;
+            rsa_public_of(at(0)?, at(1)?)?
+        }
         Func::MldsaSign => {
             budget.signature()?;
             sign::mldsa(at(0)?, at(1)?, at(2)?, opt(3), &random(32)?)?

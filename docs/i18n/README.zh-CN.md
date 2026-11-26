@@ -207,6 +207,8 @@ let outcome = node.run(&call, &mut TlsTransport::new());
 | Telegram 机器人 | 路径模板 `/{token}/getMe` 中的 `path_param` `token` = `bot{{token}}` |
 | 交易所 HMAC 签名 | 查询参数 `signature` = `{{ hex(hmac_sha256(secret, $query)) }}` |
 | AWS SigV4 | 两个头部模板（`time`、`canonical_query`、嵌套的 `hmac_sha256`）；有测试复现官方向量 |
+| HTTP Message Signatures、Hawk | 用 `ed25519_sign` 或 `hmac_sha256` 签名 `$method`、`$target_uri`、`$authority`、`$query_param("page")` 和调用方自己的头部（`$header("content-type")`，仅限契约列出的）；复现 RFC 9421 B.2.5、B.2.6 和 Hawk 示例 |
+| 把记录中的卡号放进调用方 JSON 的 JWE | 同一个 `aes_gcm_encrypt(cek, iv, json_set($body, "card", card_number), head)` 的 `aead_ciphertext(...)` 和 `aead_tag(...)`，密钥用 `rsa_encrypt_oaep` 加密；复现 RFC 7516 A.3 |
 | HTTP Digest | 第 1 步用 `header_param` 捕获 `realm`/`nonce`；第 2 步用 `md5` 应答；RFC 2617 向量 |
 | OAuth 刷新 | `fixed` POST，`json` 捕获到字段：节点返回一条新记录 |
 | 会话登录 | `fixed` POST /login，`cookie` 捕获到临时值，在调用方的请求上加 `Cookie` |

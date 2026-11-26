@@ -253,6 +253,7 @@ fn render_with(
         fields: &run.fields,
         temps: &run.captured.temps,
         vars,
+        headers: &[],
         unix: run.now / 1000,
         budget: &run.budget,
     };
