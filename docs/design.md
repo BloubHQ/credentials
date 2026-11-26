@@ -713,10 +713,23 @@ Done in part 11 (tests in `crates/engine/tests/owner_controls.rs`, fuzz target
   node bounds what goes back by the expiry it reads, not by knowing the service. A
   `kubectl` `exec` plugin that prints what the node vended is the caller's own code.
 
-Expressible by templates and the IR today, without new engine code, but not yet shown by a
-test (a hypothesis until one runs): DPoP, HTTP Message Signatures, Hawk, ACME and JWS in
-general, JWE encryption with the existing HPKE/AES-GCM/RSA functions, SAML and OIDC by `html`
-capture, `private_key_jwt`.
+Shown by tests with no new engine code (tests in `crates/engine/tests/schemes.rs`; the
+policies are the operations of `docs/policy.md`, Worked examples, which the tests read from
+that file). Every policy signs with the template analysis unchanged; two refusals are
+measured where a scheme would need the rules loosened.
+
+| Scheme | Result | Tests | Checked against | Caveat, or the missing generic capability |
+| --- | --- | --- | --- | --- |
+| DPoP (RFC 9449), `ath`, server nonce | works with caveat | `dpop_token_refresh_and_resource_request`, `dpop_retry_needs_a_server_nonce`, `dpop_ath_before_the_nonce_is_refused` | 4 ES256 proofs verified by ring (the JWK derived by `hpke_public("p256", key)`); `jti`, `htm`, `htu`, `iat`, `nonce`, `ath`; the refreshed token sealed and used by the next proof | The retry on `use_dpop_nonce` is unconditional: a server that sends no nonce fails the call after one request (measured); a conditional retry needs IR `if`. `ath` is tainted (hash of a secret alone), so it must be the last `json_set` member: before the controlled `nonce` it is refused by rule 2 (measured). No RFC example is deterministic. |
+| HTTP Message Signatures (RFC 9421) | works with caveat | `http_message_signatures_four_algorithms`, `http_message_signatures_rfc9421_vectors` | Appendix B.2.6 (Ed25519) byte for byte; 8 signatures (ed25519, ecdsa-p256-sha256, rsa-pss-sha512, hmac-sha256, each on a POST with query and body and a GET) verified over a base rebuilt from the wire (ring, `rsa`, `hmac`), with `content-digest` (RFC 9530) | A header field the caller sets cannot be covered: no template variable reads the caller's request headers (missing: a request-header variable). `@authority` needs the port written in the policy for a port other than 443. B.2.5 (HMAC) not reproduced: its key could not be checked against the RFC text offline (unmeasured). `@query-param` and response signatures untested. |
+| Hawk | works with caveat | `hawk_header_verifies`, `hawk_specification_examples` | The specification's two request examples: 2 MACs and the payload hash byte for byte (its fixed nonce in place of `$nonce`); 2 requests verified by a recomputed MAC | No variable gives the port (written in the policy); the payload hash covers a content type the policy fixes, since the caller's is unreadable (same missing variable as above). Checking the server's `Server-Authorization` is not done (untested). |
+| ACME (RFC 8555) | works as-is | `acme_jws_with_jwk_kid_and_chained_nonces` | 5 flattened JWS verified by ring: `jwk` on new-account, `kid` (found by `onlyReturnExisting`, one extra request per call) on new-order and on a POST-as-GET, each with the nonce of the response before it, `url` from the request | Retrying on `badNonce` needs IR `if`. |
+| JWS in general | works as-is | `jws_rfc7515_and_rfc8037_vectors` | RFC 7515 appendix A.1 (HS256) and RFC 8037 appendix A.4 (EdDSA): 2 whole compact serializations byte for byte | An Ed25519 JWK needs the public key as a field: no function derives it (P-256 has `hpke_public`). |
+| JWE (RFC 7516): RSA-OAEP-256 + A256GCM, ECDH-ES+A128KW + A128GCM, `dir` + A256GCM | works with caveat | `jwe_rsa_oaep_256_a256gcm`, `jwe_ecdh_es_a128kw_a128gcm`, `jwe_ecdh_es_rfc7518_appendix_c`, `jwe_dir_a256gcm_over_the_callers_body`, `jwe_of_caller_bytes_and_a_secret_is_refused` | 6 JWEs decrypted by the test (`rsa` OAEP, `p256` ECDH, Concat KDF over `sha2`, `aes-kw`, `aes-gcm`), fresh content keys, IVs and ephemeral keys each call; RFC 7518 appendix C: the content opens under the published key `VqqN6vgjbSBcIijNcacQGg` | A plaintext that mixes the caller's bytes with a secret is refused (rule 2: `slice` cannot separate ciphertext and tag of a tainted and controlled value; measured). Missing: an AEAD with ciphertext and tag as separate outputs (detached form). Decrypting a JWE response is the `decrypt` row. |
+| `private_key_jwt`, `client_secret_jwt` (RFC 7523) | works as-is | `client_assertions_private_key_jwt_and_client_secret_jwt` | RS256 verified by ring, HS256 by `hmac`; claims `iss`, `sub`, `aud`, `jti`, `iat`, `exp`; the access token sealed, only its type and lifetime returned | |
+| SAML login through forms (`html` capture) | works with caveat | `saml_login_through_forms` | Redirect parameters, CSRF token and cookie, `SAMLResponse` (with an entity) and `RelayState` reach the right hosts unchanged; the session cookie sealed | `regex` reads bodies only, so the `Location` parameters are cut with `between`, in the order the service provider writes them. An OpenID Connect form login is the same steps (untested). |
+| SAML messages signed by a service provider | not shown | — | — | Not tested. The HTTP-Redirect binding needs DEFLATE (RFC 1951) and the POST binding XML signatures over Exclusive XML Canonicalization; neither family is small, so neither was added. |
+
 
 Not done; each needs a primitive or a feature, not a site name: OAuth 1.0a normalization in
 `canonical_query`; SigV4A key derivation; NTLM and Negotiate (connection-bound: each HTTPS
@@ -727,7 +740,9 @@ without the owner (reading a code from another record, like the `mail` item of p
 OpenPGP; ssh-agent (`credentials tunnel --agent`); BIP-340 Schnorr; incoming webhook
 `verify`; `decrypt`; `generate` and rotation; egress through a proxy; SNMPv3 (RFC 3414 key
 localization and AES-CFB over the UDP relay); OAUTHBEARER; executing IR `repeat` and `if`
-(parsed and refused, section 8c).
+(parsed and refused, section 8c); found by the table above: a template variable for the
+caller's request headers, a detached AEAD output, an Ed25519 public key from its private key,
+DEFLATE and Exclusive XML Canonicalization.
 
 Each part adds its rows to `docs/threat-model.md`, fuzz targets for any new parser, and
 measured results in its pull request.
@@ -758,6 +773,11 @@ approvals inside another company's app (KakaoTalk, a bank's app push).
 - Delegations and requests of emergency access are restored from the log, like spending
   limits. A node restarted from a cut log without `restore_anchored` can bring back a
   revoked delegation or forget a cancellation; the anchor is the defence, as for limits.
+- Covering the caller's own header fields in a signature (RFC 9421, Hawk's content type)
+  needs a template variable that reads them; such a value would be caller-chosen like
+  `$body`. Whether to add it, and for which headers, is open (section 11, part 11 table).
+- Nonce retries (DPoP `use_dpop_nonce`, ACME `badNonce`) are written unconditionally until IR
+  `if` runs; until then a policy fits only servers that always ask for a nonce first.
 - Vending checks the expiry the service states. A service that states a shorter expiry than
   it honours is out of the node's reach; the owner's scope in the fixed request is the
   other bound.
