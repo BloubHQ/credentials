@@ -457,8 +457,8 @@ left open, and the more secure option taken:
   `smtp_host`, `smtp_port`, `imap_host` and `imap_port` (required).
 
 Measured on this host (Windows, `cargo test --workspace --locked --no-fail-fast`): tests
-TESTS_BEFORE before, TESTS_AFTER after, 0 failed; the release `credentials.exe` SIZE_BEFORE
-bytes before, SIZE_AFTER after. The new tests run against a MySQL, MQTT, AMQP and SFTP server
+498 before, 553 after, 0 failed; the release `credentials.exe` 12,044,288
+bytes before, 12,329,984 after (+285,696). The new tests run against a MySQL, MQTT, AMQP and SFTP server
 written in the test process, and the SSH test server now does P-384 (SHA-384) and P-521
 (SHA-512) key exchange, RSA host keys (`rsa-sha2-256/512`, keys generated with the `rsa`
 crate in the test), and verifies ECDSA P-256/P-384, RSA PKCS#1 and OpenSSH-format client
