@@ -7,6 +7,8 @@ before 1.0, minor versions may break formats and APIs.
 
 ### Changed
 
+- CI fuzzes each target for 10 seconds on a pull request, 60 on main and 300 in a new daily
+  scheduled run (previously 60 everywhere).
 - A protocol line that arrives whole is held to the line bound too (`proto::io::Io::line`):
   before, a line longer than the bound passed when its end was already buffered.
 
@@ -59,6 +61,26 @@ before 1.0, minor versions may break formats and APIs.
     signing policies, verified by ring, `rsa` and GnuPG 2.4.9 (v4 only, by hand).
   - Dev-dependencies `num-bigint` 0.4.8 and `crypto-primes` 0.7.2, both already in
     `Cargo.lock`.
+- Parameter lists, derived EC keys and binary-message helpers as template families
+  (`docs/policy.md`, Parameter lists, derived EC keys and binary messages; `docs/design.md`
+  section 11), for OAuth 1.0a, the SigV4A key and NTLMv2 over HTTP:
+  - `sorted_params(list, ...)`: 1 to 8 form-encoded lists, decoded, encoded again as RFC 3986
+    says, sorted by name and value and joined (RFC 5849 section 3.4.1.3.2). A secret and a
+    chosen value may not meet in it (rule 2); a malformed `%` fails.
+  - `kbkdf_ec_key(curve, hash, key, fixed_prefix, fixed_suffix)`: an EC private key on
+    `p256`, `p384` or `k256` from NIST SP 800-108 counter-mode candidates (HMAC-SHA-2, the
+    candidate byte 1 to 254 between prefix and suffix), the first with `c <= n - 2` giving
+    `c + 1` (FIPS 186-5 appendix A.2.2). Curve and hash are fixed by the policy (rule 6); the
+    key is a secret (rule 8). `kbkdf_counter` shares its counter-mode code.
+  - `utf16le`, `utf16be` (UTF-8 to UTF-16, no BOM), `uint_be`, `uint_le` (1 to 8 bytes as a
+    decimal number; refused on a secret, rule 9).
+  - The summary flags `weak_mechanism` on every operation whose templates compute `md4`.
+- Worked policies `oauth1-hmac-sha1`, `oauth1-rsa-sha1`, `sigv4a` and `ntlm-http` (NTLMv2 with
+  the server's timestamp, `MsvAvFlags` and the MIC, on one TLS connection with hand-written
+  HTTP/1.1, then a relay), tested in `crates/engine/tests/schemes_primitives.rs` against RFC
+  5849 sections 1.2 and 3.4.1 and MS-NLMP section 4.2.4, and by verifiers written in the test.
+- Fuzz target `parameter_lists`: `sorted_params` never panics, stays within its bound and
+  is idempotent.
 
 - DEFLATE and XML canonicalization as template families (`docs/policy.md`, Compression and
   XML; `docs/design.md` section 11), the two gaps of the scheme table:

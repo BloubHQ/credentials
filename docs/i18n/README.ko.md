@@ -236,6 +236,9 @@ step 이전 형식(`"kind": "http" | "stream" | "derive"`)의 정책은 `credent
 | SRP-6a 로그인 | `random("32")`의 `srp_public`, salt와 `B`를 받은 뒤 `srp_x`, `srp_premaster`, `sha256`, `srp_m1`, 그리고 무엇이든 반환하기 전에 서버 `M2`를 `srp_verify` |
 | OpenPGP 분리 서명 | 연결 없음: `rsa_sign_pkcs1("sha256", ...)`(MPI) 또는 다이제스트의 `ed25519_sign`을 `pgp_armor("SIGNATURE", pgp_packet("2", ...))`로 감싸고, `pgp_subpacket`과 trailer는 `be16`, `be32`, `len`으로 작성. v4는 GnuPG로 검증 |
 | SAML 서비스 제공자, WS-Security | HTTP-Redirect: `b64(deflate(authn))`와 쿼리에 대한 `rsa_sign_pkcs1_sha256` 또는 `p256_sign`. HTTP-POST: `xml_c14n("http://www.w3.org/2001/10/xml-exc-c14n#", ...)` 위의 enveloped 서명. 모두 `rsa`와 ring으로 검증 |
+| OAuth 1.0a (RFC 5849) | base string 위의 `sorted_params($query, $body, ...)`와 `hmac_sha1` 또는 `rsa_sign_pkcs1("sha1", ...)`. RFC 5849 벡터, `hmac`과 `rsa`로 검증 |
+| AWS Signature Version 4A | `kbkdf_ec_key("p256", "sha256", ...)`(SP 800-108 카운터 모드, FIPS 186-5 rejection sampling)와 `p256_sign_der`. 테스트에서 따로 도출한 키로 ring이 검증 |
+| HTTP 위의 NTLMv2 (MS-NLMP) | 하나의 `tls` 연결에서 `md4`(약함 표시), `hmac_md5`, `utf16le`, `uint_le`, MIC 포함, 이후 relay. MS-NLMP 4.2.4 벡터 |
 | Ethereum | 연결 없음: `{{ k256_sign_recoverable(key, keccak256($input)) }}`와, 받는 주소·체인·data를 고정하고 금액을 제한하는 `rlp` input 스키마 |
 | IMAP | tls: 인사말 receive, `a1 LOGIN {{user}} {{password}}` send, receive, 정책이 나열한 명령만 중계 |
 | TOTP | 연결 없음: `{{ totp(b32decode(seed)) }}` |
@@ -619,7 +622,7 @@ cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace --locked
 ```
 
-최소 Rust 버전: 1.88(`enclave` 크레이트는 `aws-nitro-enclaves-nsm-api` 때문에 1.92). CI는 `cargo audit`, `cargo deny`, MSRV 테스트, 재현 가능 빌드 검사, 대상별 60초 퍼징도 실행합니다. 변경 기록은 [CHANGELOG](../CHANGELOG.md)에 있습니다.
+최소 Rust 버전: 1.88(`enclave` 크레이트는 `aws-nitro-enclaves-nsm-api` 때문에 1.92). CI는 `cargo audit`, `cargo deny`, MSRV 테스트, 재현 가능 빌드 검사, 대상별 퍼징(PR에서 10초, main에서 60초, 매일 한 번 300초)도 실행합니다. 변경 기록은 [CHANGELOG](../CHANGELOG.md)에 있습니다.
 [CONTRIBUTING.md](../../.github/CONTRIBUTING.md)를 참고하세요.
 
 ## 보안

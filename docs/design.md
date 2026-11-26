@@ -928,6 +928,33 @@ secret influences, static request bounds and the other limits of `docs/policy.md
 branches; `engine::policy::flow`), so the nonce retries the table marks as unconditional can now
 be conditional.
 
+Since then, three of these were done with standard families (`docs/policy.md`, Parameter
+lists, derived EC keys and binary messages): `sorted_params` (the RFC 5849 normalization;
+`canonical_query` keeps SigV4's), `kbkdf_ec_key` (SP 800-108 counter mode with FIPS 186-5
+A.2.2 rejection sampling), and `utf16le`, `utf16be`, `uint_be`, `uint_le` with the existing
+`md4` (now flagged weak) for NTLMv2. NTLM is connection-bound, so its policy writes HTTP/1.1
+itself on one `tls` connection and relays the caller's requests after the handshake.
+
+| Scheme or check | Result | Tests | Checked against |
+| --- | --- | --- | --- |
+| OAuth 1.0a normalization and HMAC-SHA1 | works as-is | `oauth1_rfc5849_vectors`, `oauth1_hmac_sha1_signs_the_callers_query_and_form_body` | RFC 5849 section 1.2 (the signature `MdpQcU8iPSUjWoN/UDMsK2sui9I=`) and section 3.4.1.1 (the base string, byte for byte); two signed requests with a query and a form body holding `+`, `%2B`, UTF-8 and reserved characters, the base string rebuilt from the wire by a normalizer written in the test and the MAC recomputed with `hmac` |
+| OAuth 1.0a RSA-SHA1 and PLAINTEXT | works as-is | `oauth1_rsa_sha1_and_plaintext` | The RSA-SHA1 signature verified by the `rsa` crate over the rebuilt base string; PLAINTEXT equal to the encoded secrets |
+| SigV4A key derivation and signature | works with caveat | `sigv4a_key_derivation_and_signature_verify` | The key equals one derived in the test with `hmac` and byte arithmetic (SP 800-108 counter mode, `c <= n - 2`, `d = c + 1`); its public key (by `p256`) verifies the DER signatures of two requests with ring over a string to sign rebuilt from the wire. Caveat: no published SigV4A vector was at hand, so the check is the specification written twice, not a vendor's output |
+| `kbkdf_ec_key` rejection sampling | works as-is | `the_boundary_of_the_test`, `a_refused_candidate_moves_to_the_next_number` (unit) | `n - 1`, `n` and all ones refused, `n - 2` and zero accepted; the counter moves on after a refusal and gives up after 254 |
+| NTLMv2 (MS-NLMP) | works as-is | `ntlmv2_ms_nlmp_vectors` | MS-NLMP section 4.2.4: NTOWFv2, the LMv2 response, NTProofStr and the session base key, byte for byte |
+| NTLM over HTTP on one connection | works with caveat | `ntlmv2_over_one_tls_connection_verifies` | NEGOTIATE, a CHALLENGE built in the test, AUTHENTICATE: NTProofStr recomputed with `md4` and `hmac`, the server's timestamp in the blob, `MsvAvFlags` with the MIC bit, the MIC over the three messages; then a relayed request; a second call has a fresh client challenge. Caveats: HTTP/1.1 written by the policy (no chunked 401 bodies: a body is left for the next read); `upper` is ASCII only; no key exchange (RC4 `KEY_EXCH` is not offered, so no signing or sealing after authentication) |
+| Kerberos `Negotiate` (SPNEGO) over HTTP | not done | — | Needs the AP exchange and SPNEGO framing, not only primitives |
+| SP 800-108 feedback and double-pipeline modes | not done | — | No published vector at hand to check them against |
+
+Attacks measured with them: `sorted_params` with a secret beside chosen pairs, or mixed into
+one list, is refused (rule 2), and a sorted secret handed back (rule 5); `kbkdf_ec_key`
+handed back, or a hash of it (rule 5), and with a chosen curve or hash (rule 6), are
+refused; NTOWFv2 of a guessable password handed back (rule 5, guessable), `md4(utf16le)` of a
+mixed value (rule 1) and `uint_le` of a secret (rule 9) are refused; the summary flags
+`weak_mechanism` for the `ntlm-http` policy and not for `oauth1-hmac-sha1`; a form body with a
+lone `%` fails before sending, and a CHALLENGE without a timestamp or not in base64 fails before
+AUTHENTICATE is written.
+
 Each part adds its rows to `docs/threat-model.md`, fuzz targets for any new parser, and
 measured results in its pull request.
 

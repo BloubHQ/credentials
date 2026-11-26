@@ -226,6 +226,9 @@ let outcome = node.run(&call, &mut TlsTransport::new());
 | SRP-6a 登录 | 对 `random("32")` 求 `srp_public`，收到 salt 和 `B` 后用 `srp_x`、`srp_premaster`、`sha256`、`srp_m1`，返回任何内容之前用 `srp_verify` 检查服务器的 `M2` |
 | OpenPGP 分离签名 | 无连接：用 `pgp_armor("SIGNATURE", pgp_packet("2", ...))` 包裹 `rsa_sign_pkcs1("sha256", ...)`（MPI）或对摘要的 `ed25519_sign`，`pgp_subpacket` 与 trailer 用 `be16`、`be32`、`len` 写出；v4 经 GnuPG 验证 |
 | SAML 服务提供方、WS-Security | HTTP-Redirect：`b64(deflate(authn))`，并对查询串用 `rsa_sign_pkcs1_sha256` 或 `p256_sign` 签名；HTTP-POST：对 `xml_c14n("http://www.w3.org/2001/10/xml-exc-c14n#", ...)` 的 enveloped 签名；均用 `rsa` 和 ring 验证 |
+| OAuth 1.0a (RFC 5849) | 对 base string 用 `sorted_params($query, $body, ...)` 和 `hmac_sha1` 或 `rsa_sign_pkcs1("sha1", ...)`；RFC 5849 向量，用 `hmac` 和 `rsa` 验证 |
+| AWS Signature Version 4A | `kbkdf_ec_key("p256", "sha256", ...)`（SP 800-108 计数器模式，FIPS 186-5 拒绝采样）和 `p256_sign_der`；用测试中另行派生的密钥由 ring 验证 |
+| HTTP 上的 NTLMv2 (MS-NLMP) | 在同一个 `tls` 连接上用 `md4`（标记为弱）、`hmac_md5`、`utf16le`、`uint_le`，含 MIC，之后 relay；MS-NLMP 4.2.4 向量 |
 | 以太坊 | 无连接：`{{ k256_sign_recoverable(key, keccak256($input)) }}`，配合固定收款地址、链和 data 并限制金额的 `rlp` input 模式 |
 | IMAP | tls：receive 问候，send `a1 LOGIN {{user}} {{password}}`，receive，只转发策略列出的命令 |
 | TOTP | 无连接：`{{ totp(b32decode(seed)) }}` |
@@ -570,7 +573,7 @@ cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace --locked
 ```
 
-最低 Rust 版本：1.88（`enclave` crate 为 1.92，因为需要 `aws-nitro-enclaves-nsm-api`）。CI 还会运行 `cargo audit`、`cargo deny`、MSRV 测试、可复现构建检查，以及每个目标 60 秒的模糊测试。变更记录见 [CHANGELOG](../CHANGELOG.md)。
+最低 Rust 版本：1.88（`enclave` crate 为 1.92，因为需要 `aws-nitro-enclaves-nsm-api`）。CI 还会运行 `cargo audit`、`cargo deny`、MSRV 测试、可复现构建检查，以及每个目标的模糊测试（拉取请求 10 秒，main 上 60 秒，每日运行 300 秒）。变更记录见 [CHANGELOG](../CHANGELOG.md)。
 参见 [CONTRIBUTING.md](../../.github/CONTRIBUTING.md)。
 
 ## 安全

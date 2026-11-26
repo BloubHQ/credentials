@@ -218,3 +218,10 @@ path = "fuzz_targets/ftp_pop3_replies.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "parameter_lists"
+path = "fuzz_targets/parameter_lists.rs"
+test = false
+doc = false
+bench = false

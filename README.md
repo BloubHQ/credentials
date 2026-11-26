@@ -241,6 +241,9 @@ policy is signed, every template is analysed:
 | SRP-6a login | `srp_public` of a `random("32")`, then `srp_x`, `srp_premaster`, `sha256` and `srp_m1` after the salt and `B` come back, and `srp_verify` of the server's `M2` before anything is returned |
 | OpenPGP detached signature | no connection: `pgp_armor("SIGNATURE", pgp_packet("2", ...))` around `rsa_sign_pkcs1("sha256", ...)` (an MPI) or `ed25519_sign` of the digest, with `pgp_subpacket` and the trailer written with `be16`, `be32` and `len`; v4 verified by GnuPG |
 | SAML service provider, WS-Security | HTTP-Redirect: `b64(deflate(authn))` and `rsa_sign_pkcs1_sha256` or `p256_sign` over the query; HTTP-POST: an enveloped signature over `xml_c14n("http://www.w3.org/2001/10/xml-exc-c14n#", ...)`; each verified with `rsa` and ring |
+| OAuth 1.0a (RFC 5849) | `sorted_params($query, $body, ...)` and `hmac_sha1` or `rsa_sign_pkcs1("sha1", ...)` over the base string; RFC 5849 vectors, verified with `hmac` and `rsa` |
+| AWS Signature Version 4A | `kbkdf_ec_key("p256", "sha256", ...)` (SP 800-108 counter mode, FIPS 186-5 rejection sampling) and `p256_sign_der`; verified with ring under a key derived in the test |
+| NTLMv2 over HTTP (MS-NLMP) | `md4` (flagged weak), `hmac_md5`, `utf16le`, `uint_le` on one `tls` connection, with the MIC, then a relay; MS-NLMP 4.2.4 vectors |
 | Ethereum | no connection: `{{ k256_sign_recoverable(key, keccak256($input)) }}` with an `rlp` input schema that fixes the recipient, chain and data and bounds the value |
 | IMAP | tls: receive the greeting, send `a1 LOGIN {{user}} {{password}}`, receive, relay the commands the policy lists |
 | TOTP | no connection: `{{ totp(b32decode(seed)) }}` |
@@ -655,7 +658,7 @@ cargo test --workspace --locked
 ```
 
 Minimum Rust: 1.88 (the `enclave` crate: 1.92, for `aws-nitro-enclaves-nsm-api`). CI also runs `cargo audit`, `cargo deny`, tests on the MSRV, a
-reproducible-build check and 60 seconds of fuzzing per target. See [CONTRIBUTING.md](.github/CONTRIBUTING.md); changes are listed in
+reproducible-build check and fuzzing per target (10 seconds on a pull request, 60 on main, 300 in a daily run). See [CONTRIBUTING.md](.github/CONTRIBUTING.md); changes are listed in
 [docs/CHANGELOG.md](docs/CHANGELOG.md).
 
 ## Security

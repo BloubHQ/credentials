@@ -18,9 +18,11 @@ use crate::{Error, Result, totp};
 
 mod cbor;
 pub mod compress;
+mod eckey;
 pub(crate) mod hpke;
 mod kdf;
 mod modes;
+pub mod params;
 mod pgp;
 mod sign;
 mod srp;
@@ -347,6 +349,44 @@ fn canonical_query(query: &[u8]) -> Result<Bytes> {
         out.extend_from_slice(value);
     }
     Ok(out)
+}
+
+/// `utf16le(text)` and `utf16be(text)`: UTF-8 text as UTF-16 code units (RFC 2781) of either
+/// byte order, without a byte order mark. Text that is not UTF-8 is refused.
+fn utf16(text: &[u8], little: bool) -> Result<Bytes> {
+    let text = core::str::from_utf8(text).map_err(|_| Error::Encoding)?;
+    let mut out = Zeroizing::new(Vec::with_capacity(text.len() * 2));
+    for unit in text.encode_utf16() {
+        out.extend_from_slice(&if little {
+            unit.to_le_bytes()
+        } else {
+            unit.to_be_bytes()
+        });
+    }
+    Ok(out)
+}
+
+/// `uint_be(value)` and `uint_le(value)`: 1 to 8 octets read as an unsigned integer of
+/// either byte order, in decimal: the inverse of `be16` ... `le64`, for the length and offset
+/// fields of binary messages.
+fn uint_decode(value: &[u8], little: bool) -> Result<Bytes> {
+    let refused = || bad("uint_be and uint_le read 1 to 8 bytes");
+    if value.is_empty() || value.len() > 8 {
+        return Err(refused());
+    }
+    let mut word = [0u8; 8];
+    let place = if little {
+        word.get_mut(..value.len())
+    } else {
+        word.get_mut(8 - value.len()..)
+    };
+    place.ok_or_else(refused)?.copy_from_slice(value);
+    let number = if little {
+        u64::from_le_bytes(word)
+    } else {
+        u64::from_be_bytes(word)
+    };
+    Ok(Zeroizing::new(number.to_string().into_bytes()))
 }
 
 /// Year, month and day of a count of days since 1970-01-01 (proleptic Gregorian).
@@ -919,6 +959,11 @@ pub(crate) fn output_bound(func: Func, args: &[Bytes]) -> usize {
         // Bounded inside by what the budget has left, which they are given.
         Func::Inflate | Func::ZlibInflate | Func::GzipInflate | Func::XmlC14n => 0,
         Func::XmlEscape => len(0) * 6,
+        Func::SortedParams => params::bound(args.iter().map(|a| a.len()).sum(), args.len()),
+        // A UTF-8 sequence of n octets is one or two code units: at most 2n octets.
+        Func::Utf16Le | Func::Utf16Be => len(0) * 2,
+        Func::UintBe | Func::UintLe => 20,
+        Func::KbkdfEcKey => 64,
         _ => len(0) + 128,
     }
 }
@@ -1093,6 +1138,21 @@ fn call_family(func: Func, args: &[Bytes], budget: &Budget) -> Result<Option<Byt
         Func::GzipInflate => compress::inflate(at(0)?, compress::Framing::Gzip, budget.left())?,
         Func::XmlC14n => xml::c14n(at(0)?, at(1)?, opt(2), budget.left())?,
         Func::XmlEscape => xml::escape(at(0)?)?,
+        Func::SortedParams => {
+            let lists: Vec<&[u8]> = args.iter().map(|a| a.as_slice()).collect();
+            params::sorted(&lists)?
+        }
+        Func::Utf16Le => utf16(at(0)?, true)?,
+        Func::Utf16Be => utf16(at(0)?, false)?,
+        Func::UintBe => uint_decode(at(0)?, false)?,
+        Func::UintLe => uint_decode(at(0)?, true)?,
+        Func::KbkdfEcKey => eckey::derive(
+            eckey::Curve::parse(at(0)?)?,
+            kdf::Sha2::parse(at(1)?)?,
+            at(2)?,
+            at(3)?,
+            at(4)?,
+        )?,
         Func::Turboshake128 => turbo::turboshake(turbo::Level::L128, at(0)?, at(1)?, at(2)?)?,
         Func::Turboshake256 => turbo::turboshake(turbo::Level::L256, at(0)?, at(1)?, at(2)?)?,
         Func::Kt128 => turbo::kt(turbo::Level::L128, at(0)?, at(1)?, at(2)?)?,
