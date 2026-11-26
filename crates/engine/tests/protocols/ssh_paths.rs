@@ -703,3 +703,21 @@ fn mpint(magnitude: &[u8]) -> Vec<u8> {
     body.extend(trimmed);
     fake_ssh::string(&body)
 }
+
+#[test]
+fn an_approved_sftp_session_runs_the_commands_it_was_signed_with() {
+    same_after_approval(
+        &files_setup(),
+        "files",
+        session(
+            "box.example.com",
+            22,
+            vec![
+                command("report", &["/srv/reports/may.csv"]),
+                command("upload", &["notes", "hello"]),
+            ],
+            Vec::new(),
+        ),
+        || Fake::new(files_server()),
+    );
+}

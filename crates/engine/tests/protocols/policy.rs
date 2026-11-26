@@ -197,3 +197,64 @@ fn the_examples_of_the_reference_are_valid_policies() {
     }
     assert_eq!(count, 13);
 }
+
+/// The policy of `steps` with every use waiting for approval, or paying a fixed amount.
+fn waiting(steps: Value, approval: bool, pays: bool) -> engine::Result<()> {
+    let mut policy = policy_of(steps);
+    policy.operations[0].approval = approval;
+    if pays {
+        policy.operations[0].payment = Some(engine::policy::Payment {
+            amount: engine::policy::AmountSource::Fixed {
+                value: "100".into(),
+            },
+            currency: "EUR".into(),
+            exponent: 2,
+        });
+    }
+    policy.validate()
+}
+
+#[test]
+fn an_operation_that_streams_does_not_wait_for_approval() {
+    let streaming = [
+        // An SSH shell: the caller's frames.
+        json!([ssh_open(json!({})), {"do": "return", "relay": {"server": true, "frames": [
+            {"kind": "binary", "shape": {"raw": {"pattern": "[ -~]{1,256}"}}}]}}]),
+        // A live MQTT relay: the messages of the subscriptions.
+        json!([{"do": "open", "connection": "mqtt",
+                "destinations": [{"host": "broker.example.com", "port": 8883}],
+                "login": {"user": "device-7", "password": "{{password}}"}},
+               {"do": "send", "command": {"text": "subscribe", "params": ["sensors/+"]}},
+               {"do": "return", "relay": {"server": true}}]),
+        // A WebSocket.
+        json!([{"do": "open", "connection": "websocket",
+                "destinations": [{"host": "api.example.com", "port": 443}]},
+               {"do": "send", "request": {"from": "fixed", "method": "GET", "path": "/ws"},
+                "inject": [{"target": {"kind": "header", "name": "Authorization"},
+                            "template": "Bearer {{key}}"}]},
+               {"do": "return", "relay": {"server": true, "frames": [
+                   {"kind": "text", "shape": {"raw": {"pattern": "[a-z]{1,16}"}}}]}}]),
+        // A streamed HTTPS response.
+        json!([{"do": "open", "connection": "https",
+                "destinations": [{"host": "api.example.com", "port": 443}]},
+               {"do": "send", "request": {"from": "fixed", "method": "GET", "path": "/events"},
+                "inject": [{"target": {"kind": "header", "name": "Authorization"},
+                            "template": "Bearer {{key}}"}]},
+               {"do": "return", "response": {"body": "stream"}}]),
+    ];
+    for (i, steps) in streaming.into_iter().enumerate() {
+        // Signed as it is: the refusal below is for the wait alone.
+        waiting(steps.clone(), false, false).unwrap();
+        for (approval, pays) in [(true, false), (false, true)] {
+            let refused = waiting(steps.clone(), approval, pays);
+            assert!(
+                matches!(&refused, Err(engine::Error::PolicyInvalid { rule, .. })
+                    if rule.contains("streams does not wait")),
+                "case {i} refused at signing (approval {approval}, payment {pays}): {:?}",
+                refused.err()
+            );
+        }
+    }
+    // Commands that end: the operation waits holding nothing.
+    waiting(json!([ssh_open(json!({})), commands()]), true, false).unwrap();
+}

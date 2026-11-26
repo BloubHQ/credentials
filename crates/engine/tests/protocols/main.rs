@@ -44,6 +44,7 @@ use engine::keys::{CallerKey, DeviceKey, NodeKey, UserKey};
 use engine::log::{Event, MemorySink};
 use engine::node::{FromCaller, Node, Part, Relay, SessionOutput, SystemClock};
 use engine::policy::{Caller, Destination, FieldSpec, Operation, Policy};
+use engine::session::Pending;
 
 pub type TestNode = Node<MemorySink, SystemClock>;
 
@@ -54,6 +55,8 @@ pub fn caller_key() -> CallerKey {
 pub struct Setup {
     pub node: TestNode,
     pub record: engine::record::Record,
+    pub device: DeviceKey,
+    values: Vec<(String, Vec<u8>)>,
 }
 
 pub fn operation(value: serde_json::Value) -> Operation {
@@ -74,19 +77,27 @@ pub fn setup(fields: &[(FieldSpec, &[u8])], operations: Vec<Operation>) -> Setup
         }],
         operations,
     };
+    let values = fields
+        .iter()
+        .map(|(spec, value)| (spec.name.clone(), value.to_vec()))
+        .collect();
+    build(policy, values)
+}
+
+fn build(policy: Policy, values: Vec<(String, Vec<u8>)>) -> Setup {
     policy.validate().unwrap();
     let device = DeviceKey::generate();
     let user_key = [7u8; 32];
-    let mut values = Fields::new();
-    for (spec, value) in fields {
-        values.insert(&spec.name, value.to_vec()).unwrap();
+    let mut fields = Fields::new();
+    for (name, value) in &values {
+        fields.insert(name, value.clone()).unwrap();
     }
     let record = engine::record::Record::seal(
         &UserKey::from_bytes(&mut user_key.clone()),
         "rec-1",
         "user-1",
         device.sign_policy(policy).unwrap(),
-        &values,
+        &fields,
     )
     .unwrap();
     let node = Node::new(NodeKey::generate(), MemorySink::new(), SystemClock);
@@ -108,7 +119,23 @@ pub fn setup(fields: &[(FieldSpec, &[u8])], operations: Vec<Operation>) -> Setup
         )
         .unwrap();
     node.grant(&sealed).unwrap();
-    Setup { node, record }
+    Setup {
+        node,
+        record,
+        device,
+        values,
+    }
+}
+
+impl Setup {
+    /// The same record on a new node, with every operation waiting for the owner's approval.
+    pub fn approving(&self) -> Setup {
+        let mut policy = self.record.policy.policy.clone();
+        for operation in &mut policy.operations {
+            operation.approval = true;
+        }
+        build(policy, self.values.clone())
+    }
 }
 
 pub fn sign(s: &Setup, operation: &str, body: Body) -> SignedCall {
@@ -165,6 +192,55 @@ pub fn last_closed(s: &Setup) -> (bool, String) {
         Some(Event::Closed { ok, reason, .. }) => (ok, reason),
         _ => panic!("no closed entry"),
     }
+}
+
+/// Runs `body` as signed, then again on a copy of `s` whose operations wait for the owner's
+/// approval: nothing is opened before the approval, the waiting call is told again until it
+/// comes, and once approved the call runs the commands and messages it was signed with.
+pub fn same_after_approval<P: Peer>(s: &Setup, op: &str, body: Body, fake: impl Fn() -> Fake<P>) {
+    let mut plain = fake();
+    let expected = session_output(s.node.run(&sign(s, op, body.clone()), &mut plain).result);
+    assert!(expected.error.is_none(), "the call runs without approval");
+    assert!(!expected.results.is_empty(), "the call runs commands");
+
+    let a = s.approving();
+    let mut waiting = fake();
+    let summary = match a.node.run(&sign(&a, op, body), &mut waiting).result {
+        Ok(Output::Pending(Pending::ApprovalRequired { summary, .. })) => *summary,
+        Ok(_) => panic!("ran without waiting for the approval"),
+        Err(e) => panic!("refused: {e}"),
+    };
+    assert!(
+        waiting.opened.is_empty(),
+        "nothing opened before the approval"
+    );
+    let resume = || sign(&a, op, Body::resume(summary.id));
+    assert!(
+        matches!(
+            a.node.run(&resume(), &mut waiting).result,
+            Ok(Output::Pending(Pending::ApprovalRequired { .. }))
+        ),
+        "still waiting"
+    );
+    assert!(waiting.opened.is_empty(), "nothing opened while it waits");
+    a.node
+        .approve(&a.device.approve(&summary, engine::node::now_ms()).unwrap())
+        .unwrap();
+    let out = session_output(a.node.run(&resume(), &mut waiting).result);
+    assert!(out.error.is_none(), "the approved call ends well");
+    assert!(
+        out.results == expected.results,
+        "the approved call runs the commands it was signed with"
+    );
+    assert_eq!(waiting.opened, plain.opened);
+    assert!(
+        matches!(
+            a.node.run(&resume(), &mut waiting).result,
+            Err(engine::Error::ParkedUnknown)
+        ),
+        "the id is spent"
+    );
+    assert_eq!(a.node.waiting(), 0);
 }
 
 /// A server that runs in the test: it reads what the node writes and answers.

@@ -7,6 +7,12 @@ before 1.0, minor versions may break formats and APIs.
 
 ### Changed
 
+- **An operation on a streaming call no longer waits.** A WebSocket, an SSH shell or
+  forward, a live MQTT relay and an HTTPS operation whose response streams are refused
+  `"approval": true`, a `payment` and an item kind that waits for approval when the policy is
+  signed: the resume is a call of its own, with no stream left to relay. The node checks it
+  again before it parks anything.
+
 - Every browser fill now ends by clearing the page's history and checking it holds one
   entry (a browser that keeps it refuses the fill after the values went in), so the
   back/forward cache cannot bring a filled document back; a fill is refused when any target
@@ -734,6 +740,16 @@ before 1.0, minor versions may break formats and APIs.
 
 ### Security
 
+- An approved operation on a protocol connection (SSH and SFTP, PostgreSQL, MySQL, Redis,
+  SMTP, IMAP, POP3, FTP, MQTT, AMQP 0-9-1 and 1.0) never went on: the caller's commands and
+  messages were not kept with the waiting operation, so the resume failed
+  (`operation_unknown`, or `policy_invalid` on IMAP; measured: 13 of 13 approved sessions
+  failed, now 13 of 13 return what the same call returns unapproved, with nothing opened
+  before the approval). They are now kept as signed, counted against the 128 MiB of waiting
+  values, and wiped (as every kept caller payload now is) when the operation goes on, lapses
+  or is dropped. A resumed protocol or browser operation now takes a connection slot, as
+  the call that started it did. UDP exchanges and derivation input were already kept
+  (tested).
 - The delimiters of a caller's TLS exchanges were an oracle on a secret the server echoes:
   with `until` set to the bytes before the secret plus a guessed byte, the read ended there
   only when the guess was right (measured: 3 of 3 bytes learned). A match is now taken only

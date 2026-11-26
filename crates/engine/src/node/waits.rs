@@ -12,7 +12,8 @@ use crate::item::Origin;
 use crate::limits::{LimitRule, Spend, SpendingLimits, StateKey, Verdict, decimal, from_minor};
 use crate::log::LogSink;
 use crate::policy::{
-    AmountSource, Destination, MAX_AMOUNT, Operation, Payment, Renew, parse_query, read_amount,
+    AmountSource, Connection, Destination, MAX_AMOUNT, Operation, Payment, Renew, parse_query,
+    read_amount,
 };
 use crate::request::{Outbound, Request};
 use crate::session::{Pending, SealedAnswer};
@@ -27,9 +28,10 @@ fn random_id() -> [u8; 16] {
     id
 }
 
-/// What the caller gave, kept while the operation waits.
-fn given_of(payload: Payload<'_>, input: &[u8]) -> Given {
-    match payload {
+/// What the caller gave, kept while the operation waits: exactly what it signed, run as
+/// signed when the operation goes on (a resume carries none).
+fn given_of(payload: Payload<'_>, input: &[u8]) -> Result<Given> {
+    Ok(match payload {
         Payload::Http(request) => Given::Http(request.cloned()),
         Payload::Derive(given) => Given::Derive {
             given: given.to_vec(),
@@ -42,11 +44,24 @@ fn given_of(payload: Payload<'_>, input: &[u8]) -> Given {
             destination: destination.clone(),
             exchanges: exchanges.to_vec(),
         },
-        Payload::Describe | Payload::Resume(_) | Payload::Socket(_) | Payload::Session { .. } => {
-            Given::Http(None)
+        Payload::Session {
+            destination,
+            commands,
+            mail,
+        } => Given::Session {
+            destination: destination.clone(),
+            commands: commands.to_vec(),
+            mail: mail.to_vec(),
+        },
+        // A WebSocket holds the caller's streaming call; nothing else waits.
+        Payload::Describe | Payload::Resume(_) | Payload::Socket(_) => {
+            return Err(Error::RequestInvalid { rule: NO_WAIT });
         }
-    }
+    })
 }
+
+/// Why an operation on a streaming call does not wait.
+const NO_WAIT: &str = "an operation that streams does not wait for the owner's approval";
 
 /// Where the first request of the operation goes.
 fn first_destination(operation: &Operation, request: Option<&Request>) -> Option<Destination> {
@@ -302,6 +317,11 @@ impl<S: LogSink, C: Clock> Node<S, C> {
         if !approval {
             return Ok(None);
         }
+        // Refused when the policy is signed; checked again so a streaming call never parks.
+        if operation.streams() {
+            return Err(Error::RequestInvalid { rule: NO_WAIT });
+        }
+        let given = given_of(payload, input)?;
         let mut lines: Vec<String> = lines.into_iter().map(fit).collect();
         lines.truncate(MAX_LINES);
         let item = match policy.item {
@@ -366,7 +386,7 @@ impl<S: LogSink, C: Clock> Node<S, C> {
                 summary: Box::new(summary),
                 approved: false,
             },
-            given: given_of(payload, input),
+            given,
             spend,
             saved: None,
             pending: pending.clone(),
@@ -420,7 +440,7 @@ impl<S: LogSink, C: Clock> Node<S, C> {
             expires_ms,
             at,
             wait: state,
-            given: given_of(payload, input),
+            given: given_of(payload, input)?,
             spend: None,
             saved: Some(save(run)),
             pending: pending.clone(),
@@ -450,6 +470,15 @@ impl<S: LogSink, C: Clock> Node<S, C> {
             &Payload::Resume(id),
             now,
         )?;
+        // A protocol connection or a browser is open for the whole call: the call that goes
+        // on takes one of the bounded slots, as the one that started it did. Taken before the
+        // waiting operation is, so a full node leaves it waiting.
+        let _slot = match operation.connection() {
+            Some(c) if c.is_protocol() || c == Connection::Browser => {
+                Some(self.live.take(&record.owner, &checked.caller, policy)?)
+            }
+            _ => None,
+        };
         let parked = {
             let mut state = self.lock();
             let Some(parked) = state.parked.get_mut(id, now) else {
@@ -597,6 +626,18 @@ impl<S: LogSink, C: Clock> Node<S, C> {
                 Payload::Stream {
                     destination,
                     exchanges,
+                },
+                &[][..],
+            ),
+            Given::Session {
+                destination,
+                commands,
+                mail,
+            } => (
+                Payload::Session {
+                    destination,
+                    commands,
+                    mail,
                 },
                 &[][..],
             ),

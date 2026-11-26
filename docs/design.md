@@ -208,7 +208,12 @@ a member or field of a body contract (JSON or form), or the policy. The node wri
 under a contract again and reads the amount from the bytes it sends, by the parser that
 wrote them, so the amount counted is the amount sent; the canonical spelling only, at most
 2^53 − 1 as a JSON number, the currency the policy's (`docs/policy.md`, Payments and
-spending limits). Multipart and XML bodies carry no amount the node reads. A payment within the owner's limits is counted
+spending limits). Multipart and XML bodies carry no amount the node reads. What the caller
+signed (its request, input, TLS or UDP exchanges, protocol commands and SMTP messages) is
+kept with the waiting operation and run as signed once it is approved; an operation that
+runs on a streaming call (WebSocket, SSH shell or forward, live MQTT relay, streamed HTTPS
+response) is refused approval, payment and an item kind that waits when the policy is
+signed, since parking it would mean holding the caller's stream until the owner answers. A payment within the owner's limits is counted
 when the node decides to send it, under the same lock as the check, even if the request then
 fails: counting early can only make the owner approve sooner, never let a split payment
 through.

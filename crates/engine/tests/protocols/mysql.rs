@@ -629,3 +629,18 @@ fn the_connection_byte_limit_ends_it() {
     assert!(!ok);
     assert_eq!(reason, "bytes");
 }
+
+#[test]
+fn an_approved_session_runs_the_commands_it_was_signed_with() {
+    same_after_approval(
+        &mysql_setup(),
+        "orders",
+        session(
+            "db.example.com",
+            3306,
+            vec![command("find", &["ann"]), command("touch", &["42"])],
+            Vec::new(),
+        ),
+        || fake(MysqlServer::new(PASSWORD), SERVER_CAPS),
+    );
+}
