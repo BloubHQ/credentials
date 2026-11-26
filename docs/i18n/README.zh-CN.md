@@ -246,8 +246,10 @@ let outcome = node.run(&call, &mut TlsTransport::new());
 `run` 步骤从目的地自己的源（origin）获取模块（URL 以及最好还有 SHA-256 写在已签名的策略中），
 或使用编译进节点的经过审查的库，并在沙箱中运行它（解释器 wasmi：没有 I/O、时钟和随机数，有燃料与
 内存上限）。它的输出只能进入策略固定发往同一源的请求：不会回到调用方，不会去往其他目的地，也不会
-进入日志；签名检查会拒绝其他一切用法。未固定哈希的模块会被标记。测量结果和 JavaScript 的计划见
-[docs/sandbox.md](../sandbox.md)。
+进入日志；签名检查会拒绝其他一切用法。未固定哈希的模块会被标记。站点的 JavaScript 也以同样方式在
+经过审查的引擎模块（编译为 WebAssembly 的 boa）上运行：步骤写明目的地源上脚本的 URL 及其 SHA-256
+（必填）；脚本没有时钟、随机数和 I/O，策略可以降低其燃料、内存和时间上限。测量结果以及据以选定引擎的
+QuickJS 对比见 [docs/sandbox.md](../sandbox.md)。
 
 **签名之前。** `summarize` 按每个 secret 列出它能去哪里、以什么形式、返回什么，以及风险标记
 （条目 origin 之外的目的地、通配符、明文 HTTP、接受任意字节的输入、可逆的输出、中继，以及新
@@ -569,7 +571,7 @@ credentials verify old.jsonl <旧节点密钥> --next new.jsonl --head new.jsonl
 | [`verify`](../../crates/verify) | 节点日志验证器，以 `credentials verify` 运行 |
 | [`attest`](../../crates/attest) | AWS Nitro Enclaves 证明文档验证器，以 `credentials attest` 运行 |
 | [`client`](../../crates/client) | 面向 iOS、Android 和 Web 应用的库：密钥、节点证明验证、授权、记录和调用；通过 UniFFI 绑定 Swift 和 Kotlin，通过 wasm-bindgen 绑定 JavaScript |
-| [`sandbox`](../../crates/sandbox) | `run` 步骤的 WebAssembly 沙箱（wasmi）：燃料与内存上限，接收输入、给出一个输出，经过审查的库模块 |
+| [`sandbox`](../../crates/sandbox) | `run` 步骤的 WebAssembly 沙箱（wasmi）：燃料、内存与时间上限，接收输入、给出一个输出，经过审查的库模块，JavaScript 引擎模块（`crates/sandbox/js`） |
 | [`cli`](../../crates/cli) | `credentials` 工具：密钥、策略、记录、授权、调用、节点服务器和 `credentials host` |
 
 ## 开发

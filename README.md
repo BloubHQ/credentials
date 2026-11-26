@@ -265,8 +265,11 @@ policy) or takes a reviewed library compiled into the node, and runs it in a san
 (wasmi, an interpreter: no I/O, no clock, no randomness, fuel and memory limits). Its output
 may go only into a request the policy fixes to that same origin: never back to the caller,
 to another destination or into the log; the signing check refuses every other use. An
-unpinned module is flagged. Measurements and the plan for JavaScript are in
-[docs/sandbox.md](docs/sandbox.md).
+unpinned module is flagged. A site's JavaScript runs the same way on a reviewed engine
+module (boa compiled to WebAssembly): the step names the script's URL on the destination's
+origin and its SHA-256, which is required; the script finds no clock, randomness or I/O, and
+the policy may lower its fuel, memory and time. Measurements, and the comparison with
+QuickJS that chose the engine, are in [docs/sandbox.md](docs/sandbox.md).
 
 **Before signing.** `summarize` lists, per secret, where it can go and in what form, what
 comes back, and risk flags (a destination outside the item's origin, wildcards, plain HTTP,
@@ -656,7 +659,7 @@ explains each.
 | [`attest`](crates/attest) | Verifier of AWS Nitro Enclaves attestation documents, run as `credentials attest` |
 | [`client`](crates/client) | The app side for iOS, Android and the web: keys, node attestation, grants, records and calls, re-grants to a successor node, key backup and 6-digit device transfer, bound to Swift and Kotlin (UniFFI) and JavaScript (wasm-bindgen) |
 | [`continuity`](crates/continuity) | Node continuity: successor statements signed with Sigstore keyless signing and verified offline, and the attested hand-over between two nodes |
-| [`sandbox`](crates/sandbox) | The WebAssembly sandbox of the `run` step (wasmi): fuel and memory limits, inputs in and one output out, reviewed library modules |
+| [`sandbox`](crates/sandbox) | The WebAssembly sandbox of the `run` step (wasmi): fuel, memory and time limits, inputs in and one output out, reviewed library modules, the JavaScript engine module (`crates/sandbox/js`) |
 | [`cli`](crates/cli) | The `credentials` tool: keys, policies, records, grants, calls, a node server, and `credentials host` |
 
 ## Development

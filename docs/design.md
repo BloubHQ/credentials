@@ -719,6 +719,29 @@ there is one sandbox to audit. Runtime and engine are chosen by measured size, s
 surface in their pull request: the runtime is wasmi 1.1.0, an interpreter (measurements and
 the JavaScript plan in `docs/sandbox.md`; the step in `docs/policy.md`, `run`).
 
+The JavaScript engine is boa 0.21.1 compiled to `wasm32-unknown-unknown`, the reviewed
+library `js` (`crates/sandbox/js`), loaded by hash (`sandbox::JS_SHA256`) and built
+reproducibly from its locked sources (`build/js-module.sh`, CI job `js-module`). A `run` step
+names the script (a URL on the destination's origin, SHA-256 required) and the function to
+call; outputs are confined as for any module, and the policy may lower fuel, memory, time
+and the script's size within the node's caps. Measured against QuickJS-NG 0.16.2 (rquickjs
+0.14.0) inside the same sandbox, same PC, same scripts, medians of 21 runs:
+
+| | boa (chosen) | QuickJS-NG |
+| --- | --- | --- |
+| Module | 3,401,557 B | 812,453 B |
+| Cold start | 66.0 ms, 30.1 M fuel | 30.7 ms, 15.8 M fuel |
+| One HMAC-SHA256 in JavaScript | 128.7 ms, 75.8 M fuel | 45.9 ms, 296.9 M fuel |
+| One HS256 JWT | 163.2 ms, 93.3 M fuel | 53.5 ms, 414.4 M fuel |
+| JSON transform × 1,000 | 783 ms, 441 M fuel | 227 ms, 325 M fuel |
+| HMACs within the fuel cap (10⁹) | about 40 | about 3 |
+| Imports | the four host functions | the four and a clock (`env.__rquickjs_host_now_us`) |
+| Build | cargo only | clang and a prebuilt wasi-libc `libc.a` inside `rquickjs-sys` |
+
+boa was chosen for the imports, the build from source without a C toolchain or prebuilt
+library, and four times the signing work per unit of fuel; QuickJS is about three times
+faster by the clock and a quarter of the size (details and method in `docs/sandbox.md`).
+
 ## 8d. Primitives shipped up front
 
 Functions are never added for a site. They are added as whole families (every curve, every
@@ -817,7 +840,7 @@ As built (part 10):
 | 4 | Policy JSON Schema, `client::summarize` with risk flags, approval format (done: `docs/policy.md`; the approval runtime is part 5) | 2, 3 |
 | 5 | Sessions, challenges, approvals, spending limits (done: `docs/policy.md`, Operations that wait; amounts from body contracts and `await` on TLS before the connection opens done too; codes read from a `mail` item are next) | 2 |
 | 6 | Connection kinds in layer 1: HTTP/2, WebSocket, streamed responses (first half done: `docs/policy.md`, HTTP versions and gRPC, WebSocket; own synchronous HTTP/2 client and HPACK, one thread per open connection, the Nitro host relay unchanged), then SSH, databases, FTP, mail, queues (second half done but for the rows left in section 7c: SSH with SFTP and local forwarding, PostgreSQL, MySQL, SMTP, IMAP, Redis, MQTT 3.1.1 and 5, AMQP 0-9-1, and the `ssh` and `mail` typed kinds; then POP3, FTP over TLS and SFTP management; then SSH remote forwarding and AMQP 1.0; tunnels as an IR relay step next) | 2 |
-| 7 | Trusted code sandbox (layer 3): WebAssembly runtime, JavaScript module, origin-pinned site code (done: `run` step, `crates/sandbox`, wasmi 1.1.0 chosen by measurement; JavaScript measured with boa in the sandbox, its shipping plan in `docs/sandbox.md`) | 2 |
+| 7 | Trusted code sandbox (layer 3): WebAssembly runtime, JavaScript module, origin-pinned site code (done: `run` step, `crates/sandbox`, wasmi 1.1.0 chosen by measurement; the JavaScript engine module `js`, boa chosen over QuickJS-NG by measurement (section 8e), scripts pinned on the destination's origin, policy `limits` and a wall-clock limit; `docs/sandbox.md`) | 2 |
 | 8 | Browser fills over CDP (done: the `browser` connection and `fill`, `engine::cdp`, `docs/policy.md` Browser fills; typed `card` and `login` fills from the kind's roles; the agent's controller kept out by the endpoint's exclusive grant, the page reloaded and its history cleared before control returns; tested against an in-process fake CDP endpoint, never a real browser or endpoint) | 4, 5 |
 | 9 | Remaining primitive families (Appendices A, B), UDP relay and its protocols (done: HPKE, TurboSHAKE, KangarooTwelve, ML-DSA, SM2, brainpool ECDSA, `tls_exporter` in TLS sends, the `udp` connection and the datagram relay; `docs/policy.md` and section 7b; the rows still open and why are listed under Appendix A, Part 9) | 1 |
 | 10 | Node hand-over; key backup and device transfer in `client` (done: `crates/continuity`, `Node::hand_over`/`take_over`, `credentials hand-over`, `credentials verify --next`, `client` continuity, backup and transfer; real Nitro hardware and the real Sigstore root are not exercised by the tests, and the compiled Sigstore trust root is empty until it is committed, so nodes refuse every statement until then) | 3 |
@@ -1138,6 +1161,14 @@ approvals inside another company's app (KakaoTalk, a bank's app push).
 - Vending checks the expiry the service states. A service that states a shorter expiry than
   it honours is out of the node's reach; the owner's scope in the fixed request is the
   other bound.
+
+- The JavaScript engine module's bytes are reproduced on a Windows host only (file names in
+  the module keep the host's separator); a Linux build differs. Building it inside the
+  enclave image build instead would need the `wasm32-unknown-unknown` standard library in the
+  pinned Rust image (a download to pin by digest). Its timings were not measured on
+  `x86_64-unknown-linux-musl`. One of its dependencies, `foldhash` 0.2.0, is `Zlib`, a licence
+  not in `.github/deny.toml`'s allow list (as is `foldhash` 0.1.5 already in the node's
+  Cargo.lock); the module's crate is not checked by `cargo deny`.
 
 ## Appendix A. Gaps found against the IANA registries (2026-11)
 

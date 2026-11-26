@@ -259,8 +259,10 @@ step 이전 형식(`"kind": "http" | "stream" | "derive"`)의 정책은 `credent
 가능하면 SHA-256을 서명된 정책에 둠) 노드에 컴파일된 검토된 라이브러리를 골라 샌드박스에서 실행합니다
 (인터프리터 wasmi: I/O, 시계, 난수 없음, 연료와 메모리 한도). 그 출력은 정책이 같은 출처로 고정한
 요청에만 들어갈 수 있고, 호출자에게도, 다른 목적지에도, 로그에도 가지 않습니다. 다른 쓰임은 서명할 때
-모두 거부됩니다. 해시를 고정하지 않은 모듈은 표시됩니다. 측정 결과와 JavaScript 계획은
-[docs/sandbox.md](../sandbox.md)에 있습니다.
+모두 거부됩니다. 해시를 고정하지 않은 모듈은 표시됩니다. 사이트의 JavaScript도 같은 방식으로,
+검토된 엔진 모듈(WebAssembly로 컴파일한 boa)에서 실행됩니다. step은 목적지 출처에 있는 스크립트의
+URL과 SHA-256(필수)을 적고, 스크립트에는 시계, 난수, I/O가 없으며, 정책이 연료, 메모리, 시간 한도를
+낮출 수 있습니다. 측정 결과와 엔진을 고른 QuickJS 비교는 [docs/sandbox.md](../sandbox.md)에 있습니다.
 
 **서명 전에.** `summarize`는 비밀마다 갈 수 있는 곳과 형태, 돌아오는 것, 위험 플래그(항목의
 origin 밖 목적지, 와일드카드, 평문 HTTP, 아무 바이트나 받는 입력, 되돌릴 수 있는 출력, 릴레이,
@@ -619,7 +621,7 @@ PKCS#1 v1.5 서명을 하지 못하므로 `rsa_sign_pkcs1("sha1", …)`만 RustC
 | [`verify`](../../crates/verify) | 노드 로그 검증기, `credentials verify`로 실행 |
 | [`attest`](../../crates/attest) | AWS Nitro Enclaves 증명 문서 검증기, `credentials attest`로 실행 |
 | [`client`](../../crates/client) | iOS, Android, 웹 앱 쪽 라이브러리: 키, 노드 증명 검증, grant, 레코드, 호출. Swift와 Kotlin(UniFFI), JavaScript(wasm-bindgen) 바인딩 |
-| [`sandbox`](../../crates/sandbox) | `run` step의 WebAssembly 샌드박스(wasmi): 연료·메모리 한도, 입력을 받고 출력 하나를 냄, 검토된 라이브러리 모듈 |
+| [`sandbox`](../../crates/sandbox) | `run` step의 WebAssembly 샌드박스(wasmi): 연료·메모리·시간 한도, 입력을 받고 출력 하나를 냄, 검토된 라이브러리 모듈, JavaScript 엔진 모듈(`crates/sandbox/js`) |
 | [`cli`](../../crates/cli) | `credentials` 도구: 키, 정책, 레코드, grant, 호출, 노드 서버, `credentials host` |
 
 ## 개발
