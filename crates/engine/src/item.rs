@@ -873,6 +873,13 @@ fn check_operation(
                 "a typed item has no UDP operation",
             );
         }
+        Some(Connection::Browser) => {
+            return shape_ensure(
+                false,
+                || at.to_string(),
+                "a typed item has no browser operation yet",
+            );
+        }
         None => ShapeConnection::None,
     };
     shape_ensure(

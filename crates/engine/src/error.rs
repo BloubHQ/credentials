@@ -317,6 +317,15 @@ pub enum Error {
         /// `caller`, `owner` or `node`.
         who: &'static str,
     },
+    /// A browser fill was refused: the page is not at the policy's origin, it changed
+    /// between the check and the fill, another client is attached to it, an element is
+    /// missing or ambiguous, or the browser answered what the protocol or the node's bounds do
+    /// not allow. The text is fixed: nothing the browser or the page sent is in it.
+    #[error("fill refused: {rule}")]
+    FillRefused {
+        /// Which rule.
+        rule: &'static str,
+    },
     /// The module of a `run` step was refused: its origin did not answer 200, it is too
     /// large, it does not match its pin, or the library is unknown.
     #[error("module refused: {rule}")]

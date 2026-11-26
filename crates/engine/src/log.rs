@@ -208,7 +208,8 @@ pub enum Event {
         /// True when it ended normally (either side closed, the response ended).
         ok: bool,
         /// Why it ended, as a fixed word (`server`, `caller`, `idle`, `duration`, `bytes`,
-        /// `refused`, `reflection`, `error`).
+        /// `refused`, `reflection`, `error`; for a browser fill `navigated`, `submitted`,
+        /// `refused` or `limit`).
         reason: String,
         /// Messages (or body parts) and bytes sent to the server after the opening request.
         to_server: (u64, u64),

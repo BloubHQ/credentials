@@ -19,6 +19,8 @@ What the engine protects, against whom, under which assumptions, and what is lef
 | Caller (app or AI agent) | Nothing beyond its policy entry | Extract the secret through requests, inputs and responses; exceed its limits; replay calls; act as another caller |
 | Destination server | Receiving the secret it is meant to receive | Echo the secret back to the caller; hand back values that act as keys; send oversized or malformed responses |
 | Log store | Keeping entries | Read them; drop, cut or edit them |
+| Browser behind a CDP endpoint (browser fills) | Showing pages faithfully and receiving the values typed into the page of the policy's origin | Show a page at another origin; answer commands the node did not send; flood, stall or send huge messages; keep the values |
+| Page at the policy's origin (browser fills) | Receiving the values typed into it, as from a person | Navigate or swap frames during a fill; read a field back and keep it |
 | Server of a web page that runs the `client` package | Serving the code the owner expects | Serve other code that reads the owner's keys, or grants to a node of its choosing; swap the measurements list |
 
 ## Assumptions
@@ -38,6 +40,9 @@ What the engine protects, against whom, under which assumptions, and what is lef
   SHA-2, HMAC, TLS with WebPKI.
 - **A4.** The destination is the service the owner meant; the engine guarantees the secret
   goes to that host over TLS, not what the service then does with it.
+- **A5.** For browser fills, the browser behind the CDP endpoint the policy names is the one
+  the owner meant and renders pages faithfully: the node checks origins as the browser
+  reports them and cannot see the page's TLS through CDP.
 
 ## What stops each attack
 
@@ -138,6 +143,15 @@ What the engine protects, against whom, under which assumptions, and what is lef
 | Caller or operator reads a secret sent over UDP (datagrams carry no TLS; in an enclave the host relays them) | A `udp` send template must not be tainted: a secret goes into a datagram only through a one-way function (an HMAC, a signature); the destination is fixed by the policy and the socket is connected to it; the summary flags `plain_datagram` | `policy`, `transport::udp` |
 | Server or path answers a datagram with another one, or floods the node with datagrams | A connected socket (or the relay's per-destination socket) takes datagrams from the destination's address only; one datagram per read, at most 65,507 bytes; reads searched for reflected secrets like stream reads; at most 3 resends and 10 s per read | `transport::udp`, `relay::datagram`, `node` |
 | Host relay sends datagrams to other places than the policy names | The enclave asks for one `host:port` per socket (`DATAGRAM host:port`); the host checks it against its `udp/` allow list; the content is what the policy allows on the path anyway | `relay::datagram`, `host` |
+| Caller reads a value a browser fill types, by relaying CDP or answering for the browser | The node connects to the CDP endpoint the policy fixes, over TLS (WebPKI) through its own transport; the caller chooses at most the handshake request within its contract. There is no relay of CDP and a browser `return` takes nothing; a streaming, stream or derive call to a browser operation is refused before anything is sent. Tested | `node::browser`, `policy` |
+| A page at another origin gets the value (another tab, a look-alike host, plain `http`) | The one `page` target whose URL is at the policy's `https` origin (none or two refuse); the top frame's URL and reported security origin checked on every frame-tree read; `location.origin` checked by the node's own function in the page, in the same task that sets the value. Tested, including a frame tree that lies about the origin | `node::browser`, `cdp` |
+| The page navigates, or a frame is swapped, between the check and the fill | The frame tree is read before and after each fill: same top frame and element frame, same loader ids (a navigation changes the loader, a swap the id); the fill function checks the origins again in the same task; the element is a remote object bound to the document it was found in, so a new document makes the call fail. Tested: a navigation after the lookup (to another origin and within the origin), one right after a fill, a frame swap, and an element of a document that is gone | `node::browser` |
+| A cross-origin iframe takes the value (an ad frame, a frame nested in one) | An element is looked up only in the top frame, or in a direct child frame at the frame origin the policy names (flagged `frame_origin`); `location.ancestorOrigins` checked in the frame; a selector that matches twice, or in two frames, refuses. Tested | `node::browser`, `policy` |
+| Another CDP client (the agent's controller) reads the field during the fill | A page, or an out-of-process frame, that another client is attached to is refused; the node's functions run in an isolated world of its own; the fields are blanked after the submit when the page stays. A client that attaches after the check is not seen (residual risks) | `node::browser` |
+| The browser endpoint, or a forged one, answers what the node did not ask | One command at a time, answers matched by id and session; a second answer, a binary message, JSON that does not parse or holds a member twice, ends the fill; every result is read by a bounded typed reader; the node's functions must answer exactly `ok`. Tested for each | `cdp`, `node::browser` |
+| The value comes back to the caller through CDP events or errors | Events are dropped unread (their parameters are skipped, never kept); the messages of browser errors are skipped; refusals carry fixed texts; only the outcome and the final origin go back, searched for secrets. Tested with a browser that echoes every command, value included, as an event and in an error | `cdp`, `node::browser` |
+| Caller runs code in the page through the node | The node issues a fixed list of commands (never `Runtime.evaluate`); the only code it runs in a page is four constants of `engine::cdp`; the selector, origins and values go as JSON arguments, never as code | `cdp`, `node::browser` |
+| A browser floods, stalls or sends huge messages | 4 MiB per message, 10,000 events and 2,000 commands per connection, idle, duration (at most 5 minutes) and byte limits, an open-connection slot; each limit tested | `node::browser`, `node::live` |
 | Caller chooses the key or sender of an HPKE encryption (encrypts a secret to itself) | Rule 7: the recipient key, the PSK, its id and the sender key of `hpke_*` may not be caller-chosen; the suite and mode are fixed (rule 6); a PSK is at least 32 bytes | `template` |
 | Caller learns a secret through whether `hpke_open` fails (a chosen info or AAD next to a secret) | Every argument of `hpke_open` and `hpke_receiver_export` is sensitive (rule 1); the plaintext and exported secrets are tainted | `template` |
 | Exported TLS keying material leaves the connection it binds | `tls_exporter` exists only in a TLS `send`, after the handshake; it is tainted and never controlled, so it cannot be returned or hashed out alone; refused over TLS 1.2 (no proof of the extended master secret) | `template`, `policy`, `transport` |
@@ -153,6 +167,15 @@ These remain by design; each is listed in the README.
   the secret; accepted. A module fetched without a pin is whatever the origin serves at the
   time (flagged). A site that echoes the output transformed is not recognised by the search
   (see `docs/sandbox.md`).
+- **Browser fills trust the browser.** The node cannot see the page's TLS through CDP: the
+  certificate and the connection are the browser's, and a browser that lies (or whoever
+  runs it, such as a cloud browser service) can show any page at any origin and read every
+  value typed. The page at the origin reads the values, as it would from a person, and a
+  script of it can keep them; a script an earlier client planted in the document survives
+  unless the fill loads the page again (`navigate`). A client that attaches to the page
+  after the node's check is not seen. The fields are blanked only when the page stays after
+  the submit. Every browser operation is flagged `browser_fill`. The behaviour against a real
+  browser is not tested: the tests use an in-process fake CDP endpoint.
 - **One TEE (A1).** Only AWS Nitro Enclaves are integrated. Elsewhere the node is an ordinary
   process. The attestation document must be verified by the owner (certificate chain, PCRs,
   nonce, `user_data`); the node only produces it.

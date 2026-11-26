@@ -38,6 +38,7 @@ use crate::keys::{CallerPublicKey, DeviceKey, DevicePublicKey};
 use crate::template::{NameKind, Props, Template, Var};
 use crate::{Error, Result};
 
+mod browser;
 mod contract;
 mod input;
 pub mod legacy;
@@ -47,6 +48,10 @@ mod schema;
 pub mod summary;
 mod wait;
 
+pub use browser::{
+    BROWSER_BYTES, BROWSER_DURATION_MS, BROWSER_IDLE_MS, Element, FILL_WAIT_MS, Fill, FillField,
+    MAX_FILL_FIELDS, MAX_FILLS, MAX_NAVIGATE, MAX_SELECTOR, browser_limits,
+};
 pub use schema::JSON_SCHEMA;
 pub use summary::{Summary, summarize};
 
@@ -689,6 +694,11 @@ pub enum Connection {
     /// `receive` reads one. There is no TLS, so a send may not hold a secret in reversible
     /// form.
     Udp,
+    /// A browser, over the Chrome DevTools Protocol: a WebSocket to the CDP endpoint the
+    /// policy fixes. The first `send` is the handshake, as for a WebSocket; each later one is
+    /// a [`Fill`] the node runs itself. Nothing of the page goes back but the outcome and the
+    /// final origin; the caller issues no CDP command.
+    Browser,
 }
 
 /// The `open` step: the connection and where it may go.
@@ -845,6 +855,9 @@ pub struct Send {
     /// The command a protocol connection runs (SSH, PostgreSQL, IMAP, Redis).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub command: Option<Command>,
+    /// A browser fill (a `browser` connection, after the handshake).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fill: Option<Fill>,
 }
 
 /// The `receive` step. On HTTPS it reads the response of the `send` just before it; on a TLS
@@ -1165,6 +1178,9 @@ impl Operation {
                     if let Some(command) = &send.command {
                         out.push(command.text.as_str());
                         out.extend(command.params.iter().map(String::as_str));
+                    }
+                    if let Some(fill) = &send.fill {
+                        out.extend(fill.fields.iter().map(|f| f.template.as_str()));
                     }
                 }
                 Step::Compute(c) => out.push(&c.template),
@@ -1650,6 +1666,11 @@ impl Policy {
             || format!("{at}.frame"),
             "frame is for the messages of a WebSocket, after its handshake",
         )?;
+        ensure(
+            send.fill.is_none(),
+            || format!("{at}.fill"),
+            "fill is for a browser connection, after its handshake",
+        )?;
         let methods: Vec<Method> = match request {
             StepRequest::Fixed { method, .. } => vec![*method],
             StepRequest::Caller(contract) => contract.methods.clone(),
@@ -1660,7 +1681,7 @@ impl Policy {
             ) || matches!(request, StepRequest::Caller(c)
                 if c.headers.iter().any(|h| h.eq_ignore_ascii_case(name)))
         };
-        if open.connection == Connection::Websocket {
+        if matches!(open.connection, Connection::Websocket | Connection::Browser) {
             // The opening handshake: a GET with no body.
             ensure(
                 !send.grpc
@@ -1824,6 +1845,20 @@ impl Policy {
                     )?;
                 }
             }
+            Some(Connection::Browser) => {
+                // The caller gets the outcome and the final origin, never anything of the
+                // page, and sends no CDP command of its own.
+                ensure(
+                    ret.response.is_none() && ret.template.is_none() && ret.relay.is_none(),
+                    || at.to_string(),
+                    "a browser return takes nothing: the outcome goes back, never the page",
+                )?;
+                ensure(
+                    sent,
+                    || at.to_string(),
+                    "return needs the handshake and a fill before it",
+                )?;
+            }
             Some(Connection::Websocket) => {
                 ensure(
                     ret.response.is_none() && ret.template.is_none(),
@@ -1918,6 +1953,7 @@ impl Policy {
         let mut sends = 0usize;
         let mut polls = 0usize;
         let mut awaits = 0usize;
+        let mut fills = 0usize;
         let count = operation.steps.len();
         for (i, step) in operation.steps.iter().enumerate() {
             let at = format!("{at}.steps[{i}]");
@@ -1960,13 +1996,19 @@ impl Policy {
                                 .as_ref()
                                 .is_some_and(|p| p.body == Some(BodyProjection::Stream))
                         });
+                    let streams = streams || open.connection == Connection::Browser;
                     ensure(
                         open.limits.is_none() || streams,
                         || format!("{at}.limits"),
-                        "limits are for a WebSocket, a streamed response or a protocol connection",
+                        "limits are for a WebSocket, a browser, a streamed response or a protocol connection",
                     )?;
                     if let Some(rule) = open.limits.as_ref().and_then(StreamLimits::fault) {
                         return fail(format!("{at}.limits"), rule);
+                    }
+                    if open.connection == Connection::Browser
+                        && let Some(limits) = &open.limits
+                    {
+                        browser::check_browser_limits(&at, limits)?;
                     }
                 }
                 (Step::Send(_) | Step::Receive(_), None) => {
@@ -2003,15 +2045,33 @@ impl Policy {
                         )?;
                         self.check_https_send(&at, &kinds, open, send, &known)?;
                     }
-                    Connection::Websocket if sends == 0 => {
+                    Connection::Websocket | Connection::Browser if sends == 0 => {
                         sends += 1;
                         self.check_https_send(&at, &kinds, open, send, &known)?;
+                    }
+                    Connection::Browser => {
+                        fills += 1;
+                        ensure(fills <= MAX_FILLS, || at.clone(), "at most 8 fills")?;
+                        ensure(
+                            send.request.is_none()
+                                && send.inject.is_empty()
+                                && send.template.is_none()
+                                && !send.grpc
+                                && send.frame.is_none(),
+                            || at.clone(),
+                            "a browser send after the handshake takes fill only",
+                        )?;
+                        let Some(fill) = &send.fill else {
+                            return fail(at, "a browser send after the handshake needs a fill");
+                        };
+                        self.check_fill(&format!("{at}.fill"), &kinds, fill, &known)?;
                     }
                     Connection::Websocket => {
                         ensure(
                             send.request.is_none()
                                 && send.inject.is_empty()
                                 && !send.grpc
+                                && send.fill.is_none()
                                 && send.frame.is_some(),
                             || at.clone(),
                             "a WebSocket send after the handshake takes frame and template",
@@ -2039,6 +2099,7 @@ impl Policy {
                             send.request.is_none()
                                 && send.inject.is_empty()
                                 && !send.grpc
+                                && send.fill.is_none()
                                 && send.frame.is_none(),
                             || at.clone(),
                             "a TLS send takes template only",
@@ -2060,6 +2121,7 @@ impl Policy {
                             send.request.is_none()
                                 && send.inject.is_empty()
                                 && !send.grpc
+                                && send.fill.is_none()
                                 && send.frame.is_none(),
                             || at.clone(),
                             "a UDP send takes template only",
@@ -2132,6 +2194,12 @@ impl Policy {
                         )?;
                         self.check_captures(&at, &receive.capture, true, true, &mut known)?;
                     }
+                    Connection::Browser => {
+                        return fail(
+                            at,
+                            "a browser connection reads nothing from the page: no receive",
+                        );
+                    }
                     Connection::Websocket => {
                         ensure(
                             receive.until.is_empty(),
@@ -2190,16 +2258,22 @@ impl Policy {
                 (Step::Run(run), _) => {
                     ensure(
                         connection != Some(Connection::Websocket)
-                            && !connection.is_some_and(Connection::is_protocol),
+                            && !connection.is_some_and(Connection::is_protocol)
+                            && connection != Some(Connection::Browser),
                         || at.clone(),
-                        "run is not available on a WebSocket",
+                        "run is not available on a WebSocket, a protocol connection or a browser",
                     )?;
                     self.check_run(&at, &kinds, open, run, &known)?;
                     known.push(&run.into);
                 }
                 (Step::Return(ret), _) => {
                     ensure(i + 1 == count, || at.clone(), "return is the last step")?;
-                    self.check_return(&at, &kinds, connection, ret, &known, sends > 0)?;
+                    let sent = if connection == Some(Connection::Browser) {
+                        fills > 0
+                    } else {
+                        sends > 0
+                    };
+                    self.check_return(&at, &kinds, connection, ret, &known, sent)?;
                     let streamed = ret
                         .response
                         .as_ref()
@@ -2223,9 +2297,10 @@ impl Policy {
                     awaits += 1;
                     ensure(awaits <= MAX_AWAITS, || at.clone(), "at most 4 await steps")?;
                     ensure(
-                        connection != Some(Connection::Websocket),
+                        connection != Some(Connection::Websocket)
+                            && connection != Some(Connection::Browser),
                         || at.clone(),
-                        "a WebSocket does not wait; await is for HTTPS and derivations",
+                        "a WebSocket or a browser does not wait; await is for HTTPS and derivations",
                     )?;
                     if wait.challenge.poll.is_some() {
                         polls += 1;
@@ -2650,6 +2725,11 @@ fn summarize_send(send: &Send, out: &mut Vec<String>) {
                 out.push("  ! some query parameters take any value".into());
             }
         }
+        None if send.fill.is_some() => {
+            if let Some(fill) = &send.fill {
+                summarize_fill(fill, out);
+            }
+        }
         None => out.push(format!(
             "  send {}{:?}",
             match send.frame {
@@ -2662,6 +2742,38 @@ fn summarize_send(send: &Send, out: &mut Vec<String>) {
     }
     if send.grpc {
         out.push("  (a unary gRPC call over HTTP/2)".into());
+    }
+}
+
+fn summarize_fill(fill: &Fill, out: &mut Vec<String>) {
+    let place = |frame: &Option<String>| match frame {
+        Some(frame) => format!(" in a frame of {frame}"),
+        None => String::new(),
+    };
+    out.push(format!(
+        "  fill the page at {}{}: {}; submit {:?}{}; wait {} ms",
+        fill.origin,
+        fill.navigate
+            .as_ref()
+            .map(|p| format!(" (loaded at {p} first)"))
+            .unwrap_or_default(),
+        fill.fields
+            .iter()
+            .map(|f| format!("{:?}{} <- {:?}", f.selector, place(&f.frame), f.template))
+            .collect::<Vec<_>>()
+            .join(", "),
+        fill.submit.selector,
+        place(&fill.submit.frame),
+        fill.wait()
+    ));
+    out.push(
+        "  ! the browser behind the CDP endpoint sees the values; the node cannot see the page's TLS through CDP"
+            .into(),
+    );
+    for frame in fill.other_frames() {
+        out.push(format!(
+            "  ! values go into a frame of {frame}, another origin than the page"
+        ));
     }
 }
 
@@ -2679,6 +2791,7 @@ fn summarize_operation(operation: &Operation, out: &mut Vec<String>) {
                 Connection::Smtp => "SMTP",
                 Connection::Imap => "IMAP",
                 Connection::Redis => "Redis",
+                Connection::Browser => "browser (CDP)",
                 Connection::Udp => "UDP datagrams (no TLS)",
             },
             destination_names(&open.destinations),

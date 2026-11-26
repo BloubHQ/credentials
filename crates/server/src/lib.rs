@@ -583,6 +583,11 @@ pub fn output_json(output: &Output) -> Value {
             "kind": "closed",
             "closed": serde_json::to_value(closed).unwrap_or(Value::Null),
         }),
+        // How a browser fill ended: its outcome and the page's final origin.
+        Output::Fill(filled) => json!({
+            "kind": "fill",
+            "fill": serde_json::to_value(filled).unwrap_or(Value::Null),
+        }),
     }
 }
 

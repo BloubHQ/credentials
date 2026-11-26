@@ -45,12 +45,14 @@ use crate::response::{Http, MAX_RESPONSE};
 use crate::template::{Budget, Context, Template, Temps, Var};
 use crate::{Error, Result};
 
+mod browser;
 mod handover;
 mod live;
 mod park;
 mod proto;
 mod waits;
 
+pub use browser::{Filled, MAX_CDP_COMMANDS, MAX_CDP_EVENTS};
 pub use handover::{HandOver, MAX_PACKAGE, Successor, TakenOver};
 pub use live::{
     CallerFrame, Closed, FromCaller, MAX_STREAMS, MAX_STREAMS_PER_CALLER, MAX_STREAMS_PER_OWNER,
@@ -993,12 +995,13 @@ impl<S: LogSink, C: Clock> Node<S, C> {
                 // refused before it spends a nonce or the rate limit.
                 let kind_ok = matches!(
                     (operation.connection(), payload),
-                    (Some(Connection::Https), Payload::Http(_))
-                        | (
-                            Some(Connection::Tls | Connection::Udp),
-                            Payload::Stream { .. }
-                        )
-                        | (Some(Connection::Websocket), Payload::Socket(_))
+                    (
+                        Some(Connection::Https | Connection::Browser),
+                        Payload::Http(_)
+                    ) | (
+                        Some(Connection::Tls | Connection::Udp),
+                        Payload::Stream { .. }
+                    ) | (Some(Connection::Websocket), Payload::Socket(_))
                         | (
                             Some(
                                 Connection::Ssh
@@ -1279,6 +1282,15 @@ impl<S: LogSink, C: Clock> Node<S, C> {
             (None, _) if operation.connection().is_some_and(Connection::is_protocol) => {
                 Some(self.live.take(&record.owner, &auth.caller, policy)?)
             }
+            // A browser fill holds its CDP connection for the call: it takes a slot too.
+            (None, _) if operation.connection() == Some(Connection::Browser) => {
+                if !matches!(payload, Payload::Http(_)) {
+                    return Err(Error::RequestInvalid {
+                        rule: "a browser operation runs on an HTTP call",
+                    });
+                }
+                Some(self.live.take(&record.owner, &auth.caller, policy)?)
+            }
             (None, _) => None,
         };
         match payload {
@@ -1381,6 +1393,14 @@ impl<S: LogSink, C: Clock> Node<S, C> {
             self.renew_sessions(run, transport, updated)?;
         }
         match payload {
+            Payload::Http(request) if run.operation.connection() == Some(Connection::Browser) => {
+                let open = run
+                    .operation
+                    .open()
+                    .ok_or_else(|| run.operation.unknown())?;
+                self.run_browser(run, open, request, transport, updated)
+                    .map(Output::Fill)
+            }
             Payload::Http(request) => match self.run_https(run, request, transport, updated)? {
                 Flow::Done(response) => Ok(Output::Http(response)),
                 Flow::Park(at) => self

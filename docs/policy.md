@@ -23,13 +23,13 @@ Policy
     ├── payment: amount, currency    optional: checked against the owner's spending limits
     ├── approval: true               optional: every use waits for the owner's approval
     └── steps:  [Step]               1–64
-        ├── open     connection: https | tls, destinations, identity
-        ├── send     https: request (caller contract | fixed) + inject;  tls: template
+        ├── open     connection: https | tls | websocket | udp | browser, destinations, identity
+        ├── send     https: request (caller contract | fixed) + inject;  tls: template;  browser: fill
         ├── receive  https: the response of the send;  tls: until a delimiter;  + capture
         ├── compute  into a name, from a template
         ├── run      site code or a reviewed library in the sandbox; output only to its origin
         ├── await    a challenge: a code from the owner's device, or a site the node polls
-        ├── return   https: response projection;  tls: relay;  none: template
+        ├── return   https: response projection;  tls: relay;  browser: nothing;  none: template
         ├── repeat   (syntax only, refused)
         └── if       (syntax only, refused)
 ```
@@ -105,6 +105,7 @@ The kind of connection decides what `send`, `receive` and `return` mean:
 | `https` | One request on its own TLS connection (HTTP/2 or HTTP/1.1, chosen by ALPN; see [HTTP versions and gRPC](#http-versions-and-grpc)): `request` and `inject`. | Reads the response of the `send` just before it, for its captures. | `response`: the projection of the last response, which may be streamed. | A request within the contract of each `send` that takes it. |
 | `tls` | Writes a rendered `template`. | Reads up to and including the first of `until` (1 to 8 delimiters of 1 to 256 bytes). | `relay`: which of the caller's exchanges run after the steps. | Exchanges, each matched against `relay`. |
 | `websocket` | The first is the handshake (an HTTPS `send` with a GET); each later one writes a message: `frame` and `template`. | After the handshake, reads its answer's headers; later, the next message. | `relay`: which of the caller's frames go to the server, and whether the server's go back. | Signed frames, each matched against `relay.frames`. |
+| `browser` | The first is the handshake with the CDP endpoint (as for a WebSocket); each later one is a `fill` the node runs itself. | — (refused) | Nothing: the outcome and the page's final origin go back. | At most the handshake request, within its contract; no CDP command. |
 | none (no `open`) | — | — | `template`: the output. | Its `input`, checked by the `input` schema. |
 
 Rules for every operation:
@@ -117,23 +118,23 @@ Rules for every operation:
 - `run` needs an HTTPS connection and may appear anywhere after `open`.
 - `await` may appear in an HTTPS operation or one with no connection, at most 4 times; not
   on TLS or a WebSocket, whose connection would stay open while it waits.
-- `run` and `await` are refused on a WebSocket.
+- `run` and `await` are refused on a WebSocket and a browser; `receive` on a browser.
 - `repeat` and `if` are refused for now (see [Loops and branches](#loops-and-branches)).
 
 Protocol connections (SSH, PostgreSQL, SMTP, IMAP, Redis) fit the same steps: each kind says
 what its `send`, `receive` and `return` carry, and the template analysis stays the same (see
-[Protocol connections](#protocol-connections)). Other kinds (MySQL, MQTT, AMQP, a browser over
-CDP) are not implemented yet.
+[Protocol connections](#protocol-connections)). Other kinds (MySQL, MQTT, AMQP) are not implemented yet; a browser over CDP is
+[Browser fills](#browser-fills).
 
 ### `open`
 
 | Member | Meaning |
 | --- | --- |
-| `connection` | `https`, `tls`, `websocket` (always `wss`), or a [protocol connection](#protocol-connections): `ssh`, `postgres`, `smtp`, `imap`, `redis`; or `udp` (see [UDP](#udp)). |
+| `connection` | `https`, `tls`, `websocket` (always `wss`), or a [protocol connection](#protocol-connections): `ssh`, `postgres`, `smtp`, `imap`, `redis`; `udp` (see [UDP](#udp)); or `browser` (a CDP endpoint over `wss`; see [Browser fills](#browser-fills)). |
 | `destinations` | 1–32 hosts and ports. `*.example.com` matches exactly one label (`eu.example.com`, not `example.com` or `a.b.example.com`); `*.` must be followed by at least two labels, so `*.com` is refused. Hosts are lowercase labels of `a–z 0–9 -` (at most 253 bytes), and the port is not 0. The caller's request or stream names one of them. |
 | `identity` | Optional client certificate for mutual TLS: two templates, handed to the transport only. |
 | `protocol` | HTTPS only, optional: `h2` or `http1` pins the HTTP version. Without it the node offers both by ALPN and takes what the server picks. A pinned version the server does not agree to fails the call before the request is written (no downgrade). |
-| `limits` | For a WebSocket or an operation whose response is streamed, optional: `idle_ms` (default 30 s, at most 120 s), `duration_ms` (default 10 min, at most 1 h) and `bytes` (both ways together; default 64 MiB, at most 1 GiB). Reaching one ends the connection. |
+| `limits` | For a WebSocket, a browser or an operation whose response is streamed, optional: `idle_ms` (default 30 s, at most 120 s), `duration_ms` (default 10 min, at most 1 h) and `bytes` (both ways together; default 64 MiB, at most 1 GiB). On a browser the defaults are 10 s, 60 s and 16 MiB, and the duration is at most 5 minutes. Reaching one ends the connection. |
 
 ### `send` on HTTPS
 
@@ -318,6 +319,110 @@ capture falls back to the header of the same name, as a trailers-only gRPC answe
 A WebSocket and a streamed response are open connections: a caller holds at most 4 at once,
 an owner 16, a node 256. The node logs one entry when one opens (the `use`) and one when it
 closes, with why it closed, the status, and the messages and bytes each way.
+
+### Browser fills
+
+An agent drives a browser somewhere else (its own controller: click, read, navigate). When
+a login form needs a secret, the agent calls the node, and the **node** types it: the agent
+never sees the value, and neither does whoever carries the agent's traffic.
+
+```json
+{"name": "login",
+ "steps": [
+   {"do": "open", "connection": "browser",
+    "destinations": [{"host": "cdp.browser.example.net", "port": 443}],
+    "limits": {"duration_ms": 60000}},
+   {"do": "send",
+    "request": {"from": "caller", "methods": ["GET"], "paths": ["/devtools/browser"],
+                "query": [{"name": "session", "pattern": "[0-9a-f]{32}", "required": true}]},
+    "inject": [{"target": {"kind": "header", "name": "Authorization"},
+                "template": "Bearer {{key}}"}]},
+   {"do": "send", "fill": {
+     "origin": "https://login.example.com",
+     "fields": [{"selector": "input[name=id]", "template": "{{user}}"},
+                {"selector": "#password", "template": "{{password}}"}],
+     "submit": {"selector": "form#login"},
+     "wait_ms": 5000}},
+   {"do": "return"}
+ ]}
+```
+
+**Who connects.** The node connects to the CDP endpoint the policy fixes (`open`
+destinations), over TLS from inside the enclave, through the same transport as a WebSocket.
+The caller does not relay CDP to the node, for two reasons: CDP carries the value of a fill
+in the clear inside its WebSocket, so a relay would read every value typed; and a relay
+could answer for the browser (a page at the right origin that is not). The caller chooses
+at most the handshake request within its contract (above: which browser session, by a query
+parameter of a fixed pattern); the policy may inject the endpoint's own credential.
+
+- The first `send` is the handshake: an HTTPS `send` with a GET, as for a
+  [WebSocket](#websocket).
+- Each later `send` is a `fill` (at most 8): nothing else, and no `receive` (nothing of the
+  page is read into the operation). `compute` may come between.
+- `return` takes nothing (`{"do": "return"}`): the caller gets the outcome only. There is no
+  relay: the caller cannot send a CDP command through the node.
+- `run` and `await` are refused.
+
+| `fill` member | Meaning |
+| --- | --- |
+| `origin` | The page: exactly `https://host` or `https://host:port`, lowercase, no path. Only `https`. |
+| `fields` | 1 to 16: `selector` (a CSS selector, 1 to 256 bytes of printable ASCII, passed to the page as data), optional `frame` (below), `template` (the value; secrets allowed; it must render to UTF-8). Each a different element. |
+| `submit` | `selector` and optional `frame`: a form the node submits (`requestSubmit()`) or an element it clicks. |
+| `frame` | The origin of the frame that holds the element: a **direct child** of the top frame at that origin. Without it, the element is in the top frame. A frame of another origin than the page is flagged `frame_origin`. |
+| `navigate` | Optional: a path on `origin` the node loads the page at first, so that nothing an earlier client planted in the document survives. At most 2048 bytes, no dot segment, no placeholder. |
+| `wait_ms` | How long the node waits for each element to appear and for the page to leave after the submit: default 5000, at most 30000. |
+
+What the node does, in order. The CDP commands it issues are exactly `Target.getTargets`,
+`Target.attachToTarget`, `Target.detachFromTarget`, `Page.navigate`, `Page.getFrameTree`,
+`Page.createIsolatedWorld`, `Runtime.callFunctionOn` and `Runtime.releaseObjectGroup`; never
+`Runtime.evaluate`. The only code it runs in a page is four fixed functions of its own
+(`engine::cdp::FIND`, `FILL`, `SUBMIT`, `CLEAR`), with the selector, origins and value as
+arguments.
+
+1. It picks the one `page` target whose URL is at `origin` (none, or two, refuses) and
+   refuses when another client is attached to it; then attaches (a flattened session).
+2. For each field: it reads the frame tree; the top frame's URL (and the security origin the
+   browser reports) must be at `origin`, and the element's frame must be the top frame or a
+   direct child at the `frame` origin; a frame of any other origin is never used. In an
+   isolated world of its own in that frame, `FIND` checks `location.origin` and
+   `location.ancestorOrigins` in the page itself and looks up the selector, which must match
+   exactly one element, in exactly one frame. A frame in another process is reached through
+   its own target.
+3. It reads the frame tree again: the same top frame and frame, with the same loaders. A
+   navigation changes the loader, a frame swap the id; either refuses.
+4. `FILL` sets the value on the element found (an `input` other than `hidden`, or a
+   `textarea`), after checking the origins again in the same task, so no navigation can come
+   between that check and the value; a document that changed makes the element's id unknown
+   and the call fail. It dispatches `input` and `change`.
+5. It reads the frame tree again, as in 3.
+6. The submit element is found and checked the same way; `SUBMIT` runs on it. The node waits
+   up to `wait_ms` for the top frame to load another document: `navigated`; otherwise
+   `submitted`, and it blanks every field it filled (`CLEAR`), so a later reader of the page
+   does not find the values there.
+
+Every message of the browser is read strictly: an answer to a command the node did not send,
+a second answer, an answer from another session, a binary message or JSON that does not
+parse ends the fill; events are counted (at most 10,000) and dropped unread; a message is at
+most 4 MiB, and a connection issues at most 2,000 commands. A refusal is
+`Error::FillRefused` with a fixed text: nothing the browser or the page sent.
+
+The call is an HTTP call (`{"kind": "http"}`, with the handshake request when its contract
+takes one) and answers `{"kind": "fill", "fill": {"outcome", "origin", "fields",
+"duration_ms", "log_seqs"}}`: `outcome` is `navigated` or `submitted`, `origin` the top
+frame's origin at the end (searched for secrets like any response). A browser connection
+takes one of the open-connection slots while it runs (4 per caller, 16 per owner, 256 per
+node), and the node logs one entry when it opens (the handshake, as any request) and one
+when it closes, with why (`navigated`, `submitted`, `refused`, `idle`, `duration`, `bytes`,
+`limit`) and the messages and bytes sent.
+
+What CDP cannot give, and what stays trusted: the node cannot see the page's TLS through CDP
+(the certificate and the connection are the browser's), and a browser that lies can show
+any page at any origin. The browser behind the endpoint is trusted with the values, as is
+the page at the origin, which reads them as it would from a person. A script of the page
+(or one an earlier client planted in it, unless `navigate` reloads it) can read the field
+back and keep it; the node blanks the fields when the page stays, but cannot stop that.
+Every browser operation is flagged `browser_fill`. A typed item has no browser operation
+yet.
 
 ### Protocol connections
 
@@ -676,6 +781,11 @@ an error stops the exchanges and is returned next to the reads that completed.
 See [WebSocket](#websocket). A server message is searched as a whole, with the end of the
 one before it, so a secret split across two messages is found too.
 
+#### Browser: the outcome
+
+`{"do": "return"}`: the outcome and the final origin of the page (see
+[Browser fills](#browser-fills)); nothing of the page, and no relay.
+
 #### No connection: the output
 
 ```json
@@ -883,8 +993,9 @@ crate, which checks the policy first) gives the owner, in JSON:
 
 - per secret field: each place it goes (scheme, host, port), in what form (a header, a query
   parameter, a path parameter, the body, a client identity, a stream send, the sign-in of a
-  protocol connection and its mechanism, a command on one, or the output of a derivation and
-  whether that is one-way);
+  protocol connection and its mechanism, a command on one, a browser field with its selector
+  and frame (going to the page's origin and to the CDP endpoint), or the output of a
+  derivation and whether that is one-way);
 - per operation: the connection and destinations, each request (fixed, or the caller's
   methods, path templates, headers and query allow-list), the injections, the response
   projection or relay patterns, the input schema, and each `run` step (`runs`: the module's
@@ -918,7 +1029,9 @@ crate, which checks the policy first) gives the owner, in JSON:
 | `mail_relay` | The caller sends mail over SMTP as the item's account. |
 | `shell_relay` | The caller types into an SSH shell. |
 | `plain_datagram` | An operation sends UDP datagrams, without TLS: what they carry is readable on the path. |
-| `wider` | Against `previous`: a new destination, method, path, header, query rule, injection, operation, caller or caller key; more of the response; a looser limit; a new sign-in, host key, TLS mode, command or mail rule; a field made public or not guessable; a payment changed or an approval dropped; a session rule changed; the item unbound or its pins and sign-offs changed. |
+| `browser_fill` | The node types secrets into a page in a browser over CDP: the page and the browser behind the endpoint get them, and the node cannot check the page's TLS through CDP. |
+| `frame_origin` | A fill puts values into a frame of another origin than the page's. |
+| `wider` | Against `previous`: a new destination, method, path, header, query rule, injection, operation, caller or caller key; more of the response; a looser limit; a new sign-in, host key, TLS mode, command or mail rule; a browser fill changed; a field made public or not guessable; a payment changed or an approval dropped; a session rule changed; the item unbound or its pins and sign-offs changed. |
 | `new_destination` | Against `previous`: a destination it did not have. |
 
 What changed without widening (an operation or a caller removed) is listed in `changes`.

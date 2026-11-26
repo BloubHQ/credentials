@@ -275,6 +275,7 @@ fn convert(operation: Operation, notes: &mut Vec<String>) -> NewOperation {
                     grpc: false,
                     frame: None,
                     command: None,
+                    fill: None,
                 }));
                 if !step.capture.is_empty() {
                     out.push(NewStep::Receive(Receive {
