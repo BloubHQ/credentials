@@ -280,7 +280,7 @@ impl<'c, 's> Sftp<'c, 's> {
             }
             match self.ssh.poll_event(WAIT)? {
                 Some(Event::Data(data)) => self.buf.extend_from_slice(&data),
-                Some(Event::Stderr(_) | Event::Exit(_)) | None => {}
+                Some(Event::Stderr(_) | Event::Exit(_) | Event::Forwarded { .. }) | None => {}
                 Some(Event::Closed) => {
                     return Err(Error::transport(crate::error::TransportKind::Closed, true));
                 }

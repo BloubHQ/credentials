@@ -8,6 +8,7 @@
 //! read through [`io::Io`], which enforces the connection's bounds.
 
 pub mod amqp;
+pub mod amqp1;
 pub mod ftp;
 pub mod imap;
 pub mod io;

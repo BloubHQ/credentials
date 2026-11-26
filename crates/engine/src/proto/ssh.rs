@@ -14,6 +14,12 @@
 //! SHA-1 (`diffie-hellman-group*-sha1`, `ssh-rsa` signatures, `hmac-sha1`) and CBC are never
 //! offered, so a server that offers only them is refused before anything secret is sent. A
 //! key re-exchange the server starts is refused: the connection ends.
+//!
+//! A channel the server opens is refused (`SSH_OPEN_ADMINISTRATIVELY_PROHIBITED`), unless it
+//! is the `forwarded-tcpip` channel of the one remote forward the node asked for
+//! ([`Client::tcpip_forward`]), for exactly the address and port it asked for, while no other
+//! channel is open: then the caller of the client decides ([`Event::Forwarded`]). More than
+//! [`MAX_REFUSED_OPENS`] refused opens end the connection.
 
 use std::time::Duration;
 
@@ -73,6 +79,7 @@ const USERAUTH_BANNER: u8 = 53;
 const USERAUTH_INFO_REQUEST: u8 = 60;
 const USERAUTH_INFO_RESPONSE: u8 = 61;
 const GLOBAL_REQUEST: u8 = 80;
+const REQUEST_SUCCESS: u8 = 81;
 const REQUEST_FAILURE: u8 = 82;
 const CHANNEL_OPEN: u8 = 90;
 const CHANNEL_OPEN_CONFIRMATION: u8 = 91;
@@ -96,6 +103,10 @@ const CHANNEL_PACKET: u32 = 32 * 1024;
 const MAX_ROUNDS: usize = 8;
 /// Longest wait for one packet in a blocking read.
 const WAIT: Duration = Duration::from_millis(50);
+/// Most channels the server may open that the node refuses before the connection ends.
+pub const MAX_REFUSED_OPENS: usize = 16;
+/// Longest originator address of a `forwarded-tcpip` channel the node takes.
+const MAX_ORIGINATOR: usize = 255;
 
 fn untrusted(rule: &'static str) -> Error {
     Error::ServerUntrusted { rule }
@@ -774,6 +785,27 @@ pub enum Event {
     Exit(u32),
     /// The server closed the channel.
     Closed,
+    /// The server opened the `forwarded-tcpip` channel of the remote forward: a connection to
+    /// the address and port the node asked it to listen on, from this originator. The caller
+    /// of the client accepts it ([`Client::accept_forwarded`]) or refuses it
+    /// ([`Client::refuse_forwarded`]).
+    Forwarded {
+        /// The address the connection came from, as the server says.
+        originator: Vec<u8>,
+        /// Its port.
+        port: u32,
+    },
+}
+
+/// A `forwarded-tcpip` channel the server opened, not yet accepted or refused.
+#[derive(Debug)]
+struct PendingOpen {
+    sender: u32,
+    window: u32,
+    max_packet: u32,
+    originator: Vec<u8>,
+    port: u32,
+    reported: bool,
 }
 
 /// What a command printed and how it ended.
@@ -821,6 +853,12 @@ pub struct Client<'s> {
     pub agreed: Agreed,
     next_channel: u32,
     channel: Option<Channel>,
+    /// The remote forward the server agreed to: the address and port it listens on.
+    forward: Option<(Vec<u8>, u16)>,
+    /// True once a forwarded channel was accepted: a forward serves one connection.
+    forward_used: bool,
+    pending: Option<PendingOpen>,
+    refused_opens: usize,
     /// Bytes of channel data each way: to the server, from it.
     pub data: (u64, u64),
 }
@@ -846,6 +884,10 @@ impl<'s> Client<'s> {
             },
             next_channel: 0,
             channel: None,
+            forward: None,
+            forward_used: false,
+            pending: None,
+            refused_opens: 0,
             data: (0, 0),
         };
         client.io.write(VERSION)?;
@@ -1140,8 +1182,132 @@ impl<'s> Client<'s> {
                 }
                 Ok(true)
             }
+            Some(&CHANNEL_OPEN) => {
+                self.server_open(packet)?;
+                Ok(true)
+            }
             _ => Ok(false),
         }
+    }
+
+    /// A channel the server opens: kept for the caller when it is the `forwarded-tcpip`
+    /// channel of the node's remote forward, to exactly its address and port, while nothing
+    /// else is open or waiting; refused otherwise.
+    fn server_open(&mut self, packet: &[u8]) -> Result<()> {
+        let mut p = Parse::new(packet);
+        p.u8()?;
+        let kind = p.string()?;
+        let sender = p.u32()?;
+        let window = p.u32()?;
+        let max_packet = p.u32()?;
+        let wanted = kind == b"forwarded-tcpip"
+            && self.channel.is_none()
+            && self.pending.is_none()
+            && !self.forward_used;
+        if wanted && let Some((address, port)) = self.forward.as_ref() {
+            let connected = p.string()?;
+            let connected_port = p.u32()?;
+            let originator = p.string()?;
+            let originator_port = p.u32()?;
+            p.end()?;
+            let matches = connected == address.as_slice() && connected_port == u32::from(*port);
+            let originator_ok =
+                originator.len() <= MAX_ORIGINATOR && originator.iter().all(u8::is_ascii_graphic);
+            if matches && originator_ok {
+                self.pending = Some(PendingOpen {
+                    sender,
+                    window,
+                    max_packet,
+                    originator: originator.to_vec(),
+                    port: originator_port,
+                    reported: false,
+                });
+                return Ok(());
+            }
+        }
+        self.refuse_open(sender, 1)
+    }
+
+    /// Answers a channel open of the server with a failure (`reason` 1: administratively
+    /// prohibited; 4: resource shortage), and counts it.
+    fn refuse_open(&mut self, sender: u32, reason: u32) -> Result<()> {
+        self.refused_opens += 1;
+        if self.refused_opens > MAX_REFUSED_OPENS {
+            return Err(untrusted(
+                "the server opened more channels than the node refuses",
+            ));
+        }
+        let mut put = Put::message(CHANNEL_OPEN_FAILURE);
+        put.u32(sender).u32(reason).string(b"refused").string(b"");
+        self.send(put.bytes())
+    }
+
+    /// Asks the server to listen on `address` and `port` and forward what connects there
+    /// (RFC 4254 section 7.1, `tcpip-forward`). The node asks once per connection, never for
+    /// port 0 (a port the server would choose).
+    pub fn tcpip_forward(&mut self, address: &[u8], port: u16) -> Result<()> {
+        if self.forward.is_some() || port == 0 {
+            return Err(invalid("one remote forward, to a port the policy fixes"));
+        }
+        let mut put = Put::message(GLOBAL_REQUEST);
+        put.string(b"tcpip-forward")
+            .bool(true)
+            .string(address)
+            .u32(u32::from(port));
+        self.send(put.bytes())?;
+        // Transport messages are taken on the way (a channel the server opens before it
+        // answers is refused: no forward is set yet).
+        let packet = self.recv()?;
+        match packet.first() {
+            // With a port the node fixed, the answer carries nothing else (a port is there
+            // only when port 0 was asked).
+            Some(&REQUEST_SUCCESS) => {
+                self.forward = Some((address.to_vec(), port));
+                Ok(())
+            }
+            Some(&REQUEST_FAILURE) => Err(invalid("the server refused the remote forward")),
+            _ => Err(invalid("unexpected answer to a remote forward")),
+        }
+    }
+
+    /// Accepts the `forwarded-tcpip` channel reported by [`Event::Forwarded`]: it becomes the
+    /// open channel.
+    pub fn accept_forwarded(&mut self) -> Result<()> {
+        let pending = self
+            .pending
+            .take()
+            .ok_or_else(|| invalid("no forwarded channel waits"))?;
+        let ours = self.next_channel;
+        self.next_channel = self.next_channel.wrapping_add(1);
+        let mut put = Put::message(CHANNEL_OPEN_CONFIRMATION);
+        put.u32(pending.sender)
+            .u32(ours)
+            .u32(WINDOW)
+            .u32(CHANNEL_PACKET);
+        self.send(put.bytes())?;
+        self.channel = Some(Channel {
+            ours,
+            theirs: pending.sender,
+            window: u64::from(pending.window),
+            max_packet: usize::try_from(pending.max_packet)
+                .unwrap_or(0)
+                .clamp(1, MAX_PACKET),
+            consumed: 0,
+            closed: false,
+            sent_close: false,
+        });
+        self.forward_used = true;
+        Ok(())
+    }
+
+    /// Refuses the `forwarded-tcpip` channel reported by [`Event::Forwarded`] (a resource
+    /// shortage: the node's limits on open connections).
+    pub fn refuse_forwarded(&mut self) -> Result<()> {
+        let pending = self
+            .pending
+            .take()
+            .ok_or_else(|| invalid("no forwarded channel waits"))?;
+        self.refuse_open(pending.sender, 4)
     }
 
     /// The next message that is not a transport message.
@@ -1384,6 +1550,13 @@ impl<'s> Client<'s> {
     /// The next channel event, within `wait`; `None` when nothing came.
     pub fn poll_event(&mut self, wait: Duration) -> Result<Option<Event>> {
         loop {
+            if let Some(pending) = self.pending.as_mut().filter(|p| !p.reported) {
+                pending.reported = true;
+                return Ok(Some(Event::Forwarded {
+                    originator: pending.originator.clone(),
+                    port: pending.port,
+                }));
+            }
             if let Some(packet) = self.try_recv()? {
                 if self.transport_message(&packet)? {
                     continue;
@@ -1480,6 +1653,7 @@ impl<'s> Client<'s> {
                 Some(Event::Stderr(data)) => output.stderr.extend_from_slice(&data),
                 Some(Event::Exit(status)) => output.exit = Some(status),
                 Some(Event::Closed) => break,
+                Some(Event::Forwarded { .. }) => self.refuse_forwarded()?,
             }
             if output.stdout.len().saturating_add(output.stderr.len()) > max {
                 let _ = self.end_channel(false);
@@ -1529,6 +1703,14 @@ impl<'s> Client<'s> {
     /// Ends the connection.
     pub fn disconnect(&mut self) {
         let _ = self.end_channel(false);
+        if let Some((address, port)) = self.forward.take() {
+            let mut put = Put::message(GLOBAL_REQUEST);
+            put.string(b"cancel-tcpip-forward")
+                .bool(false)
+                .string(&address)
+                .u32(u32::from(port));
+            let _ = self.send(put.bytes());
+        }
         let mut put = Put::message(DISCONNECT);
         // 11: SSH_DISCONNECT_BY_APPLICATION.
         put.u32(11).string(b"").string(b"");

@@ -171,6 +171,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "amqp1_frames"
+path = "fuzz_targets/amqp1_frames.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "protocol_servers"
 path = "fuzz_targets/protocol_servers.rs"
 test = false

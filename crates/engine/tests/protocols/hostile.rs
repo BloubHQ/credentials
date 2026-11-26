@@ -1,9 +1,9 @@
 //! Each client against servers that send noise or truncated answers: no panic, no sign-in.
 //! (The fuzz target `protocol_servers` does the same with coverage guidance.)
 
-use engine::policy::Mechanism;
+use engine::policy::{Mechanism, SettleMode};
 use engine::proto::io::{Bounds, Io};
-use engine::proto::{amqp, imap, mqtt, mysql, postgres, redis, sftp, smtp, ssh};
+use engine::proto::{amqp, amqp1, imap, mqtt, mysql, postgres, redis, sftp, smtp, ssh};
 use zeroize::Zeroizing;
 
 use super::*;
@@ -42,7 +42,7 @@ fn inputs() -> Vec<Vec<u8>> {
         state ^= state << 17;
         state
     };
-    let seeds: [&[u8]; 9] = [
+    let seeds: [&[u8]; 10] = [
         b"SSH-2.0-x\r\n\0\0\0\x2c\x04\x14",
         b"R\0\0\0\x17\0\0\0\x0aSCRAM-SHA-256\0\0",
         b"220 hi\r\n250-x\r\n250 AUTH PLAIN\r\n235 ok\r\n",
@@ -53,10 +53,12 @@ fn inputs() -> Vec<Vec<u8>> {
         b"\x4a\0\0\0\x0a8.0\0\x01\0\0\0abcdefgh\0\xff\xff\xff\x02\0\xff\xdf\x15",
         b"\x20\x02\0\0\x90\x03\0\x01\0\x30\x07\0\x03a/bxx",
         b"\x01\0\0\0\0\0\x20\0\x0a\0\x0a\0\x09\0\0\0\0\0\0\0\0\x05PLAIN",
+        // The AMQP 1.0 SASL header and sasl-mechanisms offering PLAIN.
+        b"AMQP\x03\x01\0\0\0\0\0\x18\x02\x01\0\0\0\x53\x40\xc0\x0b\x01\xe0\x08\x01\xa3\x05PLAIN",
     ];
     let mut out = Vec::new();
     for i in 0..4500u64 {
-        let seed = seeds[(i % 9) as usize];
+        let seed = seeds[(i % 10) as usize];
         let cut = (next() as usize) % (seed.len() + 1);
         let mut bytes = seed[..cut].to_vec();
         for _ in 0..(next() % 96) {
@@ -121,14 +123,22 @@ fn clients_survive_noise_and_never_sign_in_to_it() {
                         }
                     }
                 }
-                _ => {
+                7 => {
                     if let Ok(mut c) = amqp::Client::connect(io, b"/", b"u", b"pw") {
                         let _ = c.get(b"q", 4, 4096);
                     }
                 }
+                _ => {
+                    if let Ok(mut c) =
+                        amqp1::Client::connect(io, Mechanism::Plain, b"u", b"pw", b"h")
+                    {
+                        let _ = c.send_message(b"q", b"x", SettleMode::First);
+                        let _ = c.receive(b"q", 4, Duration::ZERO, SettleMode::Second, 4096);
+                    }
+                }
             }
         };
-        for kind in 0..8 {
+        for kind in 0..9 {
             run(kind);
         }
         let _ = sftp::normalize(bytes);
@@ -136,5 +146,8 @@ fn clients_survive_noise_and_never_sign_in_to_it() {
         let _ = ssh::ClientKey::parse(bytes);
         let _ = ssh::parse_kexinit(bytes);
         let _ = postgres::Scram::with_nonce("n").last(bytes, b"pw");
+        let _ = amqp1::decode(bytes);
+        let _ = amqp1::parse_frame(bytes, amqp1::MAX_FRAME);
+        let _ = amqp1::Message::parse(bytes);
     }
 }

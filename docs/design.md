@@ -520,9 +520,8 @@ real FTP and POP3 servers.
 
 Left for later:
 
-- Tunnels as an IR relay step; SSH agent forwarding and remote forwarding (`tcpip-forward`:
-  the server would open channels to the node, a listener the policy would have to bound;
-  not trivial, so not done with FTP and POP3).
+- Tunnels as an IR relay step; SSH agent forwarding. (Remote forwarding, `tcpip-forward`, is
+  done: see below.)
 - FTP over plain TCP for a private address, once a kind has that sign-off; FTP `REST`
   (resumed transfers), `APPE`, `SITE`, `MDTM`; POP3 `PIPELINING`.
 - Typed protocol connections for the `database` and `queue` kinds (they still allow none:
@@ -533,15 +532,52 @@ Left for later:
 - A live MQTT relay searches each message whole, but not a secret split across two messages;
   the stream search of SSH spans frames, the message search does not.
 - MQTT 5 properties beyond the maximum packet size (user properties, response topics), MQTT
-  over WebSocket, AMQP 1.0 (a different protocol from 0-9-1, with its own framing and SASL
-  layer; not trivial, so not done with FTP and POP3), and AMQP consumers (`basic.consume`)
-  as a live relay.
+  over WebSocket, and AMQP consumers (`basic.consume`) as a live relay. (AMQP 1.0 is done:
+  see below.)
 
 - MySQL `COM_QUERY` text results, compression and the server's RSA key exchange (refused on
   purpose; listed so it stays a decision).
 - The transport's `open_plain` and `open_starttls` over a real socket, and real servers of
   each kind, are not exercised by a test; the fuzz target was checked to build, not run (it
   needs nightly and libFuzzer).
+
+### SSH remote forwarding and AMQP 1.0
+
+The two protocol rows left above, done (`docs/policy.md`, Protocol connections).
+
+- **Remote forwarding** (`channel: "tcpip-forward"`, RFC 4254 section 7.1). The bind is a
+  literal `address:port` of the signed policy, never 0 and never the caller's. Where the
+  forwarded connection goes was the open choice: a socket the node would open to a local
+  target the policy names, or the call itself. The node takes the second, the more secure
+  one: it opens no socket and no listener, so the caller's stream is the local end, and
+  nothing on the node's side becomes reachable from the server. The client takes one
+  `forwarded-tcpip` channel per call, only after the server agreed to the forward and only for
+  exactly its address and port, while no other channel is open or waiting; every other open is
+  refused, and more than 16 refusals end the connection (a server cannot spin the node). The
+  accepted channel takes a live slot of its own (4 per caller, 16 per owner, 256 per node) and
+  is refused as a resource shortage when the slots are full; a hand-over refuses a waiting one
+  and ends an open one; the forward is cancelled at the end. A wildcard bind (`*`, `0.0.0.0`,
+  `::`) needs `wildcard_bind: true` and is flagged; every remote forward is flagged
+  `remote_forward`.
+- **AMQP 1.0** (`connection: "amqp1"`, its own client `proto::amqp1`, next to 0-9-1). The type
+  system codec is bounded per decode (16 deep, 16,384 values, descriptors a `ulong` or a symbol
+  of at most 256 bytes: an array repeats its descriptor for each element, so a long one would
+  multiply into memory). TLS is the only mode: implicit, or the AMQP TLS header; a plain mode
+  for a private address was left out, as for every other kind, since no kind has that sign-off
+  yet. SASL takes `PLAIN`, `EXTERNAL` (the open's client certificate), `SCRAM-SHA-256` (the
+  PostgreSQL SCRAM with a user name; the broker must prove the password) and `XOAUTH2`. One
+  connection (64 KiB frames, channel-max 0), one session, one link at a time (handle-max 0).
+  `send` and `receive` take the address from the policy; the settle mode is the policy's, and a
+  broker that changes it is refused rather than followed (the caller's guarantee, such as at
+  most once for `settled`, is the policy's, not the broker's). Text in a broker's error is
+  scrubbed of the user name and the secret.
+
+Measured on this host (Windows, `cargo test --workspace --locked --no-fail-fast`): tests
+MEASURE_BEFORE before, MEASURE_AFTER after, 0 failed. The new tests run against an AMQP 1.0
+broker and the SSH test server's remote forwarding, both in the test process (the broker
+encodes with the engine's codec); the fuzz targets `amqp1_frames` and `protocol_servers` were
+checked to build (clippy), not run. Not measured: real SSH servers forwarding remotely, real
+AMQP 1.0 brokers, the release size (CI measures it).
 
 ## 8. Transport and engine gaps
 
@@ -739,7 +775,7 @@ As built (part 10):
 | 3 | Typed items, disclosure levels, `describe`, custom kinds (done: `docs/policy.md`, Typed items) | 2 |
 | 4 | Policy JSON Schema, `client::summarize` with risk flags, approval format (done: `docs/policy.md`; the approval runtime is part 5) | 2, 3 |
 | 5 | Sessions, challenges, approvals, spending limits (done: `docs/policy.md`, Operations that wait; codes read from a `mail` item, `await` on TLS and amounts from body contracts are next) | 2 |
-| 6 | Connection kinds in layer 1: HTTP/2, WebSocket, streamed responses (first half done: `docs/policy.md`, HTTP versions and gRPC, WebSocket; own synchronous HTTP/2 client and HPACK, one thread per open connection, the Nitro host relay unchanged), then SSH, databases, FTP, mail, queues (second half done but for the rows left in section 7c: SSH with SFTP and local forwarding, PostgreSQL, MySQL, SMTP, IMAP, Redis, MQTT 3.1.1 and 5, AMQP 0-9-1, and the `ssh` and `mail` typed kinds; then POP3, FTP over TLS and SFTP management; tunnels as an IR relay step next) | 2 |
+| 6 | Connection kinds in layer 1: HTTP/2, WebSocket, streamed responses (first half done: `docs/policy.md`, HTTP versions and gRPC, WebSocket; own synchronous HTTP/2 client and HPACK, one thread per open connection, the Nitro host relay unchanged), then SSH, databases, FTP, mail, queues (second half done but for the rows left in section 7c: SSH with SFTP and local forwarding, PostgreSQL, MySQL, SMTP, IMAP, Redis, MQTT 3.1.1 and 5, AMQP 0-9-1, and the `ssh` and `mail` typed kinds; then POP3, FTP over TLS and SFTP management; then SSH remote forwarding and AMQP 1.0; tunnels as an IR relay step next) | 2 |
 | 7 | Trusted code sandbox (layer 3): WebAssembly runtime, JavaScript module, origin-pinned site code (done: `run` step, `crates/sandbox`, wasmi 1.1.0 chosen by measurement; JavaScript measured with boa in the sandbox, its shipping plan in `docs/sandbox.md`) | 2 |
 | 8 | Browser fills over CDP (done: the `browser` connection and `fill`, `engine::cdp`, `docs/policy.md` Browser fills; tested against an in-process fake CDP endpoint, never a real browser; typed `card` and `login` items with browser operations, and detaching the agent's controller, are next) | 4, 5 |
 | 9 | Remaining primitive families (Appendices A, B), UDP relay and its protocols (done: HPKE, TurboSHAKE, KangarooTwelve, ML-DSA, SM2, brainpool ECDSA, `tls_exporter` in TLS sends, the `udp` connection and the datagram relay; `docs/policy.md` and section 7b; the rows still open and why are listed under Appendix A, Part 9) | 1 |

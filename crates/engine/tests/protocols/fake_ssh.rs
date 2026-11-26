@@ -221,6 +221,16 @@ pub struct SshServer {
     pub reachable: Vec<String>,
     pub forwards: Vec<String>,
     pub forwarded: Vec<u8>,
+    /// Remote forwarding: whether it agrees to listen; the channels it opens once it does
+    /// (kind, connected address, port); whether it opens them unasked, after the client's
+    /// own channel; what it saw asked and cancelled, and the client's answer to each channel
+    /// it opened (its channel number, and the failure reason, if any).
+    pub remote_ok: bool,
+    pub remote_opens: Vec<(&'static str, &'static str, u32)>,
+    pub open_unasked: bool,
+    pub binds: Vec<String>,
+    pub cancels: Vec<String>,
+    pub open_answers: Vec<(u32, Option<u32>)>,
     sftp: bool,
     sftp_in: Vec<u8>,
     forwarding: bool,
@@ -272,6 +282,12 @@ impl SshServer {
             reachable: Vec::new(),
             forwards: Vec::new(),
             forwarded: Vec::new(),
+            remote_ok: true,
+            remote_opens: Vec::new(),
+            open_unasked: false,
+            binds: Vec::new(),
+            cancels: Vec::new(),
+            open_answers: Vec::new(),
             sftp: false,
             sftp_in: Vec::new(),
             forwarding: false,
@@ -574,6 +590,43 @@ impl SshServer {
                 reply.extend((1u32 << 20).to_be_bytes());
                 reply.extend(16384u32.to_be_bytes());
                 self.send(&reply);
+                if self.open_unasked {
+                    self.open_remote();
+                }
+            }
+            80 => {
+                let kind = r.string().to_vec();
+                let want = r.bool();
+                let address = String::from_utf8(r.string().to_vec()).unwrap();
+                let port = r.u32();
+                match kind.as_slice() {
+                    b"tcpip-forward" => {
+                        self.binds.push(format!("{address}:{port}"));
+                        if want {
+                            self.send(&[if self.remote_ok { 81 } else { 82 }]);
+                        }
+                        if self.remote_ok {
+                            self.open_remote();
+                        }
+                    }
+                    b"cancel-tcpip-forward" => self.cancels.push(format!("{address}:{port}")),
+                    _ if want => self.send(&[82]),
+                    _ => {}
+                }
+            }
+            91 => {
+                // The client took a channel this server opened: data goes both ways on it.
+                let ours = r.u32();
+                let theirs = r.u32();
+                self.open_answers.push((ours, None));
+                self.channel = Some(theirs);
+                self.forwarding = true;
+                self.sent_close = false;
+            }
+            92 => {
+                let ours = r.u32();
+                let reason = r.u32();
+                self.open_answers.push((ours, Some(reason)));
             }
             98 => {
                 let _recipient = r.u32();
@@ -934,6 +987,22 @@ impl SshServer {
                 .files
                 .keys()
                 .any(|f| f.starts_with(&format!("{path}/")))
+    }
+
+    /// Opens the channels of `remote_opens`, numbered from 100, from one originator.
+    fn open_remote(&mut self) {
+        for (i, (kind, address, port)) in self.remote_opens.clone().into_iter().enumerate() {
+            let mut open = vec![90];
+            open.extend(string(kind.as_bytes()));
+            open.extend((100 + i as u32).to_be_bytes());
+            open.extend((1u32 << 20).to_be_bytes());
+            open.extend(16384u32.to_be_bytes());
+            open.extend(string(address.as_bytes()));
+            open.extend(port.to_be_bytes());
+            open.extend(string(b"203.0.113.9"));
+            open.extend((40_000 + i as u32).to_be_bytes());
+            self.send(&open);
+        }
     }
 
     fn data(&mut self, bytes: &[u8], stderr: bool) {

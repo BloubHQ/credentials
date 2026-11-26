@@ -1,5 +1,6 @@
-//! Operations on protocol connections: SSH (with SFTP and port forwarding), PostgreSQL,
-//! MySQL, SMTP, IMAP, POP3, Redis, MQTT, AMQP and FTP over TLS.
+//! Operations on protocol connections: SSH (with SFTP and port forwarding, local and
+//! remote), PostgreSQL, MySQL, SMTP, IMAP, POP3, Redis, MQTT, AMQP 0-9-1, AMQP 1.0 and FTP
+//! over TLS.
 //!
 //! Order, as for every act: the caller's commands and messages are checked against the
 //! policy before anything is logged ([`check_session`]); the node logs the use, opens the
@@ -9,6 +10,13 @@
 //! forward runs on a streaming call instead: the caller's signed frames go in within the
 //! relay's rules, and what the server sends goes back through the stream search. So do the
 //! messages of an MQTT subscription the policy keeps open, each searched whole.
+//!
+//! A remote forward (`tcpip-forward`) asks the server to listen on the address and port the
+//! policy fixes; the one connection the server then forwards comes back as a
+//! `forwarded-tcpip` channel, which the client takes only for that address and port. It takes
+//! a slot of its own, as an open connection does (refused when the caller, the owner or the
+//! node is full), and it is the call's relay: the caller's frames go to it, its bytes come
+//! back through the stream search, and it ends with the call (a hand-over included).
 
 use std::time::Duration;
 
@@ -22,11 +30,11 @@ use crate::error::TransportKind;
 use crate::log::{Detail, Event, LogSink};
 use crate::policy::{
     CommandRule, Connection, Destination, FrameKind, Login, MAX_PARAM, Mechanism, MqttVersion,
-    Open, Operation, Relay, SshChannel, Step, TlsMode,
+    Open, Operation, Relay, SettleMode, SshChannel, Step, TlsMode,
 };
 use crate::policy::{path_ok, verb_shape};
 use crate::proto::io::{Bounds, Io};
-use crate::proto::{amqp, ftp, imap, mqtt, mysql, pop3, postgres, redis, sftp, smtp, ssh};
+use crate::proto::{amqp, amqp1, ftp, imap, mqtt, mysql, pop3, postgres, redis, sftp, smtp, ssh};
 use crate::record::Record;
 use crate::reflection::{self, Secrets};
 use crate::response::MAX_RESPONSE;
@@ -359,6 +367,8 @@ struct Shape<'r> {
     wait: Duration,
     /// MQTT subscribe: keeps the subscription for what follows instead of collecting.
     keep: bool,
+    /// AMQP 1.0: how deliveries are settled.
+    settle: SettleMode,
 }
 
 impl<'r> Shape<'r> {
@@ -371,6 +381,7 @@ impl<'r> Shape<'r> {
             max_messages: crate::policy::DEFAULT_MESSAGES.0,
             wait: Duration::from_millis(crate::policy::DEFAULT_MESSAGES.1),
             keep: true,
+            settle: SettleMode::First,
         }
     }
 
@@ -391,6 +402,7 @@ impl<'r> Shape<'r> {
                     .min(crate::policy::MAX_MESSAGE_WAIT_MS),
             ),
             keep: false,
+            settle: rule.settle.unwrap_or_default(),
         }
     }
 }
@@ -419,6 +431,7 @@ enum Session<'s> {
     Mysql(mysql::Client<'s>),
     Mqtt(mqtt::Client<'s>),
     Amqp(amqp::Client<'s>),
+    Amqp1(amqp1::Client<'s>),
     Ftp(ftp::Client<'s>),
     Pop3(pop3::Client<'s>),
 }
@@ -441,6 +454,7 @@ impl<'s> Session<'s> {
             Session::Mysql(c) => c.io(),
             Session::Mqtt(c) => c.io(),
             Session::Amqp(c) => c.io(),
+            Session::Amqp1(c) => c.io(),
             Session::Ftp(c) => c.io(),
             Session::Pop3(c) => c.io(),
         }
@@ -515,8 +529,39 @@ impl<'s> Session<'s> {
                 files.finish()?;
                 Ok(ran(data.to_vec(), false, raw))
             }
-            Session::Ssh(_) if shape.channel == SshChannel::DirectTcpip => {
+            Session::Ssh(_)
+                if matches!(
+                    shape.channel,
+                    SshChannel::DirectTcpip | SshChannel::TcpipForward
+                ) =>
+            {
                 Err(refused("a forward runs on a streaming call"))
+            }
+            Session::Amqp1(client) => {
+                let address = param(rendered, 0)?;
+                let (outcome, messages) = match rendered.text.as_slice() {
+                    b"send" => (
+                        client.send_message(address, param(rendered, 1)?, shape.settle)?,
+                        Vec::new(),
+                    ),
+                    b"receive" => client.receive(
+                        address,
+                        shape.max_messages,
+                        shape.wait,
+                        shape.settle,
+                        MAX_RESPONSE,
+                    )?,
+                    _ => return Err(refused("an AMQP 1.0 command is send or receive")),
+                };
+                // Every message as it came, sections and properties included.
+                let mut raw = Zeroizing::new(Vec::new());
+                for m in &messages {
+                    raw.extend_from_slice(&m.raw);
+                    raw.push(0);
+                    raw.extend_from_slice(&m.body);
+                    raw.push(0);
+                }
+                Ok(ran(json_bytes(&outcome.json)?, outcome.failed, raw))
             }
             Session::Mysql(client) => {
                 let rows = client.query(&rendered.text, &rendered.params, columns, MAX_RESPONSE)?;
@@ -717,6 +762,7 @@ impl<'s> Session<'s> {
             Session::Mysql(client) => client.close(),
             Session::Mqtt(client) => client.close(),
             Session::Amqp(client) => client.close(),
+            Session::Amqp1(client) => client.close(),
             Session::Ftp(client) => client.close(),
             Session::Pop3(client) => client.close(),
         }
@@ -743,6 +789,7 @@ fn sign_in<'s>(
     credentials: &Credentials,
     bounds: Bounds,
     greeting: Option<&Prelude>,
+    host: &str,
 ) -> Result<Session<'s>> {
     let io = Io::new(stream, bounds);
     let login = open.login.as_ref();
@@ -816,6 +863,17 @@ fn sign_in<'s>(
             let vhost = login.and_then(|l| l.vhost.as_deref()).unwrap_or("/");
             Session::Amqp(amqp::Client::connect(io, vhost.as_bytes(), user, secret)?)
         }
+        Connection::Amqp1 => {
+            // The open's hostname: the virtual host when the policy names one.
+            let hostname = login.and_then(|l| l.vhost.as_deref()).unwrap_or(host);
+            Session::Amqp1(amqp1::Client::connect(
+                io,
+                credentials.mechanism,
+                user,
+                secret,
+                hostname.as_bytes(),
+            )?)
+        }
         Connection::Ftp => Session::Ftp(ftp::Client::connect(io, after_starttls, user, secret)?),
         Connection::Pop3 => {
             let greeting = match greeting {
@@ -846,7 +904,11 @@ fn opening_of(open: &Open) -> OpeningKind {
         (Connection::Ssh, _) => OpeningKind::Plain,
         (Connection::Postgres | Connection::Mysql, _) => OpeningKind::Starttls,
         (
-            Connection::Smtp | Connection::Imap | Connection::Pop3 | Connection::Ftp,
+            Connection::Smtp
+            | Connection::Imap
+            | Connection::Pop3
+            | Connection::Ftp
+            | Connection::Amqp1,
             Some(TlsMode::Starttls),
         ) => OpeningKind::Starttls,
         _ => OpeningKind::Tls,
@@ -886,6 +948,7 @@ fn prelude(open: &Open, stream: &mut dyn Stream, bounds: Bounds) -> Result<Optio
         Connection::Smtp => smtp::prelude(&mut io).map(|()| None),
         Connection::Imap => imap::prelude(&mut io).map(|()| None),
         Connection::Ftp => ftp::prelude(&mut io).map(|()| None),
+        Connection::Amqp1 => amqp1::prelude(&mut io).map(|()| None),
         Connection::Pop3 => pop3::prelude(&mut io).map(|g| Some(Prelude::Pop3(g))),
         Connection::Mysql => {
             let database = open.login.as_ref().is_some_and(|l| l.database.is_some());
@@ -1031,7 +1094,14 @@ impl<S: LogSink, C: Clock> Node<S, C> {
             transport,
         )?;
         let bounds = bounds_of(open);
-        let signed = sign_in(&mut *stream, open, &credentials, bounds, greeting.as_ref());
+        let signed = sign_in(
+            &mut *stream,
+            open,
+            &credentials,
+            bounds,
+            greeting.as_ref(),
+            &host,
+        );
         let mut session = match signed {
             Ok(session) => session,
             Err(error) => {
@@ -1163,13 +1233,20 @@ impl<S: LogSink, C: Clock> Node<S, C> {
         let rules = relay_of(operation).ok_or_else(|| operation.unknown())?;
         let forward = match commands {
             [] if rules.commands.is_empty() => None,
-            [one] => Some(
+            [one] if one.params.is_empty() => Some(
                 rules
                     .commands
                     .iter()
-                    .find(|c| c.name == one.name && c.ssh_channel() == SshChannel::DirectTcpip)
+                    .find(|c| {
+                        c.name == one.name
+                            && matches!(
+                                c.ssh_channel(),
+                                SshChannel::DirectTcpip | SshChannel::TcpipForward
+                            )
+                    })
                     .ok_or(refused("a forward the policy does not name"))?,
             ),
+            [_] => return Err(refused("a forward takes no parameter of the caller")),
             _ => return Err(refused("a streaming call names one forward, or nothing")),
         };
         let host = destination.host.clone();
@@ -1181,7 +1258,15 @@ impl<S: LogSink, C: Clock> Node<S, C> {
             greeting,
         } = self.open_session(run, payload, destination, commands.len(), transport)?;
         let bounds = bounds_of(open);
-        let end = match sign_in(&mut *stream, open, &credentials, bounds, greeting.as_ref()) {
+        let signed = sign_in(
+            &mut *stream,
+            open,
+            &credentials,
+            bounds,
+            greeting.as_ref(),
+            &host,
+        );
+        let end = match signed {
             Ok(mut session) => {
                 drop(credentials);
                 let end = self.session_steps(run, &mut session, &host, updated);
@@ -1271,8 +1356,19 @@ impl<S: LogSink, C: Clock> Node<S, C> {
         let Session::Ssh(client) = session else {
             return Err(operation.unknown());
         };
+        // Remote: no channel until the server forwards a connection to the bind.
+        let mut connected = true;
         match forward {
-            // The destination is the policy's, never the caller's.
+            // The destination and the bind are the policy's, never the caller's.
+            Some(rule) if rule.ssh_channel() == SshChannel::TcpipForward => {
+                let (address, port, wildcard) =
+                    crate::policy::bind_target(&rule.text).ok_or_else(|| operation.unknown())?;
+                if wildcard && rule.wildcard_bind != Some(true) {
+                    return Err(operation.unknown());
+                }
+                client.tcpip_forward(address.as_bytes(), port)?;
+                connected = false;
+            }
             Some(rule) => {
                 let (to, port) =
                     crate::policy::forward_target(&rule.text).ok_or_else(|| operation.unknown())?;
@@ -1286,8 +1382,44 @@ impl<S: LogSink, C: Clock> Node<S, C> {
         let caller_key = run.policy.caller(&live.auth.caller)?.key;
         let mut expected = 0u64;
         let mut status: Option<u32> = None;
+        // The slot of the forwarded connection, held while it is open.
+        let mut _forwarded: Option<live::Slot<'_>> = None;
         loop {
             match client.poll_event(POLL)? {
+                Some(ssh::Event::Forwarded { originator, port }) => {
+                    if self.is_handed_over() {
+                        client.refuse_forwarded()?;
+                        return Ok(End::of("handed_over", false));
+                    }
+                    let (owner, _, caller) = run.who;
+                    match self.live.take(owner, caller, run.policy) {
+                        Ok(slot) => {
+                            client.accept_forwarded()?;
+                            _forwarded = Some(slot);
+                            connected = true;
+                            let json = serde_json::json!({"forwarded": {
+                                "originator": String::from_utf8_lossy(&originator),
+                                "port": port,
+                            }});
+                            let secrets = Secrets {
+                                policy: run.policy,
+                                fields: &run.fields,
+                                captured: &run.captured.secrets,
+                                rendered: &run.tainted,
+                            };
+                            let released =
+                                Zeroizing::new(reflection::release(json_bytes(&json)?, &secrets)?);
+                            meter.to_caller.0 += 1;
+                            meter.to_caller.1 =
+                                meter.to_caller.1.saturating_add(released.len() as u64);
+                            live.relay.deliver(live::Part::Text(released))?;
+                        }
+                        // The caller, the owner or the node holds as many connections as it
+                        // may: the server is told so, and the forward waits for another.
+                        Err(Error::StreamsFull { .. }) => client.refuse_forwarded()?,
+                        Err(error) => return Err(error),
+                    }
+                }
                 Some(ssh::Event::Data(data) | ssh::Event::Stderr(data)) => {
                     if rules.server {
                         let released = scrubber.push(&data)?;
@@ -1328,6 +1460,11 @@ impl<S: LogSink, C: Clock> Node<S, C> {
                     expected += 1;
                     if self.is_handed_over() {
                         return Ok(End::of("handed_over", false));
+                    }
+                    if !connected {
+                        return Err(Error::FrameRefused {
+                            rule: "no forwarded connection is open yet",
+                        });
                     }
                     let bytes = frame_bytes(run, rules, &frame, host, &mut scrubber)?;
                     client.write_data(&bytes)?;

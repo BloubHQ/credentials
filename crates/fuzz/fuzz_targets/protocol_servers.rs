@@ -1,7 +1,7 @@
 //! Plays arbitrary bytes, in arbitrary pieces, as the server of each protocol client: SSH,
-//! PostgreSQL, MySQL, SMTP, IMAP, Redis, MQTT and AMQP. A client must never panic, never sign
-//! in to a server that did not prove what it must (an SSH host key that is not pinned, a SCRAM
-//! signature), never hand back a message on a topic it did not subscribe to, and never read
+//! PostgreSQL, MySQL, SMTP, IMAP, Redis, MQTT, AMQP 0-9-1 and AMQP 1.0. A client must never
+//! panic, never sign in to a server that did not prove what it must (an SSH host key that is
+//! not pinned, a SCRAM signature), never take more messages than it asked for, never hand back a message on a topic it did not subscribe to, and never read
 //! past the connection's byte limit. SFTP paths go through the traversal check.
 
 #![no_main]
@@ -10,15 +10,15 @@ use std::time::Duration;
 
 use engine::Result;
 use engine::egress::{Arrived, Stream};
-use engine::policy::Mechanism;
+use engine::policy::{Mechanism, SettleMode};
 use engine::proto::io::{Bounds, Io};
-use engine::proto::{amqp, imap, mqtt, mysql, postgres, redis, sftp, smtp, ssh};
+use engine::proto::{amqp, amqp1, imap, mqtt, mysql, postgres, redis, sftp, smtp, ssh};
 use libfuzzer_sys::fuzz_target;
 use zeroize::Zeroizing;
 
 const MAX: usize = 64 * 1024;
 /// The number of cases below.
-const CASES: u8 = 12;
+const CASES: u8 = 13;
 
 /// A server that sends `bytes` in pieces of `step`, then closes.
 struct Replay<'a> {
@@ -135,6 +135,23 @@ fuzz_target!(|data: &[u8]| {
             if let Ok(mut c) = mqtt::Client::connect(io, mqtt::Version::V311, b"c", b"u", b"pw") {
                 let _ = c.publish(b"a/b", b"x", 1);
                 let _ = c.collect(Duration::from_millis(1), 4, MAX);
+            }
+        }
+        11 => {
+            if step % 2 == 0 {
+                // SCRAM needs the server to prove the password; random bytes cannot.
+                assert!(
+                    amqp1::Client::connect(io, Mechanism::ScramSha256, b"u", b"pw", b"h").is_err()
+                );
+            } else if let Ok(mut c) =
+                amqp1::Client::connect(io, Mechanism::Plain, b"u", b"pw", b"h")
+            {
+                let _ = c.send_message(b"q", b"body", SettleMode::Second);
+                let wait = Duration::from_millis(1);
+                if let Ok((_, messages)) = c.receive(b"q", 4, wait, SettleMode::First, MAX) {
+                    assert!(messages.len() <= 4);
+                    assert!(messages.iter().map(|m| m.body.len()).sum::<usize>() <= MAX);
+                }
             }
         }
         _ => {

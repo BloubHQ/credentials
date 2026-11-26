@@ -140,6 +140,24 @@ impl Scram {
         }
     }
 
+    /// Starts with a fresh nonce for `user`, named in the client-first message (SASL
+    /// protocols other than PostgreSQL's, which sends an empty name). `,` and `=` are escaped
+    /// as RFC 5802 section 5.1 says; a user that is not UTF-8 or holds a NUL is refused.
+    pub fn with_user(user: &[u8]) -> Result<Self> {
+        let user = std::str::from_utf8(user).map_err(|_| Error::RequestInvalid {
+            rule: "a SCRAM user name is UTF-8",
+        })?;
+        if user.contains('\0') {
+            return Err(Error::RequestInvalid {
+                rule: "a SCRAM user name holds no NUL",
+            });
+        }
+        let mut scram = Self::new()?;
+        let name = user.replace('=', "=3D").replace(',', "=2C");
+        scram.first_bare = format!("n={name},r={}", scram.nonce);
+        Ok(scram)
+    }
+
     /// The client-first message.
     pub fn first(&self) -> String {
         format!("n,,{}", self.first_bare)
