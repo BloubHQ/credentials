@@ -235,6 +235,9 @@ policy is signed, every template is analysed:
 | JWT RS256 | no connection: `b64urlraw(header) + "." + b64urlraw($input) + "." + b64urlraw(rsa_sign_pkcs1_sha256(pem(key), …))` |
 | JWT with a lifetime the policy bounds | a `json` input schema that fixes `iss`/`aud` and has the node `set` `iat`/`exp`; or `json_set_number(..., "exp", add($unix, "300"))` in the template |
 | SAML service provider, WS-Security | HTTP-Redirect: `b64(deflate(authn))` and `rsa_sign_pkcs1_sha256` or `p256_sign` over the query; HTTP-POST: an enveloped signature over `xml_c14n("http://www.w3.org/2001/10/xml-exc-c14n#", ...)`; each verified with `rsa` and ring |
+| OAuth 1.0a (RFC 5849) | `sorted_params($query, $body, ...)` and `hmac_sha1` or `rsa_sign_pkcs1("sha1", ...)` over the base string; RFC 5849 vectors, verified with `hmac` and `rsa` |
+| AWS Signature Version 4A | `kbkdf_ec_key("p256", "sha256", ...)` (SP 800-108 counter mode, FIPS 186-5 rejection sampling) and `p256_sign_der`; verified with ring under a key derived in the test |
+| NTLMv2 over HTTP (MS-NLMP) | `md4` (flagged weak), `hmac_md5`, `utf16le`, `uint_le` on one `tls` connection, with the MIC, then a relay; MS-NLMP 4.2.4 vectors |
 | Ethereum | no connection: `{{ k256_sign_recoverable(key, keccak256($input)) }}` with an `rlp` input schema that fixes the recipient, chain and data and bounds the value |
 | IMAP | tls: receive the greeting, send `a1 LOGIN {{user}} {{password}}`, receive, relay the commands the policy lists |
 | TOTP | no connection: `{{ totp(b32decode(seed)) }}` |
