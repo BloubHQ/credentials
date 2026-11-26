@@ -101,6 +101,7 @@ pub mod log;
 pub mod node;
 pub mod policy;
 mod primitives;
+pub mod proto;
 pub mod record;
 pub mod reflection;
 pub mod request;

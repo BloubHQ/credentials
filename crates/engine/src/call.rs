@@ -8,10 +8,10 @@
 use serde::{Deserialize, Serialize};
 
 use crate::Result;
-use crate::caller::{Authorization, CallerExchange, Payload};
+use crate::caller::{Authorization, CallerCommand, CallerExchange, CallerMail, Payload};
 use crate::item::Description;
 use crate::keys::{CallerKey, NodePublicKey};
-use crate::node::{Clock, Response, StreamOutput, SystemClock};
+use crate::node::{Clock, Response, SessionOutput, StreamOutput, SystemClock};
 use crate::policy::Destination;
 use crate::record::Record;
 use crate::request::Request;
@@ -56,6 +56,19 @@ pub enum Body {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         request: Option<Request>,
     },
+    /// An operation on a protocol connection (SSH, PostgreSQL, SMTP, IMAP, Redis): the
+    /// commands it runs after its steps, or the messages it sends. An SSH shell runs on a
+    /// streaming call with no commands.
+    Session {
+        /// Where to connect (one of the destinations of the operation).
+        destination: Destination,
+        /// The caller's commands, each naming a command rule of the policy.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        commands: Vec<CallerCommand>,
+        /// The caller's messages (SMTP).
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        mail: Vec<CallerMail>,
+    },
 }
 
 impl Body {
@@ -97,6 +110,15 @@ impl Body {
             Body::Describe {} => Payload::Describe,
             Body::Resume { id } => Payload::Resume(id),
             Body::Socket { request } => Payload::Socket(request.as_ref()),
+            Body::Session {
+                destination,
+                commands,
+                mail,
+            } => Payload::Session {
+                destination,
+                commands,
+                mail,
+            },
         }
     }
 
@@ -127,6 +149,8 @@ pub enum Output {
     Http(Response),
     /// The reads of a stream operation.
     Stream(StreamOutput),
+    /// The results of the commands of a protocol connection.
+    Session(SessionOutput),
     /// The output of a derivation.
     Derive(Vec<u8>),
     /// The description of a typed item.

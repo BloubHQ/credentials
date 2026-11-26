@@ -853,6 +853,19 @@ fn check_operation(
                 "a typed item has no WebSocket operation",
             );
         }
+        Some(
+            Connection::Ssh
+            | Connection::Postgres
+            | Connection::Smtp
+            | Connection::Imap
+            | Connection::Redis,
+        ) => {
+            return shape_ensure(
+                false,
+                || at.to_string(),
+                "a typed item has no protocol connection yet",
+            );
+        }
         Some(Connection::Udp) => {
             return shape_ensure(
                 false,

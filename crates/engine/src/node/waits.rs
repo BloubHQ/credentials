@@ -35,9 +35,11 @@ fn given_of(payload: Payload<'_>, input: &[u8]) -> Given {
             given: given.to_vec(),
             input: input.to_vec(),
         },
-        Payload::Stream { .. } | Payload::Describe | Payload::Resume(_) | Payload::Socket(_) => {
-            Given::Http(None)
-        }
+        Payload::Stream { .. }
+        | Payload::Describe
+        | Payload::Resume(_)
+        | Payload::Socket(_)
+        | Payload::Session { .. } => Given::Http(None),
     }
 }
 

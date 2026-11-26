@@ -327,6 +327,21 @@ pub enum Error {
     /// The sandbox stopped a `run` step. The message is fixed: nothing the module computed.
     #[error("sandbox: {0}")]
     Sandbox(sandbox::Error),
+    /// The server of a protocol connection (SSH, a database, mail, a queue) is not the one the
+    /// policy trusts, or offered less than it requires: a host key that is not pinned, no
+    /// algorithm or authentication mechanism the node accepts, no TLS where it is required.
+    /// Nothing secret was sent to it.
+    #[error("server not trusted: {rule}")]
+    ServerUntrusted {
+        /// Which rule.
+        rule: &'static str,
+    },
+    /// The server of a protocol connection refused the node's credentials.
+    #[error("authentication refused: {rule}")]
+    AuthRefused {
+        /// Which rule.
+        rule: &'static str,
+    },
     /// The transport failed.
     #[error("transport failed: {0}")]
     Transport(TransportFault),
