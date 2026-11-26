@@ -8,9 +8,18 @@
 //! signed, so the caller sees neither the values nor the answers, and has no CDP command of
 //! its own: the node issues a fixed list ([`cdp::Method`]) and never `Runtime.evaluate`.
 //!
+//! Detaching the agent's controller. CDP lets any client of the endpoint attach to any page
+//! at any time, and a second session on the page the node holds is invisible to the node (a
+//! target says only whether some client is attached). So the node cannot keep the agent out
+//! by CDP alone. With `browser.exclusive` the policy names the header by which the endpoint
+//! answers the handshake that it handed the browser to the node alone (every other client
+//! and any live view cut off, none let in until the node's connection closes); without that
+//! exact answer the node sends no command. When the node closes, the endpoint lets the
+//! controller back in: by then the values are gone from the page (below).
+//!
 //! The order of one fill, and what each check stops:
-//! 1. the one page target at the policy's origin, with no other client attached, is chosen
-//!    and attached to (flattened session);
+//! 1. the one page target at the policy's origin, with no client attached to it or to any
+//!    other target of the browser, is chosen and attached to (flattened session);
 //! 2. optionally the page is loaded again at a path the policy fixes, so that nothing an
 //!    earlier client planted in the document is still there;
 //! 3. for each field: the frame tree is read, the top frame must be at the origin; the
@@ -26,7 +35,13 @@
 //! 6. the frame tree is read again after the fill, as in 4;
 //! 7. the submit element is found the same way and [`cdp::SUBMIT`] runs on it; the node waits
 //!    for the top frame to leave the document, and blanks the fields ([`cdp::CLEAR`]) when it
-//!    stays.
+//!    stays. Before each value and before the submit the node lists the targets again: a
+//!    client attached to any target it does not hold, or a second page at the origin, ends
+//!    the fill;
+//! 8. at the end, with `leave: reload`, a page that stayed is loaded again (a GET at the
+//!    origin), and in every case the page's history is cleared and checked to hold one
+//!    entry, so a filled document cannot come back from the back/forward cache with its
+//!    values when the controller returns.
 //!
 //! Every message from the browser is read strictly ([`cdp::parse`]): an answer to a command
 //! the node did not send, or from another session, ends the fill; events are counted and
@@ -44,7 +59,7 @@ use crate::cdp::{self, CdpError, Frame, Incoming, Method, Remote, WebOrigin};
 use crate::egress::{Arrived, Stream, Transport, Versions, dispatch_streamed};
 use crate::error::TransportKind;
 use crate::log::LogSink;
-use crate::policy::{Element, Fill, FrameKind, Open, Step, browser_limits};
+use crate::policy::{Element, Fill, FrameKind, Leave, Open, Step, browser_limits};
 use crate::record::Record;
 use crate::reflection::{self, Secrets};
 use crate::request::{Request, Wire};
@@ -243,8 +258,16 @@ impl Cdp<'_> {
 /// The page the fills go into: its target and the session attached to it, and the sessions
 /// attached to its out-of-process frames.
 struct Page {
+    target: String,
     session: String,
     frames: Vec<(String, String)>,
+}
+
+impl Page {
+    /// True for a target the node itself is attached to.
+    fn owns(&self, target: &str) -> bool {
+        self.target == target || self.frames.iter().any(|(f, _)| f == target)
+    }
 }
 
 /// An element found: where, and the frames as they were when it was found.
@@ -324,6 +347,13 @@ fn top(frames: &[Frame]) -> Result<&Frame> {
         .ok_or(Error::ResponseInvalid {
             rule: "a frame tree without its top frame",
         })
+}
+
+/// The origin of the top frame as a browser serializes it, or `null` when it is not `https`.
+fn top_origin(frames: &[Frame]) -> Result<String> {
+    Ok(WebOrigin::of_url(&top(frames)?.url)
+        .map(|o| o.serialize())
+        .unwrap_or_else(|| "null".to_string()))
 }
 
 /// The reason a function of the node gave, as a refusal.
@@ -420,10 +450,10 @@ impl<S: LogSink, C: Clock> Node<S, C> {
     ) -> Result<Filled> {
         let (end, out) = match result {
             Ok((outcome, origin, fields)) => {
-                let reason = if outcome == "navigated" {
-                    "navigated"
-                } else {
-                    "submitted"
+                let reason = match outcome.as_str() {
+                    "navigated" => "navigated",
+                    "reloaded" => "reloaded",
+                    _ => "submitted",
                 };
                 (Ok(End::of(reason, true)), Some((outcome, origin, fields)))
             }
@@ -469,8 +499,25 @@ impl<S: LogSink, C: Clock> Node<S, C> {
         let (status, headers) = response::parse_upgrade(&head)?;
         *status_out = Some(status);
         live::check_upgrade(status, &headers, key, offered)?;
+        let control = operation
+            .open()
+            .and_then(|o| o.browser.clone())
+            .unwrap_or_default();
+        // The endpoint says it handed the browser to the node alone, or nothing is sent.
+        if let Some(grant) = &control.exclusive {
+            let granted = headers.iter().any(|(name, value)| {
+                name.eq_ignore_ascii_case(&grant.header)
+                    && value.trim_ascii() == grant.value.as_bytes()
+            });
+            if !granted {
+                return Err(refused(
+                    "the endpoint did not hand the browser to the node alone",
+                ));
+            }
+        }
         let mut page: Option<Page> = None;
         let mut last: Option<(bool, String)> = None;
+        let mut last_fill: Option<&Fill> = None;
         let mut fields = 0u64;
         for step in operation.steps.iter().skip(at + 1) {
             match step {
@@ -478,11 +525,23 @@ impl<S: LogSink, C: Clock> Node<S, C> {
                 Step::Send(send) => {
                     let fill = send.fill.as_ref().ok_or_else(|| operation.unknown())?;
                     last = Some(self.fill(run, cdp, &mut page, fill)?);
+                    last_fill = Some(fill);
                     fields = fields.saturating_add(fill.fields.len() as u64);
                 }
                 Step::Return(_) => {}
                 _ => return Err(operation.unknown()),
             }
+        }
+        let mut reloaded = false;
+        if let (Some(page), Some((navigated, origin)), Some(fill)) = (&page, &mut last, last_fill) {
+            if !*navigated && control.leave == Leave::Reload {
+                let at = fill.page().ok_or_else(|| operation.unknown())?;
+                let path = fill.navigate.as_deref().unwrap_or("/");
+                self.reload(cdp, page, &at, path, Duration::from_millis(fill.wait()))?;
+                reloaded = true;
+            }
+            self.forget_history(cdp, page)?;
+            *origin = top_origin(&cdp.frames(&page.session)?)?;
         }
         if let Some(page) = &page {
             let release = format!("{{\"objectGroup\":\"{}\"}}", cdp::GROUP);
@@ -521,8 +580,74 @@ impl<S: LogSink, C: Clock> Node<S, C> {
                 rendered: &run.tainted,
             },
         )?;
-        let outcome = if navigated { "navigated" } else { "submitted" };
+        let outcome = match (navigated, reloaded) {
+            (true, _) => "navigated",
+            (false, true) => "reloaded",
+            (false, false) => "submitted",
+        };
         Ok((outcome.to_string(), origin, fields))
+    }
+
+    /// Loads the page again at `path` on `origin` with a GET (never a reload, which could
+    /// post the form again) and waits for the new document, wherever it ends up: the
+    /// document the node filled is gone either way.
+    fn reload(
+        &self,
+        cdp: &mut Cdp<'_>,
+        page: &Page,
+        origin: &WebOrigin,
+        path: &str,
+        wait: Duration,
+    ) -> Result<()> {
+        let before = top(&cdp.frames(&page.session)?)?.loader.clone();
+        let url = format!("{}{path}", origin.serialize());
+        let params = [&b"{\"url\":"[..], json_string(&url).as_slice(), b"}"].concat();
+        let navigated = cdp.must(
+            Method::Navigate,
+            Some(&page.session),
+            &params,
+            cdp::navigated,
+            "the browser refused to load the page again",
+        )?;
+        if navigated.failed || navigated.loader.is_none() {
+            return Err(refused("the browser could not load the page again"));
+        }
+        let until = deadline(wait);
+        loop {
+            let frames = cdp.frames(&page.session)?;
+            let first = top(&frames)?;
+            if first.loader != before && Some(&first.loader) == navigated.loader.as_ref() {
+                return Ok(());
+            }
+            if Instant::now() >= until {
+                return Err(refused("the page did not load again in time"));
+            }
+            cdp.pause(RETRY)?;
+        }
+    }
+
+    /// Clears the page's history and checks it holds the current document only, so no
+    /// document the node filled comes back from the back/forward cache.
+    fn forget_history(&self, cdp: &mut Cdp<'_>, page: &Page) -> Result<()> {
+        cdp.must(
+            Method::ResetNavigationHistory,
+            Some(&page.session),
+            b"{}",
+            |_| Ok(()),
+            "the browser kept the filled page in its history",
+        )?;
+        let entries = cdp.must(
+            Method::GetNavigationHistory,
+            Some(&page.session),
+            b"{}",
+            cdp::history_entries,
+            "the browser kept the filled page in its history",
+        )?;
+        if entries == 1 {
+            Ok(())
+        } else {
+            Err(refused("the browser kept the filled page in its history"))
+        }
     }
 
     /// Chooses the page target at `origin` and attaches to it.
@@ -548,11 +673,47 @@ impl<S: LogSink, C: Clock> Node<S, C> {
         if target.attached {
             return Err(refused("another client is attached to the page"));
         }
+        // A client attached anywhere in the browser (a worker of the origin sees the request
+        // that carries the values; another tab shares its storage) has not handed over.
+        if targets.iter().any(|t| t.attached) {
+            return Err(refused("another client is attached to the browser"));
+        }
         let session = self.attach_to(cdp, &target.id)?;
         Ok(Page {
+            target: target.id.clone(),
             session,
             frames: Vec::new(),
         })
+    }
+
+    /// Looks at the browser again just before a value enters the page or the form is
+    /// submitted: no client but the node attached to any target, and still one page at the
+    /// origin. What a client attaches to the page the node holds is not visible here (a
+    /// target says only that some client is attached), which is why the endpoint's exclusive
+    /// grant is what keeps the controller out; this catches what CDP does show.
+    fn watch(&self, cdp: &mut Cdp<'_>, page: &Page, origin: &WebOrigin) -> Result<()> {
+        let targets = cdp.must(
+            Method::GetTargets,
+            None,
+            b"{}",
+            cdp::targets,
+            "the browser did not list its targets",
+        )?;
+        if targets.iter().any(|t| t.attached && !page.owns(&t.id)) {
+            return Err(refused(
+                "another client attached to the browser during the fill",
+            ));
+        }
+        let pages = targets
+            .iter()
+            .filter(|t| t.kind == "page" && WebOrigin::of_url(&t.url).as_ref() == Some(origin))
+            .count();
+        if pages != 1 || !targets.iter().any(|t| t.id == page.target) {
+            return Err(refused(
+                "another page at the policy's origin opened during the fill",
+            ));
+        }
+        Ok(())
     }
 
     fn attach_to(&self, cdp: &mut Cdp<'_>, target: &str) -> Result<String> {
@@ -589,6 +750,50 @@ impl<S: LogSink, C: Clock> Node<S, C> {
             self.navigate(cdp, page, &origin, path, wait)?;
         }
         let mut filled: Vec<Found> = Vec::new();
+        let result = self.fill_in(run, cdp, page, fill, &origin, wait, &mut filled);
+        if result.is_err() {
+            // A fill that stops after a value went in does not leave it for the next reader.
+            self.blank(cdp, &filled);
+        }
+        result
+    }
+
+    /// Blanks the fields filled so far, as far as the browser still lets it, on the way out
+    /// of a fill that stopped. A field whose document is gone has nothing to blank.
+    fn blank(&self, cdp: &mut Cdp<'_>, filled: &[Found]) {
+        for found in filled {
+            let params = call_on(
+                cdp::CLEAR,
+                &found.object,
+                &[&json_string(&found.origin), &json_strings(&found.ancestors)],
+            );
+            if cdp
+                .call(
+                    Method::CallFunctionOn,
+                    Some(&found.session),
+                    &params,
+                    cdp::remote,
+                )
+                .is_err()
+            {
+                return;
+            }
+        }
+    }
+
+    /// The fields and the submit of one fill; `filled` gets each element a value went into.
+    #[allow(clippy::too_many_arguments)]
+    fn fill_in(
+        &self,
+        run: &mut Run<'_>,
+        cdp: &mut Cdp<'_>,
+        page: &mut Page,
+        fill: &Fill,
+        origin: &WebOrigin,
+        wait: Duration,
+        filled: &mut Vec<Found>,
+    ) -> Result<(bool, String)> {
+        let origin = origin.clone();
         for field in &fill.fields {
             let found = self.find(cdp, page, &origin, &field.element(), wait)?;
             let template = Template::parse(&field.template)?;
@@ -617,6 +822,7 @@ impl<S: LogSink, C: Clock> Node<S, C> {
                 &found,
                 "the page changed before the fill",
             )?;
+            self.watch(cdp, page, &origin)?;
             let params = call_on(
                 cdp::FILL,
                 &found.object,
@@ -638,16 +844,18 @@ impl<S: LogSink, C: Clock> Node<S, C> {
                 Ok(other) => return Err(reason(&other)),
                 Err(_) => return Err(refused("the page changed between the check and the fill")),
             }
+            filled.push(found);
+            let found = filled.last().ok_or_else(|| run.operation.unknown())?;
             self.unchanged(
                 cdp,
                 page,
                 &origin,
-                &found,
+                found,
                 "the page changed during the fill",
             )?;
-            filled.push(found);
         }
         let submit = self.find(cdp, page, &origin, &fill.submit, wait)?;
+        self.watch(cdp, page, &origin)?;
         self.unchanged(
             cdp,
             page,
@@ -692,7 +900,7 @@ impl<S: LogSink, C: Clock> Node<S, C> {
         if !navigated {
             // The page stayed: blank what was filled, so no later reader of the page (the
             // agent's controller, once it attaches again) finds the values there.
-            for found in &filled {
+            for found in filled.iter() {
                 let params = call_on(
                     cdp::CLEAR,
                     &found.object,
@@ -711,10 +919,7 @@ impl<S: LogSink, C: Clock> Node<S, C> {
                 }
             }
         }
-        let frames = cdp.frames(&page.session)?;
-        let origin = WebOrigin::of_url(&top(&frames)?.url)
-            .map(|o| o.serialize())
-            .unwrap_or_else(|| "null".to_string());
+        let origin = top_origin(&cdp.frames(&page.session)?)?;
         Ok((navigated, origin))
     }
 

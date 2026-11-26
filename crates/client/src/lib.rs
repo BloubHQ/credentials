@@ -91,7 +91,9 @@ pub use owner::{
     Field, endorse_device, grant, grant_without_successor, pin_record, retire_device, revoke,
     rewrap_record, seal_record, sign_policy, upgrade_policy,
 };
-pub use review::{approval_hash, approve, item_kinds, policy_json_schema, sign_kind, summarize};
+pub use review::{
+    approval_hash, approve, item_fill, item_kinds, policy_json_schema, sign_kind, summarize,
+};
 pub use session::{answer_challenge, sign_limits, sign_resume_call, update_record};
 pub use transfer::{
     MAX_ATTEMPTS, TRANSFER_TTL_MS, TransferReceiver, TransferSender, TransferredKeys,

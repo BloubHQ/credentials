@@ -59,6 +59,18 @@ fn first_destination(operation: &Operation, request: Option<&Request>) -> Option
     })
 }
 
+/// The page of the first fill of a browser operation: where its values go (a card's
+/// merchant), as opposed to the CDP endpoint it connects to.
+fn first_page(operation: &Operation) -> Option<Destination> {
+    crate::policy::flow::walk(&operation.steps)
+        .into_iter()
+        .find_map(|step| match step {
+            Step::Send(send) => send.fill.as_ref().and_then(crate::policy::Fill::page),
+            _ => None,
+        })
+        .map(|o| Destination::new(&o.host, o.port))
+}
+
 /// The amount of a payment, read only from what the node checked against the contract: a
 /// query parameter of the caller's request or a member of the checked input, or the policy.
 fn spend_of(
@@ -242,16 +254,21 @@ impl<S: LogSink, C: Clock> Node<S, C> {
             _ => None,
         };
         let destination = first_destination(operation, request);
+        // A browser fill pays at the page it fills, not at the CDP endpoint.
+        let page = first_page(operation);
         let spend = match &operation.payment {
             None => None,
             Some(payment) => {
-                let merchant = destination.clone().map(|destination| {
-                    Origin {
-                        https: true,
-                        destination,
-                    }
-                    .text()
-                });
+                let merchant = page
+                    .clone()
+                    .or_else(|| destination.clone())
+                    .map(|destination| {
+                        Origin {
+                            https: true,
+                            destination,
+                        }
+                        .text()
+                    });
                 Some(spend_of(operation, payment, request, input, merchant)?)
             }
         };
@@ -294,6 +311,15 @@ impl<S: LogSink, C: Clock> Node<S, C> {
         let origin = spend
             .as_ref()
             .and_then(|s| s.merchant.clone())
+            .or_else(|| {
+                page.clone().map(|destination| {
+                    Origin {
+                        https: true,
+                        destination,
+                    }
+                    .text()
+                })
+            })
             .or_else(|| {
                 policy
                     .item

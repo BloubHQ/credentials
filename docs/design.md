@@ -263,8 +263,37 @@ each the more secure one:
 - **A page another client is attached to is refused**, as is a second tab at the origin.
 
 Not done here: the node cannot tell scripts an earlier client injected (it does not see
-that session); `navigate` reloads the page at a fixed path instead. The item kinds `card`
-and `login` do not take browser operations yet.
+that session); `navigate` reloads the page at a fixed path instead.
+
+**Detaching the agent's controller** (done; `docs/policy.md`, Browser fills). Step 2's
+"detaches the agent" cannot be done over CDP: any client of the endpoint may attach to any
+page at any time, and a second session on the page the node holds is invisible to the node
+(`Target.getTargets` says only whether some client is attached). Of the ways to keep the
+controller out (a browser context of the node's own, which the controller can still attach
+to, and which would leave the login's cookies outside the agent's browser; moving the page,
+which CDP cannot do; detaching the controller's session, which CDP cannot do to another
+client), the only one that holds is the endpoint's: the policy's `open` names
+`browser.exclusive`, the header and exact value of the `101` answer by which the endpoint
+says it handed the browser to the node alone, and without it the node sends nothing. The
+node also refuses a browser with any client attached at the start, and lists the targets
+before each value and the submit. The reattach is the endpoint's too (when the node
+closes), so the node first makes sure nothing of the values is left: the fill must submit;
+a page that stays is blanked and, with `leave: reload`, loaded again with a GET (never a
+reload, which could post the form again); the history is cleared and checked to hold one
+entry, so the back/forward cache cannot bring the filled document back; a fill that stops
+midway blanks what it filled. Fills need not wait for a navigation away (a single-page
+login stays on its document between the password and the code), but a typed fill must
+`leave: reload`, which ends the filled document either way.
+
+**Typed browser fills** (done). The kinds `card` and `login` take browser operations: the
+kind's `shape.browser` lists the values a fill may put into a page (roles: `username`,
+`password`, `totp` from the seed; `number`, `expiry`, `expiry_month`, `expiry_year`, `cvc`,
+`holder`) and where the page is (a login's pinned origin, exactly; a card at the merchant
+the owner names, its fields possibly in a payment provider's frame).
+`ItemBinding::browser_fill` turns roles and selectors into the fill, and the node holds the
+signed policy to the kind on every check: role templates only, each once; the exclusive
+grant and `leave: reload`; no item field in the handshake. Every card use waits for the
+owner's approval before the node connects at all.
 
 ## 7. Protocol tunnels
 
@@ -789,7 +818,7 @@ As built (part 10):
 | 5 | Sessions, challenges, approvals, spending limits (done: `docs/policy.md`, Operations that wait; amounts from body contracts and `await` on TLS before the connection opens done too; codes read from a `mail` item are next) | 2 |
 | 6 | Connection kinds in layer 1: HTTP/2, WebSocket, streamed responses (first half done: `docs/policy.md`, HTTP versions and gRPC, WebSocket; own synchronous HTTP/2 client and HPACK, one thread per open connection, the Nitro host relay unchanged), then SSH, databases, FTP, mail, queues (second half done but for the rows left in section 7c: SSH with SFTP and local forwarding, PostgreSQL, MySQL, SMTP, IMAP, Redis, MQTT 3.1.1 and 5, AMQP 0-9-1, and the `ssh` and `mail` typed kinds; then POP3, FTP over TLS and SFTP management; then SSH remote forwarding and AMQP 1.0; tunnels as an IR relay step next) | 2 |
 | 7 | Trusted code sandbox (layer 3): WebAssembly runtime, JavaScript module, origin-pinned site code (done: `run` step, `crates/sandbox`, wasmi 1.1.0 chosen by measurement; JavaScript measured with boa in the sandbox, its shipping plan in `docs/sandbox.md`) | 2 |
-| 8 | Browser fills over CDP (done: the `browser` connection and `fill`, `engine::cdp`, `docs/policy.md` Browser fills; tested against an in-process fake CDP endpoint, never a real browser; typed `card` and `login` items with browser operations, and detaching the agent's controller, are next) | 4, 5 |
+| 8 | Browser fills over CDP (done: the `browser` connection and `fill`, `engine::cdp`, `docs/policy.md` Browser fills; typed `card` and `login` fills from the kind's roles; the agent's controller kept out by the endpoint's exclusive grant, the page reloaded and its history cleared before control returns; tested against an in-process fake CDP endpoint, never a real browser or endpoint) | 4, 5 |
 | 9 | Remaining primitive families (Appendices A, B), UDP relay and its protocols (done: HPKE, TurboSHAKE, KangarooTwelve, ML-DSA, SM2, brainpool ECDSA, `tls_exporter` in TLS sends, the `udp` connection and the datagram relay; `docs/policy.md` and section 7b; the rows still open and why are listed under Appendix A, Part 9) | 1 |
 | 10 | Node hand-over; key backup and device transfer in `client` (done: `crates/continuity`, `Node::hand_over`/`take_over`, `credentials hand-over`, `credentials verify --next`, `client` continuity, backup and transfer; real Nitro hardware and the real Sigstore root are not exercised by the tests, and the compiled Sigstore trust root is empty until it is committed, so nodes refuse every statement until then) | 3 |
 | 11 | Section 8a and 8b schemes as IR policies and reviewed modules (started: section 8b delegation, emergency access and credential vending done, `docs/policy.md` Vending, Delegation and emergency access; the status of every row is below) | 6, 7 |
@@ -1070,6 +1099,11 @@ approvals inside another company's app (KakaoTalk, a bank's app push).
 ## 13. Open questions
 
 - PCI DSS scope of storing card numbers in the node, and Kernel's PCI status.
+- Which cloud browser endpoints can hand a browser to one CDP client alone (cutting the
+  agent's controller and live view off until it closes) and say so in the handshake's
+  answer, as `browser.exclusive` needs; and whether a real browser's
+  `Page.resetNavigationHistory` evicts the back/forward cache entry of the filled document.
+  Neither is measured; the tests use a fake endpoint.
 - Korean card issuers: none was found with a public one-time virtual card API; cards stay real
   numbers until one is.
 - Legal limits on processing national ID numbers (주민등록번호) for identity items.

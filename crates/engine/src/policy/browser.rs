@@ -35,6 +35,70 @@ pub const BROWSER_IDLE_MS: u64 = 10_000;
 /// Default byte count of a browser connection (both ways).
 pub const BROWSER_BYTES: u64 = 16 << 20;
 
+/// Longest value of the exclusive grant's header, in bytes.
+pub const MAX_GRANT_VALUE: usize = 256;
+
+/// How the agent's controller is kept out of the browser while the node fills: the `browser`
+/// member of the `open` of a `browser` connection.
+///
+/// CDP itself cannot keep another client out: any client of the browser endpoint may attach
+/// to a page at any time, and a second session on the page the node fills is invisible to
+/// the node (a target reports only that some client is attached). So the guarantee must come
+/// from the endpoint: the handshake asks it to hand the browser to the node alone
+/// (disconnecting every other client, the agent's controller and any live view, and
+/// accepting none until the node's connection closes), and its answer says it did, in a
+/// header the policy names. Without that answer the node sends no command.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BrowserControl {
+    /// The header of the handshake's `101` answer, and its exact value, by which the
+    /// endpoint says the node holds the browser alone. Without it the fill runs beside any
+    /// client the endpoint lets in (flagged `browser_shared`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exclusive: Option<Exclusive>,
+    /// What the node leaves when the page still shows a document it filled at the end:
+    /// `blank` (the fields blanked) or `reload` (blanked, then the page loaded again at the
+    /// fill's origin, so nothing of the filled document stays in the page).
+    #[serde(default, skip_serializing_if = "Leave::is_blank")]
+    pub leave: Leave,
+}
+
+/// The endpoint's statement that the node holds the browser alone.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Exclusive {
+    /// The header name (a token; compared without case).
+    pub header: String,
+    /// Its value, exactly: 1 to 256 bytes of printable ASCII.
+    pub value: String,
+}
+
+/// What the node leaves in a page that stayed after the last submit.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Leave {
+    /// The fields it filled are blanked.
+    #[default]
+    Blank,
+    /// The fields are blanked, then the page is loaded again (a GET of the fill's `navigate`
+    /// path, or `/`, at its origin, never a reload that could post the form again): the
+    /// filled document, and whatever its scripts kept of the values, is gone.
+    Reload,
+}
+
+impl Leave {
+    fn is_blank(&self) -> bool {
+        *self == Leave::Blank
+    }
+}
+
+impl BrowserControl {
+    /// True when the endpoint must say the node holds the browser alone.
+    pub fn is_exclusive(&self) -> bool {
+        self.exclusive.is_some()
+    }
+}
+
 /// An element of the page: a CSS selector, in the top frame or in a child frame of an origin
 /// the policy names.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -207,6 +271,34 @@ impl Policy {
             fill.submit.frame.as_ref(),
         )
     }
+}
+
+/// Checks the `browser` member of an `open`: only on a browser connection; the exclusive
+/// grant a token header and a value of printable ASCII.
+pub(super) fn check_control(
+    at: &str,
+    connection: super::Connection,
+    control: Option<&BrowserControl>,
+) -> Checked {
+    let Some(control) = control else {
+        return Ok(());
+    };
+    ensure(
+        connection == super::Connection::Browser,
+        || format!("{at}.browser"),
+        "browser is for a browser connection",
+    )?;
+    if let Some(grant) = &control.exclusive {
+        ensure(
+            super::is_token(&grant.header)
+                && !grant.value.is_empty()
+                && grant.value.len() <= MAX_GRANT_VALUE
+                && grant.value.bytes().all(|b| (0x21..=0x7e).contains(&b)),
+            || format!("{at}.browser.exclusive"),
+            "exclusive names a token header and a value of 1 to 256 bytes of visible ASCII",
+        )?;
+    }
+    Ok(())
 }
 
 /// Checks the bounds of the `limits` of a browser connection: those of any open connection,

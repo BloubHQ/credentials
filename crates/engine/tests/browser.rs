@@ -19,17 +19,22 @@ use std::collections::VecDeque;
 use std::time::Duration;
 
 use engine::Error;
+use engine::approval::ApprovalSummary;
 use engine::call::{Body, Output, SignedCall};
 use engine::cdp::{self, WebOrigin};
 use engine::egress::{Arrived, ClientIdentity, Stream, Transport, Version, Versions};
 use engine::error::TransportKind;
 use engine::fields::Fields;
 use engine::grant::{GrantTerms, RecordPin};
+use engine::item::{ItemBinding, ItemFill, KindSchema, RoleField, ShapeConnection};
 use engine::keys::{CallerKey, DeviceKey, NodeKey, UserKey};
 use engine::log::{Event, MemorySink};
+use engine::node::Clock;
 use engine::node::{Filled, MAX_CDP_EVENTS, Node, SystemClock};
+use engine::policy::Element;
 use engine::policy::summary::{FlagCode, Form};
 use engine::policy::{Caller, Destination, FieldSpec, Operation, Policy};
+use engine::session::Pending;
 use serde_json::{Value, json};
 
 const USER: &str = "alice@example.com";
@@ -207,6 +212,21 @@ struct Hooks {
     oopif: Option<String>,
     /// After answering the n-th frame-tree read, forget every remote object.
     forget_objects_at_tree: Option<usize>,
+    /// A header of the handshake's answer (the endpoint's exclusive grant).
+    grant: Option<(String, String)>,
+    /// After the n-th command of this method, another client does something.
+    during: Option<(String, usize, During)>,
+    /// The browser answers the history reset but keeps the history.
+    keep_history: bool,
+}
+
+/// What another client of the browser does in the middle of a fill.
+#[derive(Clone)]
+enum During {
+    /// Attaches to the target of this id.
+    Attach(String),
+    /// Opens a page at this URL.
+    Open(String),
 }
 
 #[derive(Clone, Copy)]
@@ -238,6 +258,13 @@ struct Browser {
     answered: usize,
     stalled: bool,
     handshake: Vec<u8>,
+    /// The documents the top frame left, with the values their elements held (the
+    /// back/forward cache keeps a document as it was).
+    history: Vec<Vec<El>>,
+    /// Every value a fill set, by selector, in order.
+    typed: Vec<(String, String)>,
+    /// How many submits ran.
+    submits: usize,
 }
 
 fn element(selector: &str, kind: &'static str) -> El {
@@ -318,8 +345,31 @@ impl Browser {
         out
     }
 
+    /// True when a document the top frame left still holds `secret`.
+    fn history_holds(&self, secret: &str) -> bool {
+        self.history
+            .iter()
+            .flatten()
+            .any(|e| !secret.is_empty() && e.value.contains(secret))
+    }
+
+    /// True when a fill typed `secret` into any element.
+    fn typed_any(&self, secret: &str) -> bool {
+        self.typed.iter().any(|(_, v)| v.contains(secret))
+    }
+
+    /// The value typed into `selector`, if one was.
+    fn typed_into(&self, selector: &str) -> Option<String> {
+        self.typed
+            .iter()
+            .rev()
+            .find(|(s, _)| s == selector)
+            .map(|(_, v)| v.clone())
+    }
+
     fn navigate_top(&mut self, url: &str) {
         let top = self.frames.iter_mut().find(|f| f.parent.is_none()).unwrap();
+        self.history.push(top.elements.clone());
         top.loader += 1;
         top.url = url.into();
         top.real_origin = None;
@@ -457,6 +507,21 @@ impl Browser {
         if method == "Page.getFrameTree" && self.hooks.forget_objects_at_tree == Some(n) {
             self.objects.clear();
         }
+        if let Some((m, at, during)) = self.hooks.during.clone()
+            && m == method
+            && at == n
+        {
+            self.hooks.during = None;
+            match during {
+                During::Attach(target) => {
+                    self.targets.iter_mut().find(|t| t.0 == target).unwrap().3 = true;
+                }
+                During::Open(url) => {
+                    self.targets
+                        .push(("page-9".into(), "page".into(), url, false));
+                }
+            }
+        }
     }
 
     fn respond(&mut self, id: u64, method: &str, session: Option<&str>, params: &Value) {
@@ -514,6 +579,21 @@ impl Browser {
                 }
             }
             "Runtime.callFunctionOn" => self.call(params),
+            "Page.resetNavigationHistory" => {
+                if !self.hooks.keep_history {
+                    self.history.clear();
+                }
+                Ok(json!({}))
+            }
+            "Page.getNavigationHistory" => {
+                let mut entries: Vec<Value> = self
+                    .history
+                    .iter()
+                    .map(|_| json!({"id": 1, "url": "https://old.example/", "title": "t"}))
+                    .collect();
+                entries.push(json!({"id": 2, "url": self.frames[0].url, "title": "t"}));
+                Ok(json!({"currentIndex": entries.len() - 1, "entries": entries}))
+            }
             _ => Err("method not found".into()),
         };
         self.answer(id, session, result);
@@ -607,6 +687,8 @@ impl Browser {
                 return Ok(Self::text("kind"));
             }
             set(self, args[0].as_str().unwrap().to_string());
+            self.typed
+                .push((selector.clone(), args[0].as_str().unwrap().to_string()));
             if self.hooks.navigate_after_fill.as_deref() == Some(selector.as_str()) {
                 self.hooks.navigate_after_fill = None;
                 let url = self
@@ -623,8 +705,12 @@ impl Browser {
             }
             Ok(Self::text("ok"))
         } else if function == cdp::SUBMIT {
+            self.submits += 1;
             if self.hooks.submit_navigates {
-                self.navigate_top(&format!("{PAGE}/home"));
+                // To another document of the page's own origin.
+                let top = self.frames.iter().find(|f| f.parent.is_none()).unwrap();
+                let origin = WebOrigin::of_url(&top.url).unwrap().serialize();
+                self.navigate_top(&format!("{origin}/home"));
             }
             Ok(Self::text("ok"))
         } else if function == cdp::CLEAR {
@@ -705,8 +791,14 @@ impl Transport for Browser {
             .unwrap()
             .trim()
             .to_string();
+        let grant = self
+            .hooks
+            .grant
+            .as_ref()
+            .map(|(name, value)| format!("{name}: {value}\r\n"))
+            .unwrap_or_default();
         let head = format!(
-            "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {}\r\n\r\n",
+            "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {}\r\n{grant}\r\n",
             engine::websocket::accept(&key)
         );
         self.out.push_back(head.into_bytes());
@@ -782,7 +874,7 @@ fn closed_entry(s: &Setup) -> (String, bool) {
         .expect("a closed entry")
 }
 
-const ALLOWED: [&str; 8] = [
+const ALLOWED: [&str; 10] = [
     "Target.getTargets",
     "Target.attachToTarget",
     "Target.detachFromTarget",
@@ -791,6 +883,8 @@ const ALLOWED: [&str; 8] = [
     "Page.createIsolatedWorld",
     "Runtime.callFunctionOn",
     "Runtime.releaseObjectGroup",
+    "Page.resetNavigationHistory",
+    "Page.getNavigationHistory",
 ];
 
 fn only_allowed_methods(browser: &Browser) {
@@ -852,13 +946,17 @@ fn the_values_go_into_the_fields_the_policy_names() {
     let s = setup(vec![login()]);
     let mut browser = Browser::login_page();
     browser.hooks.submit_navigates = false;
-    // Look at the values before the node blanks them: stop right before the clear.
+    // A wrong answer to the first clear: the fill fails, and blanks on its way out.
     browser.hooks.forge = Some(("Runtime.callFunctionOn".into(), 7, Forge::NotOk));
-    let _ = run(&s, &mut browser);
-    assert_eq!(browser.value_of("#id").as_deref(), Some(USER));
+    assert!(run(&s, &mut browser).is_err());
+    assert_eq!(browser.typed_into("#id").as_deref(), Some(USER));
     assert!(
-        browser.value_of("#pw").as_deref() == Some(PASSWORD),
-        "the password field does not hold the password"
+        browser.typed_into("#pw").as_deref() == Some(PASSWORD),
+        "the password field did not get the password"
+    );
+    assert!(
+        !browser.holds_password(),
+        "a failed fill left the password in the page"
     );
 }
 
@@ -1097,7 +1195,7 @@ fn a_cross_origin_frame_gets_values_only_when_the_policy_names_it() {
     browser.hooks.forge = Some(("Runtime.callFunctionOn".into(), 7, Forge::NotOk));
     let _ = run(&s, &mut browser);
     assert!(
-        browser.value_of("#pw").as_deref() == Some(PASSWORD),
+        browser.typed_into("#pw").as_deref() == Some(PASSWORD),
         "the named frame did not get the value"
     );
     let summary = engine::policy::summarize(&policy_of(vec![operation]), None);
@@ -1291,8 +1389,15 @@ fn a_value_that_is_not_utf8_is_refused_before_the_page() {
         .iter()
         .filter(|m| *m == "Runtime.callFunctionOn")
         .count();
-    // The username's lookup and fill, then the password's lookup; no fill of it.
-    assert_eq!(fills, 3);
+    // The username's lookup and fill, then the password's lookup; no fill of it; then the
+    // username field blanked again, since the fill failed after it.
+    assert_eq!(fills, 4);
+    assert_eq!(browser.typed_into("#id").as_deref(), Some(USER));
+    assert_eq!(
+        browser.value_of("#id").as_deref(),
+        Some(""),
+        "the field kept the user name"
+    );
 }
 
 // ---------------------------------------------------------------- limits
@@ -1510,4 +1615,804 @@ fn the_summary_flags_browser_fills_and_where_the_secret_goes() {
             .iter()
             .any(|f| f.code == FlagCode::Wider && f.detail.contains("the browser fill changed"))
     );
+}
+
+// ---------------------------------------------------------------- the agent's controller
+
+const GRANT: (&str, &str) = ("cdp-exclusive", "granted");
+
+fn granted_open(mut value: Value, leave: &str) -> Value {
+    value["steps"][0]["browser"] =
+        json!({"exclusive": {"header": GRANT.0, "value": GRANT.1}, "leave": leave});
+    value
+}
+
+#[test]
+fn without_the_endpoints_exclusive_grant_nothing_is_sent() {
+    let s = setup(vec![op(granted_open(fill_value(login_fill()), "blank"))]);
+    // No grant in the answer, a wrong value, a value with more around it, another header:
+    // not one command.
+    for grant in [
+        None,
+        Some((GRANT.0.to_string(), "denied".to_string())),
+        Some((GRANT.0.to_string(), "granted, maybe".to_string())),
+        Some(("cdp-shared".to_string(), GRANT.1.to_string())),
+    ] {
+        let mut browser = Browser::login_page();
+        browser.hooks.grant = grant;
+        let result = run(&s, &mut browser);
+        refused_with(
+            &result,
+            "the endpoint did not hand the browser to the node alone",
+        );
+        assert!(browser.methods.is_empty(), "a command reached the endpoint");
+        assert!(!browser.typed_any(PASSWORD));
+        no_secret_out(&s, &result);
+    }
+    // The grant, its header name in any case: the fill runs.
+    let mut browser = Browser::login_page();
+    browser.hooks.grant = Some(("CDP-Exclusive".into(), GRANT.1.into()));
+    browser.hooks.submit_navigates = true;
+    assert_eq!(run(&s, &mut browser).unwrap().outcome, "navigated");
+    // Without `exclusive`, the summary says the controller may still be there.
+    let shared = engine::policy::summarize(&policy_of(vec![login()]), None);
+    assert!(
+        shared
+            .flags
+            .iter()
+            .any(|f| f.code == FlagCode::BrowserShared)
+    );
+    let held_policy = policy_of(vec![op(granted_open(fill_value(login_fill()), "blank"))]);
+    let held = engine::policy::summarize(&held_policy, None);
+    assert!(!held.flags.iter().any(|f| f.code == FlagCode::BrowserShared));
+    // Dropping the grant is wider.
+    let diff = engine::policy::summarize(&policy_of(vec![login()]), Some(&held_policy));
+    assert!(diff.flags.iter().any(|f| {
+        f.code == FlagCode::Wider
+            && f.detail
+                .contains("how the browser is kept to the node changed")
+    }));
+}
+
+#[test]
+fn a_client_attached_anywhere_in_the_browser_stops_the_fill() {
+    // A worker of the origin: it would see the request that carries the values.
+    let s = setup(vec![login()]);
+    let mut browser = Browser::login_page();
+    browser.targets.push((
+        "sw-1".into(),
+        "service_worker".into(),
+        format!("{PAGE}/sw.js"),
+        true,
+    ));
+    refused_with(
+        &run(&s, &mut browser),
+        "another client is attached to the browser",
+    );
+    assert!(!browser.methods.iter().any(|m| m == "Target.attachToTarget"));
+    assert!(browser.typed.is_empty());
+}
+
+fn with_worker(mut browser: Browser) -> Browser {
+    browser.targets.push((
+        "sw-1".into(),
+        "service_worker".into(),
+        format!("{PAGE}/sw.js"),
+        false,
+    ));
+    browser
+}
+
+#[test]
+fn a_client_that_attaches_during_the_fill_gets_no_further_value() {
+    // The agent attaches to a worker of the origin right after the user name is typed (the
+    // 2nd call of a function is the user name's fill).
+    let s = setup(vec![login()]);
+    let mut browser = with_worker(Browser::login_page());
+    browser.hooks.during = Some((
+        "Runtime.callFunctionOn".into(),
+        2,
+        During::Attach("sw-1".into()),
+    ));
+    let result = run(&s, &mut browser);
+    refused_with(
+        &result,
+        "another client attached to the browser during the fill",
+    );
+    assert_eq!(browser.typed_into("#id").as_deref(), Some(USER));
+    assert_eq!(browser.value_of("#id").as_deref(), Some(""), "not blanked");
+    assert!(
+        !browser.typed_any(PASSWORD),
+        "the password reached the page"
+    );
+    no_secret_out(&s, &result);
+    // It opens a second tab at the origin instead.
+    let s = setup(vec![login()]);
+    let mut browser = Browser::login_page();
+    browser.hooks.during = Some((
+        "Runtime.callFunctionOn".into(),
+        2,
+        During::Open(format!("{PAGE}/spy")),
+    ));
+    refused_with(
+        &run(&s, &mut browser),
+        "another page at the policy's origin opened during the fill",
+    );
+    assert!(!browser.typed_any(PASSWORD));
+    // Between the last value and the submit (the 5th call is the submit's lookup): no
+    // submit, and both values blanked on the way out.
+    let s = setup(vec![login()]);
+    let mut browser = with_worker(Browser::login_page());
+    browser.hooks.during = Some((
+        "Runtime.callFunctionOn".into(),
+        5,
+        During::Attach("sw-1".into()),
+    ));
+    refused_with(
+        &run(&s, &mut browser),
+        "another client attached to the browser during the fill",
+    );
+    assert!(browser.typed_any(PASSWORD), "the password was not typed");
+    assert_eq!(browser.submits, 0);
+    assert!(!browser.holds_password(), "the password stayed in the page");
+}
+
+#[test]
+fn values_do_not_wait_in_the_page_for_the_controller() {
+    // The page stays, `leave: reload`: blanked, then loaded again with a GET at the origin.
+    let s = setup(vec![op(granted_open(fill_value(login_fill()), "reload"))]);
+    let mut browser = Browser::login_page();
+    browser.hooks.grant = Some((GRANT.0.into(), GRANT.1.into()));
+    let loader = browser.frames[0].loader;
+    let result = run(&s, &mut browser);
+    let filled = result.as_ref().unwrap();
+    assert_eq!(filled.outcome, "reloaded");
+    assert_eq!(filled.origin, PAGE);
+    assert_eq!(closed_entry(&s), ("reloaded".into(), true));
+    assert!(
+        browser.frames[0].loader > loader,
+        "the document was not replaced"
+    );
+    assert_eq!(browser.frames[0].url, format!("{PAGE}/"));
+    assert!(!browser.holds_password(), "the page holds the password");
+    assert!(
+        !browser.history_holds(PASSWORD),
+        "the history holds the filled document"
+    );
+    assert!(browser.history.is_empty());
+    only_allowed_methods(&browser);
+    no_secret_out(&s, &result);
+    // The page navigates: the document it left (with the values) leaves the history too.
+    let s = setup(vec![login()]);
+    let mut browser = Browser::login_page();
+    browser.hooks.submit_navigates = true;
+    let result = run(&s, &mut browser);
+    assert_eq!(result.unwrap().outcome, "navigated");
+    assert!(
+        !browser.history_holds(PASSWORD),
+        "the back/forward cache holds the filled document"
+    );
+    // A browser that keeps the history: refused, never reported as done.
+    let s = setup(vec![login()]);
+    let mut browser = Browser::login_page();
+    browser.hooks.submit_navigates = true;
+    browser.hooks.keep_history = true;
+    refused_with(
+        &run(&s, &mut browser),
+        "the browser kept the filled page in its history",
+    );
+    // `leave: blank` (the default) blanks a page that stays and clears its history too.
+    let s = setup(vec![login()]);
+    let mut browser = Browser::login_page();
+    browser.history.push(vec![element("#old", "input")]);
+    assert_eq!(run(&s, &mut browser).unwrap().outcome, "submitted");
+    assert!(browser.history.is_empty());
+    assert!(!browser.holds_password());
+}
+
+// ---------------------------------------------------------------- typed items
+
+#[derive(Clone, Copy)]
+struct Fixed(u64);
+
+impl Clock for Fixed {
+    fn now_ms(&self) -> u64 {
+        self.0
+    }
+}
+
+struct Typed {
+    node: Node<MemorySink, Fixed>,
+    record: engine::record::Record,
+    device: DeviceKey,
+    now: u64,
+}
+
+/// RFC 6238's SHA-1 key, `12345678901234567890`, in base32.
+const SEED: &str = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ";
+const SHOP: &str = "https://shop.example.com";
+const PSP: &str = "https://pay.example.org";
+const NUMBER: &str = "4242424242424242";
+const CVC: &str = "737";
+/// 2026-11-25T00:00:00Z.
+const NOW_MS: u64 = 1_795_564_800_000;
+
+fn typed_op(fills: Vec<Value>) -> Operation {
+    let mut steps = vec![
+        json!({"do": "open", "connection": "browser",
+               "destinations": [{"host": "cdp.browser.test", "port": 443}],
+               "browser": {"exclusive": {"header": GRANT.0, "value": GRANT.1},
+                           "leave": "reload"}}),
+        json!({"do": "send",
+               "request": {"from": "fixed", "method": "GET", "path": "/devtools/browser/b1"}}),
+    ];
+    steps.extend(fills.into_iter().map(|f| json!({"do": "send", "fill": f})));
+    steps.push(json!({"do": "return"}));
+    op(json!({"name": "login", "steps": steps}))
+}
+
+fn login_binding() -> ItemBinding {
+    ItemBinding::reviewed("login").pin("origin", PAGE)
+}
+
+fn item_fill(origin: Option<&str>, roles: &[(&str, &str, Option<&str>)], submit: &str) -> ItemFill {
+    ItemFill {
+        origin: origin.map(str::to_string),
+        fields: roles
+            .iter()
+            .map(|(role, selector, frame)| RoleField {
+                role: role.to_string(),
+                selector: selector.to_string(),
+                frame: frame.map(str::to_string),
+            })
+            .collect(),
+        submit: Element {
+            selector: submit.into(),
+            frame: None,
+        },
+        navigate: None,
+        wait_ms: Some(300),
+    }
+}
+
+fn login_fill_typed(roles: &[(&str, &str)]) -> Value {
+    let roles: Vec<(&str, &str, Option<&str>)> =
+        roles.iter().map(|(r, s)| (*r, *s, None)).collect();
+    let fill = item_fill(None, &roles, "form#login");
+    serde_json::to_value(login_binding().browser_fill(&fill).unwrap()).unwrap()
+}
+
+fn typed_policy(
+    binding: ItemBinding,
+    fields: Vec<FieldSpec>,
+    operations: Vec<Operation>,
+) -> Policy {
+    Policy {
+        item: Some(binding),
+        fields,
+        callers: vec![Caller {
+            name: "app".into(),
+            key: caller_key().public(),
+            operations: operations.iter().map(|o| o.name().to_string()).collect(),
+            limit: None,
+        }],
+        operations,
+    }
+}
+
+fn login_policy(operations: Vec<Operation>) -> Policy {
+    typed_policy(
+        login_binding(),
+        vec![
+            FieldSpec::public("origin"),
+            FieldSpec::secret("username"),
+            FieldSpec::guessable("password"),
+            FieldSpec::secret("totp"),
+        ],
+        operations,
+    )
+}
+
+fn card_policy(operations: Vec<Operation>) -> Policy {
+    typed_policy(
+        ItemBinding::reviewed("card"),
+        vec![
+            FieldSpec::guessable("number"),
+            FieldSpec::guessable("expiry"),
+            FieldSpec::guessable("cvc"),
+            FieldSpec::public("holder"),
+        ],
+        operations,
+    )
+}
+
+fn typed_setup(policy: Policy, values: &[(&str, &str)], now: u64) -> Typed {
+    policy.validate().unwrap();
+    let device = DeviceKey::generate();
+    let user = [9u8; 32];
+    let mut fields = Fields::new();
+    for (name, value) in values {
+        fields.insert(name, value.as_bytes().to_vec()).unwrap();
+    }
+    let record = engine::record::Record::seal(
+        &UserKey::from_bytes(&mut user.clone()),
+        "rec-t",
+        "user-t",
+        device.sign_policy(policy).unwrap(),
+        &fields,
+    )
+    .unwrap();
+    let node = Node::new(NodeKey::generate(), MemorySink::new(), Fixed(now));
+    let terms = GrantTerms::at("user-t", now, Duration::from_secs(3600)).pin(&record);
+    node.grant(
+        &device
+            .grant(
+                &UserKey::from_bytes(&mut user.clone()),
+                &node.identity(),
+                terms,
+            )
+            .unwrap(),
+    )
+    .unwrap();
+    Typed {
+        node,
+        record,
+        device,
+        now,
+    }
+}
+
+fn login_setup(operations: Vec<Operation>, now: u64) -> Typed {
+    typed_setup(
+        login_policy(operations),
+        &[
+            ("origin", PAGE),
+            ("username", USER),
+            ("password", PASSWORD),
+            ("totp", SEED),
+        ],
+        now,
+    )
+}
+
+fn card_values() -> [(&'static str, &'static str); 4] {
+    [
+        ("number", NUMBER),
+        ("expiry", "12/40"),
+        ("cvc", CVC),
+        ("holder", "Jane Doe"),
+    ]
+}
+
+fn run_typed(t: &Typed, browser: &mut Browser, body: Body) -> engine::Result<Output> {
+    let call = caller_key()
+        .sign_call_at(
+            "app",
+            &t.node.public_key(),
+            t.record.clone(),
+            "login",
+            body,
+            t.now,
+        )
+        .unwrap();
+    t.node.run(&call, browser).result
+}
+
+fn fill_of(output: engine::Result<Output>) -> engine::Result<Filled> {
+    match output {
+        Ok(Output::Fill(filled)) => Ok(filled),
+        Ok(other) => panic!("not a fill: {:?}", core::mem::discriminant(&other)),
+        Err(e) => Err(e),
+    }
+}
+
+fn approval_of(output: engine::Result<Output>) -> ([u8; 16], ApprovalSummary) {
+    match output {
+        Ok(Output::Pending(Pending::ApprovalRequired { id, summary })) => (id, *summary),
+        other => panic!("not waiting for approval: {:?}", other.err()),
+    }
+}
+
+fn login_browser() -> Browser {
+    let mut browser = Browser::login_page();
+    browser.hooks.grant = Some((GRANT.0.into(), GRANT.1.into()));
+    browser.frames[0].elements.push(element("#otp", "input"));
+    browser
+}
+
+/// RFC 6238 by hand, over `ring`'s HMAC-SHA-1 (not the node's code): 6 digits, 30 s.
+fn totp_by_hand(seed: &[u8], unix: u64) -> String {
+    let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA1_FOR_LEGACY_USE_ONLY, seed);
+    let tag = ring::hmac::sign(&key, &(unix / 30).to_be_bytes());
+    let h = tag.as_ref();
+    let at = (h[19] & 0x0f) as usize;
+    let code = u32::from_be_bytes([h[at], h[at + 1], h[at + 2], h[at + 3]]) & 0x7fff_ffff;
+    format!("{:06}", code % 1_000_000)
+}
+
+#[test]
+fn a_login_fills_its_user_name_password_and_one_time_code() {
+    // RFC 6238 appendix B, SHA-1: the last six digits of 07081804, 89005924, 69279037.
+    for (unix, code) in [
+        (1_111_111_109u64, "081804"),
+        (1_234_567_890, "005924"),
+        (2_000_000_000, "279037"),
+    ] {
+        assert_eq!(totp_by_hand(b"12345678901234567890", unix), code);
+        let operation = typed_op(vec![login_fill_typed(&[
+            ("username", "#id"),
+            ("password", "#pw"),
+            ("totp", "#otp"),
+        ])]);
+        let t = login_setup(vec![operation], unix * 1000);
+        let mut browser = login_browser();
+        browser.hooks.submit_navigates = true;
+        let filled = fill_of(run_typed(&t, &mut browser, Body::http_fixed())).unwrap();
+        assert_eq!(filled.outcome, "navigated");
+        assert_eq!(filled.fields, 3);
+        assert_eq!(browser.typed_into("#id").as_deref(), Some(USER));
+        assert!(
+            browser.typed_into("#pw").as_deref() == Some(PASSWORD),
+            "the password field did not get the password"
+        );
+        assert!(
+            browser.typed_into("#otp").as_deref() == Some(code),
+            "the code is not RFC 6238's at {unix}"
+        );
+        assert!(!browser.history_holds(PASSWORD));
+        only_allowed_methods(&browser);
+        let shown = serde_json::to_string(&filled).unwrap();
+        assert!(!shown.contains("S3cret") && !shown.contains(code));
+    }
+}
+
+#[test]
+fn a_login_fills_only_a_page_at_its_origin_exactly() {
+    let operation = typed_op(vec![login_fill_typed(&[
+        ("username", "#id"),
+        ("password", "#pw"),
+    ])]);
+    for url in [
+        "https://sub.login.example.com/signin",
+        "https://login.example.com:8443/signin",
+        "http://login.example.com/signin",
+        "https://xn--lgin-qqa.example.com/signin",
+        "https://login.example.com.evil.test/signin",
+        "https://example.com/signin",
+    ] {
+        let t = login_setup(vec![operation.clone()], NOW_MS);
+        let mut browser = login_browser();
+        browser.targets[0].2 = url.into();
+        browser.frames[0].url = url.into();
+        let result = fill_of(run_typed(&t, &mut browser, Body::http_fixed()));
+        refused_with(&result, "no page of the browser is at the policy's origin");
+        assert!(browser.typed.is_empty(), "{url}: a value reached the page");
+    }
+    // A policy cannot move the fill elsewhere, even signed: the origin is the pin.
+    let mut moved = login_fill_typed(&[("password", "#pw")]);
+    moved["origin"] = json!("https://sub.login.example.com");
+    let err = login_policy(vec![typed_op(vec![moved])])
+        .validate()
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("at its pinned origin exactly"),
+        "{err}"
+    );
+    let elsewhere = item_fill(
+        Some("https://login.example.com:8443"),
+        &[("password", "#pw", None)],
+        "form#login",
+    );
+    assert!(login_binding().browser_fill(&elsewhere).is_err());
+}
+
+#[test]
+fn a_login_fills_the_top_frame_only() {
+    // The password field sits in a frame of another origin (an attacker's iframe), or in a
+    // child frame of the same origin: the selector never resolves into either.
+    for frame_url in [
+        "https://evil.example.net/x",
+        "https://login.example.com/inner",
+    ] {
+        let operation = typed_op(vec![login_fill_typed(&[
+            ("username", "#id"),
+            ("password", "#pw"),
+        ])]);
+        let t = login_setup(vec![operation], NOW_MS);
+        let mut browser = login_browser();
+        browser.frames[0].elements.retain(|e| e.selector != "#pw");
+        browser.frames.push(frame(
+            "frame-2",
+            Some("page-1"),
+            frame_url,
+            vec![element("#pw", "input")],
+        ));
+        let result = fill_of(run_typed(&t, &mut browser, Body::http_fixed()));
+        refused_with(&result, "no element of the page matches the selector");
+        assert!(
+            !browser.typed_any(PASSWORD),
+            "{frame_url}: the password reached a frame"
+        );
+        assert!(!browser.holds_password());
+    }
+    // A policy that names a frame is refused for a login.
+    let mut framed = login_fill_typed(&[("password", "#pw")]);
+    framed["fields"][0]["frame"] = json!(PAGE);
+    let err = login_policy(vec![typed_op(vec![framed])])
+        .validate()
+        .unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("the kind fills the top frame only"),
+        "{err}"
+    );
+}
+
+#[test]
+fn a_typed_fill_is_the_kinds_and_nothing_else() {
+    let refuse = |operation: Operation, why: &str| {
+        let err = login_policy(vec![operation])
+            .validate()
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains(why), "{err}");
+    };
+    // A value that is not a role's: the password with more around it, encoded, or joined.
+    for template in [
+        "{{password}}x",
+        "{{ b64(password) }}",
+        "{{username}}{{password}}",
+    ] {
+        let mut fill = login_fill_typed(&[("password", "#pw")]);
+        fill["fields"][0]["template"] = json!(template);
+        refuse(typed_op(vec![fill]), "one of the kind's role values");
+    }
+    // The same role twice in one fill.
+    let mut twice = login_fill_typed(&[("password", "#pw"), ("username", "#id")]);
+    twice["fields"][1]["template"] = json!("{{password}}");
+    refuse(typed_op(vec![twice]), "each at most once");
+    // Without the exclusive grant, or with `leave: blank`.
+    let fill = login_fill_typed(&[("password", "#pw")]);
+    let mut value = serde_json::to_value(typed_op(vec![fill.clone()])).unwrap();
+    value["steps"][0]["browser"]
+        .as_object_mut()
+        .unwrap()
+        .remove("exclusive");
+    refuse(op(value), "exclusive grant and leave reload");
+    let mut value = serde_json::to_value(typed_op(vec![fill.clone()])).unwrap();
+    value["steps"][0]["browser"]["leave"] = json!("blank");
+    refuse(op(value), "exclusive grant and leave reload");
+    // The handshake carries a field of the item to the endpoint.
+    let mut value = serde_json::to_value(typed_op(vec![fill])).unwrap();
+    value["steps"][1]["inject"] = json!([{"target": {"kind": "header", "name": "Authorization"},
+                                          "template": "Bearer {{password}}"}]);
+    refuse(op(value), "carries none of its fields");
+    // `browser` on another connection.
+    let mut value = fill_value(login_fill());
+    value["steps"][0]["connection"] = json!("websocket");
+    value["steps"][0]["browser"] = json!({"leave": "reload"});
+    assert!(policy_of(vec![op(value)]).validate().is_err());
+    // The builder knows only the kind's roles.
+    let unknown = item_fill(None, &[("session", "#s", None)], "form");
+    assert!(login_binding().browser_fill(&unknown).is_err());
+    // A card has no origin of its own: the owner names the merchant's.
+    let nowhere = item_fill(None, &[("number", "#cc", None)], "form");
+    assert!(
+        ItemBinding::reviewed("card")
+            .browser_fill(&nowhere)
+            .is_err()
+    );
+    // A typed fill is summarized like any: where each secret goes, and the browser flagged.
+    let policy = login_policy(vec![typed_op(vec![login_fill_typed(&[
+        ("username", "#id"),
+        ("password", "#pw"),
+    ])])]);
+    let summary = engine::policy::summarize(&policy, None);
+    assert!(
+        summary
+            .flags
+            .iter()
+            .any(|f| f.code == FlagCode::BrowserFill)
+    );
+    assert!(
+        !summary
+            .flags
+            .iter()
+            .any(|f| f.code == FlagCode::BrowserShared)
+    );
+    let password = summary
+        .secrets
+        .iter()
+        .find(|s| s.field == "password")
+        .unwrap();
+    assert!(
+        password
+            .uses
+            .iter()
+            .any(|u| matches!(u.form, Form::BrowserField { .. }))
+    );
+}
+
+#[test]
+fn kinds_hold_browser_roles_to_their_fields() {
+    let rule_of = |kind: &KindSchema| match kind.validate() {
+        Err(Error::KindInvalid { rule, .. }) => rule,
+        other => panic!("not refused: {:?}", other.err()),
+    };
+    let login = engine::item::reviewed_kind("login").unwrap().clone();
+    login.validate().unwrap();
+    for template in ["{{ nobody }}", "plain", "{{"] {
+        let mut k = login.clone();
+        k.shape.browser.as_mut().unwrap().roles[0].template = template.into();
+        assert_eq!(
+            rule_of(&k),
+            "a role's template parses and reads fields of the kind only"
+        );
+    }
+    let mut k = login.clone();
+    k.shape.browser = None;
+    assert_eq!(
+        rule_of(&k),
+        "a kind with a browser connection names its browser roles"
+    );
+    let mut k = login.clone();
+    k.shape
+        .connections
+        .retain(|c| *c != ShapeConnection::Browser);
+    assert_eq!(
+        rule_of(&k),
+        "browser roles are for a kind with named fields and a browser connection"
+    );
+    let mut k = login.clone();
+    k.shape.browser.as_mut().unwrap().origin = None;
+    assert_eq!(
+        rule_of(&k),
+        "a kind whose destinations are a pinned origin fills pages at that origin only"
+    );
+    let mut k = login.clone();
+    k.shape.browser.as_mut().unwrap().origin = Some("username".into());
+    assert!(rule_of(&k).starts_with("the browser origin is a pinned field"));
+    let mut k = login;
+    let first = k.shape.browser.as_ref().unwrap().roles[0].clone();
+    k.shape.browser.as_mut().unwrap().roles.push(first);
+    assert_eq!(rule_of(&k), "1 to 16 roles of distinct names and templates");
+}
+
+fn card_browser() -> Browser {
+    let mut b = Browser::default();
+    b.hooks.grant = Some((GRANT.0.into(), GRANT.1.into()));
+    b.targets.push((
+        "page-1".into(),
+        "page".into(),
+        format!("{SHOP}/checkout"),
+        false,
+    ));
+    b.frames.push(frame(
+        "page-1",
+        None,
+        &format!("{SHOP}/checkout"),
+        vec![element("#name", "input"), element("form#pay", "form")],
+    ));
+    b.frames.push(frame(
+        "frame-2",
+        Some("page-1"),
+        &format!("{PSP}/card"),
+        vec![
+            element("#cc", "input"),
+            element("#exp-m", "input"),
+            element("#exp-y", "input"),
+            element("#cvc", "input"),
+        ],
+    ));
+    b.hooks.submit_navigates = true;
+    b
+}
+
+fn card_fill() -> Value {
+    let fill = item_fill(
+        Some(SHOP),
+        &[
+            ("number", "#cc", Some(PSP)),
+            ("expiry_month", "#exp-m", Some(PSP)),
+            ("expiry_year", "#exp-y", Some(PSP)),
+            ("cvc", "#cvc", Some(PSP)),
+            ("holder", "#name", None),
+        ],
+        "form#pay",
+    );
+    serde_json::to_value(ItemBinding::reviewed("card").browser_fill(&fill).unwrap()).unwrap()
+}
+
+#[test]
+fn every_card_fill_waits_for_the_owners_approval() {
+    let t = typed_setup(
+        card_policy(vec![typed_op(vec![card_fill()])]),
+        &card_values(),
+        NOW_MS,
+    );
+    let mut browser = card_browser();
+    let (id, summary) = approval_of(run_typed(&t, &mut browser, Body::http_fixed()));
+    // Nothing reached the endpoint before the approval: not even the handshake.
+    assert!(browser.handshake.is_empty() && browser.methods.is_empty());
+    // The owner sees the merchant's page and the masked card, never its secrets.
+    assert_eq!(summary.origin.as_deref(), Some(SHOP));
+    let text = serde_json::to_string(&summary).unwrap();
+    assert!(text.contains("4242"), "the masked number is shown");
+    for secret in [NUMBER, "\"737\"", "12/40"] {
+        assert!(!text.contains(secret), "a secret value is in the summary");
+    }
+    // Not approved yet: still waiting, still nothing sent.
+    approval_of(run_typed(&t, &mut browser, Body::resume(id)));
+    assert!(browser.methods.is_empty());
+    t.node
+        .approve(&t.device.approve(&summary, t.now).unwrap())
+        .unwrap();
+    let filled = fill_of(run_typed(&t, &mut browser, Body::resume(id))).unwrap();
+    assert_eq!(filled.outcome, "navigated");
+    assert_eq!(filled.origin, SHOP);
+    assert!(
+        browser.typed_into("#cc").as_deref() == Some(NUMBER),
+        "the number field"
+    );
+    assert_eq!(browser.typed_into("#exp-m").as_deref(), Some("12"));
+    assert_eq!(browser.typed_into("#exp-y").as_deref(), Some("40"));
+    assert!(
+        browser.typed_into("#cvc").as_deref() == Some(CVC),
+        "the code field"
+    );
+    assert_eq!(browser.typed_into("#name").as_deref(), Some("Jane Doe"));
+    assert!(!browser.history_holds(NUMBER) && !browser.history_holds(CVC));
+    // The approval was for that use only.
+    let mut again = card_browser();
+    approval_of(run_typed(&t, &mut again, Body::http_fixed()));
+    assert!(again.methods.is_empty());
+}
+
+#[test]
+fn a_card_goes_into_the_frame_the_policy_names_only() {
+    let t = typed_setup(
+        card_policy(vec![typed_op(vec![card_fill()])]),
+        &card_values(),
+        NOW_MS,
+    );
+    let mut browser = card_browser();
+    browser.frames[1].url = "https://evil.example.net/card".into();
+    let (id, summary) = approval_of(run_typed(&t, &mut browser, Body::http_fixed()));
+    t.node
+        .approve(&t.device.approve(&summary, t.now).unwrap())
+        .unwrap();
+    let result = fill_of(run_typed(&t, &mut browser, Body::resume(id)));
+    refused_with(&result, "no element of the page matches the selector");
+    assert!(!browser.typed_any(NUMBER) && !browser.typed_any(CVC));
+}
+
+#[test]
+fn describe_of_a_typed_item_never_shows_a_secret() {
+    let login = login_policy(vec![typed_op(vec![login_fill_typed(&[(
+        "password", "#pw",
+    )])])]);
+    let mut fields = Fields::new();
+    for (n, v) in [
+        ("origin", PAGE),
+        ("username", USER),
+        ("password", PASSWORD),
+        ("totp", SEED),
+    ] {
+        fields.insert(n, v.as_bytes().to_vec()).unwrap();
+    }
+    let text = serde_json::to_string(&engine::item::describe(&login, &fields).unwrap()).unwrap();
+    assert!(text.contains("a***@example.com") && text.contains(PAGE));
+    for secret in ["S3cret", SEED, USER] {
+        assert!(!text.contains(secret), "a secret is in the description");
+    }
+    let card = card_policy(vec![typed_op(vec![card_fill()])]);
+    let mut fields = Fields::new();
+    for (n, v) in card_values() {
+        fields.insert(n, v.as_bytes().to_vec()).unwrap();
+    }
+    let text = serde_json::to_string(&engine::item::describe(&card, &fields).unwrap()).unwrap();
+    assert!(text.contains("4242") && text.contains("Jane Doe"));
+    for secret in [NUMBER, "\"737\"", "12/40"] {
+        assert!(!text.contains(secret), "a secret is in the description");
+    }
 }

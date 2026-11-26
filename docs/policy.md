@@ -470,15 +470,56 @@ parameter of a fixed pattern); the policy may inject the endpoint's own credenti
 | `navigate` | Optional: a path on `origin` the node loads the page at first, so that nothing an earlier client planted in the document survives. At most 2048 bytes, no dot segment, no placeholder. |
 | `wait_ms` | How long the node waits for each element to appear and for the page to leave after the submit: default 5000, at most 30000. |
 
+**Keeping the agent's controller out.** The agent's own CDP client (its controller) drives
+the same browser. While the node fills, that client must not read the page, its inputs,
+screenshots or network. CDP cannot guarantee it by itself: any client of the endpoint may
+attach to any page at any time, and a second session on the page the node holds is
+invisible to the node (a target reports only whether *some* client is attached). So the
+`open` of a browser connection may ask the endpoint for the browser alone, and name the
+answer that says it was granted:
+
+```json
+{"do": "open", "connection": "browser",
+ "destinations": [{"host": "cdp.browser.example.net", "port": 443}],
+ "browser": {"exclusive": {"header": "cdp-exclusive", "value": "granted"}, "leave": "reload"}}
+```
+
+| `browser` member | Meaning |
+| --- | --- |
+| `exclusive` | `header` (a token, compared without case) and `value` (exactly, 1 to 256 bytes of visible ASCII) of the `101` answer to the handshake by which the endpoint says it handed the browser to the node alone: every other client (the agent's controller, a live view) cut off, none let in until the node's connection closes. The handshake request asks for it in whatever way the endpoint takes (a fixed query parameter or header). Without that exact header the node sends **no command** (`the endpoint did not hand the browser to the node alone`). Without `exclusive` the operation is flagged `browser_shared`. |
+| `leave` | What the node leaves when the page still shows the document it filled after the last submit: `blank` (default: the fields blanked) or `reload` (blanked, then the page is loaded again with a GET of the fill's `navigate` path, or `/`, at its origin, and the outcome is `reloaded`). Never a reload, which could post the form again. |
+
+When the node closes its connection, the endpoint lets the controller back in. By then:
+
+- the page left the document it filled (`navigated`), or the node blanked the fields, and
+  with `leave: reload` loaded the page again, so neither the fields nor whatever the
+  document's scripts kept of the values in memory are there;
+- in every case the node cleared the page's history (`Page.resetNavigationHistory`) and
+  checked it holds one entry (`Page.getNavigationHistory`): the back/forward cache keeps a
+  document with the values in its inputs, and `history.back()` would bring it back. A
+  browser that keeps the history refuses the fill (`the browser kept the filled page in its
+  history`) after the values went in: the caller is not told it succeeded;
+- a fill that stops after a value went in (any refusal or error) blanks the fields filled
+  so far on its way out, as far as the browser still answers.
+
+What the node checks itself, besides the grant: no client is attached to any target of the
+browser when it starts (a worker of the origin would see the request carrying the values),
+and just before each value and before the submit it lists the targets again: a client
+attached to a target it does not hold, or a second page at the origin, ends the fill before
+the next value. A client attached to the page the node holds cannot be seen this way; that
+is what `exclusive` is for.
+
 What the node does, in order. The CDP commands it issues are exactly `Target.getTargets`,
 `Target.attachToTarget`, `Target.detachFromTarget`, `Page.navigate`, `Page.getFrameTree`,
-`Page.createIsolatedWorld`, `Runtime.callFunctionOn` and `Runtime.releaseObjectGroup`; never
-`Runtime.evaluate`. The only code it runs in a page is four fixed functions of its own
-(`engine::cdp::FIND`, `FILL`, `SUBMIT`, `CLEAR`), with the selector, origins and value as
-arguments.
+`Page.createIsolatedWorld`, `Runtime.callFunctionOn`, `Runtime.releaseObjectGroup`,
+`Page.resetNavigationHistory` and `Page.getNavigationHistory`; never `Runtime.evaluate`.
+The only code it runs in a page is four fixed functions of its own (`engine::cdp::FIND`,
+`FILL`, `SUBMIT`, `CLEAR`), with the selector, origins and value as arguments.
 
+0. With `exclusive`, the handshake's answer must carry the grant, or nothing is sent.
 1. It picks the one `page` target whose URL is at `origin` (none, or two, refuses) and
-   refuses when another client is attached to it; then attaches (a flattened session).
+   refuses when another client is attached to it or to any other target of the browser;
+   then attaches (a flattened session).
 2. For each field: it reads the frame tree; the top frame's URL (and the security origin the
    browser reports) must be at `origin`, and the element's frame must be the top frame or a
    direct child at the `frame` origin; a frame of any other origin is never used. In an
@@ -488,15 +529,18 @@ arguments.
    its own target.
 3. It reads the frame tree again: the same top frame and frame, with the same loaders. A
    navigation changes the loader, a frame swap the id; either refuses.
-4. `FILL` sets the value on the element found (an `input` other than `hidden`, or a
-   `textarea`), after checking the origins again in the same task, so no navigation can come
-   between that check and the value; a document that changed makes the element's id unknown
-   and the call fail. It dispatches `input` and `change`.
+4. It lists the targets again (above), then `FILL` sets the value on the element found (an
+   `input` other than `hidden`, or a `textarea`), after checking the origins again in the
+   same task, so no navigation can come between that check and the value; a document that
+   changed makes the element's id unknown and the call fail. It dispatches `input` and
+   `change`.
 5. It reads the frame tree again, as in 3.
-6. The submit element is found and checked the same way; `SUBMIT` runs on it. The node waits
-   up to `wait_ms` for the top frame to load another document: `navigated`; otherwise
-   `submitted`, and it blanks every field it filled (`CLEAR`), so a later reader of the page
-   does not find the values there.
+6. The submit element is found and checked the same way, the targets listed again; `SUBMIT`
+   runs on it. The node waits up to `wait_ms` for the top frame to load another document:
+   `navigated`; otherwise `submitted`, and it blanks every field it filled (`CLEAR`), so a
+   later reader of the page does not find the values there.
+7. After the last fill: with `leave: reload`, a page that stayed is loaded again
+   (`reloaded`); then the history is cleared and checked.
 
 Every message of the browser is read strictly: an answer to a command the node did not send,
 a second answer, an answer from another session, a binary message or JSON that does not
@@ -506,12 +550,12 @@ most 4 MiB, and a connection issues at most 2,000 commands. A refusal is
 
 The call is an HTTP call (`{"kind": "http"}`, with the handshake request when its contract
 takes one) and answers `{"kind": "fill", "fill": {"outcome", "origin", "fields",
-"duration_ms", "log_seqs"}}`: `outcome` is `navigated` or `submitted`, `origin` the top
-frame's origin at the end (searched for secrets like any response). A browser connection
-takes one of the open-connection slots while it runs (4 per caller, 16 per owner, 256 per
-node), and the node logs one entry when it opens (the handshake, as any request) and one
-when it closes, with why (`navigated`, `submitted`, `refused`, `idle`, `duration`, `bytes`,
-`limit`) and the messages and bytes sent.
+"duration_ms", "log_seqs"}}`: `outcome` is `navigated`, `submitted` or `reloaded`, `origin`
+the top frame's origin at the end (searched for secrets like any response). A browser
+connection takes one of the open-connection slots while it runs (4 per caller, 16 per owner,
+256 per node), and the node logs one entry when it opens (the handshake, as any request) and
+one when it closes, with why (`navigated`, `submitted`, `reloaded`, `refused`, `idle`,
+`duration`, `bytes`, `limit`) and the messages and bytes sent.
 
 What CDP cannot give, and what stays trusted: the node cannot see the page's TLS through CDP
 (the certificate and the connection are the browser's), and a browser that lies can show
@@ -519,8 +563,57 @@ any page at any origin. The browser behind the endpoint is trusted with the valu
 the page at the origin, which reads them as it would from a person. A script of the page
 (or one an earlier client planted in it, unless `navigate` reloads it) can read the field
 back and keep it; the node blanks the fields when the page stays, but cannot stop that.
-Every browser operation is flagged `browser_fill`. A typed item has no browser operation
-yet.
+Every browser operation is flagged `browser_fill`. The endpoint's `exclusive` grant is a
+statement of the endpoint, which the owner trusts with the browser anyway: the node cannot
+check that the endpoint really cut the controller off. Once the controller is back, it has
+the browser as before: the cookies and storage the login left (that is the point of the
+login), and anything the site's own scripts kept where a script can read it (a value in
+`localStorage`, say). The node's tests run against an in-process fake CDP endpoint; no real
+browser or endpoint has been measured.
+
+#### Typed browser fills
+
+A `login` or `card` item fills a page without a hand-written template: its kind lists the
+values a fill may put into a page (**roles**), and the owner picks the element of each by a
+selector. `engine::item::ItemBinding::browser_fill` turns roles and selectors into the
+`fill` the policy carries:
+
+```text
+{"fields": [{"role": "username", "selector": "#id"},
+            {"role": "password", "selector": "#pw"},
+            {"role": "totp", "selector": "#otp"}],
+ "submit": {"selector": "form#login"}}
+->
+{"origin": "https://login.example.com",
+ "fields": [{"selector": "#id", "template": "{{username}}"},
+            {"selector": "#pw", "template": "{{password}}"},
+            {"selector": "#otp", "template": "{{ totp(b32decode(totp)) }}"}],
+ "submit": {"selector": "form#login"}}
+```
+
+| Kind | Page | Roles |
+| --- | --- | --- |
+| `login` | its pinned `origin`, exactly; top frame only | `username`, `password`, `totp` (RFC 6238, 6 digits, 30 s, from the seed) |
+| `card` | the merchant's origin the owner names; a field may be in a direct child frame of another origin (a payment provider's), flagged `frame_origin` | `number`, `expiry` (as stored), `expiry_month` (its first two characters), `expiry_year` (after the `/`, as stored: `YY` or `YYYY`), `cvc`, `holder` |
+
+The node holds a typed browser operation to the kind on every signature check, whoever wrote
+the fill:
+
+- the `open` asks for the endpoint's `exclusive` grant and `leave: reload`, so a typed fill
+  never runs beside the agent's controller and never leaves the filled document in the page;
+- the handshake carries none of the item's fields (no injection): the caller's own
+  credential for its browser goes in its request, within its contract;
+- each fill is at the kind's page origin (a login's pin, exactly: another scheme, port,
+  subdomain or look-alike host is another origin), in the top frame unless the kind allows
+  frames;
+- each value is exactly one of the kind's role templates (`{{password}}`, never
+  `{{password}}x` or `{{ b64(password) }}`), each role at most once per fill.
+
+A card waits for the owner's approval of every use, browser fills included: nothing reaches
+the endpoint, not even the handshake, before the approval. The approval shows the merchant's
+page origin (not the CDP endpoint) and the masked card. A custom kind may name browser roles
+too (`shape.browser`: `origin`, a pinned origin field; `frames`; `roles`, 1 to 16 of distinct
+names and templates, each reading fields of the kind only), under the same rules.
 
 ### Protocol connections
 
@@ -1359,8 +1452,8 @@ The reviewed kinds ship in the node (`crates/engine/src/items.json`, or `item_ki
 
 | Kind | Fields (secret · masked · public) | Shape |
 | --- | --- | --- |
-| `card` | cvc · number (brand and last four), expiry (year) · holder, billing | HTTPS to the owner's destinations; JSON members back; every use waits for the owner's approval |
-| `login` | password, totp, session · username (email) · origin (pinned), session_expires | HTTPS to the pinned origin only; may capture `session` |
+| `card` | cvc · number (brand and last four), expiry (year) · holder, billing | HTTPS to the owner's destinations; JSON members back; browser fills of its roles at the merchant's page ([Typed browser fills](#typed-browser-fills)); every use waits for the owner's approval |
+| `login` | password, totp, session · username (email) · origin (pinned), session_expires | HTTPS to the pinned origin only; may capture `session`; browser fills of its roles at the pinned origin only |
 | `oauth` | client_secret, refresh_token, access_token · — · provider (pinned), client_id, scopes | HTTPS; JSON members back; captures the tokens |
 | `identity` | national_id · name, birth_date, phone, email, address · — | HTTPS; JSON members back |
 | `totp` | seed (≥128 bits) · account · digits, period, issuer | derivations only |
@@ -1505,6 +1598,7 @@ crate, which checks the policy first) gives the owner, in JSON:
 | `plain_datagram` | An operation sends UDP datagrams, without TLS: what they carry is readable on the path. |
 | `browser_fill` | The node types secrets into a page in a browser over CDP: the page and the browser behind the endpoint get them, and the node cannot check the page's TLS through CDP. |
 | `frame_origin` | A fill puts values into a frame of another origin than the page's. |
+| `browser_shared` | A browser connection without the endpoint's `exclusive` grant: the agent's controller, or any other client of the endpoint, may be attached to the page while the node fills it. |
 | `vend` | An operation hands back a credential minted from the secret ([Vending](#vending)): the caller holds it until it expires. |
 | `repeat` | A loop sends requests again, up to the operation's `most_requests`: a request that is not idempotent can take effect more than once. |
 | `caller_amount` | The caller chooses the amount of a payment (a query parameter, an input member, a body member or a form field), within the contract's bounds; the spending limits and approvals apply. |

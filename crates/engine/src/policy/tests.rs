@@ -88,6 +88,7 @@ fn the_shape_of_an_operation_is_checked() {
                 host_keys: Vec::new(),
                 tls: None,
                 version: None,
+                browser: None,
             }),
         ],
         payment: None,

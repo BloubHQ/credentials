@@ -15,8 +15,16 @@
         {"name": "billing", "disclosure": "public", "optional": true,
          "checks": [{"check": "length", "min": 1, "max": 512}]}
       ],
-      "shape": {"connections": ["https"], "destinations": {"from": "owner"}, "returns": "json",
-                "approval": true}
+      "shape": {"connections": ["https", "browser"], "destinations": {"from": "owner"}, "returns": "json",
+                "approval": true,
+                "browser": {"frames": true, "roles": [
+                  {"role": "number", "template": "{{number}}"},
+                  {"role": "expiry", "template": "{{expiry}}"},
+                  {"role": "expiry_month", "template": "{{ slice(expiry, \"0\", \"2\") }}"},
+                  {"role": "expiry_year", "template": "{{ between(expiry, \"/\", \"\") }}"},
+                  {"role": "cvc", "template": "{{cvc}}"},
+                  {"role": "holder", "template": "{{holder}}"}
+                ]}}
     },
     {
       "name": "login",
@@ -33,8 +41,13 @@
         {"name": "session_expires", "disclosure": "public", "optional": true,
          "checks": [{"check": "integer", "min": 0, "max": 9999999999999}]}
       ],
-      "shape": {"connections": ["https"], "destinations": {"from": "origin", "field": "origin"},
-                "returns": "all", "captures": ["session"]}
+      "shape": {"connections": ["https", "browser"], "destinations": {"from": "origin", "field": "origin"},
+                "returns": "all", "captures": ["session"],
+                "browser": {"origin": "origin", "roles": [
+                  {"role": "username", "template": "{{username}}"},
+                  {"role": "password", "template": "{{password}}"},
+                  {"role": "totp", "template": "{{ totp(b32decode(totp)) }}"}
+                ]}}
     },
     {
       "name": "oauth",

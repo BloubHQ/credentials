@@ -66,6 +66,24 @@ pub fn item_kinds() -> String {
     engine::item::ITEMS_JSON.to_string()
 }
 
+/// The browser fill of a typed item, for the owner who picks elements by role: `binding_json`
+/// is the policy's `item` (`{"kind": "login", "pins": {"origin": ...}}`), `fill_json` the
+/// roles and selectors (`{"fields": [{"role": "password", "selector": "#pw"}], "submit":
+/// {"selector": "form"}}`, with `origin` for a kind without one, such as a card). Returns the
+/// `fill` member of a `send`, each value the template of its role. The policy that carries it
+/// still needs `browser.exclusive` and `leave: reload` on its `open` to sign.
+#[cfg_attr(not(target_arch = "wasm32"), uniffi::export)]
+pub fn item_fill(binding_json: String, fill_json: String) -> Result<String> {
+    let binding: engine::item::ItemBinding =
+        serde_json::from_str(&binding_json).map_err(ClientError::json("item binding"))?;
+    let fill: engine::item::ItemFill =
+        serde_json::from_str(&fill_json).map_err(ClientError::json("item fill"))?;
+    let fill = binding
+        .browser_fill(&fill)
+        .map_err(ClientError::engine("cannot make the fill"))?;
+    to_json(&fill)
+}
+
 /// Signs a custom kind of item (JSON, as a kind of [`item_kinds`]) with the device key, after
 /// checking its rules. A policy binds it with `{"kind": <name>, "custom": <signed kind>}`; a
 /// node accepts it when a device of the owner signed it. A custom kind cannot take the name

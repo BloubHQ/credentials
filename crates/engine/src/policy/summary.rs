@@ -327,6 +327,10 @@ pub enum FlagCode {
     BrowserFill,
     /// A fill puts values into a frame of another origin than the page's.
     FrameOrigin,
+    /// A browser connection without the endpoint's exclusive grant: the agent's controller
+    /// (or any other client of the endpoint) may be attached to the page while the node
+    /// fills it, and read the values there.
+    BrowserShared,
     /// An SSH remote forward: the server listens on the policy's address and port, and the
     /// one connection it forwards there reaches the caller.
     RemoteForward,
@@ -1135,6 +1139,21 @@ fn risk_flags(policy: &Policy, origin: Option<&Origin>, flags: &mut Vec<Flag>) {
                         fill.origin
                     ),
                 );
+                if !operation
+                    .open()
+                    .and_then(|o| o.browser.as_ref())
+                    .is_some_and(crate::policy::BrowserControl::is_exclusive)
+                {
+                    flag(
+                        flags,
+                        FlagCode::BrowserShared,
+                        &at,
+                        format!(
+                            "the endpoint is not asked to hand the browser to the node alone: a controller still attached can read what the node types into {}",
+                            fill.origin
+                        ),
+                    );
+                }
                 for frame in fill.other_frames() {
                     flag(
                         flags,
@@ -1377,6 +1396,11 @@ fn diff_operation(
         }
         if prev_open.and_then(|o| o.tls) != open.tls {
             wider.push(format!("operation {name}: how TLS starts changed"));
+        }
+        if prev_open.and_then(|o| o.browser.as_ref()) != open.browser.as_ref() {
+            wider.push(format!(
+                "operation {name}: how the browser is kept to the node changed"
+            ));
         }
         if prev_open.and_then(|o| o.limits.as_ref()) != open.limits.as_ref() {
             wider.push(format!("operation {name}: the connection limits changed"));

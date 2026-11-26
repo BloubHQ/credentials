@@ -235,6 +235,7 @@ fn convert(operation: Operation, notes: &mut Vec<String>) -> NewOperation {
                 host_keys: Vec::new(),
                 tls: None,
                 version: None,
+                browser: None,
             })];
             let mut templates: Vec<String> = Vec::new();
             for path in &paths {
@@ -324,6 +325,7 @@ fn convert(operation: Operation, notes: &mut Vec<String>) -> NewOperation {
                 host_keys: Vec::new(),
                 tls: None,
                 version: None,
+                browser: None,
             })];
             for exchange in script {
                 out.push(match exchange {
