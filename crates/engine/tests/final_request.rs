@@ -779,7 +779,10 @@ fn a_secret_in_the_query_never_leaks_through_a_request_variable() {
         ..FakeServer::default()
     };
     let response = call(&s, "o", Some(&req), &mut server).result.unwrap();
-    assert_eq!(response.body(), server.request(0).field("X-Q").as_bytes());
+    assert!(
+        response.body() == server.request(0).field("X-Q").as_bytes(),
+        "the echo of a public value is returned"
+    );
 
     // Raw, through the target URI and a path parameter, the same.
     for (path, inject) in [
