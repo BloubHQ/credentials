@@ -563,6 +563,39 @@ impl Reads {
     }
 }
 
+/// The fields each injection of a `send` carries, in listed order: those its template reads,
+/// and those of every injection whose value it sees in the request as it is sent
+/// ([`crate::request::Plan`]), through each other. Injections with no render order (the
+/// policy does not sign) carry only their own.
+fn injected_fields(reads: &Reads, inject: &[super::Injection]) -> Vec<Vec<String>> {
+    let mut out: Vec<Vec<String>> = inject
+        .iter()
+        .map(|i| reads.fields_of(&i.template))
+        .collect();
+    let Ok(plan) = crate::request::Plan::new(inject) else {
+        return out;
+    };
+    for &i in &plan.order {
+        let seen: Vec<String> = plan
+            .reads
+            .get(i)
+            .into_iter()
+            .flatten()
+            .filter_map(|&j| out.get(j))
+            .flatten()
+            .cloned()
+            .collect();
+        if let Some(own) = out.get_mut(i) {
+            for field in seen {
+                if !own.contains(&field) {
+                    own.push(field);
+                }
+            }
+        }
+    }
+    out
+}
+
 fn injects(send: &Send) -> Vec<String> {
     send.inject
         .iter()
@@ -728,8 +761,8 @@ fn uses_in(operation: &Operation) -> Vec<(String, SecretUse)> {
         })
         .unwrap_or_default();
     let mut out = Vec::new();
-    let mut add = |step: usize, template: &str, form: Form, places: &[Place]| {
-        for field in reads.fields_of(template) {
+    let mut add = |step: usize, fields: Vec<String>, form: Form, places: &[Place]| {
+        for field in fields {
             out.push((
                 field,
                 SecretUse {
@@ -745,8 +778,8 @@ fn uses_in(operation: &Operation) -> Vec<(String, SecretUse)> {
         match step {
             Step::Open(open) => {
                 if let Some(identity) = &open.identity {
-                    add(i, &identity.cert, Form::Identity, &places);
-                    add(i, &identity.key, Form::Identity, &places);
+                    add(i, reads.fields_of(&identity.cert), Form::Identity, &places);
+                    add(i, reads.fields_of(&identity.key), Form::Identity, &places);
                 }
                 if let Some(login) = &open.login {
                     let mechanism = login
@@ -756,7 +789,7 @@ fn uses_in(operation: &Operation) -> Vec<(String, SecretUse)> {
                         let form = Form::Login {
                             mechanism: mechanism.to_string(),
                         };
-                        add(i, template, form, &places);
+                        add(i, reads.fields_of(template), form, &places);
                     }
                 }
             }
@@ -781,25 +814,28 @@ fn uses_in(operation: &Operation) -> Vec<(String, SecretUse)> {
                     }
                     _ => places.clone(),
                 };
-                for injection in &send.inject {
+                // A template that reads the request as it is sent reads what the injections
+                // it sees put there: their fields go into its target too.
+                let fields = injected_fields(&reads, &send.inject);
+                for (injection, fields) in send.inject.iter().zip(fields) {
                     let form = match &injection.target {
                         Target::Header { name } => Form::Header { name: name.clone() },
                         Target::Query { name } => Form::Query { name: name.clone() },
                         Target::PathParam { name } => Form::PathParam { name: name.clone() },
                         Target::Body => Form::Body,
                     };
-                    add(i, &injection.template, form, &to);
+                    add(i, fields, form, &to);
                 }
                 if let Some(template) = &send.template {
-                    add(i, template, Form::StreamSend, &to);
+                    add(i, reads.fields_of(template), Form::StreamSend, &to);
                 }
                 if let Some(command) = &send.command {
                     let form = Form::Command {
                         name: "step".into(),
                     };
-                    add(i, &command.text, form.clone(), &to);
+                    add(i, reads.fields_of(&command.text), form.clone(), &to);
                     for p in &command.params {
-                        add(i, p, form.clone(), &to);
+                        add(i, reads.fields_of(p), form.clone(), &to);
                     }
                 }
                 if let Some(fill) = &send.fill {
@@ -818,22 +854,22 @@ fn uses_in(operation: &Operation) -> Vec<(String, SecretUse)> {
                             selector: field.selector.clone(),
                             frame: field.frame.clone(),
                         };
-                        add(i, &field.template, form, &to);
+                        add(i, reads.fields_of(&field.template), form, &to);
                     }
                 }
             }
             Step::Return(ret) => {
                 if let Some(template) = &ret.template {
                     let one_way = !reads.reversible_in(template);
-                    add(i, template, Form::Output { one_way }, &[]);
+                    add(i, reads.fields_of(template), Form::Output { one_way }, &[]);
                 }
                 for rule in ret.relay.iter().flat_map(|r| &r.commands) {
                     let form = Form::Command {
                         name: rule.name.clone(),
                     };
-                    add(i, &rule.text, form.clone(), &places);
+                    add(i, reads.fields_of(&rule.text), form.clone(), &places);
                     for t in rule.params.iter().filter_map(|p| p.template.as_deref()) {
-                        add(i, t, form.clone(), &places);
+                        add(i, reads.fields_of(t), form.clone(), &places);
                     }
                 }
             }
@@ -847,7 +883,7 @@ fn uses_in(operation: &Operation) -> Vec<(String, SecretUse)> {
                     module: run.module_name(),
                 };
                 for input in &run.inputs {
-                    add(i, input, form.clone(), &to);
+                    add(i, reads.fields_of(input), form.clone(), &to);
                 }
             }
             Step::Receive(_) | Step::Compute(_) | Step::Repeat(_) | Step::If(_) => {}

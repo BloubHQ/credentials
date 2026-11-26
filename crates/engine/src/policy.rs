@@ -1282,13 +1282,26 @@ pub struct Policy {
     pub operations: Vec<Operation>,
 }
 
-/// The headers and query parameters of the caller's request a template of a `send` reads:
-/// only a send that takes the caller's request has them, and only those its contract lets
-/// the caller set, so the analysis knows each value a template reads and a caller cannot put
-/// a header the contract refuses into a signature.
-fn check_components(at: &str, template: &Template, request: &StepRequest) -> Checked {
-    let headers = template.headers();
-    let params = template.query_params();
+/// The headers and query parameters a template of a `send` reads: one the `send` injects, or
+/// one of the caller's request that its contract lets the caller set (only a send that takes
+/// the caller's request has those). So the analysis knows each value a template reads, and a
+/// caller cannot put a header the contract refuses into a signature.
+fn check_components(
+    at: &str,
+    template: &Template,
+    request: &StepRequest,
+    inject: &[Injection],
+) -> Checked {
+    let headers: Vec<&str> = template
+        .headers()
+        .into_iter()
+        .filter(|h| !crate::request::injects_header(inject, h))
+        .collect();
+    let params: Vec<&str> = template
+        .query_params()
+        .into_iter()
+        .filter(|q| !crate::request::injects_query(inject, q))
+        .collect();
     if headers.is_empty() && params.is_empty() {
         return Ok(());
     }
@@ -1486,6 +1499,23 @@ impl Policy {
         var_ok: fn(Var) -> bool,
         after_handshake: bool,
     ) -> Result<(Template, bool)> {
+        let template = self.template_static(at, text, known, var_ok, after_handshake)?;
+        let tainted = template
+            .analyze(&|name| kinds.kind(name))
+            .map_err(|rule| Error::policy(at, rule))?;
+        Ok((template, tainted))
+    }
+
+    /// Parses a template and checks its names and variables, without the analysis: what an
+    /// injection's template needs before its order is known ([`crate::request::Plan`]).
+    fn template_static(
+        &self,
+        at: &str,
+        text: &str,
+        known: &[&str],
+        var_ok: fn(Var) -> bool,
+        after_handshake: bool,
+    ) -> Result<Template> {
         let template = Template::parse(text).map_err(|_| Error::policy(at, "template syntax"))?;
         if !after_handshake && template.calls(crate::template::Func::TlsExporter) {
             return Err(Error::policy(
@@ -1506,10 +1536,7 @@ impl Policy {
                 "template reads a variable not available here",
             ));
         }
-        let tainted = template
-            .analyze(&|name| kinds.kind(name))
-            .map_err(|rule| Error::policy(at, rule))?;
-        Ok((template, tainted))
+        Ok(template)
     }
 
     fn check_captures<'a>(
@@ -1834,11 +1861,23 @@ impl Policy {
                 }
                 Target::Body => bodies += 1,
             }
-            let (template, _) =
-                self.check_template(&at, kinds, &injection.template, known, Var::in_request)?;
-            check_components(&at, &template, request)?;
+            let template =
+                self.template_static(&at, &injection.template, known, Var::in_request, false)?;
+            check_components(&at, &template, request, &send.inject)?;
         }
-        ensure(bodies <= 1, || format!("{at}.inject"), "at most one body")
+        ensure(bodies <= 1, || format!("{at}.inject"), "at most one body")?;
+        // The injections read the request as it is sent: they must have an order, and each is
+        // analysed with every component it reads holding what the others put in it.
+        let plan = crate::request::Plan::new(&send.inject).map_err(|fault| {
+            Error::policy(format!("{at}.inject[{}]", fault.index()), fault.rule())
+        })?;
+        let props = plan.props(&send.inject, &|n| kinds.kind(n));
+        for (i, props) in props.into_iter().enumerate() {
+            if let Err(rule) = props {
+                return fail(format!("{at}.inject[{i}]"), rule);
+            }
+        }
+        Ok(())
     }
 
     fn check_return(

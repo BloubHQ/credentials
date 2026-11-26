@@ -1,7 +1,9 @@
 //! Building the request of one step from the caller request (or the one the policy fixes) and
 //! the injections of the step.
 //!
-//! Every rendered value is placed by its target; the wire bytes are built in one buffer of a
+//! The injections render in the order of [`Plan`] (each template reads the request as it is
+//! sent, but for its own target); every rendered value is placed by its target, in the order
+//! the policy lists them; the wire bytes are built in one buffer of a
 //! length computed up front, so no reallocation leaves a copy of a value behind, and the buffer
 //! is a [`Secret`].
 
@@ -9,14 +11,18 @@ use std::collections::HashMap;
 
 use getrandom::SysRng;
 use getrandom::rand_core::{Rng as _, UnwrapErr};
-use zeroize::Zeroizing;
+use zeroize::{Zeroize as _, Zeroizing};
 
 use crate::fields::Fields;
-use crate::policy::{Destination, Kinds, Method, Operation, Send, StepRequest, Target};
+use crate::policy::{Destination, Injection, Kinds, Method, Operation, Send, StepRequest, Target};
 use crate::primitives::{hex, pct};
 use crate::secret::Secret;
 use crate::template::{Budget, Context, Template, Temps, Var};
+
+mod order;
+
 use crate::{Error, Result};
+pub(crate) use order::{Plan, injects_header, injects_query};
 
 /// Longest path and query, in bytes.
 pub const MAX_PATH: usize = 2048;
@@ -136,35 +142,175 @@ impl<'a> Outbound<'a> {
         })
     }
 
-    fn vars(&self, unix_ms: u64) -> HashMap<Var, Vec<u8>> {
+    /// The variables that do not depend on the injections: one `$nonce` and one `$boundary`
+    /// for the whole request.
+    fn fixed_vars(&self, unix_ms: u64) -> HashMap<Var, Vec<u8>> {
         let mut random = [0u8; 16];
         UnwrapErr(SysRng).fill_bytes(&mut random);
         let nonce = hex(&random).to_vec();
         UnwrapErr(SysRng).fill_bytes(&mut random);
         let boundary = format!("boundary-{}", String::from_utf8_lossy(&hex(&random)));
-        let (pathname, query) = self.path.split_once('?').unwrap_or((self.path, ""));
-        let host = self.destination.host.to_ascii_lowercase();
-        let authority = match self.destination.port {
-            443 => host,
-            port => format!("{host}:{port}"),
-        };
-        let target_uri = format!("https://{authority}{}", self.path);
         HashMap::from([
             (Var::Method, self.method.as_str().as_bytes().to_vec()),
             (Var::Host, self.destination.host.as_bytes().to_vec()),
             (Var::Port, self.destination.port.to_string().into_bytes()),
             (Var::Scheme, b"https".to_vec()),
-            (Var::Authority, authority.into_bytes()),
-            (Var::TargetUri, target_uri.into_bytes()),
-            (Var::Path, self.path.as_bytes().to_vec()),
-            (Var::PathName, pathname.as_bytes().to_vec()),
-            (Var::Query, query.as_bytes().to_vec()),
-            (Var::Body, self.body.to_vec()),
+            (Var::Authority, self.authority().into_bytes()),
             (Var::Unix, (unix_ms / 1000).to_string().into_bytes()),
             (Var::UnixMs, unix_ms.to_string().into_bytes()),
             (Var::Boundary, boundary.into_bytes()),
             (Var::Nonce, nonce),
         ])
+    }
+
+    /// The host in lowercase, then `:` and the port unless it is 443 (RFC 9421 section
+    /// 2.2.3).
+    fn authority(&self) -> String {
+        let host = self.destination.host.to_ascii_lowercase();
+        match self.destination.port {
+            443 => host,
+            port => format!("{host}:{port}"),
+        }
+    }
+}
+
+/// The request as it is sent, seen from one injection: the values rendered so far but the
+/// injection's own (`own`). With no `own` and every value rendered, the request on the wire.
+struct View<'v> {
+    request: &'v Outbound<'v>,
+    inject: &'v [Injection],
+    values: &'v [Option<Zeroizing<Vec<u8>>>],
+    own: Option<usize>,
+}
+
+impl View<'_> {
+    /// The rendered values other than `own`'s, as they go on the wire, in listed order, with
+    /// their targets.
+    fn others(&self) -> impl Iterator<Item = (&Target, &[u8])> {
+        self.inject
+            .iter()
+            .zip(self.values)
+            .enumerate()
+            .filter(move |(j, _)| Some(*j) != self.own)
+            .filter_map(|(_, (i, v))| v.as_deref().map(|v| (&i.target, v.as_slice())))
+    }
+
+    /// The path with the path parameters filled, and the caller's query.
+    fn path(&self) -> Result<Zeroizing<Vec<u8>>> {
+        let mut path = Zeroizing::new(self.request.path.as_bytes().to_vec());
+        for (target, value) in self.others() {
+            let Target::PathParam { name } = target else {
+                continue;
+            };
+            let placeholder = format!("{{{name}}}");
+            let at = crate::response::find(&path, placeholder.as_bytes())
+                .ok_or(invalid("path parameter missing"))?;
+            let rest = at + placeholder.len();
+            let mut next = Zeroizing::new(Vec::with_capacity(
+                path.len().saturating_sub(placeholder.len()) + value.len(),
+            ));
+            next.extend_from_slice(path.get(..at).unwrap_or_default());
+            next.extend_from_slice(value);
+            next.extend_from_slice(path.get(rest..).unwrap_or_default());
+            path = next;
+        }
+        Ok(path)
+    }
+
+    /// The injected query parameters, encoded, in listed order.
+    fn query(&self) -> Vec<(&str, &[u8])> {
+        self.others()
+            .filter_map(|(target, value)| match target {
+                Target::Query { name } => Some((name.as_str(), value)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The request target: the filled path, then each injected query parameter.
+    fn target(&self) -> Result<Zeroizing<Vec<u8>>> {
+        let path = self.path()?;
+        let query = self.query();
+        let len = path.len()
+            + query
+                .iter()
+                .map(|(n, v)| n.len() + v.len() + 2)
+                .sum::<usize>();
+        let mut out = Zeroizing::new(Vec::with_capacity(len));
+        out.extend_from_slice(&path);
+        let mut has_query = path.contains(&b'?');
+        for (name, value) in query {
+            out.push(if has_query { b'&' } else { b'?' });
+            has_query = true;
+            out.extend_from_slice(name.as_bytes());
+            out.push(b'=');
+            out.extend_from_slice(value);
+        }
+        Ok(out)
+    }
+
+    /// The injected headers, in listed order.
+    fn injected_headers(&self) -> Vec<(&str, &[u8])> {
+        self.others()
+            .filter_map(|(target, value)| match target {
+                Target::Header { name } => Some((name.as_str(), value)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Every header a template may read: the caller's, then the injected ones.
+    fn headers(&self) -> Vec<(&str, &[u8])> {
+        let mut out: Vec<(&str, &[u8])> = self
+            .request
+            .headers
+            .iter()
+            .map(|(n, v)| (n.as_str(), v.as_bytes()))
+            .collect();
+        out.extend(self.injected_headers());
+        out
+    }
+
+    /// The body: the injected one, else the caller's.
+    fn body(&self) -> &[u8] {
+        self.others()
+            .find(|(target, _)| **target == Target::Body)
+            .map_or(self.request.body, |(_, value)| value)
+    }
+
+    /// Adds the variables `template` reads that depend on the injections.
+    fn add_vars(&self, template: &Template, vars: &mut HashMap<Var, Vec<u8>>) -> Result<()> {
+        let reads = template.vars();
+        let any = |list: &[Var]| reads.iter().any(|v| list.contains(v));
+        if any(&[
+            Var::Path,
+            Var::PathName,
+            Var::Query,
+            Var::QueryParam,
+            Var::TargetUri,
+        ]) {
+            let target = self.target()?;
+            let (pathname, query) = match target.iter().position(|b| *b == b'?') {
+                Some(at) => (
+                    target.get(..at).unwrap_or_default(),
+                    target.get(at + 1..).unwrap_or_default(),
+                ),
+                None => (target.as_slice(), &[][..]),
+            };
+            let authority = self.request.authority();
+            let mut uri = Vec::with_capacity(8 + authority.len() + target.len());
+            uri.extend_from_slice(b"https://");
+            uri.extend_from_slice(authority.as_bytes());
+            uri.extend_from_slice(&target);
+            vars.insert(Var::PathName, pathname.to_vec());
+            vars.insert(Var::Query, query.to_vec());
+            vars.insert(Var::Path, target.to_vec());
+            vars.insert(Var::TargetUri, uri);
+        }
+        if any(&[Var::Body]) {
+            vars.insert(Var::Body, self.body().to_vec());
+        }
+        Ok(())
     }
 }
 
@@ -195,65 +341,83 @@ pub(crate) enum Wire<'k> {
     Upgrade(&'k str),
 }
 
-/// Renders the injections of `send` and builds the HTTP/1.1 bytes.
+/// Renders the injections of `send` in their order ([`Plan`]) and builds the HTTP/1.1
+/// bytes. Each template reads the request as it is sent but for its own target.
 pub(crate) fn build(
     send: &Send,
     request: &Outbound<'_>,
     inputs: &Inputs<'_>,
     wire_kind: Wire<'_>,
 ) -> Result<Built> {
-    let ctx = Context {
-        fields: inputs.fields,
-        temps: inputs.temps,
-        vars: request.vars(inputs.unix_ms),
-        headers: request.headers,
-        unix: inputs.unix_ms / 1000,
-        budget: inputs.budget,
-    };
+    let plan =
+        Plan::new(&send.inject).map_err(|fault| Error::TemplateInvalid { rule: fault.rule() })?;
     let kind = |name: &str| inputs.kinds.kind(name);
+    let props = plan.props(&send.inject, &kind);
+    let fixed_vars = request.fixed_vars(inputs.unix_ms);
 
-    let mut headers: Vec<(&str, Zeroizing<Vec<u8>>)> = Vec::new();
-    let mut query: Vec<(&str, Zeroizing<Vec<u8>>)> = Vec::new();
-    let mut params: Vec<(String, Zeroizing<Vec<u8>>)> = Vec::new();
-    let mut body: Option<Zeroizing<Vec<u8>>> = None;
+    let mut values: Vec<Option<Zeroizing<Vec<u8>>>> = send.inject.iter().map(|_| None).collect();
     let mut tainted = Vec::new();
-
-    for injection in &send.inject {
-        let template = Template::parse(&injection.template)?;
-        let value = template.render(&ctx)?;
-        if template.tainted(&kind) && !matches!(injection.target, Target::Body) {
+    for &i in &plan.order {
+        let (Some(injection), Some(template)) = (send.inject.get(i), plan.templates.get(i)) else {
+            return Err(invalid("injection out of range"));
+        };
+        let value = {
+            let view = View {
+                request,
+                inject: &send.inject,
+                values: &values,
+                own: Some(i),
+            };
+            let mut vars = fixed_vars.clone();
+            view.add_vars(template, &mut vars)?;
+            let headers = view.headers();
+            let mut ctx = Context {
+                fields: inputs.fields,
+                temps: inputs.temps,
+                vars,
+                headers: &headers,
+                unix: inputs.unix_ms / 1000,
+                budget: inputs.budget,
+            };
+            let rendered = template.render(&ctx);
+            // The variables can hold what other injections put in the request.
+            ctx.vars.values_mut().for_each(|v| v.zeroize());
+            rendered?
+        };
+        // A template that breaks a rule counts as tainted, as the analysis takes it.
+        let reversible = props
+            .get(i)
+            .is_none_or(|p| p.as_ref().map_or(true, |p| p.tainted()));
+        if reversible && !matches!(injection.target, Target::Body) {
             tainted.push(value.clone());
         }
-        match &injection.target {
-            Target::Header { name } => {
+        let placed = match &injection.target {
+            Target::Header { .. } => {
                 if !value
                     .iter()
                     .all(|b| *b == b'\t' || (0x20..=0x7e).contains(b))
                 {
                     return Err(Error::SecretInvalid);
                 }
-                headers.push((name, value));
+                value
             }
-            Target::Query { name } => query.push((name, pct(&value))),
-            Target::PathParam { name } => params.push((format!("{{{name}}}"), pct(&value))),
-            Target::Body => body = Some(value),
+            Target::Query { .. } | Target::PathParam { .. } => pct(&value),
+            Target::Body => value,
+        };
+        if let Some(slot) = values.get_mut(i) {
+            *slot = Some(placed);
         }
     }
 
-    let mut path = Zeroizing::new(request.path.as_bytes().to_vec());
-    for (placeholder, value) in &params {
-        let text = core::str::from_utf8(&path).map_err(|_| invalid("path not UTF-8"))?;
-        let (before, after) = text
-            .split_once(placeholder.as_str())
-            .ok_or(invalid("path parameter missing"))?;
-        let mut next = Zeroizing::new(Vec::with_capacity(before.len() + value.len() + after.len()));
-        next.extend_from_slice(before.as_bytes());
-        next.extend_from_slice(value);
-        next.extend_from_slice(after.as_bytes());
-        path = next;
-    }
-
-    let body_bytes: &[u8] = body.as_deref().map_or(request.body, |b| b.as_slice());
+    let view = View {
+        request,
+        inject: &send.inject,
+        values: &values,
+        own: None,
+    };
+    let target = view.target()?;
+    let headers = view.injected_headers();
+    let body_bytes = view.body();
     let framed;
     let body_bytes: &[u8] = if matches!(wire_kind, Wire::Grpc) {
         framed = crate::grpc::frame(body_bytes)?;
@@ -284,11 +448,7 @@ pub(crate) fn build(
     };
     let capacity = 32
         + request.method.as_str().len()
-        + path.len()
-        + query
-            .iter()
-            .map(|(n, v)| n.len() + v.len() + 2)
-            .sum::<usize>()
+        + target.len()
         + request.destination.host.len()
         + port.len()
         + headers
@@ -308,15 +468,7 @@ pub(crate) fn build(
     let out = wire.expose_mut();
     out.extend_from_slice(request.method.as_str().as_bytes());
     out.push(b' ');
-    out.extend_from_slice(&path);
-    let mut has_query = path.contains(&b'?');
-    for (name, value) in &query {
-        out.push(if has_query { b'&' } else { b'?' });
-        has_query = true;
-        out.extend_from_slice(name.as_bytes());
-        out.push(b'=');
-        out.extend_from_slice(value);
-    }
+    out.extend_from_slice(&target);
     out.extend_from_slice(b" HTTP/1.1\r\nHost: ");
     out.extend_from_slice(request.destination.host.as_bytes());
     out.extend_from_slice(port.as_bytes());

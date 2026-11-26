@@ -219,6 +219,66 @@ headers; the engine sends `Accept-Encoding: identity` and `Connection: close`.
 | `{"kind": "path_param", "name": "token"}` | Replaces the `{token}` segment of the path. |
 | `{"kind": "body"}` | Sets the body (at most one per send). |
 
+Headers and query parameters go on the wire in the order the injections are listed, after the
+caller's.
+
+#### Injection order
+
+A template of an injection reads the request **as it is sent**: `$path`, `$pathname`,
+`$query`, `$target_uri` and `$query_param` with every path parameter filled and every
+injected query parameter appended, `$header` with every injected header, `$body` with the
+injected body, but never what the injection itself sets. So a signature covers what the
+policy puts in the request as well as what the caller sends, and an injection depends on
+each other injection whose target lies in a component its template reads:
+
+| The other injection sets | Read through |
+| --- | --- |
+| a path parameter | `$path` `$pathname` `$target_uri` |
+| a query parameter `n` | `$path` `$query` `$target_uri` `$query_param("n")` (under any case and percent-encoding) |
+| a header `n` | `$header("n")` (any case) |
+| the body | `$body` |
+
+The injections render in dependency order, the listed order breaking ties: the first listed
+injection whose dependencies have all rendered goes next. Dependencies are known from the
+policy alone (a component is named by a literal), so signing checks them exactly:
+
+- injections that read each other, directly or through others, form a cycle and the policy
+  is refused (`injections read each other's components in a cycle`);
+- a template that names the header or query parameter its own injection sets is refused
+  (`a template reads the header or query parameter its own injection sets`);
+- a variable that holds the injection's own target holds the request without it: in a query
+  injection `$query` lacks that parameter, in a path parameter `$path` keeps its own
+  `{name}` as written, and in the body's injection `$body` is the caller's body.
+
+`$header("name")` reads a header the contract lists (the caller's) or one the `send` injects,
+in a caller request or a fixed one; `$query_param("name")` the same for query parameters. A
+fixed request still has no caller headers to read. A value the policy injects carries its
+properties into every variable that holds it: a secret put in the path makes `$path`,
+`$pathname` and `$target_uri` tainted, an injected header is to `$header` exactly what its
+template is, and every rule of [the analysis](#the-analysis) applies as if the secret had
+been written in place of the variable. A rendered value that holds such a variable is a
+tainted rendered value, so a server that echoes it has the response dropped
+([Secure defaults](#secure-defaults)).
+
+The signature of RFC 5849 section 1.2 with every `oauth_*` parameter in the query (section
+3.5.3), the signature listed first and rendered last, over the query as sent without itself:
+
+```json
+{"name": "oauth1-query",
+ "steps": [
+  {"do": "open", "connection": "https", "destinations": [{"host": "photos.example.net", "port": 443}]},
+  {"do": "send", "request": {"from": "caller", "methods": ["GET"], "paths": ["/photos"], "query": [{"name": "file"}, {"name": "size"}]},
+   "inject": [
+    {"target": {"kind": "query", "name": "oauth_signature"}, "template": "{{ b64(hmac_sha1(pct(consumer_secret) + \"&\" + pct(token_secret), $method + \"&\" + pct($scheme + \"://\" + $authority + $pathname) + \"&\" + pct(sorted_params($query)))) }}"},
+    {"target": {"kind": "query", "name": "oauth_consumer_key"}, "template": "{{ consumer_key }}"},
+    {"target": {"kind": "query", "name": "oauth_token"}, "template": "{{ token }}"},
+    {"target": {"kind": "query", "name": "oauth_signature_method"}, "template": "HMAC-SHA1"},
+    {"target": {"kind": "query", "name": "oauth_timestamp"}, "template": "{{ $unix }}"},
+    {"target": {"kind": "query", "name": "oauth_nonce"}, "template": "{{ $nonce }}"}]},
+  {"do": "return", "response": {"body": "all"}}
+ ]}
+```
+
 ### `send` on TLS
 
 `{"do": "send", "template": "a1 LOGIN {{user}} {{password}}\r\n"}` writes the rendered
@@ -1873,14 +1933,14 @@ with nested braces work. A template is at most 8 KiB, 512 nodes and 24 levels de
 
 | Variable | Value | Where |
 | --- | --- | --- |
-| `$method` `$host` `$path` `$pathname` `$query` `$body` | The request being built | HTTPS `send` injections |
+| `$method` `$host` `$path` `$pathname` `$query` `$body` | The request as it is sent: path parameters filled, injected query parameters appended, the injected body; never the reading injection's own target ([Injection order](#injection-order)) | HTTPS `send` injections |
 | `$unix` `$unix_ms` | The node's clock | everywhere |
 | `$nonce` | 32 random hex characters, the same throughout one request (or TLS send, or operation with no connection) | everywhere |
 | `$boundary` | A random multipart boundary | HTTPS `send` injections |
 | `$input` | The caller's input, after its schema | operations with no connection |
 | `$port` `$scheme` `$authority` `$target_uri` | The destination port in decimal; `https`; the host in lowercase, then `:` and the port unless it is 443 (RFC 9421 `@authority`); `https://` + `$authority` + `$path` (`@target-uri`) | HTTPS `send` injections |
-| `$header("name")` | The caller's header of that name (case does not matter), as RFC 9110 section 5.3 combines field lines: each value without the spaces and tabs around it, joined by `, `; empty when the caller sent none | HTTPS `send` injections of a `send` that takes the caller's request, for a header its contract lists |
-| `$query_param("name")` | The caller's query parameter as RFC 9421 section 2.2.8 (`@query-param`) normalizes it: parsed as `application/x-www-form-urlencoded` (`+` is a space) and percent-encoded again, so a space is `%20`; the name is written encoded the same way; empty when absent | as `$header`, for a parameter its contract lists |
+| `$header("name")` | The header of that name as it is sent, the caller's or an injected one (case does not matter), as RFC 9110 section 5.3 combines field lines: each value without the spaces and tabs around it, joined by `, `; empty when there is none | HTTPS `send` injections, for a header the `send` injects or (a `send` that takes the caller's request) its contract lists |
+| `$query_param("name")` | The query parameter as it is sent, the caller's or an injected one, as RFC 9421 section 2.2.8 (`@query-param`) normalizes it: parsed as `application/x-www-form-urlencoded` (`+` is a space) and percent-encoded again, so a space is `%20`; the name is written encoded the same way; empty when absent | as `$header`, for a parameter the `send` injects or its contract lists |
 
 TLS sends and identities can read `$host`, `$unix`, `$unix_ms` and `$nonce`; `compute` on a
 connection reads `$unix`, `$unix_ms` and `$nonce`, and with no connection what the `return`
@@ -2082,7 +2142,9 @@ Their values are chosen by the caller, like `$body`: *controlled* and not secret
 derived components are `$method` (`@method`), `$target_uri` (`@target-uri`), `$authority`
 (`@authority`), `$scheme` (`@scheme`), `$path` (`@request-target`), `$pathname` (`@path`),
 `"?" + $query` (`@query`) and `$query_param("name")` (`@query-param`); a header field is
-`$header("name")`. `$path` and `$pathname` are the path before path parameters are filled.
+`$header("name")`. Each reads the request as it is sent, with what the policy injects in place
+([Injection order](#injection-order)); before, `$path` and `$pathname` were the path before
+path parameters were filled, and injected headers and query parameters were not readable.
 
 The caller's request signed over its method, target URI, authority (port 8443 here), one
 query parameter, two of its headers and the digest of its body:
