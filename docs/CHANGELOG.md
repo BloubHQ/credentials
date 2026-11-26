@@ -58,6 +58,27 @@ before 1.0, minor versions may break formats and APIs.
 
 ### Added
 
+- SSH remote port forwarding and AMQP 1.0 (`docs/policy.md`, Protocol connections;
+  `docs/design.md` section 7c), the two protocol rows left in section 7c:
+  - SSH `channel: "tcpip-forward"` (RFC 4254 section 7.1): the server listens on the
+    `address:port` the signed policy fixes (port 1 to 65535, never the caller's), and the one
+    `forwarded-tcpip` connection it forwards there, for exactly that address and port, is the
+    call's relay; the node opens no socket of its own. Any other channel the server opens is
+    refused (more than 16 end the connection); the forwarded connection takes a live slot of
+    its own and ends on a hand-over. A wildcard bind needs `wildcard_bind: true`. Summary
+    flags `remote_forward` and `wildcard_bind`. Engine `ssh::Client::tcpip_forward`,
+    `accept_forwarded`, `refuse_forwarded`, `ssh::Event::Forwarded`, `MAX_REFUSED_OPENS`.
+  - `connection: "amqp1"`: AMQP 1.0 over TLS or the AMQP TLS header, SASL `plain`,
+    `external` (new mechanism: the open's client certificate), `scram-sha-256` and `xoauth2`;
+    commands `send` (address, body) and `receive` (address; `max_messages`, `wait_ms`) with
+    `settle` `settled`, `first` or `second`. Frames of 64 KiB, values 16 deep and 16,384 a
+    decode, descriptors a `ulong` or a symbol of 256 bytes, messages of 1 MiB; unknown
+    performatives, other channels or links, a changed settle mode and deliveries past the
+    credit are refused. Engine `proto::amqp1` (codec, framing, client),
+    `postgres::Scram::with_user`, `policy::SettleMode`, `policy::bind_target`. Schema: the
+    connection, the mechanism, the channel, `settle` and `wildcard_bind`.
+  - Fuzz target `amqp1_frames` (the AMQP 1.0 type decoder, frames, performatives and
+    messages); `protocol_servers` and the noise test take the AMQP 1.0 client too.
 - SRP-6a and OpenPGP framing as template families (`docs/policy.md`, SRP-6a and OpenPGP;
   `docs/design.md` section 11), two rows of the list of schemes not done:
   - `srp_public`, `srp_x`, `srp_u`, `srp_premaster`, `srp_m1` and `srp_verify` (RFC 2945,

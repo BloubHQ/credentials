@@ -1,5 +1,6 @@
-//! The protocol connections of layer 1: SSH (with SFTP and port forwarding), PostgreSQL,
-//! MySQL, SMTP, IMAP, POP3, Redis, MQTT, AMQP and FTP over TLS.
+//! The protocol connections of layer 1: SSH (with SFTP and port forwarding, local and
+//! remote), PostgreSQL, MySQL, SMTP, IMAP, POP3, Redis, MQTT, AMQP 0-9-1, AMQP 1.0 and FTP
+//! over TLS.
 //!
 //! Each is a standard family with one meaning for the steps:
 //!
@@ -56,8 +57,11 @@ pub enum Mechanism {
     /// SASL `SCRAM-SHA-256` (PostgreSQL).
     #[serde(rename = "scram-sha-256")]
     ScramSha256,
-    /// SASL `PLAIN` (SMTP, IMAP `AUTHENTICATE`, AMQP).
+    /// SASL `PLAIN` (SMTP, IMAP `AUTHENTICATE`, AMQP, AMQP 1.0).
     Plain,
+    /// SASL `EXTERNAL` (AMQP 1.0): the TLS client certificate of the `open` authenticates;
+    /// `user` is the authorization identity (may be empty), and no password is sent.
+    External,
     /// SMTP `AUTH LOGIN`, IMAP `LOGIN`.
     Login,
     /// SASL `XOAUTH2` (SMTP, IMAP), with a bearer token.
@@ -86,6 +90,7 @@ impl Mechanism {
             Mechanism::KeyboardInteractive => "keyboard-interactive",
             Mechanism::ScramSha256 => "scram-sha-256",
             Mechanism::Plain => "plain",
+            Mechanism::External => "external",
             Mechanism::Login => "login",
             Mechanism::Xoauth2 => "xoauth2",
             Mechanism::Auth => "auth",
@@ -109,6 +114,35 @@ pub enum MqttVersion {
     V5,
 }
 
+/// How a delivery of AMQP 1.0 is settled (section 3.4 of the standard): the link's
+/// `snd-settle-mode` and `rcv-settle-mode`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SettleMode {
+    /// `snd-settle-mode` settled: the sender settles before the receiver says anything, so a
+    /// message is delivered at most once.
+    Settled,
+    /// `snd-settle-mode` unsettled, `rcv-settle-mode` first: the receiver settles when it
+    /// states its outcome (at least once). The default.
+    #[default]
+    First,
+    /// `snd-settle-mode` unsettled, `rcv-settle-mode` second: the receiver states its outcome
+    /// unsettled and settles only after the sender has, so neither forgets a delivery the
+    /// other still holds. A broker that does not take it is refused.
+    Second,
+}
+
+impl SettleMode {
+    /// Its name.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SettleMode::Settled => "settled",
+            SettleMode::First => "first",
+            SettleMode::Second => "second",
+        }
+    }
+}
+
 /// What an SSH command rule runs on.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -123,6 +157,11 @@ pub enum SshChannel {
     /// Local port forwarding: `text` is the `host:port` the server connects to, fixed by the
     /// policy; the caller's frames go there on a streaming call.
     DirectTcpip,
+    /// Remote port forwarding (RFC 4254 section 7.1): `text` is the `address:port` the server
+    /// listens on, fixed by the policy (never port 0, never chosen by the caller). One
+    /// connection the server accepts there comes back on the streaming call as a
+    /// `forwarded-tcpip` channel; the caller's frames go to it.
+    TcpipForward,
 }
 
 /// A prompt of SSH keyboard-interactive authentication and its answer.
@@ -188,6 +227,9 @@ impl Login {
             Connection::Mqtt if self.token.is_some() => Mechanism::Token,
             Connection::Mqtt => Mechanism::Password,
             Connection::Amqp => Mechanism::Plain,
+            Connection::Amqp1 if self.token.is_some() => Mechanism::Xoauth2,
+            Connection::Amqp1 if self.password.is_some() => Mechanism::Plain,
+            Connection::Amqp1 => Mechanism::External,
             Connection::Ftp => Mechanism::User,
             Connection::Pop3 if self.token.is_some() => Mechanism::Xoauth2,
             Connection::Pop3 => Mechanism::User,
@@ -300,10 +342,17 @@ pub struct CommandRule {
     /// MQTT `subscribe` and AMQP `get`: most messages handed back (1 to 256, default 16).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_messages: Option<usize>,
-    /// MQTT `subscribe`: how long it waits for messages, in milliseconds (1 to 60,000,
-    /// default 5,000).
+    /// MQTT `subscribe` and AMQP 1.0 `receive`: how long it waits for messages, in
+    /// milliseconds (1 to 60,000, default 5,000).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wait_ms: Option<u64>,
+    /// AMQP 1.0 `send` and `receive`: how deliveries are settled (`first` by default).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub settle: Option<SettleMode>,
+    /// SSH `tcpip-forward`: true to let the server listen on every address (`0.0.0.0`, `::`,
+    /// `*`), which the summary flags; without it such a bind is refused.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wildcard_bind: Option<bool>,
 }
 
 impl CommandRule {
@@ -342,6 +391,7 @@ impl Connection {
                 | Connection::Mysql
                 | Connection::Mqtt
                 | Connection::Amqp
+                | Connection::Amqp1
                 | Connection::Ftp
                 | Connection::Pop3
         )
@@ -361,6 +411,7 @@ impl Connection {
             Connection::Mysql => "mysql",
             Connection::Mqtt => "mqtt",
             Connection::Amqp => "amqp",
+            Connection::Amqp1 => "amqp1",
             Connection::Ftp => "ftp",
             Connection::Pop3 => "pop3",
             Connection::Udp => "udp",
@@ -382,6 +433,12 @@ fn mechanisms(connection: Connection) -> &'static [Mechanism] {
         Connection::Redis => &[Mechanism::Auth],
         Connection::Mqtt => &[Mechanism::Password, Mechanism::Token],
         Connection::Amqp => &[Mechanism::Plain],
+        Connection::Amqp1 => &[
+            Mechanism::Plain,
+            Mechanism::External,
+            Mechanism::ScramSha256,
+            Mechanism::Xoauth2,
+        ],
         Connection::Ftp => &[Mechanism::User],
         Connection::Pop3 => &[
             Mechanism::User,
@@ -428,6 +485,26 @@ pub fn forward_target(text: &str) -> Option<(&str, u16)> {
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b':'));
     host_ok.then_some((host, port))
+}
+
+/// The `address:port` of a `tcpip-forward` rule: an address or host name the server listens
+/// on (or `*`), a port other than 0, and whether the address is a wildcard (`*`, `0.0.0.0`,
+/// `::`), which listens on every address of the server.
+pub fn bind_target(text: &str) -> Option<(&str, u16, bool)> {
+    let (host, port) = text.rsplit_once(':')?;
+    let host = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
+    let port: u16 = port.parse().ok().filter(|p| *p > 0)?;
+    let wildcard = matches!(host, "*" | "0.0.0.0" | "::" | "0:0:0:0:0:0:0:0");
+    let host_ok = wildcard
+        || (!host.is_empty()
+            && host.len() <= 253
+            && host
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b':')));
+    host_ok.then_some((host, port, wildcard))
 }
 
 /// True when `text` is a template with no placeholder (its value is known now).
@@ -527,6 +604,8 @@ fn verb_params(connection: Connection, verb: &str) -> Option<usize> {
         (Connection::Mqtt, "subscribe") => Some(1),
         (Connection::Amqp, "publish") => Some(3),
         (Connection::Amqp, "get") => Some(1),
+        (Connection::Amqp1, "send") => Some(2),
+        (Connection::Amqp1, "receive") => Some(1),
         _ => None,
     }
 }
@@ -549,10 +628,14 @@ impl Policy {
             open.tls.is_none()
                 || matches!(
                     connection,
-                    Connection::Smtp | Connection::Imap | Connection::Pop3 | Connection::Ftp
+                    Connection::Smtp
+                        | Connection::Imap
+                        | Connection::Pop3
+                        | Connection::Ftp
+                        | Connection::Amqp1
                 ),
             || format!("{at}.tls"),
-            "tls (implicit or starttls) is for SMTP, IMAP, POP3 and FTP; the others fix how they reach TLS",
+            "tls (implicit or starttls) is for SMTP, IMAP, POP3, FTP and AMQP 1.0; the others fix how they reach TLS",
         )?;
         ensure(
             open.version.is_none() || connection == Connection::Mqtt,
@@ -600,6 +683,7 @@ impl Policy {
                 | Mechanism::Apop,
             ) => given == (true, false, false, false),
             Some(Mechanism::Publickey) => given == (false, true, false, false),
+            Some(Mechanism::External) => given == (false, false, false, false),
             Some(Mechanism::KeyboardInteractive) => given == (false, false, false, true),
             Some(Mechanism::Xoauth2 | Mechanism::Token) => given == (false, false, true, false),
             None => false,
@@ -610,7 +694,14 @@ impl Policy {
             "login gives exactly the credential its mechanism uses (password, key, token or answers)",
         )?;
         ensure(
-            !login.user.is_empty() || matches!(connection, Connection::Redis | Connection::Mqtt),
+            mechanism != Some(Mechanism::External) || open.identity.is_some(),
+            || format!("{at}.mechanism"),
+            "external signs in with the TLS client certificate: the open needs an identity",
+        )?;
+        ensure(
+            !login.user.is_empty()
+                || matches!(connection, Connection::Redis | Connection::Mqtt)
+                || mechanism == Some(Mechanism::External),
             || format!("{at}.user"),
             "login names a user",
         )?;
@@ -633,10 +724,10 @@ impl Policy {
         )?;
         ensure(
             login.vhost.is_none()
-                || (connection == Connection::Amqp
+                || (matches!(connection, Connection::Amqp | Connection::Amqp1)
                     && login.vhost.as_deref().is_some_and(|d| literal_ok(d, 255))),
             || format!("{at}.vhost"),
-            "vhost is for AMQP: 1 to 255 visible ASCII bytes",
+            "vhost is for AMQP and AMQP 1.0 (its open's hostname): 1 to 255 visible ASCII bytes",
         )?;
         ensure(
             login.answers.len() <= MAX_ANSWERS
@@ -701,7 +792,7 @@ impl Policy {
             ensure(
                 command.params.len() == n,
                 || format!("{at}.params"),
-                "MQTT publish takes the topic and payload, subscribe the filter; AMQP publish the exchange, routing key and body, get the queue",
+                "MQTT publish takes the topic and payload, subscribe the filter; AMQP publish the exchange, routing key and body, get the queue; AMQP 1.0 send the address and body, receive the address",
             )?;
             self.check_literal_params(&at, connection, &command.text, &command.params)?;
         }
@@ -741,12 +832,15 @@ impl Policy {
                 (Connection::Amqp, "publish", 0 | 1) | (Connection::Amqp, "get", 0) => {
                     crate::proto::amqp::name_ok(p.as_bytes())
                 }
+                (Connection::Amqp1, "send" | "receive", 0) => {
+                    crate::proto::amqp1::address_ok(p.as_bytes())
+                }
                 _ => true,
             };
             ensure(
                 ok,
                 || format!("{at}.params[{i}]"),
-                "an MQTT topic or filter, or an AMQP name, that the protocol cannot carry",
+                "an MQTT topic or filter, an AMQP name or an AMQP 1.0 address that the protocol cannot carry",
             )?;
         }
         Ok(())
@@ -775,11 +869,11 @@ impl Policy {
                     "a Redis command is 1 to 4 literal words of letters, digits, _ - .",
                 );
             }
-            Connection::Mqtt | Connection::Amqp => {
+            Connection::Mqtt | Connection::Amqp | Connection::Amqp1 => {
                 return ensure(
                     verb_params(connection, text).is_some(),
                     || at.clone(),
-                    "an MQTT command is publish or subscribe; an AMQP command publish or get",
+                    "an MQTT command is publish or subscribe; an AMQP command publish or get; an AMQP 1.0 command send or receive",
                 );
             }
             Connection::Ftp | Connection::Pop3 => {
@@ -822,6 +916,7 @@ impl Policy {
         let verb = rule.text.as_str();
         let subscribe = connection == Connection::Mqtt && verb == "subscribe";
         let get = connection == Connection::Amqp && verb == "get";
+        let receive = connection == Connection::Amqp1 && verb == "receive";
         ensure(
             rule.qos.is_none() || (connection == Connection::Mqtt && rule.qos <= Some(1)),
             || format!("{at}.qos"),
@@ -829,21 +924,31 @@ impl Policy {
         )?;
         ensure(
             rule.max_messages.is_none()
-                || ((subscribe || get)
+                || ((subscribe || get || receive)
                     && rule
                         .max_messages
                         .is_some_and(|n| (1..=MAX_MESSAGES).contains(&n))),
             || format!("{at}.max_messages"),
-            "max_messages is for MQTT subscribe and AMQP get: 1 to 256",
+            "max_messages is for MQTT subscribe, AMQP get and AMQP 1.0 receive: 1 to 256",
         )?;
         ensure(
             rule.wait_ms.is_none()
-                || (subscribe
+                || ((subscribe || receive)
                     && rule
                         .wait_ms
                         .is_some_and(|n| (1..=MAX_MESSAGE_WAIT_MS).contains(&n))),
             || format!("{at}.wait_ms"),
-            "wait_ms is for MQTT subscribe: 1 to 60000",
+            "wait_ms is for MQTT subscribe and AMQP 1.0 receive: 1 to 60000",
+        )?;
+        ensure(
+            rule.settle.is_none() || connection == Connection::Amqp1,
+            || format!("{at}.settle"),
+            "settle is for AMQP 1.0 send and receive",
+        )?;
+        ensure(
+            rule.wildcard_bind.is_none() || rule.channel == Some(SshChannel::TcpipForward),
+            || format!("{at}.wildcard_bind"),
+            "wildcard_bind is for an SSH tcpip-forward rule",
         )?;
         let params = rule.params.len();
         match (connection, rule.ssh_channel()) {
@@ -870,22 +975,36 @@ impl Policy {
                 || format!("{at}.text"),
                 "a direct-tcpip rule is the host:port it forwards to, with no parameters",
             ),
-            (Connection::Mqtt | Connection::Amqp, _) => {
+            (Connection::Ssh, crate::policy::SshChannel::TcpipForward) => {
+                let Some((_, _, wildcard)) = bind_target(verb).filter(|_| params == 0) else {
+                    return fail(
+                        format!("{at}.text"),
+                        "a tcpip-forward rule is the address:port the server listens on (a literal, port 1 to 65535), with no parameters",
+                    );
+                };
+                ensure(
+                    !wildcard || rule.wildcard_bind == Some(true),
+                    || format!("{at}.text"),
+                    "a bind on every address (*, 0.0.0.0, ::) needs wildcard_bind: true",
+                )
+            }
+            (Connection::Mqtt | Connection::Amqp | Connection::Amqp1, _) => {
                 let Some(n) = verb_params(connection, verb) else {
                     return fail(
                         format!("{at}.text"),
-                        "an MQTT command is publish or subscribe; an AMQP command publish or get",
+                        "an MQTT command is publish or subscribe; an AMQP command publish or get; an AMQP 1.0 command send or receive",
                     );
                 };
                 ensure(
                     params == n,
                     || format!("{at}.params"),
-                    "MQTT publish takes the topic and payload, subscribe the filter; AMQP publish the exchange, routing key and body, get the queue",
+                    "MQTT publish takes the topic and payload, subscribe the filter; AMQP publish the exchange, routing key and body, get the queue; AMQP 1.0 send the address and body, receive the address",
                 )?;
-                // AMQP: the exchange, routing key and queue are the policy's.
+                // AMQP: the exchange, routing key and queue are the policy's; AMQP 1.0: the
+                // address.
                 let fixed = match (connection, verb) {
                     (Connection::Amqp, "publish") => 2,
-                    (Connection::Amqp, _) => 1,
+                    (Connection::Amqp | Connection::Amqp1, _) => 1,
                     _ => 0,
                 };
                 ensure(
@@ -893,7 +1012,7 @@ impl Policy {
                         p.template.is_some() && p.pattern.is_none() && p.max_len.is_none()
                     }),
                     || format!("{at}.params"),
-                    "an AMQP exchange, routing key and queue are templates of the policy",
+                    "an AMQP exchange, routing key and queue, and an AMQP 1.0 address, are templates of the policy",
                 )?;
                 self.check_literal_params(
                     at,
@@ -927,7 +1046,12 @@ impl Policy {
         let forwards = relay
             .commands
             .iter()
-            .filter(|c| c.channel == Some(crate::policy::SshChannel::DirectTcpip))
+            .filter(|c| {
+                matches!(
+                    c.channel,
+                    Some(SshChannel::DirectTcpip | SshChannel::TcpipForward)
+                )
+            })
             .count();
         ensure(
             !live
@@ -937,12 +1061,12 @@ impl Policy {
                     _ => false,
                 },
             || format!("{at}.frames"),
-            "frames and server are for a WebSocket, an SSH shell or forward (whose only commands are direct-tcpip rules), or the live messages of MQTT (server, with no frames or commands)",
+            "frames and server are for a WebSocket, an SSH shell or forward (whose only commands are direct-tcpip and tcpip-forward rules), or the live messages of MQTT (server, with no frames or commands)",
         )?;
         ensure(
             forwards == 0 || live,
             || format!("{at}.commands"),
-            "a direct-tcpip rule runs on a streaming relay (frames or server)",
+            "a direct-tcpip or tcpip-forward rule runs on a streaming relay (frames or server)",
         )?;
         ensure(
             relay.mail.is_some() == (connection == Connection::Smtp)
@@ -1121,6 +1245,7 @@ pub(super) fn open_lines(open: &Open, out: &mut Vec<String>) {
     if open.tls == Some(TlsMode::Starttls) {
         out.push(match open.connection {
             Connection::Ftp => "  TLS by AUTH TLS before anything else".into(),
+            Connection::Amqp1 => "  TLS by the AMQP TLS header before anything else".into(),
             Connection::Pop3 => "  TLS by STLS before anything else".into(),
             _ => "  TLS by STARTTLS before anything else".into(),
         });
@@ -1148,7 +1273,13 @@ pub(super) fn relay_lines(relay: &Relay, out: &mut Vec<String>) {
         let what = match rule.channel {
             Some(SshChannel::Sftp) => format!("SFTP {}", rule.text),
             Some(SshChannel::DirectTcpip) => format!("a forward to {}", rule.text),
-            _ => format!("{:?}", rule.text),
+            Some(SshChannel::TcpipForward) => {
+                format!("a remote forward from the server's {}", rule.text)
+            }
+            _ => match rule.settle {
+                Some(mode) => format!("{:?} (settle {})", rule.text, mode.as_str()),
+                None => format!("{:?}", rule.text),
+            },
         };
         out.push(format!(
             "  return: the caller may run {} = {what}{}{}",
@@ -1175,6 +1306,18 @@ pub(super) fn relay_lines(relay: &Relay, out: &mut Vec<String>) {
                 "  ! {}: the caller's bytes reach {} through the SSH server",
                 rule.name, rule.text
             ));
+        }
+        if rule.channel == Some(SshChannel::TcpipForward) {
+            out.push(format!(
+                "  ! {}: whoever reaches {} on the SSH server opens a connection to the caller through the node",
+                rule.name, rule.text
+            ));
+            if bind_target(&rule.text).is_some_and(|(_, _, wildcard)| wildcard) {
+                out.push(format!(
+                    "  ! {}: {} listens on every address of the SSH server",
+                    rule.name, rule.text
+                ));
+            }
         }
     }
     if let Some(mail) = &relay.mail {

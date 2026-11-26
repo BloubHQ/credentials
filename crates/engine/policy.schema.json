@@ -199,7 +199,7 @@
       "required": ["do", "connection", "destinations"],
       "properties": {
         "do": {"const": "open"},
-        "connection": {"enum": ["https", "tls", "websocket", "ssh", "postgres", "smtp", "imap", "redis", "mysql", "mqtt", "amqp", "ftp", "pop3", "udp", "browser"]},
+        "connection": {"enum": ["https", "tls", "websocket", "ssh", "postgres", "smtp", "imap", "redis", "mysql", "mqtt", "amqp", "amqp1", "ftp", "pop3", "udp", "browser"]},
         "destinations": {"type": "array", "minItems": 1, "maxItems": 32, "items": {"$ref": "#/$defs/Destination"}},
         "identity": {
           "type": "object",
@@ -248,7 +248,7 @@
         "database": {"type": "string", "minLength": 1, "maxLength": 63},
         "client_id": {"type": "string", "minLength": 1, "maxLength": 64},
         "vhost": {"type": "string", "minLength": 1, "maxLength": 255},
-        "mechanism": {"enum": ["password", "publickey", "keyboard-interactive", "scram-sha-256", "plain", "login", "xoauth2", "auth", "caching-sha2-password", "token", "user", "apop"]}
+        "mechanism": {"enum": ["password", "publickey", "keyboard-interactive", "scram-sha-256", "plain", "login", "xoauth2", "auth", "caching-sha2-password", "token", "user", "apop", "external"]}
       }
     },
     "Command": {
@@ -282,10 +282,12 @@
           }
         },
         "columns": {"type": "array", "maxItems": 32, "items": {"type": "string", "minLength": 1}},
-        "channel": {"enum": ["exec", "sftp", "direct-tcpip"]},
+        "channel": {"enum": ["exec", "sftp", "direct-tcpip", "tcpip-forward"]},
         "qos": {"enum": [0, 1]},
         "max_messages": {"type": "integer", "minimum": 1, "maximum": 256},
-        "wait_ms": {"type": "integer", "minimum": 1, "maximum": 60000}
+        "wait_ms": {"type": "integer", "minimum": 1, "maximum": 60000},
+        "settle": {"enum": ["settled", "first", "second"]},
+        "wildcard_bind": {"type": "boolean"}
       }
     },
     "MailRule": {

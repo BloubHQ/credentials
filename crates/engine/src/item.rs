@@ -1017,7 +1017,8 @@ fn shape_connection(at: &str, operation: &Operation) -> Result<ShapeConnection> 
             | Connection::Redis
             | Connection::Mysql
             | Connection::Mqtt
-            | Connection::Amqp,
+            | Connection::Amqp
+            | Connection::Amqp1,
         ) => refuse("a typed item has no database or queue connection yet"),
         Some(Connection::Udp) => refuse("a typed item has no UDP operation"),
         Some(Connection::Browser) => refuse("a typed item has no browser operation yet"),

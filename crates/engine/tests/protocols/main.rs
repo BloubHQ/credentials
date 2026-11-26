@@ -10,6 +10,8 @@
 )]
 
 mod amqp;
+mod amqp1;
+mod fake_amqp1;
 mod fake_ftp;
 mod fake_mail;
 mod fake_pg;
@@ -27,6 +29,7 @@ mod postgres;
 mod redis;
 mod ssh;
 mod ssh_paths;
+mod ssh_remote;
 
 use std::collections::VecDeque;
 use std::time::Duration;

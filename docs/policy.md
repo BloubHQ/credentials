@@ -489,9 +489,9 @@ yet.
 
 ### Protocol connections
 
-`ssh` (with SFTP and local port forwarding), `postgres`, `mysql`, `smtp`, `imap`, `pop3`,
-`ftp` (over TLS only), `redis`, `mqtt` and `amqp` are standard protocol families, never a
-site's:
+`ssh` (with SFTP and local and remote port forwarding), `postgres`, `mysql`, `smtp`, `imap`,
+`pop3`, `ftp` (over TLS only), `redis`, `mqtt`, `amqp` (0-9-1) and `amqp1` (AMQP 1.0) are
+standard protocol families, never a site's:
 the node signs in with the item's secret, runs the commands the policy fixes or shapes, and
 hands back results after the reflection search. Each is its own client in the engine
 (`engine::proto`), synchronous, with only modern algorithms.
@@ -518,10 +518,10 @@ The `open` of a protocol connection:
 
 | Member | Meaning |
 | --- | --- |
-| `login` | Required. `user` and one credential, each a template: `password`; `key` (SSH: an Ed25519 or ECDSA P-256/P-384 key in PKCS#8, or an unencrypted OpenSSH key; RSA in PKCS#8 or PKCS#1); `token` (an OAuth 2.0 bearer token for `xoauth2`, or the MQTT `token` mechanism); or `answers` (SSH keyboard-interactive: up to 8 `{"prompt": <regular expression the whole prompt must match>, "template"}`). Literals: `database` (PostgreSQL, MySQL), `client_id` (MQTT, 1 to 64 visible ASCII bytes; without it a random `credentials-...` one, so two connections never take over each other's session) and `vhost` (AMQP, default `/`). `mechanism` is optional. The credential must be the one its mechanism uses. `user` may be empty for Redis and MQTT. |
-| `mechanism` | SSH `password`, `publickey`, `keyboard-interactive`; PostgreSQL `scram-sha-256`; MySQL `caching-sha2-password`; SMTP `plain`, `login`, `xoauth2`; IMAP `login`, `plain`, `xoauth2`; POP3 `user` (default for a password), `apop`, `plain`, `login`, `xoauth2` (default for a token); FTP `user`; Redis `auth`; MQTT `password`, `token`; AMQP `plain`. Without it, the kind's default for the credential given. The node uses this mechanism or none: a server that does not offer it is refused, never answered with another. |
+| `login` | Required. `user` and one credential, each a template: `password`; `key` (SSH: an Ed25519 or ECDSA P-256/P-384 key in PKCS#8, or an unencrypted OpenSSH key; RSA in PKCS#8 or PKCS#1); `token` (an OAuth 2.0 bearer token for `xoauth2`, or the MQTT `token` mechanism); or `answers` (SSH keyboard-interactive: up to 8 `{"prompt": <regular expression the whole prompt must match>, "template"}`). Literals: `database` (PostgreSQL, MySQL), `client_id` (MQTT, 1 to 64 visible ASCII bytes; without it a random `credentials-...` one, so two connections never take over each other's session) and `vhost` (AMQP, default `/`; AMQP 1.0: the `hostname` of its SASL init and `open`, default the destination's host). `mechanism` is optional. The credential must be the one its mechanism uses. `user` may be empty for Redis and MQTT, and for AMQP 1.0 `external` (no authorization identity). |
+| `mechanism` | SSH `password`, `publickey`, `keyboard-interactive`; PostgreSQL `scram-sha-256`; MySQL `caching-sha2-password`; SMTP `plain`, `login`, `xoauth2`; IMAP `login`, `plain`, `xoauth2`; POP3 `user` (default for a password), `apop`, `plain`, `login`, `xoauth2` (default for a token); FTP `user`; Redis `auth`; MQTT `password`, `token`; AMQP `plain`; AMQP 1.0 `plain` (default for a password), `scram-sha-256`, `xoauth2` (default for a token), `external` (default with no credential: the TLS client certificate of the open's `identity`, which it requires; `user` is then the authorization identity). Without it, the kind's default for the credential given. The node uses this mechanism or none: a server that does not offer it is refused, never answered with another. |
 | `host_keys` | SSH only, required: 1 to 16 pinned host keys, `type base64` as in `known_hosts` (`ssh-ed25519`, `ecdsa-sha2-nistp256/384/521`, `ssh-rsa` for an RSA key verified with `rsa-sha2-256/512` only). The node offers only the algorithms of the pinned keys and refuses a key that is not pinned before it sends any credential. |
-| `tls` | SMTP, IMAP, POP3 and FTP: `implicit` (default; ports 465, 993, 995 and 990) or `starttls` (587 and 143; POP3 `STLS` on 110, RFC 2595; FTP `AUTH TLS` on 21, RFC 4217). A server that does not offer STARTTLS, or sends anything after its go-ahead before the handshake, is refused. There is no plain mode: no kind sends a credential over a plain connection, so FTP and POP3 do not either, whatever the address. PostgreSQL and MySQL always ask for TLS (`SSLRequest`) before anything else and refuse a server that does not take it; Redis, MQTT and AMQP are TLS from the first byte; SSH encrypts itself. |
+| `tls` | SMTP, IMAP, POP3 and FTP: `implicit` (default; ports 465, 993, 995 and 990) or `starttls` (587 and 143; POP3 `STLS` on 110, RFC 2595; FTP `AUTH TLS` on 21, RFC 4217); AMQP 1.0 `implicit` (default, 5671) or `starttls`, the AMQP TLS protocol header on 5672 (section 5.2 of the standard: the server must answer with the same header and nothing else, then TLS starts). A server that does not offer STARTTLS, or sends anything after its go-ahead before the handshake, is refused. There is no plain mode: no kind sends a credential over a plain connection, so FTP and POP3 do not either, whatever the address. PostgreSQL and MySQL always ask for TLS (`SSLRequest`) before anything else and refuse a server that does not take it; Redis, MQTT and AMQP are TLS from the first byte; SSH encrypts itself. |
 | `version` | MQTT only: `3.1.1` (default) or `5`. |
 | `limits` | As for a WebSocket: idle, duration and bytes (both ways). Reaching one ends the connection. |
 
@@ -529,7 +529,7 @@ The `open` of a protocol connection:
 policy fixes (an SSH command line, an SQL statement with `$1`... (PostgreSQL) or `?` (MySQL)
 for the parameters, an IMAP command without its tag, a Redis command name, or a verb: MQTT
 `publish` (topic, payload) or `subscribe` (filter), AMQP `publish` (exchange, routing key,
-body) or `get` (queue)), and for MQTT `qos` 0 or 1. A `receive` after it captures from what
+body) or `get` (queue), AMQP 1.0 `send` (address, body) or `receive` (address)), and for MQTT `qos` 0 or 1. A `receive` after it captures from what
 came back (`between`, `regex` or `all`). `run`, `await` and HTTP requests are refused. An MQTT
 `subscribe` the policy sends stays subscribed for the rest of the connection.
 
@@ -541,14 +541,17 @@ came back (`between`, `regex` or `all`). `run`, `await` and HTTP requests are re
   `template` that reads the caller's value, checked by the `pattern`, as `$input`
   (`"level={{ $input }}"`). A parameter of the caller with no pattern is flagged
   `param_unpinned`. `columns` (PostgreSQL, MySQL) keeps only those columns of the rows.
-  Members of some kinds: `channel` (SSH: `exec` by default, `sftp`, `direct-tcpip`), `qos`
-  (MQTT, 0 or 1), `max_messages` (MQTT `subscribe`, AMQP `get`: 1 to 256, default 16) and
-  `wait_ms` (MQTT `subscribe`: 1 to 60,000, default 5,000).
+  Members of some kinds: `channel` (SSH: `exec` by default, `sftp`, `direct-tcpip`,
+  `tcpip-forward`), `qos` (MQTT, 0 or 1), `max_messages` (MQTT `subscribe`, AMQP `get`, AMQP
+  1.0 `receive`: 1 to 256, default 16), `wait_ms` (MQTT `subscribe`, AMQP 1.0 `receive`: 1 to
+  60,000, default 5,000), `settle` (AMQP 1.0: `settled`, `first` by default, or `second`) and
+  `wildcard_bind` (SSH `tcpip-forward`: see remote forwarding below).
 - `mail` (SMTP only, and the only relay of SMTP): `senders` and `recipients`, 1 to 16 patterns
   each that the whole envelope addresses must match, `max_recipients` (default and at most 100)
   and `max_bytes` (default and at most 8 MiB).
 - `frames` and `server`: a streaming call, as for a WebSocket. SSH: an interactive shell (no
-  commands), or a forward (every command a `direct-tcpip` rule; the call names one). The
+  commands), or a forward (every command a `direct-tcpip` or `tcpip-forward` rule; the call
+  names one). The
   caller's signed frames go to the shell or the forwarded connection within their rules; what
   comes back goes back with `server: true`, after the stream search. MQTT: `server: true` alone
   hands back the messages of the subscriptions the policy's `send` steps made, each as a text
@@ -617,6 +620,31 @@ What each kind does with them:
   acknowledging each, as `[{"exchange", "routing_key", "redelivered", "payload"}]`. The
   exchange, routing key and queue of a caller's command are templates of the policy, never the
   caller's.
+- **AMQP 1.0** (OASIS AMQP 1.0, ISO/IEC 19464) over TLS from the first byte, or after the AMQP
+  TLS header (`tls: "starttls"`); there is no plain mode. Then the SASL header and the named
+  mechanism only: a broker that does not offer it, answers the SASL header with another layer
+  (no sign-in), or sends a challenge to a mechanism that has none is refused before anything
+  secret is written, and SCRAM-SHA-256 must prove the broker knows the password (in a
+  challenge or the outcome's additional data) before the outcome is taken. One connection
+  (`max-frame-size` 64 KiB: a larger frame is refused, and the node writes none larger than the
+  broker's), channel 0 only, one session (a window of 1024 transfers), one link at a time.
+  `send` attaches a sending link to the address, waits for credit, and transfers the body as
+  one `data` section; unless `settled`, it waits for the broker's outcome:
+  `{"outcome": "accepted"}`, or `rejected`, `released` or `modified` with status 1 (a
+  rejection's `error` as `{"condition", "description"}`, with the user name and the secret
+  scrubbed); `settled` returns `{"settled": true}` (at most once). `receive` attaches a
+  receiving link, gives credit for `max_messages`, takes what comes within `wait_ms`, and
+  detaches; each message as `{"payload", "subject", "message_id", "content_type",
+  "delivery_count"}` (`payload` as text, `{"base64"}`, or the JSON of an `amqp-value`).
+  `settle`: `settled` (sent settled, at most once), `first` (the node accepts and settles each
+  delivery; the broker settles first on a send), `second` (the receiver settles only after the
+  sender did). A broker that changes the settle mode the node asked for, settles otherwise than
+  the mode, sends more deliveries than the credit, overruns the session window, uses another
+  channel or link, or sends a performative the standard does not define is refused. Values are
+  decoded within bounds: 16 levels deep, 16,384 values a frame or message, a descriptor a
+  `ulong` or a symbol of at most 256 bytes. A message is at most 1 MiB (announced as
+  `max-message-size`), and the messages of a result together within the result limit. The
+  address of each command is a template of the policy, never the caller's.
 - **POP3** (RFC 1939): `CAPA`, then the named mechanism and no other: `USER`/`PASS` (refused
   when `CAPA` answers without `USER`), `APOP` (MD5 over the greeting's timestamp and the
   password; refused without a timestamp, flagged `weak_mechanism`), or `AUTH` (RFC 5034) with
@@ -663,6 +691,22 @@ What each kind does with them:
   a destination. The node opens one `direct-tcpip` channel on a streaming call and relays the
   caller's signed frames to it and the bytes back through the stream search. The summary flags
   each forward rule with its destination.
+- **Remote forwarding** (SSH, `channel: "tcpip-forward"`, RFC 4254 section 7.1): the rule's
+  `text` is the `address:port` the server listens on, a literal of the policy with a port from
+  1 to 65535 (never 0, a port the server would choose) and no parameters; the caller names the
+  rule, never a bind. A bind on every address of the server (`*`, `0.0.0.0`, `::`) is refused
+  unless the rule says `wildcard_bind: true`; the summary flags it `wildcard_bind`, and every
+  remote forward `remote_forward`. On a streaming call the node asks the server to listen there
+  and takes one `forwarded-tcpip` channel, for exactly that address and port, while no other
+  channel is open; any other channel the server opens is refused (administratively
+  prohibited), and more than 16 refused opens end the connection. The forwarded connection is
+  the call's relay: the node opens no socket or listener of its own, so the caller's stream is
+  the local end. The caller is handed `{"forwarded": {"originator", "port"}}` as a text part,
+  its signed frames go to the connection (a frame before it arrives is refused), and the bytes
+  come back through the stream search. It takes a live slot of its own (refused as a resource
+  shortage when the caller, the owner or the node holds as many as it may), the forward is
+  cancelled (`cancel-tcpip-forward`) when the call ends, and a hand-over ends it as it ends any
+  relay.
 
 Every result is redacted and searched for secrets before it goes back, in the form the server
 sent it (a value in a row, a bulk string) and as JSON, and across results. A protocol
@@ -808,6 +852,35 @@ each way.
    {"do": "return", "relay": {"server": true,
      "frames": [{"kind": "binary"}],
      "commands": [{"name": "db", "text": "db.internal:5432", "channel": "direct-tcpip"}]}}
+ ]}
+```
+
+```json
+{"name": "callback",
+ "steps": [
+   {"do": "open", "connection": "ssh",
+    "destinations": [{"host": "bastion.example.com", "port": 22}],
+    "host_keys": ["ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIIpE5S3nEfaq9h6S6l5bSkF1H0R1mAEbvYMVg4Ccmi6G"],
+    "login": {"user": "tunnel", "key": "{{ssh_key}}"},
+    "limits": {"idle_ms": 60000, "duration_ms": 900000}},
+   {"do": "return", "relay": {"server": true,
+     "frames": [{"kind": "binary"}],
+     "commands": [{"name": "hook", "text": "127.0.0.1:9000", "channel": "tcpip-forward"}]}}
+ ]}
+```
+
+```json
+{"name": "jobs",
+ "steps": [
+   {"do": "open", "connection": "amqp1",
+    "destinations": [{"host": "bus.example.com", "port": 5671}],
+    "login": {"user": "app", "password": "{{amqp_password}}", "mechanism": "scram-sha-256"}},
+   {"do": "return", "relay": {"commands": [
+     {"name": "submit", "text": "send", "settle": "second",
+      "params": [{"template": "jobs"}, {"pattern": "[0-9]{1,9}", "template": "job:{{ $input }}"}]},
+     {"name": "results", "text": "receive", "max_messages": 8, "wait_ms": 2000,
+      "params": [{"template": "results"}]}
+   ]}}
  ]}
 ```
 
@@ -1364,6 +1437,8 @@ crate, which checks the policy first) gives the owner, in JSON:
 | `param_unpinned` | A command parameter of the caller has no pattern (only its length bounds it). |
 | `mail_relay` | The caller sends mail over SMTP as the item's account. |
 | `shell_relay` | The caller types into an SSH shell. |
+| `remote_forward` | An SSH remote forward: the server listens on the policy's address and port, and the one connection it forwards there reaches the caller. |
+| `wildcard_bind` | A remote forward binds every address of the server (`*`, `0.0.0.0`, `::`): anyone who reaches the server can open the forwarded connection. |
 | `plain_datagram` | An operation sends UDP datagrams, without TLS: what they carry is readable on the path. |
 | `browser_fill` | The node types secrets into a page in a browser over CDP: the page and the browser behind the endpoint get them, and the node cannot check the page's TLS through CDP. |
 | `frame_origin` | A fill puts values into a frame of another origin than the page's. |

@@ -324,6 +324,12 @@ pub enum FlagCode {
     BrowserFill,
     /// A fill puts values into a frame of another origin than the page's.
     FrameOrigin,
+    /// An SSH remote forward: the server listens on the policy's address and port, and the
+    /// one connection it forwards there reaches the caller.
+    RemoteForward,
+    /// A remote forward binds every address of the server (`0.0.0.0`, `::`, `*`): anyone
+    /// who reaches the server can open the forwarded connection.
+    WildcardBind,
     /// An operation hands the caller a credential minted from the secret (bounded in time
     /// and scope by the policy).
     Vend,
@@ -414,6 +420,26 @@ fn protocol_flags(flags: &mut Vec<Flag>, at: &str, relay: &super::Relay) {
         }
     }
     for rule in &relay.commands {
+        if rule.ssh_channel() == super::SshChannel::TcpipForward {
+            let at = format!("{at}.commands.{}", rule.name);
+            flag(
+                flags,
+                FlagCode::RemoteForward,
+                &at,
+                format!(
+                    "the server listens on {} and the connection it forwards reaches the caller",
+                    rule.text
+                ),
+            );
+            if super::bind_target(&rule.text).is_some_and(|(_, _, wildcard)| wildcard) {
+                flag(
+                    flags,
+                    FlagCode::WildcardBind,
+                    &at,
+                    "the forward binds every address of the server: anyone who reaches it can connect",
+                );
+            }
+        }
         for (i, p) in rule.params.iter().enumerate() {
             if p.unpinned() {
                 flag(

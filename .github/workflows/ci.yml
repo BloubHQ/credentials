@@ -117,8 +117,8 @@ jobs:
 
   fuzz:
     runs-on: ubuntu-latest
-    # Seconds per target: 10 on a pull request, 60 on main, 300 in the daily run. With 28
-    # targets that is about 5, 28 and 140 minutes plus the build.
+    # Seconds per target: 10 on a pull request, 60 on main, 300 in the daily run. With 30
+    # targets that is about 5, 30 and 150 minutes plus the build.
     timeout-minutes: ${{ github.event_name == 'schedule' && 180 || github.event_name == 'push' && 75 || 30 }}
     env:
       FUZZ_SECONDS: ${{ github.event_name == 'schedule' && 300 || github.event_name == 'push' && 60 || 10 }}

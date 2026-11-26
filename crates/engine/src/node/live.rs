@@ -143,6 +143,7 @@ struct Counts {
 }
 
 /// One open connection, counted until it is dropped.
+#[must_use]
 pub(crate) struct Slot<'n> {
     slots: &'n Slots,
     owner: String,
@@ -422,6 +423,7 @@ impl<S: LogSink, C: Clock> Node<S, C> {
             | Connection::Mysql
             | Connection::Mqtt
             | Connection::Amqp
+            | Connection::Amqp1
             | Connection::Ftp
             | Connection::Pop3 => Err(operation.unknown()),
         }

@@ -1,7 +1,7 @@
 //! AMQP 0-9-1 over TLS: PLAIN only, publications to the exchanges and routing keys the policy
 //! fixes (mandatory, confirmed), messages got from the queues it fixes.
 
-use engine::policy::FieldSpec;
+use engine::policy::{Caller, FieldSpec};
 use serde_json::{Value, json};
 
 use super::*;
@@ -421,22 +421,30 @@ fn exchanges_and_routing_keys_are_the_policys() {
         );
         assert!(fake.opened.is_empty());
     }
-    // A caller-chosen exchange or routing key does not validate.
-    let policy = Policy {
+    // A caller-chosen exchange or routing key does not validate; the same command with the
+    // policy's exchange does, so the refusal is for the exchange and not for the policy.
+    let policy = |exchange: Value| Policy {
         item: None,
         fields: vec![FieldSpec::secret("password")],
-        callers: vec![],
+        callers: vec![Caller {
+            name: "app".into(),
+            key: caller_key().public(),
+            operations: vec!["orders".into()],
+            limit: None,
+        }],
         operations: vec![operation(json!({"name": "orders", "steps": [
             {"do": "open", "connection": "amqp",
              "destinations": [{"host": "mq.example.com", "port": 5671}],
              "login": {"user": "app", "password": "{{password}}"}},
             {"do": "return", "relay": {"commands": [
                 {"name": "any", "text": "publish",
-                 "params": [{"pattern": "[a-z]{1,8}"}, {"template": "k"}, {"max_len": 10}]}
+                 "params": [exchange, {"template": "k"}, {"max_len": 10}]}
             ]}}
         ]}))],
     };
-    assert!(policy.validate().is_err());
+    let ok = policy(json!({"template": "x"})).validate();
+    assert!(ok.is_ok(), "{ok:?}");
+    assert!(policy(json!({"pattern": "[a-z]{1,8}"})).validate().is_err());
 }
 
 #[test]
