@@ -230,6 +230,46 @@ credentials verify log.jsonl "$NODE_KEY" --head log.jsonl.head.json
 1 it is invalid, 2 usage error or a file that cannot be read. A first entry whose signature
 fails asks whether the key given is the node's log public key.
 
+### Windows PowerShell
+
+The walkthrough above is for a POSIX shell. In PowerShell, steps 1 to 3 and 6 read:
+
+```powershell
+mkdir demo; cd demo
+credentials keygen device --out device.key
+credentials keygen user   --out user.key
+$CALLER = credentials keygen caller --out caller.key
+credentials keygen node   --out node.key
+
+@"
+{
+  "fields": [{"name": "key", "secret": true}],
+  "callers": [{"name": "app", "key": "$CALLER", "operations": ["sign"]}],
+  "operations": [{"name": "sign",
+                  "input": {"raw": {"max_len": 64, "pattern": "[a-z0-9]+"}},
+                  "steps": [{"do": "return",
+                             "template": "{{ hex(hmac_sha256(key, `$input)) }}"}]}]
+}
+"@ | Set-Content -Encoding ascii policy.json
+credentials policy check policy.json
+credentials policy sign policy.json --device device.key --out signed.json
+
+$bytes = [byte[]]::new(32)
+[System.Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($bytes)
+[System.IO.File]::WriteAllBytes("$PWD\hmac.key", $bytes)
+credentials seal --user-key user.key --id signer --owner me --policy signed.json `
+    --field key=@hmac.key --out record.json
+Remove-Item hmac.key
+
+credentials call derive --caller-key caller.key --caller app --node identity.json `
+    --record record.json --operation sign --input 'hello' --send http://127.0.0.1:8700
+```
+
+Write JSON documents with `--out`, not with `>`: Windows PowerShell 5.1 writes redirected
+output as UTF-16, which `credentials` refuses (it says so and suggests `--out`); a UTF-8 byte
+order mark, as `Set-Content -Encoding utf8` writes it, is accepted. An environment variable
+for `env:VAR` is set with `$env:HMAC_KEY = "..."`.
+
 ## Commands
 
 | Command | Does |

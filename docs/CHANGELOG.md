@@ -22,6 +22,12 @@ before 1.0, minor versions may break formats and APIs.
   a panic in a connection still ends only that connection. Measured (`cargo build --release
   -p cli --locked`, Windows x86-64): `credentials.exe` 17,839,104 bytes before, 18,059,264
   after (+220,160, +1.2%).
+- Windows: the CLI reads a JSON document that starts with a UTF-8 byte order mark (as
+  `Set-Content -Encoding utf8` writes it), and refuses UTF-16 (what `>` writes in Windows
+  PowerShell 5.1) with a message that suggests `--out`; before, both failed with "expected
+  value at line 1 column 1". The CLI walkthrough has a PowerShell section, and the README
+  quick start the PowerShell way to set the token.
+
 - The CLI names where in a JSON document a field fails, in the path style of the semantic
   checks (``policy.json: operations[0].steps[0]: missing field `port` ``, `callers[0].key:
   invalid base64 array`), through `serde_path_to_error` (MIT or Apache-2.0); before, the

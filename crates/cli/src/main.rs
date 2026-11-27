@@ -992,9 +992,11 @@ fn run(command: Command) -> Res<()> {
             Ok(())
         }
         Command::Policy(PolicyCommand::Upgrade { policy, out }) => {
-            let text = std::fs::read_to_string(&policy)
+            let bytes = std::fs::read(&policy)
                 .map_err(|e| format!("cannot read {}: {e}", policy.display()))?;
-            let upgraded = engine::policy::legacy::upgrade_json(&text)
+            let text = std::str::from_utf8(files::json_text(&policy, &bytes)?)
+                .map_err(|e| format!("{}: {e}", policy.display()))?;
+            let upgraded = engine::policy::legacy::upgrade_json(text)
                 .map_err(|e| format!("{}: {e}", policy.display()))?;
             for note in &upgraded.notes {
                 eprintln!("note: {note}");

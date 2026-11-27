@@ -605,6 +605,34 @@ fn policy_check_names_the_rule() {
 }
 
 #[test]
+fn json_with_a_byte_order_mark_is_read_and_utf16_names_the_fix() {
+    let dir = temp_dir("bom");
+    let policy = dir.join("policy.json");
+    let text = r#"{"fields": [{"name": "k", "secret": true}], "callers": [],
+        "operations": [{"name": "d", "steps": [{"do": "return", "template": "x"}]}]}"#;
+    // UTF-8 with a byte order mark, as `Set-Content -Encoding utf8` writes it.
+    let mut bom = vec![0xEF, 0xBB, 0xBF];
+    bom.extend_from_slice(text.as_bytes());
+    std::fs::write(&policy, &bom).unwrap();
+    // The document is read: the check gets as far as the rules (it has no caller).
+    let out = run(&["policy", "check", s(&policy)]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("policy invalid at callers"), "{stderr}");
+    // UTF-16LE with its mark, as `>` writes it in Windows PowerShell 5.1.
+    let mut utf16 = vec![0xFF, 0xFE];
+    utf16.extend(text.encode_utf16().flat_map(u16::to_le_bytes));
+    std::fs::write(&policy, &utf16).unwrap();
+    let out = run(&["policy", "check", s(&policy)]);
+    assert_eq!(out.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("UTF-16") && stderr.contains("--out"),
+        "{stderr}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn policy_errors_name_the_place_in_the_document() {
     let dir = temp_dir("where");
     let policy = dir.join("bad.json");
