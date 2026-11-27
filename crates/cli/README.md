@@ -343,7 +343,11 @@ answer 403, so the status tells a stranger nothing more.
   on Unix; on Windows the file is shared for reading only), so a second `serve` on the same
   `--log` fails at start; `credentials verify` can still read it. On Unix the directory is
   synced after the log is created and after each checkpoint rename; Windows has no directory
-  sync, so there a new log file or checkpoint name is as durable as the filesystem makes it.
+  sync, so there a new log file or checkpoint name is as durable as the filesystem makes it
+  (`serve` on Windows is for development). The lock and the sync hold on a local filesystem;
+  a log on a network share (NFS, SMB) is not supported. On Unix the lock is advisory: it
+  stops only processes that take it, so stop a `serve` from before it before starting a new
+  one on the same log.
 - **Checkpoint.** `log.jsonl.head.json` is the signed head after the last act that appended to
   the log (a refused act writes nothing). Here it sits next to the log, where the operator can
   roll both back together; a real deployment keeps it in TEE-sealed storage or behind a monotonic counter and restarts with `--anchor <head.json>`,

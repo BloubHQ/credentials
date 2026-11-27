@@ -13,8 +13,10 @@ before 1.0, minor versions may break formats and APIs.
   in use by another process" instead of appending over entries the first one confirmed;
   `credentials verify` can still read a live log. On Unix the directory is synced after a log
   file is created and after a checkpoint is renamed into place, so a power loss cannot lose
-  the new name; Windows has no directory sync (documented). New error variant
-  `server::logfile::Error::InUse` (#54).
+  the new name; Windows has no directory sync (documented). Both hold on local filesystems
+  only; a log on a network share is not supported. On Unix the lock is advisory: a `serve`
+  from before this release does not take it, so stop the old one before starting the new
+  one on the same log. New error variant `server::logfile::Error::InUse` (#54).
 - Delegation: a delegated call that waits for the owner's approval (an operation marked
   `approval`, a card, a payment over the limits) works. Its summary named the caller as the
   label `delegate/caller`, which is no name, so every such call failed with

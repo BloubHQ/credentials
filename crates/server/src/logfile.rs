@@ -5,7 +5,9 @@
 //! One writer per log: a [`FileSink`] holds an exclusive lock on its file while it lives
 //! (`flock` on Unix; on Windows the file is opened sharing reads only), so a second
 //! `credentials serve` on the same `--log` fails at start instead of writing over the first
-//! one's confirmed entries. A reader (`credentials verify`) can still read the file.
+//! one's confirmed entries. A reader (`credentials verify`) can still read the file. On Unix
+//! the lock is advisory (it stops only processes that take it), and on a network filesystem
+//! its behaviour depends on the server and client: a log belongs on a local filesystem.
 //!
 //! Durability: every entry is `sync_data`'d before `append` returns. On Unix the directory is
 //! synced as well after the log file is created and after a checkpoint is renamed into place,
