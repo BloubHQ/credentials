@@ -639,11 +639,13 @@ mod tests {
     /// The relay connector against a host that answers like `credentials host` and echoes.
     #[test]
     fn connector_through_relay() {
-        let listener = TcpListener::bind("127.0.0.1:0").ok();
-        let Some(listener) = listener else { return };
-        let Ok(address) = listener.local_addr() else {
-            return;
-        };
+        // A setup that fails is a failure, not a silent pass (#92).
+        let listener = TcpListener::bind("127.0.0.1:0");
+        assert!(listener.is_ok(), "the test listener binds");
+        let Ok(listener) = listener else { return };
+        let address = listener.local_addr();
+        assert!(address.is_ok(), "the test listener has an address");
+        let Ok(address) = address else { return };
         let host = thread::spawn(move || {
             let (mut stream, _) = listener.accept().ok()?;
             let target = read_tunnel_request(&mut stream).ok()?;
