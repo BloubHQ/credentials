@@ -100,6 +100,30 @@ jobs:
           path: dist/*
           if-no-files-found: error
 
+  # The JavaScript engine module of the sandbox (crates/sandbox/libraries/js.wasm, boa compiled
+  # to WebAssembly) is checked in; this job builds it again from its locked sources and
+  # compares the bytes (build/js-module.sh). The bytes are those of a build on a Windows host:
+  # file names compiled into the module keep the host's path separator.
+  js-module:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup target add wasm32-unknown-unknown
+      - name: Build the module again and compare it with the one checked in
+        shell: bash
+        run: build/js-module.sh --check
+      - name: Lint the module's crate
+        shell: bash
+        working-directory: crates/sandbox/js
+        env:
+          RUSTFLAGS: --cfg getrandom_backend="unsupported"
+        run: |
+          cargo fmt --check
+          cargo clippy --locked --target wasm32-unknown-unknown -- -D warnings
+
   msrv:
     runs-on: ubuntu-latest
     timeout-minutes: 30

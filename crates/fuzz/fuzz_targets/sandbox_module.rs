@@ -26,6 +26,7 @@ fuzz_target!(|data: &[u8]| {
     let limits = Limits {
         fuel: 1_000_000,
         memory: 4 * 1024 * 1024,
+        ..Limits::default()
     };
     let checked = sandbox::check(module);
     for entry in ["run", "entry"] {

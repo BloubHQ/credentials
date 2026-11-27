@@ -71,7 +71,7 @@ pub use proto::{
     MqttVersion, ParamRule, SettleMode, SshChannel, TlsMode, VerbShape, bind_target,
     forward_target, path_ok, verb_shape,
 };
-pub use run::{ModuleRef, ModuleSource, RunModule};
+pub use run::{ModuleRef, ModuleSource, RunLimits, RunModule, ScriptSource};
 pub use summary::diff;
 pub use vend::{Expiry, MAX_VEND_MS, TimeFormat, VEND_SKEW_MS, Vend};
 pub(crate) use wait::is_currency;

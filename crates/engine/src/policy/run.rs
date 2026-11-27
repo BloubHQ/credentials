@@ -7,6 +7,12 @@
 //! computed from it, may only go into a request the policy fixes to that same origin. It never
 //! reaches `return`, a request of the caller, another destination or the log. The origin
 //! already receives the secret, so running its own code on it gives it nothing new.
+//!
+//! A JavaScript source runs the same way: the step names the reviewed engine module
+//! ([`sandbox::JS`]) as its library and the `script`, a URL on the destination's own origin
+//! pinned by its SHA-256 (required). The output goes to the script's origin. The bounds of a
+//! run (fuel, memory, time, the size of a script) may be lowered by the signed policy
+//! (`limits`), never raised past the node's.
 
 use serde::{Deserialize, Serialize};
 
@@ -18,6 +24,9 @@ use crate::template::{Template, Var};
 
 /// Most inputs of a `run` step.
 pub const MAX_RUN_INPUTS: usize = sandbox::MAX_INPUTS;
+/// Most inputs of a `run` step that runs a script: the engine takes two for the source and
+/// the function name.
+pub const MAX_SCRIPT_INPUTS: usize = sandbox::MAX_SCRIPT_ARGS;
 /// Longest module URL.
 pub const MAX_URL: usize = 2048;
 
@@ -32,12 +41,83 @@ pub struct ModuleSource {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,
     /// The SHA-256 of the module, 64 lowercase hex digits. Without it the site may change
-    /// the code at any time; the summary flags it.
+    /// the code at any time; the summary flags it. For a library it is optional and pins the
+    /// release's bytes: a node whose library differs refuses the step.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sha256: Option<String>,
     /// The name of a reviewed library module ([`sandbox::LIBRARIES`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub library: Option<String>,
+}
+
+/// A JavaScript source for the engine module: fetched with `GET` from the destination's own
+/// origin and pinned.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ScriptSource {
+    /// `https://host[:port]/path` on one of the connection's destinations: where the script
+    /// comes from and where the output may go.
+    pub url: String,
+    /// The SHA-256 of the script's bytes, 64 lowercase hex digits. Required: the engine runs
+    /// only the source the owner signed.
+    pub sha256: String,
+}
+
+/// Bounds of one `run`, each at most the node's ([`sandbox::Limits::default`]). A bound left
+/// out is the node's.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RunLimits {
+    /// Fuel, 1 to [`sandbox::MAX_FUEL`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fuel: Option<u64>,
+    /// Linear memory in bytes, 1 to [`sandbox::MAX_MEMORY`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory: Option<u64>,
+    /// Wall-clock milliseconds, 1 to [`sandbox::MAX_TIME`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub time_ms: Option<u64>,
+    /// For a script: its largest size in bytes, 1 to [`sandbox::MAX_SCRIPT`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<u64>,
+}
+
+impl RunLimits {
+    /// The sandbox's limits: the node's, lowered by these.
+    pub fn sandbox(&self) -> sandbox::Limits {
+        let node = sandbox::Limits::default();
+        let size = |v: Option<u64>, cap: usize| {
+            v.map_or(cap, |v| usize::try_from(v).unwrap_or(usize::MAX).min(cap))
+        };
+        sandbox::Limits {
+            fuel: self.fuel.map_or(node.fuel, |v| v.min(node.fuel)),
+            memory: size(self.memory, node.memory),
+            time: self.time_ms.map_or(node.time, |ms| {
+                core::time::Duration::from_millis(ms).min(node.time)
+            }),
+            script: size(self.source, node.script),
+        }
+    }
+
+    /// The first bound out of its range, as a rule.
+    fn fault(&self, script: bool) -> Option<&'static str> {
+        let max_time = u64::try_from(sandbox::MAX_TIME.as_millis()).unwrap_or(u64::MAX);
+        let within = |v: Option<u64>, cap: u64| v.is_none_or(|v| (1..=cap).contains(&v));
+        let as_u64 = |v: usize| u64::try_from(v).unwrap_or(u64::MAX);
+        if !within(self.fuel, sandbox::MAX_FUEL) {
+            Some("limits.fuel is 1 to 1000000000")
+        } else if !within(self.memory, as_u64(sandbox::MAX_MEMORY)) {
+            Some("limits.memory is 1 to 67108864 bytes")
+        } else if !within(self.time_ms, max_time) {
+            Some("limits.time_ms is 1 to 5000")
+        } else if !within(self.source, as_u64(sandbox::MAX_SCRIPT)) {
+            Some("limits.source is 1 to 262144 bytes")
+        } else if self.source.is_some() && !script {
+            Some("limits.source bounds a script; this step runs no script")
+        } else {
+            None
+        }
+    }
 }
 
 /// The `run` step: runs `entry` of a module on rendered `inputs` (secrets allowed) and keeps
@@ -55,9 +135,18 @@ pub struct RunModule {
     /// The name of the output.
     pub into: String,
     /// For a library: the destination its output may go to. It may be left out when the
-    /// connection has exactly one concrete destination. A URL module's origin is its URL's.
+    /// connection has exactly one concrete destination. A URL module's origin is its URL's,
+    /// a script's its script's.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub destination: Option<Destination>,
+    /// A JavaScript source the engine module runs: `module` is then `{"library": "js"}` and
+    /// `entry` the name of the function the script defines, called with the inputs as
+    /// `Uint8Array`s.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub script: Option<ScriptSource>,
+    /// Bounds of the run, lower than the node's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limits: Option<RunLimits>,
 }
 
 /// A module, resolved.
@@ -74,6 +163,16 @@ pub enum ModuleRef<'a> {
     },
     /// A reviewed library module.
     Library(&'a str),
+    /// A JavaScript source fetched with `GET path` from `origin`, run by the engine module
+    /// [`sandbox::JS`].
+    Script {
+        /// Host and port.
+        origin: Destination,
+        /// Path and query.
+        path: &'a str,
+        /// The pin.
+        sha256: [u8; 32],
+    },
 }
 
 /// Splits `https://host[:port]/path` into the destination and the path, or `None`.
@@ -126,28 +225,49 @@ fn parse_sha256(hex: &str) -> Option<[u8; 32]> {
 impl RunModule {
     /// The module, or `None` when the source is malformed.
     pub fn source(&self) -> Option<ModuleRef<'_>> {
-        match (&self.module.url, &self.module.library) {
-            (Some(url), None) => {
+        let pin = match &self.module.sha256 {
+            Some(hex) => Some(parse_sha256(hex)?),
+            None => None,
+        };
+        match (&self.module.url, &self.module.library, &self.script) {
+            (Some(url), None, None) => {
                 let (origin, path) = parse_url(url)?;
-                let sha256 = match &self.module.sha256 {
-                    Some(hex) => Some(parse_sha256(hex)?),
-                    None => None,
-                };
                 Some(ModuleRef::Url {
                     origin,
                     path,
-                    sha256,
+                    sha256: pin,
                 })
             }
-            (None, Some(name)) if self.module.sha256.is_none() => Some(ModuleRef::Library(name)),
+            (None, Some(name), None) => Some(ModuleRef::Library(name)),
+            (None, Some(name), Some(script)) if name == sandbox::JS => {
+                let (origin, path) = parse_url(&script.url)?;
+                Some(ModuleRef::Script {
+                    origin,
+                    path,
+                    sha256: parse_sha256(&script.sha256)?,
+                })
+            }
             _ => None,
         }
+    }
+
+    /// The SHA-256 pin of a library, when the policy gives one.
+    pub fn library_pin(&self) -> Option<[u8; 32]> {
+        match (&self.module.library, &self.module.sha256) {
+            (Some(_), Some(hex)) => parse_sha256(hex),
+            _ => None,
+        }
+    }
+
+    /// The sandbox's limits of this step: the node's, lowered by `limits`.
+    pub fn sandbox_limits(&self) -> sandbox::Limits {
+        self.limits.unwrap_or_default().sandbox()
     }
 
     /// The origin the output may go to, on the connection `open`.
     pub fn origin(&self, open: &Open) -> Option<Destination> {
         match self.source()? {
-            ModuleRef::Url { origin, .. } => Some(origin),
+            ModuleRef::Url { origin, .. } | ModuleRef::Script { origin, .. } => Some(origin),
             ModuleRef::Library(_) => match &self.destination {
                 Some(d) => Some(d.clone()),
                 None => match open.destinations.as_slice() {
@@ -158,12 +278,14 @@ impl RunModule {
         }
     }
 
-    /// How the module is named in a summary: its URL, or `library <name>`.
+    /// How the module is named in a summary: its URL, `library <name>`, or for a script its
+    /// URL.
     pub fn module_name(&self) -> String {
-        match (&self.module.url, &self.module.library) {
-            (Some(url), _) => url.clone(),
-            (None, Some(name)) => format!("library {name}"),
-            (None, None) => String::new(),
+        match (&self.module.url, &self.module.library, &self.script) {
+            (Some(url), _, _) => url.clone(),
+            (None, Some(_), Some(script)) => script.url.clone(),
+            (None, Some(name), None) => format!("library {name}"),
+            (None, None, _) => String::new(),
         }
     }
 
@@ -198,13 +320,42 @@ impl Policy {
                 "run needs an HTTPS connection: its output goes only into a request to the module's origin",
             );
         };
+        if run.script.is_some() {
+            ensure(
+                run.module.url.is_none()
+                    && run.module.library.as_deref() == Some(sandbox::JS)
+                    && run.source().is_some(),
+                || format!("{at}.script"),
+                "a script runs on the library js and is a url on https with a sha256 of 64 lowercase hex digits",
+            )?;
+        }
         let Some(source) = run.source() else {
             return fail(
                 format!("{at}.module"),
-                "module is a url on https (with an optional sha256 of 64 lowercase hex digits) or a library",
+                "module is a url on https or a library, each with an optional sha256 of 64 lowercase hex digits",
             );
         };
+        if let Some(fault) = run.limits.and_then(|l| l.fault(run.script.is_some())) {
+            return fail(format!("{at}.limits"), fault);
+        }
         match source {
+            ModuleRef::Script { origin, .. } => {
+                ensure(
+                    run.destination.is_none(),
+                    || format!("{at}.destination"),
+                    "a script names its origin; destination is for a library",
+                )?;
+                ensure(
+                    open.destinations.iter().any(|d| d.matches(&origin)),
+                    || format!("{at}.script.url"),
+                    "the script comes from the destination's own origin: a URL on one of the connection's destinations",
+                )?;
+                ensure(
+                    run.inputs.len() <= MAX_SCRIPT_INPUTS,
+                    || format!("{at}.inputs"),
+                    "at most 14 inputs for a script",
+                )?;
+            }
             ModuleRef::Url { origin, .. } => {
                 ensure(
                     run.destination.is_none(),
@@ -222,6 +373,11 @@ impl Policy {
                     sandbox::library(name).is_some(),
                     || format!("{at}.module.library"),
                     "unknown library module",
+                )?;
+                ensure(
+                    name != sandbox::JS,
+                    || format!("{at}.script"),
+                    "the library js runs a script: name it in script",
                 )?;
                 let origin = run.origin(open);
                 ensure(
@@ -415,10 +571,11 @@ pub(super) fn summary_line(run: &RunModule, open: Option<&Open>) -> Vec<String> 
         .and_then(|o| run.origin(o))
         .map(|d| format!("{}:{}", d.host, d.port))
         .unwrap_or_default();
-    let pin = match &run.module.sha256 {
-        Some(hex) => format!(" (sha256 {hex})"),
-        None if run.module.url.is_some() => " (not pinned)".into(),
-        None => String::new(),
+    let pin = match (&run.script, &run.module.sha256) {
+        (Some(script), _) => format!(" (sha256 {}) in library js", script.sha256),
+        (None, Some(hex)) => format!(" (sha256 {hex})"),
+        (None, None) if run.module.url.is_some() => " (not pinned)".into(),
+        (None, None) => String::new(),
     };
     let mut out = vec![format!(
         "  run {} of {}{pin} on [{}] into {}, only to {origin}",
@@ -427,6 +584,22 @@ pub(super) fn summary_line(run: &RunModule, open: Option<&Open>) -> Vec<String> 
         run.inputs.join(", "),
         run.into
     )];
+    if let Some(limits) = &run.limits {
+        let mut bounds = Vec::new();
+        if let Some(v) = limits.fuel {
+            bounds.push(format!("fuel {v}"));
+        }
+        if let Some(v) = limits.memory {
+            bounds.push(format!("memory {v} bytes"));
+        }
+        if let Some(v) = limits.time_ms {
+            bounds.push(format!("time {v} ms"));
+        }
+        if let Some(v) = limits.source {
+            bounds.push(format!("script at most {v} bytes"));
+        }
+        out.push(format!("    limits: {}", bounds.join(", ")));
+    }
     if run.unpinned() {
         out.push(format!(
             "  ! the module {} has no sha256: the site can change the code that reads the secrets",

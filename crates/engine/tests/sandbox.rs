@@ -22,7 +22,7 @@ use engine::node::{Clock, Node, Outcome, Response};
 use engine::policy::summary::FlagCode;
 use engine::policy::{
     Caller, CallerRequest, Compute, Destination, FieldSpec, Injection, Method, ModuleSource,
-    Operation, Policy, Return, RunModule, Send, Step, Target, summarize,
+    Operation, Policy, Return, RunLimits, RunModule, ScriptSource, Send, Step, Target, summarize,
 };
 use engine::record::Record;
 use sha2::{Digest, Sha256};
@@ -143,6 +143,8 @@ fn run_step(module: ModuleSource) -> Step {
         inputs: vec!["{{password}}".into()],
         into: "enc".into(),
         destination: None,
+        script: None,
+        limits: None,
     })
 }
 
@@ -432,9 +434,14 @@ fn fuel_and_memory_exhaustion_stop_the_module() {
             replies: VecDeque::from([http_200(&module)]),
             ..FakeTransport::default()
         };
-        assert_eq!(
-            call(&s, &mut transport).result.unwrap_err(),
-            Error::Sandbox(expected)
+        let error = call(&s, &mut transport).result.unwrap_err();
+        // The loop runs 10^9 fuel (1.25 s in release on the measured host); a debug build
+        // among parallel tests may reach the 5 s time limit first.
+        assert!(
+            error == Error::Sandbox(expected)
+                || (expected == sandbox::Error::Fuel
+                    && error == Error::Sandbox(sandbox::Error::Time)),
+            "{error:?}"
         );
         assert_eq!(transport.sent.len(), 1, "the login never went out");
     }
@@ -538,6 +545,8 @@ fn every_escape_of_the_output_is_refused_at_signing() {
         inputs: vec!["{{enc}}".into()],
         into: "again".into(),
         destination: None,
+        script: None,
+        limits: None,
     };
     second.module.url = Some(format!("https://api.example.net{MODULE_PATH}"));
     let operation = Operation::https("login", login())
@@ -684,4 +693,362 @@ fn the_output_does_not_ride_on_a_status_poll() {
             && rule.contains("goes only into a request the policy fixes"),
         "{rule}"
     );
+}
+
+// JavaScript: a pinned script from the destination's origin, run by the reviewed engine module.
+
+/// The signing script of the sandbox tests: SHA-256, HMAC-SHA256 and a JWT in JavaScript.
+const HS256: &str = include_str!("../../sandbox/tests/fixtures/hs256.js");
+const SCRIPT_PATH: &str = "/static/sign.js";
+
+fn script_url() -> String {
+    format!("https://login.example.com{SCRIPT_PATH}")
+}
+
+fn js_run(script: &str, entry: &str, inputs: &[&str], limits: Option<RunLimits>) -> RunModule {
+    RunModule {
+        module: ModuleSource {
+            library: Some("js".into()),
+            ..ModuleSource::default()
+        },
+        entry: entry.into(),
+        inputs: inputs.iter().map(|i| (*i).to_string()).collect(),
+        into: "mac".into(),
+        destination: None,
+        script: Some(ScriptSource {
+            url: script_url(),
+            sha256: hex(&Sha256::digest(script.as_bytes())),
+        }),
+        limits,
+    }
+}
+
+/// Runs `run` and posts `mac` and the engine's own HMAC of the password to the login origin.
+fn js_policy(run: RunModule) -> Policy {
+    let operation = Operation::https("login", login())
+        .destination(other())
+        .then(Step::Run(run))
+        .then(Step::Compute(Compute {
+            into: "native".into(),
+            template: "{{ hmac_sha256(password, \"message\") }}".into(),
+        }))
+        .then(Send {
+            inject: vec![body("js={{ hex(mac) }}&native={{ hex(native) }}")],
+            ..post_login()
+        })
+        .then(Return::status());
+    policy_of(vec![operation])
+}
+
+fn serving(script: &str) -> FakeTransport {
+    FakeTransport {
+        replies: VecDeque::from([http_200(script.as_bytes())]),
+        ..FakeTransport::default()
+    }
+}
+
+/// The value of `name=` in a request, up to the next `&` or the end.
+fn form_value(wire: &[u8], name: &str) -> Vec<u8> {
+    let key = format!("{name}=");
+    let at = wire
+        .windows(key.len())
+        .position(|w| w == key.as_bytes())
+        .expect("the request carries the value");
+    let rest = &wire[at + key.len()..];
+    let end = rest.iter().position(|b| *b == b'&').unwrap_or(rest.len());
+    rest[..end].to_vec()
+}
+
+#[test]
+fn a_javascript_hmac_matches_the_engine_and_goes_only_to_its_origin() {
+    let clock = TestClock;
+    let run = js_run(HS256, "sign", &["{{password}}", "message"], None);
+    let s = setup(&clock, js_policy(run));
+    let mut transport = serving(HS256);
+    let response = call(&s, &mut transport).result.unwrap();
+    assert_eq!(response.status(), 200);
+    assert_eq!(transport.sent.len(), 2, "the script fetch and the login");
+    assert!(transport.sent.iter().all(|(d, _)| *d == login()));
+    let fetch = String::from_utf8_lossy(&transport.sent[0].1).into_owned();
+    assert!(fetch.starts_with(&format!("GET {SCRIPT_PATH} HTTP/1.1\r\n")));
+    let posted = &transport.sent[1].1;
+    let js = form_value(posted, "js");
+    let native = form_value(posted, "native");
+    assert_eq!(js.len(), 64, "a 32-byte MAC in hex");
+    assert!(
+        js == native,
+        "the JavaScript HMAC equals the engine's native one"
+    );
+    assert!(!contains(posted, SECRET), "the secret is not sent as is");
+    let log = serde_json::to_vec(&s.node.with_sink(|sink| sink.entries().to_vec())).unwrap();
+    assert!(!contains(&log, SECRET), "the log holds no secret");
+    assert!(!contains(&log, &js), "the log holds no output");
+    // The summary names the script, its pin and the engine.
+    let summary = summarize(&s.record.policy.policy, None);
+    let run = &summary.operations[0].runs[0];
+    assert_eq!(run.module, script_url());
+    assert_eq!(run.engine.as_deref(), Some("js"));
+    assert_eq!(
+        run.sha256.as_deref(),
+        Some(hex(&Sha256::digest(HS256.as_bytes())).as_str())
+    );
+    assert!(!run.unpinned);
+    assert!(
+        s.record
+            .policy
+            .policy
+            .summary()
+            .iter()
+            .any(|l| l.contains("in library js"))
+    );
+}
+
+#[test]
+fn a_javascript_jwt_is_hs256_and_deterministic() {
+    let clock = TestClock;
+    let run = js_run(HS256, "jwt", &["{{password}}", "user", "1700000000"], None);
+    let operation = Operation::https("login", login())
+        .then(Step::Run(run))
+        .then(Send {
+            inject: vec![body("token={{mac}}")],
+            ..post_login()
+        })
+        .then(Return::status());
+    let s = setup(&clock, policy_of(vec![operation]));
+    let mut first = serving(HS256);
+    call(&s, &mut first).result.unwrap();
+    let mut second = serving(HS256);
+    call(&s, &mut second).result.unwrap();
+    let token = form_value(&first.sent[1].1, "token");
+    assert!(
+        token == form_value(&second.sent[1].1, "token"),
+        "same inputs, same JWT"
+    );
+    let token = String::from_utf8(token).unwrap();
+    let (input, signature) = token.rsplit_once('.').unwrap();
+    let mut mac = <hmac::Hmac<Sha256> as hmac::KeyInit>::new_from_slice(SECRET).unwrap();
+    hmac::Mac::update(&mut mac, input.as_bytes());
+    let expected = base64::Engine::encode(
+        &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+        hmac::Mac::finalize(mac).into_bytes(),
+    );
+    assert!(
+        signature == expected,
+        "the JWT's signature is HS256 under the password"
+    );
+}
+
+#[test]
+fn a_script_that_does_not_match_its_pin_is_refused() {
+    let clock = TestClock;
+    let run = js_run(HS256, "sign", &["{{password}}", "message"], None);
+    let s = setup(&clock, js_policy(run));
+    let mut transport = serving("function sign(k) { return k; }");
+    let error = call(&s, &mut transport).result.unwrap_err();
+    assert_eq!(
+        error,
+        Error::ModuleRefused {
+            rule: "the module does not match its sha256 pin"
+        }
+    );
+    assert_eq!(transport.sent.len(), 1, "only the fetch went out");
+    // A script over the policy's source limit is refused before it runs.
+    let small = RunLimits {
+        source: Some(100),
+        ..RunLimits::default()
+    };
+    let run = js_run(HS256, "sign", &["{{password}}", "message"], Some(small));
+    let s = setup(&clock, js_policy(run));
+    let mut transport = serving(HS256);
+    assert_eq!(
+        call(&s, &mut transport).result.unwrap_err(),
+        Error::ModuleRefused {
+            rule: "module or script larger than its limit"
+        }
+    );
+    assert_eq!(transport.sent.len(), 1, "only the fetch went out");
+}
+
+#[test]
+fn a_script_is_bounded_by_its_policy() {
+    let clock = TestClock;
+    let spin = "function sign() { for (;;) {} }";
+    for (limits, expected) in [
+        (
+            RunLimits {
+                fuel: Some(20_000_000),
+                ..RunLimits::default()
+            },
+            sandbox::Error::Fuel,
+        ),
+        (
+            RunLimits {
+                time_ms: Some(50),
+                ..RunLimits::default()
+            },
+            sandbox::Error::Time,
+        ),
+    ] {
+        let run = js_run(spin, "sign", &["{{password}}"], Some(limits));
+        let s = setup(&clock, js_policy(run));
+        let mut transport = serving(spin);
+        assert_eq!(
+            call(&s, &mut transport).result.unwrap_err(),
+            Error::Sandbox(expected)
+        );
+        assert_eq!(transport.sent.len(), 1, "the login never goes out");
+    }
+    let hog = "function sign() { const k = []; for (;;) k.push(new Uint8Array(1 << 20)); }";
+    let limits = RunLimits {
+        memory: Some(16 * 1024 * 1024),
+        ..RunLimits::default()
+    };
+    let s = setup(&clock, js_policy(js_run(hog, "sign", &[], Some(limits))));
+    let mut transport = serving(hog);
+    assert_eq!(
+        call(&s, &mut transport).result.unwrap_err(),
+        Error::Sandbox(sandbox::Error::Memory)
+    );
+    // A script that reaches for I/O fails in the sandbox.
+    let io = "function sign() { return fetch('https://api.example.net/'); }";
+    let s = setup(&clock, js_policy(js_run(io, "sign", &[], None)));
+    let mut transport = serving(io);
+    assert_eq!(
+        call(&s, &mut transport).result.unwrap_err(),
+        Error::Sandbox(sandbox::Error::Trap)
+    );
+    assert_eq!(transport.sent.len(), 1, "only the fetch went out");
+    // Bounds outside the node's are refused at signing.
+    for (limits, rule) in [
+        (
+            RunLimits {
+                fuel: Some(sandbox::MAX_FUEL + 1),
+                ..RunLimits::default()
+            },
+            "limits.fuel",
+        ),
+        (
+            RunLimits {
+                memory: Some(0),
+                ..RunLimits::default()
+            },
+            "limits.memory",
+        ),
+        (
+            RunLimits {
+                time_ms: Some(60_000),
+                ..RunLimits::default()
+            },
+            "limits.time_ms",
+        ),
+        (
+            RunLimits {
+                source: Some(1 << 20),
+                ..RunLimits::default()
+            },
+            "limits.source",
+        ),
+    ] {
+        let error = sign_error(js_policy(js_run(HS256, "sign", &[], Some(limits))));
+        assert!(error.contains(rule), "{error}");
+    }
+    // A source bound on a step that runs no script.
+    let mut policy = login_policy(url_module(None), post_login());
+    if let Step::Run(run) = &mut policy.operations[0].steps[1] {
+        run.limits = Some(RunLimits {
+            source: Some(10),
+            ..RunLimits::default()
+        });
+    }
+    let error = sign_error(policy);
+    assert!(error.contains("runs no script"), "{error}");
+}
+
+#[test]
+fn a_script_output_is_confined_and_its_source_checked_at_signing() {
+    let refused = "goes only into a request the policy fixes";
+    let run = || js_run(HS256, "sign", &["{{password}}", "message"], None);
+    // To another destination.
+    let operation = Operation::https("login", login())
+        .destination(other())
+        .then(Step::Run(run()))
+        .then(Send {
+            inject: vec![body("mac={{ hex(mac) }}")],
+            ..Send::fixed_to(Method::Post, "/x", other())
+        })
+        .then(Return::status());
+    let rule = sign_error(policy_of(vec![operation]));
+    assert!(rule.contains(refused), "{rule}");
+    // Into the caller's request.
+    let operation = Operation::https("login", login())
+        .then(Step::Run(run()))
+        .then(Send {
+            inject: vec![body("mac={{ hex(mac) }}")],
+            ..Send::caller(CallerRequest::new([Method::Post]).paths(["/**"]))
+        })
+        .then(Return::status());
+    let rule = sign_error(policy_of(vec![operation]));
+    assert!(rule.contains(refused), "{rule}");
+    // A script from an origin that is not a destination.
+    let mut foreign = run();
+    if let Some(script) = &mut foreign.script {
+        script.url = "https://cdn.example.org/sign.js".into();
+    }
+    let rule = sign_error(js_policy(foreign));
+    assert!(rule.contains("destination's own origin"), "{rule}");
+    // A script whose pin is not a SHA-256.
+    let mut bad_pin = run();
+    if let Some(script) = &mut bad_pin.script {
+        script.sha256 = "abc".into();
+    }
+    let rule = sign_error(js_policy(bad_pin));
+    assert!(rule.contains("sha256"), "{rule}");
+    // A script on any module but the engine, and the engine with no script.
+    let mut on_url = run();
+    on_url.module = url_module(None);
+    let rule = sign_error(js_policy(on_url));
+    assert!(rule.contains("library js"), "{rule}");
+    let mut bare = run();
+    bare.script = None;
+    let rule = sign_error(js_policy(bare));
+    assert!(rule.contains("runs a script"), "{rule}");
+    // Too many inputs for a script: the engine takes two.
+    let mut wide = run();
+    wide.inputs = vec!["x".into(); 15];
+    let rule = sign_error(js_policy(wide));
+    assert!(rule.contains("at most 14 inputs"), "{rule}");
+    // A script cannot be given without its pin: the policy JSON needs `sha256`.
+    let json = r#"{"url": "https://login.example.com/s.js"}"#;
+    assert!(serde_json::from_str::<ScriptSource>(json).is_err());
+}
+
+#[test]
+fn a_library_pin_is_checked_on_the_node() {
+    let clock = TestClock;
+    let pinned = |sha256: String| {
+        let mut policy = login_policy(
+            ModuleSource {
+                library: Some("lenprefix8".into()),
+                sha256: Some(sha256),
+                ..ModuleSource::default()
+            },
+            post_login(),
+        );
+        if let Step::Open(open) = &mut policy.operations[0].steps[0] {
+            open.destinations.truncate(1);
+        }
+        policy
+    };
+    let right = hex(&sandbox::library_sha256("lenprefix8").unwrap());
+    let s = setup(&clock, pinned(right));
+    call(&s, &mut FakeTransport::default()).result.unwrap();
+    let s = setup(&clock, pinned("0".repeat(64)));
+    let mut transport = FakeTransport::default();
+    assert_eq!(
+        call(&s, &mut transport).result.unwrap_err(),
+        Error::ModuleRefused {
+            rule: "the library does not match its sha256 pin"
+        }
+    );
+    assert!(transport.sent.is_empty(), "nothing went out");
 }

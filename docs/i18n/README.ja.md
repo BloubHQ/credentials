@@ -263,7 +263,10 @@ let outcome = node.run(&call, &mut TlsTransport::new());
 サンドボックスで実行します (インタプリタ wasmi: I/O・時計・乱数なし、燃料とメモリの上限)。出力は
 ポリシーが同じオリジンに固定したリクエストにしか入れられず、呼び出し元にも、ほかの宛先にも、ログにも
 行きません。それ以外の使い方は署名時にすべて拒否されます。ハッシュを固定しないモジュールはフラグが
-付きます。測定結果と JavaScript の計画は [docs/sandbox.md](../sandbox.md) にあります。
+付きます。サイトの JavaScript も同じ方法で、レビュー済みのエンジンモジュール (WebAssembly に
+コンパイルした boa) 上で実行されます。ステップは宛先のオリジンにあるスクリプトの URL と SHA-256 (必須) を
+書き、スクリプトには時計・乱数・I/O がなく、ポリシーは燃料・メモリ・時間の上限を下げられます。測定結果と、
+エンジンを選んだ QuickJS との比較は [docs/sandbox.md](../sandbox.md) にあります。
 
 **署名の前に。** `summarize` は secret ごとに送り先と形式、返るもの、リスクフラグ (アイテムの
 オリジン外の宛先、ワイルドカード、平文 HTTP、任意バイトの入力、可逆な出力、リレー、新しい
@@ -628,7 +631,7 @@ PKCS#1 v1.5 署名ができないので、`rsa_sign_pkcs1("sha1", …)` だけ�
 | [`verify`](../../crates/verify) | ノードログの検証ツール。`credentials verify` として実行 |
 | [`attest`](../../crates/attest) | AWS Nitro Enclaves のアテステーションドキュメントの検証ツール。`credentials attest` として実行 |
 | [`client`](../../crates/client) | iOS・Android・Web のアプリ側ライブラリ: 鍵、ノードのアテステーション検証、グラント、レコード、呼び出し。Swift と Kotlin (UniFFI)、JavaScript (wasm-bindgen) のバインディング |
-| [`sandbox`](../../crates/sandbox) | `run` ステップの WebAssembly サンドボックス (wasmi): 燃料とメモリの上限、入力を受け取り出力を 1 つ返す、レビュー済みライブラリモジュール |
+| [`sandbox`](../../crates/sandbox) | `run` ステップの WebAssembly サンドボックス (wasmi): 燃料・メモリ・時間の上限、入力を受け取り出力を 1 つ返す、レビュー済みライブラリモジュール、JavaScript エンジンモジュール (`crates/sandbox/js`) |
 | [`cli`](../../crates/cli) | `credentials` ツール: 鍵、ポリシー、レコード、グラント、呼び出し、ノードサーバー、`credentials host` |
 
 ## 開発

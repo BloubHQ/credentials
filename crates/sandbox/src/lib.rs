@@ -21,22 +21,29 @@
 //! generated at run time. Nothing a module can reach varies between runs (no clock, no
 //! randomness, no host state), so a module gives the same output for the same inputs on every
 //! node of a release. Execution costs fuel (wasmi's units, plus one per 64 bytes a host
-//! function copies) and stops at [`MAX_FUEL`]; the memory stops at [`MAX_MEMORY`]. Every
+//! function copies) and stops at [`MAX_FUEL`]; the memory stops at [`MAX_MEMORY`]; the wall
+//! clock stops it at [`MAX_TIME`] (checked between slices of [`FUEL_SLICE`] fuel). Every
 //! failure is a fixed [`Error`]: nothing the module computes reaches an error message. The
 //! memory is erased before it is freed.
 //!
-//! The choice of runtime, with its measurements, is in `docs/sandbox.md`.
+//! [`run_script`] runs a JavaScript source on the reviewed library module [`JS`] (the boa
+//! engine compiled to WebAssembly, `crates/sandbox/js`), through the same ABI.
+//!
+//! The choice of runtime and of the JavaScript engine, with their measurements, is in
+//! `docs/sandbox.md`.
+
+use std::time::{Duration, Instant};
 
 use wasmi::errors::{ErrorKind, InstantiationError};
 use wasmi::{
     Caller, CompilationMode, Config, EnforcedLimits, Engine, Extern, ExternType, Linker, Module,
-    Store, StoreLimits, StoreLimitsBuilder, TrapCode,
+    Store, StoreLimits, StoreLimitsBuilder, TrapCode, TypedResumableCall,
 };
 use zeroize::{Zeroize, Zeroizing};
 
 mod libraries;
 
-pub use libraries::{LIBRARIES, library};
+pub use libraries::{JS, JS_SHA256, LIBRARIES, library, library_sha256};
 
 /// The module name of the host functions.
 pub const HOST: &str = "credentials";
@@ -56,6 +63,17 @@ pub const MAX_FUEL: u64 = 1_000_000_000;
 pub const MAX_MEMORY: usize = 64 * 1024 * 1024;
 /// Longest entry name.
 pub const MAX_ENTRY: usize = 64;
+/// Longest run by the wall clock. The interpreter checks it between slices of
+/// [`FUEL_SLICE`] fuel, so a run may overshoot it by one slice (about 12 ms on the measured
+/// host); fuel stays the bound that does not depend on the machine.
+pub const MAX_TIME: Duration = Duration::from_secs(5);
+/// The fuel a module runs between two looks at the clock: 12.5 ms of the interpreter on the
+/// measured host (`docs/sandbox.md`).
+pub const FUEL_SLICE: u64 = 10_000_000;
+/// Largest JavaScript source of [`run_script`], in bytes.
+pub const MAX_SCRIPT: usize = 256 * 1024;
+/// Most arguments of a JavaScript function: the inputs left after the source and the name.
+pub const MAX_SCRIPT_ARGS: usize = MAX_INPUTS - 2;
 
 /// Bytes copied by a host function per unit of fuel.
 const COPY_PER_FUEL: usize = 64;
@@ -93,19 +111,31 @@ pub enum Error {
     /// The output grew past [`MAX_OUTPUT`].
     #[error("output larger than the limit")]
     Output,
+    /// The run took longer than its time limit.
+    #[error("module ran out of time")]
+    Time,
+    /// A JavaScript source larger than its limit, or a library module whose bytes do not
+    /// match the hash compiled into the node.
+    #[error("script or library refused")]
+    Refused,
     /// The module trapped (unreachable, out of bounds, division by zero, stack overflow, a bad
     /// call to a host function).
     #[error("module trapped")]
     Trap,
 }
 
-/// The limits of one run. [`Limits::default`] is the most a node allows.
+/// The limits of one run. [`Limits::default`] is the most a node allows; a signed policy may
+/// set lower ones, never higher.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Limits {
     /// Fuel, at most [`MAX_FUEL`].
     pub fuel: u64,
     /// Linear memory in bytes, at most [`MAX_MEMORY`].
     pub memory: usize,
+    /// Wall-clock time, at most [`MAX_TIME`].
+    pub time: Duration,
+    /// For [`run_script`]: the largest source, at most [`MAX_SCRIPT`].
+    pub script: usize,
 }
 
 impl Default for Limits {
@@ -113,6 +143,8 @@ impl Default for Limits {
         Limits {
             fuel: MAX_FUEL,
             memory: MAX_MEMORY,
+            time: MAX_TIME,
+            script: MAX_SCRIPT,
         }
     }
 }
@@ -132,6 +164,8 @@ struct Host {
     limits: StoreLimits,
     /// A failure a host function saw, reported instead of the trap it causes.
     fault: Option<Error>,
+    /// Fuel of the run not yet given to the store: the store holds one slice at a time.
+    reserve: u64,
 }
 
 fn config() -> Config {
@@ -209,6 +243,8 @@ pub fn run_with(
     }
     let fuel = limits.fuel.min(MAX_FUEL);
     let memory = limits.memory.min(MAX_MEMORY);
+    let time = limits.time.min(MAX_TIME);
+    let started = Instant::now();
     // One engine per run: nothing compiled or cached is shared between runs.
     let engine = Engine::new(&config());
     let module = compile(&engine, module)?;
@@ -224,9 +260,12 @@ pub fn run_with(
             .trap_on_grow_failure(true)
             .build(),
         fault: None,
+        reserve: 0,
     };
     let mut store = Store::new(&engine, host);
     store.limiter(|host| &mut host.limits);
+    // A start function runs with all the fuel; the entry then runs slice by slice, with a look
+    // at the clock between two slices.
     store.set_fuel(fuel).map_err(|_| Error::Fuel)?;
     let linker = linker(&engine)?;
     let called = linker
@@ -236,11 +275,34 @@ pub fn run_with(
             let func = instance
                 .get_typed_func::<(), ()>(&store, entry)
                 .map_err(|_| Error::Entry)?;
-            func.call(&mut store, ())
+            refill(&mut store, 0)?;
+            let mut call = func
+                .call_resumable(&mut store, ())
                 .map_err(|error| stopped(&error, Error::Trap))?;
+            loop {
+                match call {
+                    TypedResumableCall::Finished(()) => break,
+                    TypedResumableCall::HostTrap(trap) => {
+                        return Err(stopped(trap.host_error(), Error::Trap));
+                    }
+                    TypedResumableCall::OutOfFuel(pending) => {
+                        if started.elapsed() > time {
+                            return Err(Error::Time);
+                        }
+                        refill(&mut store, pending.required_fuel())?;
+                        call = pending
+                            .resume(&mut store)
+                            .map_err(|error| stopped(&error, Error::Trap))?;
+                    }
+                }
+            }
             Ok(instance)
         });
-    let used = fuel.saturating_sub(store.get_fuel().unwrap_or(0));
+    let left = store
+        .get_fuel()
+        .unwrap_or(0)
+        .saturating_add(store.data().reserve);
+    let used = fuel.saturating_sub(left);
     // The memory may hold inputs and whatever the module derived from them.
     if let Ok(instance) = &called
         && let Some(memory) = instance.get_memory(&store, "memory")
@@ -252,10 +314,55 @@ pub fn run_with(
         return Err(fault);
     }
     called?;
+    // A run that finished within its fuel but past its time is refused too.
+    if started.elapsed() > time {
+        return Err(Error::Time);
+    }
     Ok(Ran {
         output: core::mem::take(&mut host.output),
         fuel: used,
     })
+}
+
+/// Pools the fuel left in the store with the reserve and gives the store the next slice of
+/// it: at least `need`, or [`Error::Fuel`] when the pool has less.
+fn refill(store: &mut Store<Host>, need: u64) -> Result<(), Error> {
+    let left = store.get_fuel().map_err(|_| Error::Fuel)?;
+    let pool = left.saturating_add(store.data().reserve);
+    if pool < need || pool == 0 {
+        return Err(Error::Fuel);
+    }
+    let slice = FUEL_SLICE.max(need).min(pool);
+    store.set_fuel(slice).map_err(|_| Error::Fuel)?;
+    store.data_mut().reserve = pool.saturating_sub(slice);
+    Ok(())
+}
+
+/// Runs the function `entry` of a JavaScript `script` on `args` with the reviewed engine
+/// module [`JS`], under `limits` (each capped at the node's). The script is input 0, the
+/// name input 1, the arguments the rest; the engine calls the function with each argument
+/// as a `Uint8Array` and writes what it returns (`crates/sandbox/js`).
+pub fn run_script(
+    script: &[u8],
+    entry: &str,
+    args: &[&[u8]],
+    limits: Limits,
+) -> Result<Ran, Error> {
+    if script.len() > limits.script.min(MAX_SCRIPT) {
+        return Err(Error::Refused);
+    }
+    if !is_token(entry) {
+        return Err(Error::Entry);
+    }
+    if args.len() > MAX_SCRIPT_ARGS {
+        return Err(Error::Inputs);
+    }
+    let module = library(JS).ok_or(Error::Refused)?;
+    let mut inputs: Vec<&[u8]> = Vec::with_capacity(args.len().saturating_add(2));
+    inputs.push(script);
+    inputs.push(entry.as_bytes());
+    inputs.extend_from_slice(args);
+    run_with(module, "run", &inputs, limits)
 }
 
 /// What stopped a module, from the error of wasmi: fuel, memory, or `other`.
@@ -293,16 +400,27 @@ fn fail(caller: &mut Caller<'_, Host>, error: Error) -> wasmi::Error {
     wasmi::Error::from(TrapCode::UnreachableCodeReached)
 }
 
-/// Charges the fuel of copying `len` bytes.
+/// Charges the fuel of copying `len` bytes, from the store's slice and then the reserve.
 fn charge(caller: &mut Caller<'_, Host>, len: usize) -> Result<(), wasmi::Error> {
     let cost = u64::try_from(len / COPY_PER_FUEL)
         .unwrap_or(u64::MAX)
         .saturating_add(1);
     let left = caller.get_fuel().unwrap_or(0);
-    match left.checked_sub(cost) {
-        Some(left) => caller.set_fuel(left).map_err(|_| fail(caller, Error::Fuel)),
+    if let Some(left) = left.checked_sub(cost) {
+        return caller.set_fuel(left).map_err(|_| fail(caller, Error::Fuel));
+    }
+    let pool = left.saturating_add(caller.data().reserve);
+    match pool.checked_sub(cost) {
+        Some(pool) => {
+            let slice = pool.min(FUEL_SLICE);
+            caller.data_mut().reserve = pool.saturating_sub(slice);
+            caller
+                .set_fuel(slice)
+                .map_err(|_| fail(caller, Error::Fuel))
+        }
         None => {
             let _ = caller.set_fuel(0);
+            caller.data_mut().reserve = 0;
             Err(fail(caller, Error::Fuel))
         }
     }

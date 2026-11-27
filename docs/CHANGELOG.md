@@ -78,6 +78,20 @@ before 1.0, minor versions may break formats and APIs.
 
 ### Added
 
+- JavaScript in the sandbox (layer 3): the reviewed library module `js`, the boa engine 0.21.1
+  compiled to WebAssembly (`crates/sandbox/js`, checked in as
+  `crates/sandbox/libraries/js.wasm`, rebuilt and compared by `build/js-module.sh` and the CI
+  job `js-module`), chosen over QuickJS-NG by measurement (`docs/sandbox.md`, Choice of
+  engine). A `run` step names a `script` (a URL on the destination's own origin, SHA-256
+  required) and the function to call; the node fetches it as a logged request, refuses a
+  mismatch, and `sandbox::run_script` runs it with the inputs as `Uint8Array`s. Scripts find
+  no `Date`, `Math.random`, timers or I/O, and get `TextEncoder`, `TextDecoder`, `atob`,
+  `btoa`; the output is confined to the script's origin like a module's.
+- `run` steps take `limits` (`fuel`, `memory`, `time_ms`, `source`), each at most the node's,
+  and a library may be pinned by `sha256`. The sandbox has a wall-clock limit of 5 s per run
+  (`sandbox::MAX_TIME`, checked between slices of 10⁷ fuel) and new errors `Time` and
+  `Refused`; `sandbox::Limits` gained `time` and `script`.
+- Fuzz target `sandbox_script`: arbitrary JavaScript sources and arguments on the engine.
 - DTLS 1.2 and 1.3 (RFC 6347, RFC 9147) as the `dtls` connection (`docs/policy.md`, DTLS;
   `docs/design.md` section 7b): `send` writes one record of 1 to 16,384 bytes, `receive`
   reads one, over the datagram path of `udp` (a connected UDP socket, or the enclave's

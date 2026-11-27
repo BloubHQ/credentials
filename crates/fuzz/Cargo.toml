@@ -102,6 +102,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "sandbox_script"
+path = "fuzz_targets/sandbox_script.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "decimal_amount"
 path = "fuzz_targets/decimal_amount.rs"
 test = false

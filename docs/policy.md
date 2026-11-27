@@ -1129,7 +1129,8 @@ encrypts or packages a password before the login call) in the sandbox of layer 3
 | `module` | The code |
 | --- | --- |
 | `{"url": "https://host[:port]/path", "sha256": "<64 hex>"}` | Fetched by the node with `GET` from the destination's own origin, over the operation's connection, as a logged request. The host and port must be one of the connection's destinations (concrete or matched by a `*.` pattern). `sha256` (optional) pins the bytes; without it the summary flags `run_unpinned`, since the site may change the code at any time. A status other than 200, a module over 8 MiB or a pin mismatch stops the operation (`ModuleRefused`) before any later request. |
-| `{"library": "lenprefix8"}` | A reviewed module compiled into the node (and so into its measurement, PCR2). `destination` names where its output may go; it may be left out when the connection has one concrete destination. |
+| `{"library": "lenprefix8"}` | A reviewed module compiled into the node (and so into its measurement, PCR2). `destination` names where its output may go; it may be left out when the connection has one concrete destination. An optional `sha256` pins the library's bytes: a node whose library differs refuses the step (`ModuleRefused`). |
+| `{"library": "js"}` with `script` | The reviewed JavaScript engine module (boa compiled to WebAssembly, `docs/sandbox.md`, JavaScript) runs the script the step names; see below. |
 
 | Member | Meaning |
 | --- | --- |
@@ -1137,13 +1138,39 @@ encrypts or packages a password before the login call) in the sandbox of layer 3
 | `inputs` | 0 to 16 templates, rendered like a `compute` (fields, temporaries, the clock and `$nonce`; no request variable): secrets may go in. |
 | `into` | A new token name for the output; never a field. |
 | `destination` | For a library only: the destination its output may go to. |
+| `script` | For the library `js` only: `{"url": "https://host[:port]/path", "sha256": "<64 hex>"}`, both required. |
+| `limits` | Optional bounds lower than the node's: `fuel` (1 to 10⁹), `memory` (bytes, 1 to 67,108,864), `time_ms` (1 to 5,000), `source` (the script's largest size in bytes, 1 to 262,144; only with a `script`). A bound left out is the node's. |
+
+A site's JavaScript runs on the engine module:
+
+```json
+{"do": "run",
+ "module": {"library": "js"},
+ "script": {"url": "https://login.example.com/static/sign.js",
+            "sha256": "2c26b46b68ffc68ff99b453c1d30413413422d706483bfa0f98a5e886266e7ae"},
+ "entry": "sign", "inputs": ["{{password}}", "{{ $unix }}"], "into": "sig",
+ "limits": {"fuel": 200000000, "time_ms": 1000}}
+```
+
+The node fetches the script with `GET` from the destination's own origin, as a logged request
+(the URL's host and port must be one of the connection's destinations), and refuses it
+(`ModuleRefused`) when the status is not 200, it is larger than `limits.source` (at most
+256 KiB), or its SHA-256 is not the pin: the engine only ever runs the source the owner
+signed. The script runs once; then the function named by `entry` is called with the inputs
+(at most 14) as `Uint8Array`s, and what it returns is the output: a `Uint8Array`, an
+`ArrayBuffer`, a string (as UTF-8), or a promise of one. An exception or any other value is
+`Sandbox` `Trap`. The script finds ECMAScript (typed arrays, `BigInt`, `JSON`, promises) and
+`TextEncoder`, `TextDecoder`, `atob`, `btoa`; it finds no `Date`, no `Math.random`, no timers
+and no I/O (no `fetch`, no `import`): the time and random bytes come in as inputs. The output
+is confined to the script's origin exactly like a module's, and `destination` is refused.
 
 The module sees only its inputs: it imports at most `input_count`, `input_len`,
 `input_read` and `output` of the module `credentials` (no WASI, no clock, no randomness
 unless an input carries it, no I/O), exports its memory as `memory`, and runs under a fuel
-limit (10⁹ units, 1.25 s measured) and a memory limit (64 MiB), with at most 64 KiB of output.
-A failure is `Sandbox` with a fixed reason (`Fuel`, `Memory`, `Trap`, `Import`, ...):
-nothing the module computed reaches an error.
+limit (10⁹ units, 1.25 s measured), a memory limit (64 MiB) and a time limit (5 s), with at
+most 64 KiB of output; `limits` may lower each. A failure is `Sandbox` with a fixed reason
+(`Fuel`, `Memory`, `Time`, `Trap`, `Import`, ...): nothing the module computed reaches an
+error.
 
 The output is **confined to the module's origin** (the URL's host and port, or a library's
 `destination`). When the policy is signed:
@@ -1604,7 +1631,7 @@ crate, which checks the policy first) gives the owner, in JSON:
   methods, path templates, headers and query allow-list), the injections, the response
   projection or relay patterns, the input schema, and each `run` step (`runs`: the module's
   URL or library, its origin, its pin or `unpinned`, the entry, the inputs and the output
-  name); a secret read by a module's input is listed as going in `module_input` to the
+  name; for a script its URL, its pin and `engine: "js"`; the `limits` the policy sets); a secret read by a module's input is listed as going in `module_input` to the
   module's origin; `most_requests`, the most requests one use makes, and `control`, its
   loops and branches in words (a request inside one is listed at the step of the loop or
   branch);

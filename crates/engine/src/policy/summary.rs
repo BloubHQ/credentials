@@ -154,9 +154,16 @@ pub struct RunSummary {
     /// Where the module and its output go: the module's origin.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub origin: Option<Place>,
-    /// The SHA-256 pin of a fetched module; `None` when it is not pinned or is a library.
+    /// The SHA-256 pin of a fetched module, of a script, or of a library when the policy pins
+    /// one; `None` when it is not pinned.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sha256: Option<String>,
+    /// For a script: the engine module that runs it (`js`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub engine: Option<String>,
+    /// The bounds the policy sets, lower than the node's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limits: Option<super::RunLimits>,
     /// True for a module fetched without a pin: the site can change the code.
     pub unpinned: bool,
     /// The exported function called.
@@ -937,7 +944,12 @@ fn run_summary(step: usize, run: &RunModule, operation: &Operation) -> RunSummar
         origin: operation
             .open()
             .and_then(|o| run.origin(o).map(|d| place(o.connection, &d))),
-        sha256: run.module.sha256.clone(),
+        sha256: match &run.script {
+            Some(script) => Some(script.sha256.clone()),
+            None => run.module.sha256.clone(),
+        },
+        engine: run.script.as_ref().and(run.module.library.clone()),
+        limits: run.limits,
         unpinned: run.unpinned(),
         entry: run.entry.clone(),
         inputs: run.inputs.clone(),
