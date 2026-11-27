@@ -228,7 +228,9 @@ before 1.0, minor versions may break formats and APIs.
 
 - Web client: key objects `DeviceKey`, `UserKey` and `CallerKey`, which keep a key in wasm
   memory and use it by reference, beside the string API. A key object is wiped when it is
-  freed, and becomes a JavaScript string only through `exportKey()`. Each has the calls of its
+  freed: by `free()`, at the end of a `using` scope (`Symbol.dispose`), or when the garbage
+  collector collects it (a `FinalizationRegistry`, whenever that runs). It becomes a
+  JavaScript string only through `exportKey()`. Each has the calls of its
   kind as methods (`device.grant(user, node, ...)`, `user.sealRecord(...)`,
   `caller.signCall(...)`), which call the same functions as the string API (#55).
 - JavaScript in the sandbox (layer 3): the reviewed library module `js`, the boa engine 0.21.1
