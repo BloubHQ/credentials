@@ -372,3 +372,8 @@ These remain by design; each is listed in the README.
   to the same successor while it runs.
 - **Dependencies.** ring, rustls and other crates keep internal buffers; the zeroizing
   allocator erases them when freed, not while in use.
+- **The stack.** `Zeroizing` and the zeroizing allocator cover the heap, not the stack, in the
+  enclave as in the clients: a library that works through a fixed buffer on the stack leaves
+  the bytes in that frame until it is reused (base64's `encode_string` did, with key text;
+  the client now encodes keys with `encode_slice`, #55). The web smoke test scans the
+  module's memory, stack included, after each step; nothing checks a native stack.
