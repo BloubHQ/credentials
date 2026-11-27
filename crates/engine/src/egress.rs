@@ -243,6 +243,21 @@ pub trait Transport {
         let _ = destination;
         Err(Error::transport(TransportKind::Unsupported, false))
     }
+
+    /// Opens DTLS (1.2 or 1.3) over UDP datagrams to `destination` (a `dtls` operation) and
+    /// returns once the handshake is complete and the server's certificate accepted: for the
+    /// host of `destination`, as [`Transport::open`] checks it, and, when `pins` is not empty,
+    /// holding a key whose SHA-256 (of its DER `SubjectPublicKeyInfo`) is one of them. Each
+    /// [`Stream::write`] then sends one record, each [`Stream::read_until`] with no delimiter
+    /// reads one. The default refuses.
+    fn open_dtls(
+        &mut self,
+        destination: &Destination,
+        pins: &[[u8; 32]],
+    ) -> Result<Box<dyn Stream + '_>> {
+        let _ = (destination, pins);
+        Err(Error::transport(TransportKind::Unsupported, false))
+    }
 }
 
 /// How a protocol connection is opened.
@@ -328,6 +343,19 @@ pub(crate) fn open_stream<'t, T: Transport>(
 ) -> Result<(u64, Box<dyn Stream + 't>)> {
     let seq = confirmed.seq();
     let stream = transport.open(destination, identity)?;
+    Ok((seq, stream))
+}
+
+/// Opens the DTLS exchange of a `dtls` operation. Consumes the confirmation: one entry, one
+/// exchange.
+pub(crate) fn open_dtls<'t, T: Transport>(
+    confirmed: Confirmed,
+    transport: &'t mut T,
+    destination: &Destination,
+    pins: &[[u8; 32]],
+) -> Result<(u64, Box<dyn Stream + 't>)> {
+    let seq = confirmed.seq();
+    let stream = transport.open_dtls(destination, pins)?;
     Ok((seq, stream))
 }
 

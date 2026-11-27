@@ -78,6 +78,29 @@ before 1.0, minor versions may break formats and APIs.
 
 ### Added
 
+- DTLS 1.2 and 1.3 (RFC 6347, RFC 9147) as the `dtls` connection (`docs/policy.md`, DTLS;
+  `docs/design.md` section 7b): `send` writes one record of 1 to 16,384 bytes, `receive`
+  reads one, over the datagram path of `udp` (a connected UDP socket, or the enclave's
+  datagram relay, `udp/host:port` in `--allow`). Nothing is written before the handshake is
+  complete and the server's certificate passes the verifier of a `tls` connection (WebPKI
+  chain to the transport's roots, validity, host name); `open.pins` (at most 16,
+  `sha256/` and the base64 of the SHA-256 of the `SubjectPublicKeyInfo`) also requires one
+  of those keys, and lets a self-signed certificate with a pinned key through. Sends may
+  hold secrets (encrypted, unlike `udp`); no client certificate, no PSK suite, no
+  `tls_exporter`. The caller's exchanges are at most 64 records with no delimiters, read
+  through the delimiter-safe reader and the stream search. A new pin, or dropping all pins,
+  widens a policy in its diff. The schema has `dtls` and `pins`; `Transport::open_dtls`
+  (default: refused); `transport::dtls` with `DtlsStream`, `Trust` and a `dimpl` crypto
+  provider on ring and rustls-webpki; the `dtls_client` fuzz target.
+- New dependency `dimpl` 0.8.0 (MIT OR Apache-2.0, `forbid(unsafe_code)`), built with no
+  crypto backend, and the provider `transport::dtls` gives it from ring, rustls-webpki and
+  `aes`: 11 new packages in `Cargo.lock` (276 to 287): `dimpl`, `arrayvec`, `nom` 8 (next to
+  7), `rand` 0.9, `rand_chacha` 0.9, `rand_core` 0.9 (next to 0.10), `ppv-lite86`,
+  `getrandom` 0.3 (next to 0.2 and 0.4), and `r-efi` 5.3 (next to 6.0), `wasip2`,
+  `wit-bindgen`, which build only for UEFI and WASI targets. No RustCrypto crate of the
+  previous generation; `credentials.exe` (release, Windows x86_64) grows from 13,692,928 to
+  14,379,008 bytes (+686,080, +5.0 %).
+
 - Typed browser fills and the agent's controller kept out of a fill (`docs/policy.md`,
   Browser fills and Typed browser fills; `docs/design.md` section 6, part 8):
   - `open.browser` on a `browser` connection: `exclusive` (`header`, `value`) names the

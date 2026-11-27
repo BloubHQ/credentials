@@ -469,6 +469,7 @@ impl Operation {
                 limits: None,
                 login: None,
                 host_keys: Vec::new(),
+                pins: Vec::new(),
                 tls: None,
                 version: None,
                 browser: None,
@@ -493,6 +494,11 @@ impl Operation {
     /// An operation that exchanges UDP datagrams with `destination`.
     pub fn udp(name: &str, destination: Destination) -> Self {
         Self::opening(name, Connection::Udp, destination)
+    }
+
+    /// An operation that exchanges DTLS records with `destination`.
+    pub fn dtls(name: &str, destination: Destination) -> Self {
+        Self::opening(name, Connection::Dtls, destination)
     }
 
     /// An operation with no connection.
@@ -551,6 +557,16 @@ impl Operation {
                 cert: cert.into(),
                 key: key.into(),
             });
+        }
+        self
+    }
+
+    /// Adds a pin (`sha256/` and base64) to the `open` step: a key the server's certificate
+    /// of a DTLS connection may hold.
+    #[must_use]
+    pub fn pin(mut self, pin: &str) -> Self {
+        if let Some(Step::Open(open)) = self.steps.first_mut() {
+            open.pins.push(pin.into());
         }
         self
     }

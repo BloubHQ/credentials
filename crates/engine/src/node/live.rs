@@ -400,6 +400,7 @@ impl<S: LogSink, C: Clock> Node<S, C> {
             Connection::Https => self.streamed(run, open, request, transport, &mut live, updated),
             Connection::Tls
             | Connection::Udp
+            | Connection::Dtls
             | Connection::Ssh
             | Connection::Postgres
             | Connection::Smtp

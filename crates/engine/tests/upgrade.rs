@@ -72,7 +72,11 @@ fn assert_safe_defaults(name: &str, policy: &Policy) {
                 }
             }
             Some(
-                Connection::Tls | Connection::Websocket | Connection::Udp | Connection::Browser,
+                Connection::Tls
+                | Connection::Websocket
+                | Connection::Udp
+                | Connection::Dtls
+                | Connection::Browser,
             ) => {
                 assert_eq!(returns.relay, None, "{name}: no relay")
             }

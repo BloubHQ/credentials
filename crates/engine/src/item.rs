@@ -1129,6 +1129,7 @@ fn shape_connection(at: &str, operation: &Operation) -> Result<ShapeConnection> 
             | Connection::Amqp1,
         ) => refuse("a typed item has no database or queue connection yet"),
         Some(Connection::Udp) => refuse("a typed item has no UDP operation"),
+        Some(Connection::Dtls) => refuse("a typed item has no DTLS operation"),
         Some(Connection::Browser) => Ok(ShapeConnection::Browser),
         None => Ok(ShapeConnection::None),
     }

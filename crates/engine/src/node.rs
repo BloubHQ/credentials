@@ -74,6 +74,9 @@ pub const MAX_INPUT: usize = 1024 * 1024;
 pub const MAX_EXCHANGES: usize = 64;
 /// Largest datagram of a `udp` operation: the largest UDP payload over IPv4.
 pub const MAX_DATAGRAM: usize = 65_507;
+/// Largest record of a `dtls` operation, each way: 2^14 bytes of plaintext (RFC 6347
+/// section 4.1, RFC 9147 section 4).
+pub const MAX_RECORD: usize = 16_384;
 /// Most bytes of all temporary values of one operation.
 pub const MAX_TEMPS: usize = 1024 * 1024;
 /// Most nonces a node remembers.
@@ -1065,7 +1068,7 @@ impl<S: LogSink, C: Clock> Node<S, C> {
                         Some(Connection::Https | Connection::Browser),
                         Payload::Http(_)
                     ) | (
-                        Some(Connection::Tls | Connection::Udp),
+                        Some(Connection::Tls | Connection::Udp | Connection::Dtls),
                         Payload::Stream { .. }
                     ) | (Some(Connection::Websocket), Payload::Socket(_))
                         | (
@@ -1965,10 +1968,21 @@ impl<S: LogSink, C: Clock> Node<S, C> {
             detail: detail.seal(&run.user_key, &run.record.owner, &run.record.id)?,
         };
         let (seq, confirmed) = self.lock().commit(now, who, event)?;
-        let opened = if open.connection == Connection::Udp {
-            crate::egress::open_datagrams(confirmed, transport, destination)
-        } else {
-            open_stream(confirmed, transport, destination, client.as_ref())
+        let opened = match open.connection {
+            Connection::Udp => crate::egress::open_datagrams(confirmed, transport, destination),
+            Connection::Dtls => {
+                // The policy check read every pin; one that does not read is a policy
+                // this node does not know.
+                let pins = open
+                    .pins
+                    .iter()
+                    .map(|p| crate::policy::parse_pin(p).ok_or_else(|| operation.unknown()))
+                    .collect::<Result<Vec<_>>>();
+                pins.and_then(|pins| {
+                    crate::egress::open_dtls(confirmed, transport, destination, &pins)
+                })
+            }
+            _ => open_stream(confirmed, transport, destination, client.as_ref()),
         };
         let (_, mut stream) = match opened {
             Ok(opened) => opened,
@@ -2243,6 +2257,18 @@ fn check_exchanges(
     if !operation.allows_destination(destination) {
         return Err(destination.denied());
     }
+    if operation.connection() == Some(Connection::Dtls) {
+        // One record each way: no delimiter, and a send that fits one record.
+        let records_ok = exchanges.len() <= MAX_EXCHANGES
+            && exchanges
+                .iter()
+                .all(|e| !e.send.is_empty() && e.send.len() <= MAX_RECORD && e.until.is_empty());
+        if !records_ok {
+            return Err(Error::RequestInvalid {
+                rule: "exchanges: at most 64 records of 1 to 16384 bytes, with no delimiters",
+            });
+        }
+    }
     if operation.connection() == Some(Connection::Udp) {
         // One datagram each way: no delimiter, and a send that fits one datagram.
         let datagrams_ok = exchanges.len() <= MAX_EXCHANGES
@@ -2255,7 +2281,10 @@ fn check_exchanges(
             });
         }
     }
-    let delimited = operation.connection() != Some(Connection::Udp);
+    let delimited = !matches!(
+        operation.connection(),
+        Some(Connection::Udp | Connection::Dtls)
+    );
     let exchanges_ok = exchanges.len() <= MAX_EXCHANGES
         && exchanges.iter().all(|e| {
             e.send.len() <= MAX_BODY
