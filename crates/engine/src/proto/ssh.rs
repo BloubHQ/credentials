@@ -1105,10 +1105,11 @@ impl<'s> Client<'s> {
     fn send(&mut self, payload: &[u8]) -> Result<()> {
         let dir = &mut self.out;
         let block = dir.cipher.block();
-        // AES-GCM leaves the length out of the blocks; the others count it.
+        // An AEAD (AES-GCM, ChaCha20-Poly1305) leaves the length out of the blocks, as OpenSSH
+        // does (its `aadlen`); in the clear it is counted.
         let counted = match dir.cipher {
-            Cipher::Gcm { .. } => 1 + payload.len(),
-            _ => 4 + 1 + payload.len(),
+            Cipher::Gcm { .. } | Cipher::Chacha { .. } => 1 + payload.len(),
+            Cipher::Clear => 4 + 1 + payload.len(),
         };
         let mut padding = block - counted % block;
         if padding < 4 {
@@ -1165,8 +1166,8 @@ impl<'s> Client<'s> {
         let length = usize::try_from(u32::from_be_bytes(length)).map_err(|_| Error::Encoding)?;
         let block = dir.cipher.block();
         let counted = match dir.cipher {
-            Cipher::Gcm { .. } => length,
-            _ => length + 4,
+            Cipher::Gcm { .. } | Cipher::Chacha { .. } => length,
+            Cipher::Clear => length + 4,
         };
         if !(5..=MAX_PACKET).contains(&length) || counted % block != 0 {
             return Err(invalid("packet length invalid"));

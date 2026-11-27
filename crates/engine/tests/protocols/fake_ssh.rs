@@ -389,9 +389,11 @@ impl SshServer {
             return;
         }
         let dir = &mut self.out;
+        // As OpenSSH: an AEAD leaves the length out of the blocks.
         let (block, counted) = match dir.cipher {
             Cipher::Gcm { .. } => (16, 1 + payload.len()),
-            Cipher::Clear | Cipher::Chacha(_) => (8, 5 + payload.len()),
+            Cipher::Chacha(_) => (8, 1 + payload.len()),
+            Cipher::Clear => (8, 5 + payload.len()),
         };
         let mut padding = block - counted % block;
         if padding < 4 {
@@ -443,6 +445,14 @@ impl SshServer {
             Cipher::Clear => 0,
             _ => 16,
         };
+        // OpenSSH refuses a packet out of block alignment ("padding error"): an AEAD's
+        // length is left out of the blocks.
+        let aligned = match self.inn.cipher {
+            Cipher::Gcm { .. } => length % 16 == 0,
+            Cipher::Chacha(_) => length % 8 == 0,
+            Cipher::Clear => (length + 4) % 8 == 0,
+        };
+        assert!(aligned, "padding error: a packet of {length} bytes");
         if self.inbuf.len() < 4 + length + tag {
             return None;
         }

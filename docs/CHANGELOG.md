@@ -7,6 +7,12 @@ before 1.0, minor versions may break formats and APIs.
 
 ### Changed
 
+- SSH: `chacha20-poly1305@openssh.com` works against OpenSSH. The node counted the 4-byte
+  packet length in the block alignment of its padding, as in the clear; OpenSSH leaves it
+  out for every AEAD, as for AES-GCM, so sshd refused the node's first encrypted packet
+  (`padding error`), and the node would have refused sshd's. Found by the new interop matrix
+  against OpenSSH 10.2; the fake server now checks the alignment as OpenSSH does (#106).
+
 - SSH: a key re-exchange the server starts is carried out instead of ending the connection.
   Servers rekey after a volume or a time (Dropbear at 1 GiB or 8 hours, Paramiko at 512 MB,
   OpenSSH with `RekeyLimit`), so a long SFTP transfer or shell failed. The server must prove
