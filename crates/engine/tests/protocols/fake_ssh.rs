@@ -448,9 +448,9 @@ impl SshServer {
         // OpenSSH refuses a packet out of block alignment ("padding error"): an AEAD's
         // length is left out of the blocks.
         let aligned = match self.inn.cipher {
-            Cipher::Gcm { .. } => length % 16 == 0,
-            Cipher::Chacha(_) => length % 8 == 0,
-            Cipher::Clear => (length + 4) % 8 == 0,
+            Cipher::Gcm { .. } => length.is_multiple_of(16),
+            Cipher::Chacha(_) => length.is_multiple_of(8),
+            Cipher::Clear => (length + 4).is_multiple_of(8),
         };
         assert!(aligned, "padding error: a packet of {length} bytes");
         if self.inbuf.len() < 4 + length + tag {
