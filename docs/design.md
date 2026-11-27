@@ -32,7 +32,7 @@ servers live elsewhere; they are callers, and the vault treats them as untrusted
 | Typed items and their policies | Drafting a policy for a new site |
 | Sessions, one-time-code challenges, owner approvals: formats and checks | Approval cards, push notifications, app screens |
 | The fill step of a browser task: the node drives the browser for the moment secrets enter it | The browser controller the agent uses (click, read, navigate), the Kernel account |
-| Protocol tunnels on the node, `credentials tunnel` on the caller's machine | Agent tools that use a tunnel |
+| Protocol connections on the node (`ssh`, `postgres`, `mysql`, ... operations); planned: tunnels, `credentials tunnel` on the caller's machine | Agent tools that use a tunnel |
 | Reflection filtering, default deny, hand-over between nodes | Deployment infrastructure |
 | `client` crate: verify a node, grant, summarize and sign policies, approve, back up keys | Keychain / Block Store glue, UI |
 
@@ -302,6 +302,10 @@ owner's approval before the node connects at all.
 
 ## 7. Protocol tunnels
 
+**Status: planned.** There is no `credentials tunnel` subcommand and no `tunnel` crate yet. The
+protocols below are reached today as operations of their own kinds (section 7c), not through a
+local port.
+
 The node authenticates to the server with the secret, then relays bytes. Callers keep their
 tools: `credentials tunnel --item prod-db --listen 127.0.0.1:5432` opens a local port; `psql`,
 `ssh`, `mysql`, FileZilla connect to it unchanged.
@@ -337,7 +341,7 @@ Every module: TLS (or SSH) ends inside the enclave; a fuzz target for its parser
 credential never written into the relayed stream after authentication; a log entry per
 session with start, end and byte counts (contents only if the policy asks for it).
 
-**Implementation.** crate `tunnel` (protocol modules, behind one `Authenticator` trait),
+**Planned implementation.** crate `tunnel` (protocol modules, behind one `Authenticator` trait),
 `engine` operation kind `session`, the caller side in `cli` (`credentials tunnel`), the
 relay over the existing vsock egress.
 
@@ -709,7 +713,7 @@ AMQP 1.0 brokers, the release size (CI measures it).
 | HOTP, Steam Guard, other OTP variants | games, older 2FA | counter-based `hotp` (counter stored in the item), Steam's alphabet |
 | SMS codes without the owner | sites that only send SMS | a phone number the node controls (an SMS provider account as an item); the node reads the code itself |
 | OpenPGP | signing, decrypting mail and files | item `pgp`; sign and decrypt by derive, the private key stays |
-| ssh-agent | `git`, `ssh`, `scp` with the caller's own tools | the node answers the ssh-agent protocol through `credentials tunnel --agent`, signing challenges without handing over the key |
+| ssh-agent | `git`, `ssh`, `scp` with the caller's own tools | planned: the node answers the ssh-agent protocol through `credentials tunnel --agent` (not implemented), signing challenges without handing over the key |
 | Schnorr (BIP-340), EIP-712, Solana | Bitcoin Taproot, typed Ethereum signatures | `secp256k1_schnorr_sign`; EIP-712 by templates over `keccak256` |
 | Incoming webhooks | Stripe, GitHub, Slack callbacks to the service | operation `verify`: the node checks a signature over the caller's payload and returns one bit |
 | Decrypting what a service sent | encrypted API responses, PGP mail | derive `decrypt` whose output is the plaintext of the data, never the key |
