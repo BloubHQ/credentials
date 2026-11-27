@@ -234,9 +234,12 @@ fn presents_the_client_certificate_of_the_operation() {
 #[test]
 fn a_silent_server_times_out() {
     let server = load("api");
-    let (address, _got) = serve(server_config(&server, None), |stream| {
+    let (read_tx, read_rx) = mpsc::channel();
+    let (address, _got) = serve(server_config(&server, None), move |stream| {
         let mut buf = [0u8; 1024];
-        let _ = stream.read(&mut buf);
+        if stream.read(&mut buf).is_ok_and(|n| n > 0) {
+            let _ = read_tx.send(());
+        }
         thread::sleep(Duration::from_secs(3));
     });
     let mut transport = transport(address).timeouts(
@@ -245,11 +248,12 @@ fn a_silent_server_times_out() {
         Duration::from_secs(5),
     );
     let started = Instant::now();
-    assert_eq!(
-        send(&mut transport, "api.test", None, 1 << 20),
-        Err(Error::transport(TransportKind::Timeout, true))
-    );
+    let result = send(&mut transport, "api.test", None, 1 << 20);
     assert!(started.elapsed() < Duration::from_secs(2));
+    // The idle timeout covers the TLS handshake too: on a loaded host it can lapse before the
+    // request is written, and then nothing was sent. The server says whether it read one.
+    let read = read_rx.recv_timeout(Duration::from_secs(5)).is_ok();
+    assert_eq!(result, Err(Error::transport(TransportKind::Timeout, read)));
 }
 
 #[test]

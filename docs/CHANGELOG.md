@@ -22,6 +22,13 @@ before 1.0, minor versions may break formats and APIs.
   a panic in a connection still ends only that connection. Measured (`cargo build --release
   -p cli --locked`, Windows x86-64): `credentials.exe` 17,839,104 bytes before, 18,059,264
   after (+220,160, +1.2%).
+- Tests that failed under load wait for a signal instead of a fixed pause: the SSH slot
+  tests wait until each held connection reached the fake server (and hold it for 5 s, not
+  1.5 s), the TLS idle-timeout test expects `sent: true` only when the server read the
+  request (the timeout also covers the handshake), and the connection-cap test of the CLI
+  probes with 500 ms and checks its deadline before each probe. The host's log directory
+  test fails instead of passing silently when it cannot set up.
+
 - MQTT 3.1.1: a token or password without a user name now goes with a user name of zero
   length, as [MQTT-3.1.2-22] requires (strict brokers closed the connection). MQTT 5: the
   Server Keep Alive of the CONNACK sets the ping interval ([MQTT-3.2.2-21]); before, 60

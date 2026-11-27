@@ -675,15 +675,24 @@ fn connections_beyond_the_cap_are_refused() {
     let slow: Vec<TcpStream> = (0..2).map(|_| slow_client(port)).collect();
     // The server counts a connection once it has accepted it; on a loaded host that can take
     // longer than a fixed pause, so the check is repeated until the cap is reached.
+    // Each probe is short and the deadline is checked before it, so a probe the server holds
+    // cannot run the loop past the deadline.
+    let probe = Duration::from_millis(500);
     let deadline = Instant::now() + Duration::from_secs(5);
-    while get_identity(port, Duration::from_secs(3)) != Some(503) {
+    loop {
         assert!(Instant::now() < deadline, "the cap was not reached");
+        if get_identity(port, probe) == Some(503) {
+            break;
+        }
         std::thread::sleep(Duration::from_millis(100));
     }
     drop(slow);
     let deadline = Instant::now() + Duration::from_secs(5);
-    while get_identity(port, Duration::from_secs(3)) != Some(200) {
+    loop {
         assert!(Instant::now() < deadline, "the slots were not freed");
+        if get_identity(port, probe) == Some(200) {
+            break;
+        }
         std::thread::sleep(Duration::from_millis(100));
     }
     let _ = std::fs::remove_dir_all(&dir);
