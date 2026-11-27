@@ -7,6 +7,12 @@ before 1.0, minor versions may break formats and APIs.
 
 ### Changed
 
+- Web client: a secret key returned to JavaScript (`generateKey`, `importKey`,
+  `generateBackupKey`, `unwrapKeys`, `TransferReceiver.open`) is decoded from a borrow of the
+  key in wasm memory, which is then wiped. Before, the returned `String` was freed from wasm
+  memory unwiped. The JavaScript types are unchanged (`string`). The READMEs say that on the
+  web the key strings live in the JavaScript heap until garbage-collected, where nothing can
+  erase them (#55, first step).
 - Hostile destinations cannot make the node use far more memory or CPU than they send (#52).
   Measured in release builds with a counting allocator, on the inputs of the report:
   - PostgreSQL: NULL values counted for nothing against the 16 MiB result limit. The rows are

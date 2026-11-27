@@ -227,6 +227,12 @@ The client hands every secret key to the app as a string and erases its own copi
 the key strings the app passes in, once a call is done. Where the app keeps them decides how
 safe the owner is.
 
+On the web the key strings are JavaScript strings: the client erases its copies in wasm
+memory (a key it returns is decoded from a borrow and then wiped, and a key the app passes
+in is wiped after the call), but the JavaScript strings themselves live in the JavaScript
+heap until the garbage collector frees them, and nothing can erase them there. A page that
+keeps a key keeps it in the JavaScript heap, and in whatever storage it writes it to.
+
 - **Device key** (Ed25519): signs grants, revocations, policies, pins and device changes. It
   never needs to leave the device.
 - **User key** (32 random bytes): encrypts the records, and leaves the device by design,

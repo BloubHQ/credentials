@@ -621,7 +621,8 @@ PKCS#1 v1.5 서명을 하지 못하므로 `rsa_sign_pkcs1("sha1", …)`만 RustC
   다른 앱에서의 승인은 노드나 호출자가 아니라 소유자에게서 옵니다(`await` 단계).
 - **웹 페이지는 앱보다 약합니다.** [`client`](../../crates/client) 패키지는 페이지에서도 앱과 같은 검증을 하지만,
   페이지 서버는 불러올 때마다 다른 코드를 보낼 수 있습니다. grant는 되도록 앱에서 하세요. 키도 하드웨어
-  키가 아닙니다(Secure Enclave와 StrongBox는 P-256 키만 담습니다).
+  키가 아닙니다(Secure Enclave와 StrongBox는 P-256 키만 담습니다). 페이지에서 키는 JavaScript 문자열이라,
+  클라이언트가 자기 사본은 지우지만 그 문자열은 가비지 컬렉션 전까지 JavaScript 힙에 남습니다.
 
 ## 크레이트
 

@@ -650,7 +650,8 @@ explains each.
 - **A web page is weaker than an app.** The [`client`](crates/client) package runs in a page
   as in an app, but the server of the page can send other code at any load; grant from an
   app where you can. Its keys are not hardware keys either (the Secure Enclave and StrongBox
-  hold P-256 only).
+  hold P-256 only), and in a page they are JavaScript strings: the client erases its own
+  copies, but the strings stay in the JavaScript heap until garbage-collected.
 
 ## Crates
 
