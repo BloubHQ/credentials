@@ -22,6 +22,7 @@ before 1.0, minor versions may break formats and APIs.
   a panic in a connection still ends only that connection. Measured (`cargo build --release
   -p cli --locked`, Windows x86-64): `credentials.exe` 17,839,104 bytes before, 18,059,264
   after (+220,160, +1.2%).
+
 - Windows: the CLI reads a JSON document that starts with a UTF-8 byte order mark (as
   `Set-Content -Encoding utf8` writes it), and refuses UTF-16 (what `>` writes in Windows
   PowerShell 5.1) with a message that suggests `--out`; before, both failed with "expected

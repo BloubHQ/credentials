@@ -441,9 +441,13 @@ impl<S: LogSink, C: Clock> Node<S, C> {
             to_caller: meter.to_caller,
             duration_ms: meter.elapsed_ms(),
         };
-        let logged = self
-            .lock()
-            .and_then(|mut state| state.commit(self.clock.checked_now_ms().unwrap_or(run.now), run.who, event));
+        let logged = self.lock().and_then(|mut state| {
+            state.commit(
+                self.clock.checked_now_ms().unwrap_or(run.now),
+                run.who,
+                event,
+            )
+        });
         let end = end.map_err(|(_, error)| error)?;
         logged?;
         Ok(Closed {
