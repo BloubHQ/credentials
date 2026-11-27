@@ -481,6 +481,40 @@ exit
 }
 
 #[test]
+fn output_and_exit_status_while_the_window_is_zero_still_reach_the_caller() {
+    // The server's window is 0 when the caller's first frame is written: the output, error
+    // output and exit status that come while the write waits are kept for the relay, in
+    // order, not dropped.
+    let s = setup(&[password_field()], vec![shell_operation()]);
+    let mut peer = server();
+    peer.exec = |input| (input.to_vec(), Vec::new(), 0);
+    peer.hold_window = true;
+    let mut fake = Fake::new(peer);
+    let call = sign(
+        &s,
+        "shell",
+        session("box.example.com", 22, Vec::new(), Vec::new()),
+    );
+    let mut caller = TestCaller::default();
+    caller.sends.push_back(frame(&call, 0, b"ls\n"));
+    caller.sends.push_back(frame(&call, 1, b"exit\n"));
+    let closed = match s.node.relay(&call, &mut fake, &mut caller).result {
+        Ok(engine::call::Output::Closed(closed)) => closed,
+        Ok(_) => panic!("not closed"),
+        Err(e) => panic!("relay failed: {e}"),
+    };
+    assert_eq!(closed.reason, "server");
+    assert_eq!(
+        String::from_utf8_lossy(&caller.output()),
+        "$ late\nwarn\nls\n",
+        "the output that came while the write waited is relayed"
+    );
+    assert_eq!(fake.peer.shell_input, b"ls\nexit\n");
+    // The exit status 3 came while the write waited: the relay does not end as a success.
+    assert_eq!(last_closed(&s), (false, "server".into()));
+}
+
+#[test]
 fn a_secret_echoed_by_a_shell_ends_the_relay_before_it_goes_back() {
     let s = setup(&[password_field()], vec![shell_operation()]);
     let mut peer = server();

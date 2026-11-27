@@ -122,7 +122,8 @@ enum Command {
     #[command(disable_help_flag = true)]
     Verify {
         /// The arguments of the verifier: `<log.jsonl> <node-public-key> [--head <file>]
-        /// [--owner <name>] [--user-key <file>] [--json]`.
+        /// [--owner <name>] [--user-key <file>] [--next <log.jsonl>]... [--json]`; `--next`
+        /// follows the chain into the log of the node this one handed over to.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
         args: Vec<String>,
     },

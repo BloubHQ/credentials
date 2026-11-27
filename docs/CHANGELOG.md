@@ -793,6 +793,17 @@ before 1.0, minor versions may break formats and APIs.
 
 ### Security
 
+- The sandbox now wipes a module's memory when a run fails (trap, fuel, time, output limit,
+  a start function that traps, an entry it refuses), not only when it succeeds: the memory
+  handle is kept outside the run, by the instance or by the first host call, so a lost
+  instance no longer leaves inputs and derived values in freed memory for binaries without
+  the zeroing allocator (tested on each path).
+- An SSH write that waited for the server's window dropped what the server sent meanwhile:
+  shell output, error output, the exit status (a failed command could end as a success) and
+  a forwarded channel, which was then never accepted or refused. These events are now kept
+  in order, at most 2 MiB of output and 256 events, and every read takes them before it
+  reads the connection again; closing a channel refuses a forwarded channel still waiting
+  (tested with a server that sends output and `exit-status` while the window is 0).
 - A panic while the node's state is locked halts the node for good, as a failed log append
   halts it, instead of serving on from a half-updated state (sequence numbers, floors, rate
   counts): every act, checkpoint and reconcile fails with the new `Error::StateLost` (503 in

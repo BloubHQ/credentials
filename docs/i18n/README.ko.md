@@ -174,7 +174,8 @@ let outcome = node.run(&call, &mut TlsTransport::new());
 ```
 
 operation은 연결 하나 위의 **step** 목록입니다: `open`(HTTPS, TLS 스트림, WebSocket, 프로토콜 연결, UDP 데이터그램, CDP로 조작하는 브라우저, 또는 연결 없음),
-`send`, `receive`(캡처 포함), `compute`(템플릿을 이후 step이 읽는 이름에 담음), 그리고 호출자에게
+`send`, `receive`(캡처 포함), `compute`(템플릿을 이후 step이 읽는 이름에 담음), `run`(샌드박스에서
+실행하는 사이트 자신의 코드, 아래 참고), 그리고 호출자에게
 무엇이 돌아가는지 정하는 `return`.
 
 | 연결 | 하는 일 |
@@ -333,6 +334,7 @@ credentials verify log.jsonl <node-public-key>                   # the whole cha
 credentials verify log.jsonl <node-public-key> --head head.json  # must end at a signed checkpoint
 credentials verify log.jsonl <node-public-key> --owner alice     # one owner's chain
 credentials verify log.jsonl <node-public-key> --owner alice --user-key key.txt   # with the details
+credentials verify old.jsonl <old-node-key> --next new.jsonl     # one chain across a hand-over
 ```
 
 ## 노드 운영
@@ -363,7 +365,12 @@ credentials verify log.jsonl <node-public-key> --owner alice --user-key key.txt 
   `Node::restore_anchored`로 재시작하세요. 잘린 로그를 거부합니다.
 - **명령줄과 서버.** [`credentials`](../../crates/cli)로 키 생성, 정책 서명, 레코드 봉인, grant와 서명된
   호출 생성을 할 수 있고, `credentials serve`는 내구성 있는 JSONL 로그와 함께 HTTP로 노드를
-  실행합니다.
+  실행합니다. `POST /answer`, `/approve`, `/limits`는 기다리는 작업에 대해 소유자의 기기가 서명한
+  것을 받고, `/delegate`와 `/delegation/change`는 그 기기의 위임을 받습니다. 노드가 재시작할 때
+  기다리던 작업은 사라집니다.
+  `POST /stream`은 WebSocket, 스트리밍 응답, SSH 셸을 양방향 프레임 메시지로 실행하며
+  (`server::stream`), 열린 연결마다 스레드 하나를 씁니다.
+  브라우저 채우기는 평범한 `POST /call`이며 `{"kind": "fill", ...}`로 답합니다.
 - **동시성.** 모든 메서드가 `&self`를 받으므로 노드 하나를 여러 스레드가 공유하면 됩니다. Transport
   I/O는 노드의 락 밖에서 실행됩니다.
 
@@ -395,7 +402,7 @@ flowchart LR
 - **부팅.** 프로그램은 커널이 NSM(`nsm-hwrng`)에서 난수를 얻지 않으면 시작을 거부하고, 그다음 새 노드
   키를 생성합니다. Nitro에는 봉인 저장소가 없으므로 **재시작한 enclave는 새 노드**이며 새 신원(identity)과
   새 로그 파일을 갖고, 소유자는 그 노드에 grant를 다시 줍니다(grant는 한 노드의 키에 봉인되므로 어차피
-  재시작 후에는 남지 않습니다).
+  재시작 후에는 남지 않습니다). 단, 이전 노드가 이 노드에 넘겨준 경우는 예외입니다(아래).
 - **API.** vsock 포트 5000에서 `credentials serve`의 HTTP API([`server`](../../crates/server) 크레이트의 같은
   서버 코드)를 제공하고, 여기에 `GET /attestation?nonce=<base64url>`이 더해집니다. 이 요청은
   `{"identity": <NodeIdentity>, "document": <base64url>}`로 답합니다. document는 COSE로 서명된 NSM 증명
@@ -527,6 +534,10 @@ credentials verify old.jsonl <이전 노드 키> --next new.jsonl --head new.jso
 - grant는 봉인 대상이 된 노드에서만, 노드가 해당 소유자의 기기로 알고 있는 기기에서 온 것만 열리며(첫
   사용은 신뢰), 재전송할 수 없습니다. 폐기에는 알려진 기기가 필요합니다.
 - 레코드는 pin이나 노드가 본 세대보다 이전으로 롤백될 수 없습니다.
+- 챌린지에 답하고 승인을 내리는 것은 소유자의 알려진 기기만 할 수 있으며, 그 대상은 노드가 만든
+  내용 그대로입니다. 기다리는 작업은 그것을 시작한 호출자에게만 이어지고, 그 값은 노드를 떠나지
+  않습니다. 소유자의 한도 안의 결제는 무엇이든 보내기 전에 집계되고, 한도를 넘으면 소유자가
+  승인합니다.
 - 템플릿은 서명 전에 분석됩니다. derivation은 비밀 값, 비밀 값에 대한 오라클, 추측 가능한 필드의
   추측을 확인하는 수단을 돌려줄 수 없습니다.
 - 응답은 엄격하게 파싱되고(프레이밍, 인코딩, 크기), 캡처된 비밀 값은 가려지며, 알려진 형태의 비밀
@@ -596,6 +607,9 @@ PKCS#1 v1.5 서명을 하지 못하므로 `rsa_sign_pkcs1("sha1", …)`만 RustC
 - **UDP 데이터그램은 암호화되지 않습니다.** `udp` operation이 주고받는 내용은 경로 위에서,
   그리고 enclave의 호스트가 읽을 수 있습니다. 정책은 일방향 함수를 거친 값 말고는 비밀 값이 들어가지
   않게 합니다. `dtls` operation은 대신 이를 암호화합니다.
+- **사이트 코드는 사이트와 같은 수준으로 신뢰합니다.** `run` 모듈은 비밀 값을 가지고 계산합니다.
+  모듈이 실패할지, 얼마나 걸릴지는 비밀 값에 따라 달라질 수 있고, 해시를 고정하지 않은 모듈은 출처가
+  내려 주는 것이면 무엇이든 될 수 있습니다.
 - **브라우저 채우기는 브라우저를 신뢰합니다.** 노드는 CDP로 페이지의 TLS를 볼 수 없습니다. 거짓을
   말하는 브라우저나 그 운영자는 아무 페이지나 아무 origin으로 보여 주고 입력된 값을 읽을 수 있습니다.
   페이지는 (사람이 입력할 때처럼) 값을 읽고 그 스크립트가 값을 보관할 수 있습니다. 노드는 CDP로는
@@ -621,7 +635,8 @@ PKCS#1 v1.5 서명을 하지 못하므로 `rsa_sign_pkcs1("sha1", …)`만 RustC
 | [`host`](../../crates/host) | enclave의 부모 인스턴스에서 실행되는 프로그램, `credentials host`로 실행 |
 | [`verify`](../../crates/verify) | 노드 로그 검증기, `credentials verify`로 실행 |
 | [`attest`](../../crates/attest) | AWS Nitro Enclaves 증명 문서 검증기, `credentials attest`로 실행 |
-| [`client`](../../crates/client) | iOS, Android, 웹 앱 쪽 라이브러리: 키, 노드 증명 검증, grant, 레코드, 호출. Swift와 Kotlin(UniFFI), JavaScript(wasm-bindgen) 바인딩 |
+| [`client`](../../crates/client) | iOS, Android, 웹 앱 쪽 라이브러리: 키, 노드 증명 검증, grant, 레코드, 호출, 후속 노드에 다시 grant, 키 백업과 6자리 코드 기기 이전. Swift와 Kotlin(UniFFI), JavaScript(wasm-bindgen) 바인딩 |
+| [`continuity`](../../crates/continuity) | 노드 연속성: Sigstore 키리스 서명으로 서명하고 오프라인으로 검증하는 후속 진술, 그리고 두 노드 사이의 증명된 넘겨주기 |
 | [`sandbox`](../../crates/sandbox) | `run` step의 WebAssembly 샌드박스(wasmi): 연료·메모리·시간 한도, 입력을 받고 출력 하나를 냄, 검토된 라이브러리 모듈, JavaScript 엔진 모듈(`crates/sandbox/js`) |
 | [`cli`](../../crates/cli) | `credentials` 도구: 키, 정책, 레코드, grant, 호출, 노드 서버, `credentials host` |
 
