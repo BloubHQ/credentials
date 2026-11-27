@@ -5,6 +5,7 @@
 // revocations, device changes, calls, policy summaries, the JSON Schema, kinds of item and
 // approvals. Randomness and time come from JavaScript here
 // (crypto.getRandomValues, Date.now), which is what this test checks beyond the host tests.
+// At the end it looks for the keys in the module's memory: the client erases its copies.
 
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
@@ -13,7 +14,16 @@ import { pathToFileURL } from "node:url";
 
 const dir = resolve(process.argv[2] ?? "pkg");
 const client = await import(pathToFileURL(join(dir, "client.js")).href);
-await client.default({ module_or_path: await readFile(join(dir, "client_bg.wasm")) });
+const wasm = await client.default({ module_or_path: await readFile(join(dir, "client_bg.wasm")) });
+
+/// How many times `text` is in the module's linear memory.
+function inMemory(text) {
+  const memory = Buffer.from(wasm.memory.buffer);
+  const needle = Buffer.from(text);
+  let count = 0;
+  for (let at = memory.indexOf(needle); at !== -1; at = memory.indexOf(needle, at + 1)) count++;
+  return count;
+}
 
 const { KeyKind } = client;
 
@@ -251,5 +261,14 @@ for (let left = 2; left >= 0; left--) {
   assert.equal(guarded.attemptsLeft(), left);
 }
 assert.deepEqual(code(() => guarded.offer()), ["transfer_refused", undefined]);
+
+// Every key above went in and out of the module as text, through every call that takes one
+// (#55): none is left in its memory. (The JavaScript strings are another matter: they stay in
+// the JavaScript heap until garbage-collected.)
+const left = Object.fromEntries(
+  Object.entries({ device, user, caller, backupKey }).map(([name, key]) => [name, inMemory(key)]),
+);
+console.log("key text left in wasm memory:", JSON.stringify(left));
+assert.deepEqual(left, { device: 0, user: 0, caller: 0, backupKey: 0 });
 
 console.log("web package: smoke test passed");
