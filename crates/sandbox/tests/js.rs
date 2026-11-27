@@ -356,3 +356,41 @@ fn measure() {
         println!("HMAC chain x{count}: {t:?}, {f} fuel");
     }
 }
+
+/// A script that is not UTF-8 is refused before the engine sees it. These two bytes were found
+/// by the fuzz target `sandbox_script`: given to the engine, they panicked wasmi 1.1.0 (#95).
+#[test]
+fn a_script_that_is_not_utf8_fails_without_a_panic() {
+    let limits = Limits {
+        fuel: 40_000_000,
+        memory: 16 * 1024 * 1024,
+        time: Duration::from_secs(2),
+        ..Limits::default()
+    };
+    let result = std::panic::catch_unwind(|| run_script(b"\n\xb0", "f", &[], limits));
+    let result = result.expect("the sandbox panicked");
+    assert_eq!(
+        result.err().map(|e| e.to_string()),
+        Some(Error::Refused.to_string())
+    );
+}
+
+/// The same bytes given to the engine module directly, past the UTF-8 check: the panic inside
+/// wasmi is caught and the run fails with `Interpreter`, without unwinding into the caller.
+#[test]
+fn a_panic_inside_the_interpreter_is_an_error() {
+    let limits = Limits {
+        fuel: 40_000_000,
+        memory: 16 * 1024 * 1024,
+        time: Duration::from_secs(2),
+        ..Limits::default()
+    };
+    let module = library(JS).unwrap();
+    let inputs: [&[u8]; 2] = [b"\n\xb0", b"f"];
+    let result = std::panic::catch_unwind(|| sandbox::run_with(module, "run", &inputs, limits));
+    let result = result.expect("the panic reached the caller");
+    assert_eq!(
+        result.err().map(|e| e.to_string()),
+        Some(Error::Interpreter.to_string())
+    );
+}

@@ -21,7 +21,7 @@ is `run` (`docs/policy.md`, `run`); the crate is `crates/sandbox`.
 | Structure | wasmi's strict limits: at most 10,000 functions, 1,000 globals, 100 tables, 1,000 element and data segments, 32 parameters and results, functions of 40 bytes on average once the code exceeds 1,000 bytes. |
 | Proposals | Wasm 2.0 as compilers emit it by default (bulk memory, reference types, multi-value, sign extension, saturating conversions, mutable globals) and floats. Off: SIMD, memory64 (not compiled in), multi-memory, tail calls, extended constants, custom page sizes, wide arithmetic. |
 | State | None: one engine, store and instance per run. The memory is erased before it is freed. |
-| Errors | `ModuleTooLarge`, `ModuleInvalid`, `Import`, `NoMemory`, `Entry`, `Inputs`, `Fuel`, `Memory`, `Output`, `Time`, `Trap`, `Refused`: fixed messages, no byte of the module, its inputs or its memory. |
+| Errors | `ModuleTooLarge`, `ModuleInvalid`, `Import`, `NoMemory`, `Entry`, `Inputs`, `Fuel`, `Memory`, `Output`, `Time`, `Trap`, `Refused`, `Interpreter`: fixed messages, no byte of the module, its inputs or its memory. A panic inside wasmi is caught and comes back as `Interpreter`; a JavaScript source that is not UTF-8 is `Refused` before the engine runs. |
 
 Determinism: nothing a module can reach varies between runs, so it gives the same output for
 the same inputs. Float NaNs keep the bits the CPU gives (wasmi 1.x has no NaN

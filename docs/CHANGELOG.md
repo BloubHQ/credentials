@@ -777,6 +777,12 @@ before 1.0, minor versions may break formats and APIs.
 
 ### Security
 
+- **A panic inside the sandbox's interpreter no longer reaches the node.** The fuzz target
+  `sandbox_script` found a 2-byte script (`0a b0`, not UTF-8) that panics wasmi 1.1.0
+  (`unreachable` in its executor) through the JavaScript engine module. Every call into wasmi
+  now runs under `catch_unwind`: a panic ends the run with the new error `Interpreter`, and
+  the memory is still wiped. `run_script` refuses a source that is not UTF-8 before the
+  engine sees it (#95).
 - The sandbox now wipes a module's memory when a run fails (trap, fuel, time, output limit,
   a start function that traps, an entry it refuses), not only when it succeeds: the memory
   handle is kept outside the run, by the instance or by the first host call, so a lost

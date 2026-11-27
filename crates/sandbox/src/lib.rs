@@ -32,6 +32,7 @@
 //! The choice of runtime and of the JavaScript engine, with their measurements, is in
 //! `docs/sandbox.md`.
 
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::time::{Duration, Instant};
 
 use wasmi::errors::{ErrorKind, InstantiationError};
@@ -114,14 +115,18 @@ pub enum Error {
     /// The run took longer than its time limit.
     #[error("module ran out of time")]
     Time,
-    /// A JavaScript source larger than its limit, or a library module whose bytes do not
-    /// match the hash compiled into the node.
+    /// A JavaScript source larger than its limit or not UTF-8, or a library module whose bytes
+    /// do not match the hash compiled into the node.
     #[error("script or library refused")]
     Refused,
     /// The module trapped (unreachable, out of bounds, division by zero, stack overflow, a bad
     /// call to a host function).
     #[error("module trapped")]
     Trap,
+    /// The interpreter itself failed (a panic inside wasmi, caught): the run is abandoned and
+    /// its memory wiped.
+    #[error("the interpreter failed")]
+    Interpreter,
 }
 
 /// The limits of one run. [`Limits::default`] is the most a node allows; a signed policy may
@@ -284,41 +289,46 @@ fn run_observed(
     // at the clock between two slices.
     store.set_fuel(fuel).map_err(|_| Error::Fuel)?;
     let linker = linker(&engine)?;
-    let called = linker
-        .instantiate_and_start(&mut store, &module)
-        .map_err(|error| stopped(&error, Error::ModuleInvalid))
-        .and_then(|instance| {
-            // The handle is kept in the store's data, outside this closure, before the entry
-            // can fail.
-            if let Some(memory) = instance.get_memory(&store, "memory") {
-                store.data_mut().memory = Some(memory);
-            }
-            let func = instance
-                .get_typed_func::<(), ()>(&store, entry)
-                .map_err(|_| Error::Entry)?;
-            refill(&mut store, 0)?;
-            let mut call = func
-                .call_resumable(&mut store, ())
-                .map_err(|error| stopped(&error, Error::Trap))?;
-            loop {
-                match call {
-                    TypedResumableCall::Finished(()) => break,
-                    TypedResumableCall::HostTrap(trap) => {
-                        return Err(stopped(trap.host_error(), Error::Trap));
-                    }
-                    TypedResumableCall::OutOfFuel(pending) => {
-                        if started.elapsed() > time {
-                            return Err(Error::Time);
+    // A panic inside the interpreter (one was found by fuzzing, in wasmi 1.1.0) ends this run
+    // with an error instead of unwinding into the node; the release profile unwinds.
+    let called = catch_unwind(AssertUnwindSafe(|| {
+        linker
+            .instantiate_and_start(&mut store, &module)
+            .map_err(|error| stopped(&error, Error::ModuleInvalid))
+            .and_then(|instance| {
+                // The handle is kept in the store's data, outside this closure, before the entry
+                // can fail.
+                if let Some(memory) = instance.get_memory(&store, "memory") {
+                    store.data_mut().memory = Some(memory);
+                }
+                let func = instance
+                    .get_typed_func::<(), ()>(&store, entry)
+                    .map_err(|_| Error::Entry)?;
+                refill(&mut store, 0)?;
+                let mut call = func
+                    .call_resumable(&mut store, ())
+                    .map_err(|error| stopped(&error, Error::Trap))?;
+                loop {
+                    match call {
+                        TypedResumableCall::Finished(()) => break,
+                        TypedResumableCall::HostTrap(trap) => {
+                            return Err(stopped(trap.host_error(), Error::Trap));
                         }
-                        refill(&mut store, pending.required_fuel())?;
-                        call = pending
-                            .resume(&mut store)
-                            .map_err(|error| stopped(&error, Error::Trap))?;
+                        TypedResumableCall::OutOfFuel(pending) => {
+                            if started.elapsed() > time {
+                                return Err(Error::Time);
+                            }
+                            refill(&mut store, pending.required_fuel())?;
+                            call = pending
+                                .resume(&mut store)
+                                .map_err(|error| stopped(&error, Error::Trap))?;
+                        }
                     }
                 }
-            }
-            Ok(())
-        });
+                Ok(())
+            })
+    }))
+    .unwrap_or(Err(Error::Interpreter));
     let left = store
         .get_fuel()
         .unwrap_or(0)
@@ -370,7 +380,8 @@ pub fn run_script(
     args: &[&[u8]],
     limits: Limits,
 ) -> Result<Ran, Error> {
-    if script.len() > limits.script.min(MAX_SCRIPT) {
+    // A source is UTF-8 text; any other bytes are refused before the engine sees them.
+    if script.len() > limits.script.min(MAX_SCRIPT) || core::str::from_utf8(script).is_err() {
         return Err(Error::Refused);
     }
     if !is_token(entry) {
