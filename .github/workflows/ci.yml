@@ -68,6 +68,51 @@ jobs:
           cargo test --locked --target x86_64-unknown-linux-musl
           -p sandbox -p engine -p server -p transport -p relay -p attest -p continuity -p enclave
 
+  # The OpenPGP signatures the engine writes, checked by implementations independent of it:
+  # GnuPG for version 4 (RSA and EdDSA), OpenPGP.js for version 4 and version 6 (GnuPG does
+  # not read version 6). The OpenPGP.js package is pinned by its npm integrity.
+  openpgp-interop:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      OPENPGP_JS: openpgp@6.3.3
+      OPENPGP_JS_INTEGRITY: sha512-W0foQI+Zb7/TCy7Z50gqZejYe3oJkiZJ9OSV4ImuRT8MmoKOJhtAMvRm6w9STlyYluLiuezG7+0Qdqbcmmx7ig==
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - name: Write the signatures and certificates
+        env:
+          CREDENTIALS_INTEROP_DIR: ${{ runner.temp }}/interop
+        run: cargo test --locked -p engine --test schemes_srp_pgp openpgp_detached_signatures_verify
+      - name: GnuPG, version 4
+        env:
+          GNUPGHOME: ${{ runner.temp }}/gnupg
+          DIR: ${{ runner.temp }}/interop
+        run: |
+          mkdir -m 700 "$GNUPGHOME"
+          gpg --version | head -1
+          gpg --batch --import "$DIR/rsa.pub" "$DIR/eddsa.pub"
+          for name in rsa eddsa; do
+            gpg --batch --status-fd 1 --verify "$DIR/$name.asc" "$DIR/data.txt" > status
+            grep -q "^\[GNUPG:\] GOODSIG" status
+            echo "$name: good signature"
+            if printf 'other' | gpg --batch --verify "$DIR/$name.asc" - 2>/dev/null; then
+              echo "$name: a signature over other data verified"; exit 1
+            fi
+          done
+      - name: OpenPGP.js, versions 4 and 6
+        working-directory: ${{ runner.temp }}
+        env:
+          DIR: ${{ runner.temp }}/interop
+        run: |
+          tarball=$(npm pack --silent "$OPENPGP_JS")
+          actual="sha512-$(openssl dgst -sha512 -binary "$tarball" | base64 -w0)"
+          test "$actual" = "$OPENPGP_JS_INTEGRITY"
+          mkdir openpgp && tar -xzf "$tarball" -C openpgp
+          node "$GITHUB_WORKSPACE/.github/interop/openpgp.mjs" openpgp/package/dist/node/openpgp.mjs "$DIR"
+
   # The client crate for apps: the web package (wasm-bindgen, with a smoke test in Node), the
   # Android libraries with the Kotlin bindings, and an XCFramework with the Swift bindings
   # (build/client.sh). Not a required check.
