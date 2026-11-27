@@ -8,10 +8,13 @@ on:
     branches: [main]
     paths:
       - "build/**"
+      - "crates/attest/**"
+      - "crates/continuity/**"
       - "crates/enclave/**"
       - "crates/engine/**"
       - "crates/server/**"
       - "crates/relay/**"
+      - "crates/sandbox/**"
       - "crates/transport/**"
       - "Cargo.toml"
       - "Cargo.lock"
@@ -20,10 +23,13 @@ on:
   pull_request:
     paths:
       - "build/**"
+      - "crates/attest/**"
+      - "crates/continuity/**"
       - "crates/enclave/**"
       - "crates/engine/**"
       - "crates/server/**"
       - "crates/relay/**"
+      - "crates/sandbox/**"
       - "crates/transport/**"
       - "Cargo.toml"
       - "Cargo.lock"

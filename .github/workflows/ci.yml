@@ -7,6 +7,8 @@ on:
   # The long fuzz run (see the fuzz job).
   schedule:
     - cron: "17 3 * * *"
+  # A long fuzz run on demand, the same as the daily one.
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -46,6 +48,70 @@ jobs:
           persist-credentials: false
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - run: cargo test --workspace --locked
+
+  # The enclave runs as x86_64-unknown-linux-musl: the crates it links (the sandbox with its
+  # JavaScript engine, the engine, the server, transport, relay, attestation and continuity)
+  # are tested on that target too, not only on the hosts' own.
+  musl:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - run: rustup target add x86_64-unknown-linux-musl
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: musl
+      - run: >-
+          cargo test --locked --target x86_64-unknown-linux-musl
+          -p sandbox -p engine -p server -p transport -p relay -p attest -p continuity -p enclave
+
+  # The OpenPGP signatures the engine writes, checked by implementations independent of it:
+  # GnuPG for version 4 (RSA and EdDSA), OpenPGP.js for version 4 and version 6 (GnuPG does
+  # not read version 6). The OpenPGP.js package is pinned by its npm integrity.
+  openpgp-interop:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      OPENPGP_JS: openpgp@6.3.3
+      OPENPGP_JS_INTEGRITY: sha512-W0foQI+Zb7/TCy7Z50gqZejYe3oJkiZJ9OSV4ImuRT8MmoKOJhtAMvRm6w9STlyYluLiuezG7+0Qdqbcmmx7ig==
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - name: Write the signatures and certificates
+        env:
+          CREDENTIALS_INTEROP_DIR: ${{ runner.temp }}/interop
+        run: cargo test --locked -p engine --test schemes_srp_pgp openpgp_detached_signatures_verify
+      - name: GnuPG, version 4
+        env:
+          GNUPGHOME: ${{ runner.temp }}/gnupg
+          DIR: ${{ runner.temp }}/interop
+        run: |
+          mkdir -m 700 "$GNUPGHOME"
+          gpg --version | head -1
+          gpg --batch --import "$DIR/rsa.pub" "$DIR/eddsa.pub"
+          for name in rsa eddsa; do
+            gpg --batch --status-fd 1 --verify "$DIR/$name.asc" "$DIR/data.txt" > status
+            grep -q "^\[GNUPG:\] GOODSIG" status
+            echo "$name: good signature"
+            if printf 'other' | gpg --batch --verify "$DIR/$name.asc" - 2>/dev/null; then
+              echo "$name: a signature over other data verified"; exit 1
+            fi
+          done
+      - name: OpenPGP.js, versions 4 and 6
+        working-directory: ${{ runner.temp }}
+        env:
+          DIR: ${{ runner.temp }}/interop
+        run: |
+          tarball=$(npm pack --silent "$OPENPGP_JS")
+          actual="sha512-$(openssl dgst -sha512 -binary "$tarball" | base64 -w0)"
+          test "$actual" = "$OPENPGP_JS_INTEGRITY"
+          mkdir openpgp && tar -xzf "$tarball" -C openpgp
+          node "$GITHUB_WORKSPACE/.github/interop/openpgp.mjs" openpgp/package/dist/node/openpgp.mjs "$DIR"
 
   # The client crate for apps: the web package (wasm-bindgen, with a smoke test in Node), the
   # Android libraries with the Kotlin bindings, and an XCFramework with the Swift bindings
@@ -143,9 +209,9 @@ jobs:
     runs-on: ubuntu-latest
     # Seconds per target: 10 on a pull request, 60 on main, 300 in the daily run. With 30
     # targets that is about 5, 30 and 150 minutes plus the build.
-    timeout-minutes: ${{ github.event_name == 'schedule' && 180 || github.event_name == 'push' && 75 || 30 }}
+    timeout-minutes: ${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && 180 || github.event_name == 'push' && 75 || 30 }}
     env:
-      FUZZ_SECONDS: ${{ github.event_name == 'schedule' && 300 || github.event_name == 'push' && 60 || 10 }}
+      FUZZ_SECONDS: ${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && 300 || github.event_name == 'push' && 60 || 10 }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

@@ -914,9 +914,11 @@ fn openpgp_detached_signatures_verify() {
     }
     assert_ne!(salts[0], salts[1]);
 
-    // Certificates for GnuPG, which the test does not run (`--import`, then `--verify`).
+    // Certificates for the tools outside the test (the CI job `openpgp-interop`: GnuPG for
+    // version 4, OpenPGP.js for both versions).
     keep("rsa.pub", &rsa_certificate(&private));
     keep("eddsa.pub", &eddsa_certificate());
+    keep("v6.pub", &v6_certificate());
 }
 
 /// The framing functions against RFC 9580 directly: the three length forms, the critical
@@ -1033,6 +1035,41 @@ fn certificate(body: &[u8], algorithm: u8, sign: impl Fn(&[u8]) -> Vec<u8>) -> V
     sig.extend(sign(&input));
     let mut out = packet(6, body);
     out.extend(packet(13, uid));
+    out.extend(packet(2, &sig));
+    out
+}
+
+/// A version 6 certificate (RFC 9580 sections 5.2.3 and 10.1): the Ed25519 key packet and a
+/// direct-key self-signature (type 0x1F) with a fixed salt, for tools outside the test.
+fn v6_certificate() -> Vec<u8> {
+    use ed25519_dalek::Signer as _;
+    let key = ed25519_dalek::SigningKey::from_bytes(&unhex(ED25519_SECRET).try_into().unwrap());
+    let body = v6_key_body();
+    let fingerprint = v6_fingerprint(&body);
+    let salt = [0x5au8; 16];
+    let mut sub = vec![5, 2];
+    sub.extend(KEY_CREATED.to_be_bytes());
+    sub.extend([2, 27, 0x03]);
+    sub.extend([34, 33, 6]);
+    sub.extend(&fingerprint);
+    let mut hashed = vec![6, 0x1f, 27, 8];
+    hashed.extend((sub.len() as u32).to_be_bytes());
+    hashed.extend(&sub);
+    let mut input = salt.to_vec();
+    input.push(0x9b);
+    input.extend((body.len() as u32).to_be_bytes());
+    input.extend(&body);
+    input.extend(&hashed);
+    input.extend([0x06, 0xff]);
+    input.extend((hashed.len() as u32).to_be_bytes());
+    let digest = sha256(&[&input]);
+    let mut sig = hashed;
+    sig.extend(0u32.to_be_bytes());
+    sig.extend(&digest[..2]);
+    sig.push(16);
+    sig.extend(salt);
+    sig.extend(key.sign(&digest).to_bytes());
+    let mut out = packet(6, &body);
     out.extend(packet(2, &sig));
     out
 }
