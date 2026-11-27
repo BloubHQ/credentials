@@ -293,6 +293,105 @@ fn errors_never_carry_module_bytes() {
 }
 
 #[test]
+fn memory_is_wiped_on_every_path() {
+    // Each module copies the secret into its memory, then ends one way.
+    let read = "(call $input_read (i32.const 0) (i32.const 0))";
+    let module = |run_body: &str, extra: &str| {
+        wasm(&format!(
+            r#"(memory (export "memory") 1)
+               (func (export "run") {read} {run_body})
+               {extra}"#
+        ))
+    };
+    let quick = Limits {
+        fuel: 100_000,
+        ..Limits::default()
+    };
+    let no_time = Limits {
+        time: Duration::ZERO,
+        ..Limits::default()
+    };
+    let over = MAX_OUTPUT + 1;
+    /// A name, the module, its entry, the limits and how the run ends.
+    type Case<'a> = (&'a str, Vec<u8>, &'a str, Limits, Result<(), Error>);
+    let cases: Vec<Case<'_>> = vec![
+        ("success", module("", ""), "run", Limits::default(), Ok(())),
+        (
+            "trap",
+            module("(unreachable)", ""),
+            "run",
+            Limits::default(),
+            Err(Error::Trap),
+        ),
+        (
+            "fuel",
+            module("(loop $l (br $l))", ""),
+            "run",
+            quick,
+            Err(Error::Fuel),
+        ),
+        (
+            "time",
+            module("(loop $l (br $l))", ""),
+            "run",
+            no_time,
+            Err(Error::Time),
+        ),
+        (
+            "output limit",
+            module(
+                &format!("(call $output (i32.const 0) (i32.const {over}))"),
+                "",
+            ),
+            "run",
+            Limits::default(),
+            Err(Error::Output),
+        ),
+        (
+            "start function trap",
+            module("", &format!("(func $s {read} (unreachable)) (start $s)")),
+            "run",
+            Limits::default(),
+            Err(Error::ModuleInvalid),
+        ),
+        (
+            "start function trap after reading a length",
+            module(
+                "",
+                "(func $s (i32.store (i32.const 64) (call $input_len (i32.const 0))) (unreachable)) (start $s)",
+            ),
+            "run",
+            Limits::default(),
+            Err(Error::ModuleInvalid),
+        ),
+        (
+            "entry refused after the start function",
+            module("", &format!("(func $s {read}) (start $s)")),
+            "missing",
+            Limits::default(),
+            Err(Error::Entry),
+        ),
+    ];
+    for (case, bytes, entry, limits, expected) in cases {
+        let mut seen = None;
+        let result = run_observed(&bytes, entry, &[SECRET], limits, &mut |memory| {
+            seen = memory.map(<[u8]>::to_vec);
+        });
+        assert_eq!(
+            result.map(|_| ()),
+            expected,
+            "{case}: the run ends as expected"
+        );
+        let memory = seen.unwrap_or_else(|| panic!("{case}: the run had a memory"));
+        assert!(!memory.is_empty(), "{case}: the memory has pages");
+        assert!(
+            memory.iter().all(|b| *b == 0),
+            "{case}: the memory is not wiped"
+        );
+    }
+}
+
+#[test]
 fn stack_overflow_traps() {
     let module = wasm(
         r#"(memory (export "memory") 1)

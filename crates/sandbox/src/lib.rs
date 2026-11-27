@@ -166,6 +166,9 @@ struct Host {
     fault: Option<Error>,
     /// Fuel of the run not yet given to the store: the store holds one slice at a time.
     reserve: u64,
+    /// The module's memory, once the instance or a host function has seen it. The handle
+    /// stays valid in the store after an instance is lost to a failed start function.
+    memory: Option<wasmi::Memory>,
 }
 
 fn config() -> Config {
@@ -231,6 +234,18 @@ pub fn run_with(
     inputs: &[&[u8]],
     limits: Limits,
 ) -> Result<Ran, Error> {
+    run_observed(module, entry, inputs, limits, &mut |_| {})
+}
+
+/// [`run_with`], showing `observe` the module's memory as it is left after the wipe: `None`
+/// when the run never had one. The tests check through it that every path wipes.
+fn run_observed(
+    module: &[u8],
+    entry: &str,
+    inputs: &[&[u8]],
+    limits: Limits,
+    observe: &mut dyn FnMut(Option<&[u8]>),
+) -> Result<Ran, Error> {
     if !is_token(entry) {
         return Err(Error::Entry);
     }
@@ -261,6 +276,7 @@ pub fn run_with(
             .build(),
         fault: None,
         reserve: 0,
+        memory: None,
     };
     let mut store = Store::new(&engine, host);
     store.limiter(|host| &mut host.limits);
@@ -272,6 +288,11 @@ pub fn run_with(
         .instantiate_and_start(&mut store, &module)
         .map_err(|error| stopped(&error, Error::ModuleInvalid))
         .and_then(|instance| {
+            // The handle is kept in the store's data, outside this closure, before the entry
+            // can fail.
+            if let Some(memory) = instance.get_memory(&store, "memory") {
+                store.data_mut().memory = Some(memory);
+            }
             let func = instance
                 .get_typed_func::<(), ()>(&store, entry)
                 .map_err(|_| Error::Entry)?;
@@ -296,19 +317,20 @@ pub fn run_with(
                     }
                 }
             }
-            Ok(instance)
+            Ok(())
         });
     let left = store
         .get_fuel()
         .unwrap_or(0)
         .saturating_add(store.data().reserve);
     let used = fuel.saturating_sub(left);
-    // The memory may hold inputs and whatever the module derived from them.
-    if let Ok(instance) = &called
-        && let Some(memory) = instance.get_memory(&store, "memory")
-    {
+    // The memory may hold inputs and whatever the module derived from them: it is wiped on
+    // every path, whether the run finished, trapped, ran out of fuel or time, or was refused.
+    let memory = store.data().memory;
+    if let Some(memory) = memory {
         memory.data_mut(&mut store).zeroize();
     }
+    observe(memory.map(|memory| memory.data(&store)));
     let host = store.data_mut();
     if let Some(fault) = host.fault {
         return Err(fault);
@@ -385,9 +407,18 @@ fn stopped(error: &wasmi::Error, other: Error) -> Error {
 
 /// The memory a host function reads or writes.
 fn memory_of(caller: &mut Caller<'_, Host>) -> Result<wasmi::Memory, wasmi::Error> {
-    match caller.get_export("memory").and_then(Extern::into_memory) {
+    remember_memory(caller);
+    match caller.data().memory {
         Some(memory) => Ok(memory),
         None => Err(fail(caller, Error::NoMemory)),
+    }
+}
+
+/// Keeps the handle of the module's memory for the wipe, before anything the host gives the
+/// module can reach it.
+fn remember_memory(caller: &mut Caller<'_, Host>) {
+    if caller.data().memory.is_none() {
+        caller.data_mut().memory = caller.get_export("memory").and_then(Extern::into_memory);
     }
 }
 
@@ -435,7 +466,8 @@ fn input_index(caller: &Caller<'_, Host>, index: i32) -> Option<usize> {
 fn linker(engine: &Engine) -> Result<Linker<Host>, Error> {
     let mut linker = Linker::<Host>::new(engine);
     linker
-        .func_wrap(HOST, "input_count", |caller: Caller<'_, Host>| -> i32 {
+        .func_wrap(HOST, "input_count", |mut caller: Caller<'_, Host>| -> i32 {
+            remember_memory(&mut caller);
             i32::try_from(caller.data().inputs.len()).unwrap_or(i32::MAX)
         })
         .map_err(|_| Error::Import)?;
@@ -443,7 +475,8 @@ fn linker(engine: &Engine) -> Result<Linker<Host>, Error> {
         .func_wrap(
             HOST,
             "input_len",
-            |caller: Caller<'_, Host>, index: i32| -> i32 {
+            |mut caller: Caller<'_, Host>, index: i32| -> i32 {
+                remember_memory(&mut caller);
                 input_index(&caller, index)
                     .and_then(|i| caller.data().inputs.get(i))
                     .map_or(-1, |input| i32::try_from(input.len()).unwrap_or(-1))

@@ -231,6 +231,9 @@ pub struct SshServer {
     pub binds: Vec<String>,
     pub cancels: Vec<String>,
     pub open_answers: Vec<(u32, Option<u32>)>,
+    /// A session channel opens with a window of 0; after the shell's prompt the server sends
+    /// more output, error output and an exit status, and only then opens the window.
+    pub hold_window: bool,
     sftp: bool,
     sftp_in: Vec<u8>,
     forwarding: bool,
@@ -288,6 +291,7 @@ impl SshServer {
             binds: Vec::new(),
             cancels: Vec::new(),
             open_answers: Vec::new(),
+            hold_window: false,
             sftp: false,
             sftp_in: Vec::new(),
             forwarding: false,
@@ -587,7 +591,8 @@ impl SshServer {
                 let mut reply = vec![91];
                 reply.extend(theirs.to_be_bytes());
                 reply.extend(7u32.to_be_bytes());
-                reply.extend((1u32 << 20).to_be_bytes());
+                let window = if self.hold_window { 0 } else { 1u32 << 20 };
+                reply.extend(window.to_be_bytes());
                 reply.extend(16384u32.to_be_bytes());
                 self.send(&reply);
                 if self.open_unasked {
@@ -665,6 +670,21 @@ impl SshServer {
                     b"shell" => {
                         self.shell = true;
                         self.data(b"$ ", false);
+                        if self.hold_window {
+                            // All of it reaches the client while its window is still 0.
+                            self.data(b"late\n", false);
+                            self.data(b"warn\n", true);
+                            let mut exit = vec![98];
+                            exit.extend(channel.to_be_bytes());
+                            exit.extend(string(b"exit-status"));
+                            exit.push(0);
+                            exit.extend(3u32.to_be_bytes());
+                            self.send(&exit);
+                            let mut adjust = vec![93];
+                            adjust.extend(channel.to_be_bytes());
+                            adjust.extend((1u32 << 20).to_be_bytes());
+                            self.send(&adjust);
+                        }
                     }
                     b"subsystem" => {
                         assert_eq!(r.string(), b"sftp");
