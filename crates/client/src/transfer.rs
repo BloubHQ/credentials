@@ -335,8 +335,17 @@ impl TransferSender {
         state.done = true;
         drop(state);
         // {"owner": <owner>, "keys": <the keys, as a backup holds them>}
-        let mut contents = Zeroizing::new(b"{\"owner\":".to_vec());
-        contents.extend(serde_json::to_vec(owner).map_err(|_| refused("cannot encode the owner"))?);
+        // Sized up front: a buffer that grew would free a copy of the keys before it, unwiped.
+        let owner_json =
+            serde_json::to_vec(owner).map_err(|_| refused("cannot encode the owner"))?;
+        let mut contents = Zeroizing::new(Vec::with_capacity(
+            owner_json
+                .len()
+                .saturating_add(plain_keys.len())
+                .saturating_add(32),
+        ));
+        contents.extend_from_slice(b"{\"owner\":");
+        contents.extend_from_slice(&owner_json);
         contents.extend_from_slice(b",\"keys\":");
         contents.extend_from_slice(&plain_keys);
         contents.push(b'}');
