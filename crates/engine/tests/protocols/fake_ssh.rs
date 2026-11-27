@@ -352,7 +352,8 @@ impl SshServer {
 
     fn kexinit(&self) -> Vec<u8> {
         let mut kex = self.kex.clone();
-        if self.strict {
+        // As OpenSSH: the strict marker is in the first KEXINIT only.
+        if self.strict && self.session_id.is_empty() {
             kex.push("kex-strict-s-v00@openssh.com");
         }
         let mut p = vec![KEXINIT];
@@ -503,10 +504,13 @@ impl SshServer {
                     .cloned();
                 self.agreed_kex = kex.unwrap_or_default();
                 self.agreed_cipher = cipher.unwrap_or_default();
-                self.strict_on = self.strict
-                    && client_kex
-                        .iter()
-                        .any(|k| k == "kex-strict-c-v00@openssh.com");
+                // Strict key exchange is agreed once, in the first exchange.
+                if self.session_id.is_empty() {
+                    self.strict_on = self.strict
+                        && client_kex
+                            .iter()
+                            .any(|k| k == "kex-strict-c-v00@openssh.com");
+                }
             }
             30 => {
                 // KEX_ECDH_INIT.

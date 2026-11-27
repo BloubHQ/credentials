@@ -12,6 +12,11 @@ before 1.0, minor versions may break formats and APIs.
   out for every AEAD, as for AES-GCM, so sshd refused the node's first encrypted packet
   (`padding error`), and the node would have refused sshd's. Found by the new interop matrix
   against OpenSSH 10.2; the fake server now checks the alignment as OpenSSH does (#106).
+- SSH: a key re-exchange keeps the strict key exchange the first exchange agreed. OpenSSH
+  sends the strict markers in its first KEXINIT only, so with ChaCha20-Poly1305 the node
+  refused the server's first re-exchange as "chacha20-poly1305 without strict key
+  exchange". The node now sends its own marker in the first KEXINIT only, too. Found by the
+  same interop matrix; the fake server now leaves the marker out of a re-exchange (#106).
 
 - SSH: a key re-exchange the server starts is carried out instead of ending the connection.
   Servers rekey after a volume or a time (Dropbear at 1 GiB or 8 hours, Paramiko at 512 MB,
