@@ -673,8 +673,13 @@ fn connections_beyond_the_cap_are_refused() {
         &["--max-connections", "2"],
     );
     let slow: Vec<TcpStream> = (0..2).map(|_| slow_client(port)).collect();
-    std::thread::sleep(Duration::from_millis(300));
-    assert_eq!(get_identity(port, Duration::from_secs(3)), Some(503));
+    // The server counts a connection once it has accepted it; on a loaded host that can take
+    // longer than a fixed pause, so the check is repeated until the cap is reached.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while get_identity(port, Duration::from_secs(3)) != Some(503) {
+        assert!(Instant::now() < deadline, "the cap was not reached");
+        std::thread::sleep(Duration::from_millis(100));
+    }
     drop(slow);
     let deadline = Instant::now() + Duration::from_secs(5);
     while get_identity(port, Duration::from_secs(3)) != Some(200) {
