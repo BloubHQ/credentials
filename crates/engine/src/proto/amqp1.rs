@@ -512,7 +512,7 @@ impl<'a> Decoder<'a> {
         if constructor == 0x00 {
             return Err(invalid("an AMQP array element described twice"));
         }
-        let mut items = Vec::with_capacity(count.min(1024));
+        let mut items = super::announced(count);
         for _ in 0..count {
             let item = self.body(constructor, depth + 1)?;
             items.push(match &descriptor {
@@ -555,7 +555,7 @@ impl<'a> Decoder<'a> {
         if count > end.saturating_sub(self.at) {
             return Err(invalid("an AMQP count larger than its size"));
         }
-        let mut items = Vec::with_capacity(count.min(1024));
+        let mut items = super::announced(count);
         for _ in 0..count {
             items.push(item(self)?);
             if self.at > end {
