@@ -200,6 +200,15 @@ pub struct SshServer {
     /// What a command prints: (stdout, stderr, exit status).
     pub exec: fn(&[u8]) -> (Vec<u8>, Vec<u8>, u32),
     pub misbehave: Misbehave,
+    /// Starts a key re-exchange in the middle of every command's output.
+    pub rekey_mid_exec: bool,
+    /// The host key it proves in a key re-exchange (`None`: the first one).
+    pub rekey_host: Option<HostKind>,
+    /// Key re-exchanges it finished.
+    pub rekeys: usize,
+    /// True from its re-exchange KEXINIT to its NEWKEYS: other messages wait (RFC 4253, 7.1).
+    rekeying: bool,
+    held: Vec<Vec<u8>>,
     /// What it saw.
     pub execs: Vec<Vec<u8>>,
     pub methods: Vec<String>,
@@ -272,6 +281,11 @@ impl SshServer {
             prompts: Vec::new(),
             exec: |_| (Vec::new(), Vec::new(), 0),
             misbehave: Misbehave::None,
+            rekey_mid_exec: false,
+            rekey_host: None,
+            rekeys: 0,
+            rekeying: false,
+            held: Vec::new(),
             execs: Vec::new(),
             methods: Vec::new(),
             signed_in: false,
@@ -348,7 +362,22 @@ impl SshServer {
         p
     }
 
+    /// Starts a key re-exchange.
+    fn rekey(&mut self) {
+        self.server_kexinit = self.kexinit();
+        let init = self.server_kexinit.clone();
+        self.send(&init);
+        self.rekeying = true;
+        if let Some(host) = self.rekey_host.take() {
+            self.host = host;
+        }
+    }
+
     fn send(&mut self, payload: &[u8]) {
+        if self.rekeying && !matches!(payload.first(), Some(1..=4 | 20 | 21 | 30 | 31)) {
+            self.held.push(payload.to_vec());
+            return;
+        }
         let dir = &mut self.out;
         let (block, counted) = match dir.cipher {
             Cipher::Gcm { .. } => (16, 1 + payload.len()),
@@ -529,7 +558,9 @@ impl SshServer {
                 self.send(&[21]);
                 self.k = k_mpint;
                 self.h = h.clone();
-                self.session_id = h;
+                if self.session_id.is_empty() {
+                    self.session_id = h;
+                }
                 let (key_len, iv_len) = sizes(&self.agreed_cipher);
                 let key_c = self.derive(b'C', key_len);
                 let iv_c = self.derive(b'A', iv_len);
@@ -540,6 +571,13 @@ impl SshServer {
                     self.out.seq = 0;
                 }
                 self.pending_in = Some(cipher(&self.agreed_cipher, key_c, &iv_c));
+                if self.rekeying {
+                    self.rekeying = false;
+                    self.rekeys += 1;
+                    for held in std::mem::take(&mut self.held) {
+                        self.send(&held);
+                    }
+                }
             }
             21 => {
                 self.inn.cipher = self.pending_in.take().unwrap();
@@ -659,7 +697,14 @@ impl SshServer {
                         let command = r.string().to_vec();
                         self.execs.push(command.clone());
                         let (stdout, stderr, status) = (self.exec)(&command);
-                        self.data(&stdout, false);
+                        if self.rekey_mid_exec {
+                            let half = stdout.len() / 2;
+                            self.data(&stdout[..half], false);
+                            self.rekey();
+                            self.data(&stdout[half..], false);
+                        } else {
+                            self.data(&stdout, false);
+                        }
                         if !stderr.is_empty() {
                             self.data(&stderr, true);
                         }
@@ -1050,8 +1095,7 @@ impl SshServer {
         self.signed_in = true;
         self.send(&[52]);
         if self.misbehave == Misbehave::Rekey {
-            let init = self.kexinit();
-            self.send(&init);
+            self.rekey();
         }
     }
 
