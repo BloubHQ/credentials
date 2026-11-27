@@ -52,6 +52,10 @@ before 1.0, minor versions may break formats and APIs.
   (median of 401 runs, old and new interleaved, a fresh buffer each, every frame used): 10-byte
   frames, 514-543 us before and 368-383 us now in 4 KiB reads (what the links read), 918-977 us
   and 382-397 us in 16 KiB reads; 1,202-byte frames in 4 KiB reads, 6.2-7.0 us and 5.5-6.2 us.
+- Relay: the egress side of a datagram link sends each datagram straight from its read
+  buffer (`relay::datagram::peek_datagram`) instead of copying it out first. 64 KiB of frames
+  in 4 KiB reads, median of 401 interleaved runs, release: 10-byte frames 344-386 us before,
+  23 us now; 1,202-byte frames 5.8-6.3 us before, 2.0-2.2 us now.
 - Log files: one writer per log. `credentials serve` and `credentials host` hold an exclusive
   lock on each log file while they write it (`flock` on Unix; on Windows the file is opened
   sharing reads only), so a second process on the same file fails at start with "the log is
