@@ -259,12 +259,17 @@ const keys = JSON.stringify([
   { kind: "user", key: user },
 ]);
 const backupKey = client.generateBackupKey();
+track("generateBackupKey");
 const blob = client.wrapKeys(backupKey, "alice", keys);
+track("wrapKeys");
 assert.equal(JSON.parse(blob).format, "credentials-key-backup/v1");
 assert.ok(!blob.includes(device) && !blob.includes(user));
 assert.deepEqual(JSON.parse(client.unwrapKeys(backupKey, "alice", blob)), JSON.parse(keys));
+track("unwrapKeys");
 assert.deepEqual(code(() => client.unwrapKeys(client.generateBackupKey(), "alice", blob)), ["backup_refused", undefined]);
+track("unwrapKeys, other key");
 assert.deepEqual(code(() => client.unwrapKeys(backupKey, "bob", blob)), ["backup_refused", undefined]);
+track("unwrapKeys, other owner");
 
 track("backup");
 
