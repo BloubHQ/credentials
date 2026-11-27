@@ -13,9 +13,11 @@ on:
 permissions:
   contents: read
 
+# Scheduled and dispatched runs share the ref of main with pushes: the event name keeps them in
+# their own group, and only pull requests cancel a run in progress.
 concurrency:
-  group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  group: ci-${{ github.ref }}-${{ github.event_name }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always
