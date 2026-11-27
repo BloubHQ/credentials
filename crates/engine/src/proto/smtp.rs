@@ -95,9 +95,11 @@ fn expect(io: &mut Io<'_>, codes: &[u16]) -> Result<Reply> {
     }
 }
 
-/// `EHLO` and its capabilities, upper case.
+/// `EHLO` and its capabilities, upper case. The node names itself with an address literal
+/// (RFC 5321 section 4.1.4): a server with a strict HELO check refuses `localhost`, and the
+/// node has no name of its own to give.
 fn ehlo(io: &mut Io<'_>) -> Result<Vec<String>> {
-    io.write(b"EHLO localhost\r\n")?;
+    io.write(b"EHLO [127.0.0.1]\r\n")?;
     let r = expect(io, &[250])?;
     Ok(r.lines
         .iter()

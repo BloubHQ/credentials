@@ -234,6 +234,8 @@ pub struct SshServer {
     /// A session channel opens with a window of 0; after the shell's prompt the server sends
     /// more output, error output and an exit status, and only then opens the window.
     pub hold_window: bool,
+    /// Told once a silent command or a remote forward is set up: the connection is open.
+    pub ready: Option<std::sync::mpsc::Sender<()>>,
     sftp: bool,
     sftp_in: Vec<u8>,
     forwarding: bool,
@@ -292,6 +294,7 @@ impl SshServer {
             cancels: Vec::new(),
             open_answers: Vec::new(),
             hold_window: false,
+            ready: None,
             sftp: false,
             sftp_in: Vec::new(),
             forwarding: false,
@@ -607,6 +610,9 @@ impl SshServer {
                 match kind.as_slice() {
                     b"tcpip-forward" => {
                         self.binds.push(format!("{address}:{port}"));
+                        if let Some(ready) = &self.ready {
+                            let _ = ready.send(());
+                        }
                         if want {
                             self.send(&[if self.remote_ok { 81 } else { 82 }]);
                         }
@@ -644,7 +650,11 @@ impl SshServer {
                     self.send(&ok);
                 }
                 match kind.as_slice() {
-                    b"exec" if self.misbehave == Misbehave::Silent => {}
+                    b"exec" if self.misbehave == Misbehave::Silent => {
+                        if let Some(ready) = &self.ready {
+                            let _ = ready.send(());
+                        }
+                    }
                     b"exec" => {
                         let command = r.string().to_vec();
                         self.execs.push(command.clone());

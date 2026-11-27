@@ -349,6 +349,15 @@ impl Ledger {
                 .as_deref()
                 .map(|m| format!(" at {m}"))
                 .unwrap_or_default();
+            // A rule that is not valid (a bound that is no amount) never lets a payment
+            // through: it reads as exceeded.
+            if rule.fault().is_some() {
+                lines.push(format!(
+                    "a spending limit in {}{at} is not valid",
+                    rule.currency
+                ));
+                continue;
+            }
             let bound = |b: &Option<String>| b.as_deref().and_then(scaled);
             if let Some(max) = bound(&rule.per_payment)
                 && amount > max
@@ -405,6 +414,9 @@ impl Ledger {
             return Err(Error::LimitsInvalid {
                 rule: "more rules or payments than a ledger holds",
             });
+        }
+        if let Some(rule) = state.rules.iter().find_map(LimitRule::fault) {
+            return Err(Error::LimitsInvalid { rule });
         }
         Ok(Self {
             rules: state.rules,
@@ -600,5 +612,38 @@ mod tests {
         assert_eq!(ledger.spends.len(), 1);
         ledger.expire(10 + MONTH_MS);
         assert_eq!(ledger.spends.len(), 0);
+    }
+
+    #[test]
+    fn a_carried_rule_that_is_not_valid_is_refused_and_never_lets_a_payment_through() {
+        let spend = Spend {
+            currency: "EUR".into(),
+            merchant: None,
+            scaled: from_minor(100, 2).unwrap().to_string(),
+            minor: 100,
+            exponent: 2,
+        };
+        for bound in ["1e9", "025"] {
+            let rule = LimitRule {
+                currency: "EUR".into(),
+                merchant: None,
+                per_payment: None,
+                per_day: Some(bound.into()),
+                per_month: None,
+            };
+            let state = LedgerState {
+                rules: vec![rule.clone()],
+                issued_ms: 1,
+                spends: Vec::new(),
+            };
+            assert!(Ledger::from_state(state).is_err(), "{bound:?} was carried");
+            // A ledger that holds one all the same reads the bound as exceeded.
+            let mut ledger = Ledger::default();
+            ledger.set(vec![rule], 1);
+            assert!(
+                matches!(ledger.verdict(&spend, 10), Verdict::Above(_)),
+                "{bound:?} let a payment through"
+            );
+        }
     }
 }

@@ -281,9 +281,22 @@ pub(crate) enum Framing {
     Close,
 }
 
+/// True when `wire`, a request in HTTP/1.1 form, is a `HEAD` request: its response has no
+/// body, whatever its length headers say.
+// Methods are case-sensitive (RFC 9110 section 9.1) and the node writes the request line
+// from `policy::Method`, whose only spelling is upper case.
+pub fn is_head_request(wire: &[u8]) -> bool {
+    wire.starts_with(b"HEAD ")
+}
+
 /// The framing of a body, under the rules every response follows: no content coding but
-/// `identity`, no partial body, no transfer coding but `chunked`, one length at most.
-pub(crate) fn framing(status: u16, headers: &Fields) -> Result<Framing> {
+/// `identity`, no partial body, no transfer coding but `chunked`, one length at most. A
+/// response to `HEAD` (`head`) and any `204` or `304` has no body, whatever its length
+/// headers say (RFC 9112 section 6.3).
+pub(crate) fn framing(status: u16, headers: &Fields, head: bool) -> Result<Framing> {
+    if head || status == 204 || status == 304 {
+        return Ok(Framing::Length(0));
+    }
     if named(headers, "content-encoding")
         .iter()
         .any(|v| !v.trim_ascii().eq_ignore_ascii_case(b"identity"))
@@ -298,9 +311,7 @@ pub(crate) fn framing(status: u16, headers: &Fields) -> Result<Framing> {
     match codings.as_slice() {
         [] => match lengths.as_slice() {
             [] => Ok(Framing::Close),
-            [one] => core::str::from_utf8(one)
-                .ok()
-                .and_then(|v| v.parse::<usize>().ok())
+            [one] => crate::encoding::digits::<usize>(one)
                 .map(Framing::Length)
                 .ok_or(invalid("content length")),
             _ => Err(invalid("several content lengths")),
@@ -492,8 +503,8 @@ impl BodyDecoder {
 }
 
 impl Http {
-    /// Parses a response.
-    pub fn parse(mut bytes: &[u8]) -> Result<Self> {
+    /// Parses a response; `head` when it answers a `HEAD` request, so it has no body.
+    pub fn parse_reply(mut bytes: &[u8], to_head: bool) -> Result<Self> {
         if bytes.len() > MAX_RESPONSE {
             return Err(Error::transport(
                 crate::error::TransportKind::TooLarge,
@@ -507,13 +518,13 @@ impl Http {
             let rest = rest.get(4..).unwrap_or_default();
             match parse_head(head)? {
                 None => bytes = rest,
-                Some((status, headers)) => return Self::framed(status, headers, rest),
+                Some((status, headers)) => return Self::framed(status, headers, rest, to_head),
             }
         }
     }
 
-    fn framed(status: u16, mut headers: Fields, raw_body: &[u8]) -> Result<Self> {
-        let (body, trailers) = match framing(status, &headers)? {
+    fn framed(status: u16, mut headers: Fields, raw_body: &[u8], head: bool) -> Result<Self> {
+        let (body, trailers) = match framing(status, &headers, head)? {
             Framing::Close => (Zeroizing::new(raw_body.to_vec()), Vec::new()),
             Framing::Length(length) => (
                 Zeroizing::new(
@@ -940,11 +951,26 @@ Transfer-Encoding: chunked\r\n\r\n\
 7\r\n{\"a\":{\"\r\ne\r\nb\":\"x/y\",\"n\":1\r\nb\r\n.50,\"l\":[7]\r\n2\r\n}}\r\n0\r\n\r\n";
 
     fn get(source: Source) -> Option<Vec<u8>> {
-        Http::parse(RESPONSE)
+        Http::parse_reply(RESPONSE, false)
             .unwrap()
             .capture(&source)
             .unwrap()
             .map(|v| v.to_vec())
+    }
+
+    #[test]
+    fn only_the_upper_case_head_method_exists() {
+        assert_eq!(crate::policy::Method::Head.as_str(), "HEAD");
+        assert!(serde_json::from_str::<crate::policy::Method>("\"HEAD\"").is_ok());
+        assert!(serde_json::from_str::<crate::policy::Method>("\"head\"").is_err());
+        assert!(is_head_request(
+            b"HEAD / HTTP/1.1
+"
+        ));
+        assert!(!is_head_request(
+            b"head / HTTP/1.1
+"
+        ));
     }
 
     #[test]
@@ -1004,7 +1030,7 @@ Transfer-Encoding: chunked\r\n\r\n\
             (b"HTTP/1.1 200 OK\r\nX: a\r\n b\r\n\r\n", "folded header"),
         ] {
             assert_eq!(
-                Http::parse(bytes).map(|_| ()),
+                Http::parse_reply(bytes, false).map(|_| ()),
                 Err(Error::ResponseInvalid { rule }),
                 "{rule}"
             );
@@ -1013,7 +1039,9 @@ Transfer-Encoding: chunked\r\n\r\n\
 
     #[test]
     fn hands_back_the_decoded_response() {
-        let response = Http::parse(RESPONSE).unwrap().into_response(vec![3]);
+        let response = Http::parse_reply(RESPONSE, false)
+            .unwrap()
+            .into_response(vec![3]);
         assert_eq!(response.status(), 401);
         assert_eq!(response.body(), br#"{"a":{"b":"x/y","n":1.50,"l":[7]}}"#);
         assert!(response.header("transfer-encoding").is_none());

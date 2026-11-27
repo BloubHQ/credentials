@@ -214,9 +214,7 @@ fn request(wire: &[u8]) -> Result<Request<'_>, H2Error> {
             continue;
         }
         if name == b"content-length" {
-            length = core::str::from_utf8(value)
-                .ok()
-                .and_then(|v| v.parse::<usize>().ok());
+            length = engine::encoding::digits::<usize>(value);
         }
         if CONNECTION_FIELDS.contains(&name.as_slice()) || (name == b"te" && value != b"trailers") {
             continue;
@@ -288,13 +286,8 @@ pub fn check_fields(fields: Vec<hpack::Field>, trailers: bool) -> Result<Checked
             ));
         }
         if name == b"content-length" {
-            let text = core::str::from_utf8(&value).map_err(|_| protocol("content-length"))?;
-            if text.is_empty() || !text.bytes().all(|b| b.is_ascii_digit()) {
-                return Err(protocol("content-length"));
-            }
-            let n = text
-                .parse::<u64>()
-                .map_err(|_| protocol("content-length"))?;
+            let n = engine::encoding::digits::<u64>(&value)
+                .ok_or_else(|| protocol("content-length"))?;
             if length.is_some_and(|l| l != n) {
                 return Err(protocol("content-length given twice"));
             }
@@ -349,6 +342,8 @@ pub struct Conn<S: Io> {
     phase: Phase,
     data_len: u64,
     length: Option<u64>,
+    /// The request is a `HEAD`: its response has no body.
+    head_request: bool,
     /// HTTP/1.1 bytes of the response not yet handed out.
     out: Vec<u8>,
     io_timeout: Duration,
@@ -416,6 +411,7 @@ impl<S: Io> Conn<S> {
             phase: Phase::Head,
             data_len: 0,
             length: None,
+            head_request: engine::response::is_head_request(wire),
             out: Vec::new(),
             io_timeout,
             deadline,
@@ -746,7 +742,13 @@ impl<S: Io> Conn<S> {
                 lines(&mut self.out, &checked.fields);
                 self.out
                     .extend_from_slice(b"transfer-encoding: chunked\r\n\r\n");
-                self.length = checked.length;
+                // A response to HEAD and any 204 or 304 has no body, whatever its length says
+                // (RFC 9113 section 8.1.1): a DATA frame on it is refused.
+                self.length = if self.head_request || status == 204 || status == 304 {
+                    Some(0)
+                } else {
+                    checked.length
+                };
                 self.phase = Phase::Body;
                 if end_stream {
                     self.finish(&[])?;
@@ -927,6 +929,36 @@ mod tests {
             run(server).unwrap(),
             "HTTP/1.1 200 \r\ncontent-type: application/grpc\r\ntransfer-encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\ngrpc-status: 0\r\n\r\n"
         );
+    }
+
+    #[test]
+    fn head_204_and_304_have_no_body_whatever_their_length_says() {
+        let head_wire = b"HEAD /f HTTP/1.1\r\nHost: api.example.com\r\nContent-Length: 0\r\n\r\n";
+        let empty = "HTTP/1.1 200 \r\ntransfer-encoding: chunked\r\n\r\n0\r\n\r\n";
+        let mut server = settings();
+        server.extend(head(
+            &[(b":status", b"200"), (b"content-length", b"12")],
+            END_STREAM,
+        ));
+        let out = exchange_scripted(&server, head_wire, 1 << 20).unwrap();
+        assert_eq!(String::from_utf8(out).unwrap(), empty);
+        // A DATA frame after the head of such a response is refused.
+        server.truncate(settings().len());
+        server.extend(head(&[(b":status", b"200"), (b"content-length", b"1")], 0));
+        server.extend(frame(DATA, END_STREAM, 1, b"x"));
+        assert!(matches!(
+            exchange_scripted(&server, head_wire, 1 << 20),
+            Err(H2Error::Protocol(_))
+        ));
+        for status in [&b"204"[..], b"304"] {
+            let mut server = settings();
+            server.extend(head(
+                &[(b":status", status), (b"content-length", b"7")],
+                END_STREAM,
+            ));
+            let out = run(server).unwrap();
+            assert!(out.ends_with("\r\n\r\n0\r\n\r\n"), "{out}");
+        }
     }
 
     #[test]

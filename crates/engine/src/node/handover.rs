@@ -295,7 +295,7 @@ impl<S: LogSink, C: Clock> Node<S, C> {
     /// with the same successor, it hands back the same [`HandOver`] (one that did not arrive);
     /// with another, it fails with [`Error::HandedOver`].
     pub fn hand_over(&self, successor: &Successor) -> Result<HandOver> {
-        let now = self.clock.now_ms();
+        let now = self.now()?;
         let mut guard = self.lock()?;
         let state = &mut *guard;
         if let Some(done) = &state.handed_over {
@@ -435,7 +435,7 @@ impl<S: LogSink, C: Clock> Node<S, C> {
                 return Err(invalid("an owner is carried twice"));
             }
         }
-        let now = self.clock.now_ms();
+        let now = self.now()?;
         let mut guard = self.lock()?;
         let state = &mut *guard;
         if !state.log.is_empty()

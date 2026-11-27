@@ -1601,7 +1601,12 @@ impl Policy {
         var_ok: fn(Var) -> bool,
         after_handshake: bool,
     ) -> Result<Template> {
-        let template = Template::parse(text).map_err(|_| Error::policy(at, "template syntax"))?;
+        let template = Template::parse(text).map_err(|e| match e {
+            Error::TemplateSyntax { offset } => {
+                Error::policy(format!("{at} (byte {offset})"), "template syntax")
+            }
+            _ => Error::policy(at, "template syntax"),
+        })?;
         if !after_handshake && template.calls(crate::template::Func::TlsExporter) {
             return Err(Error::policy(
                 at,

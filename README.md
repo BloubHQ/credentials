@@ -104,6 +104,10 @@ cargo test --workspace
 GITHUB_TOKEN=ghp_... cargo run -p transport --example github_user
 ```
 
+In PowerShell, set the token first: `$env:GITHUB_TOKEN = "ghp_..."; cargo run -p transport
+--example github_user`. The CLI walkthrough has a
+[PowerShell section](crates/cli/README.md#windows-powershell).
+
 The [`github_user`](crates/transport/examples/github_user.rs) example runs every part in one
 process: the device seals a token into a record, signs a policy that allows only
 `GET https://api.github.com/user`, and grants a node; an application signs a call; the node

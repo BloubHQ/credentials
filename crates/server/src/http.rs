@@ -141,10 +141,8 @@ fn parse_head(head: &[u8]) -> Result<Head, ReadError> {
             ));
         }
         if name.eq_ignore_ascii_case("content-length") {
-            let n: usize = value
-                .trim()
-                .parse()
-                .map_err(|_| bad("Content-Length is not a number"))?;
+            let n: usize = engine::encoding::digits(value.trim().as_bytes())
+                .ok_or_else(|| bad("Content-Length is not a number"))?;
             if content_length.is_some_and(|old| old != n) {
                 return Err(bad("conflicting Content-Length headers"));
             }
@@ -250,4 +248,27 @@ pub fn respond<C: Connection>(stream: &mut C, status: u16, body: &[u8]) {
     let _ = stream.shutdown_write();
     let _ = stream.set_read_timeout(Some(Duration::from_millis(200)));
     let _ = io::copy(&mut Read::by_ref(stream).take(256 * 1024), &mut io::sink());
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::panic)]
+mod tests {
+    use super::*;
+
+    fn length(value: &str) -> Result<Option<usize>, ReadError> {
+        let head = format!("POST /call HTTP/1.1\r\nHost: n\r\nContent-Length: {value}");
+        parse_head(head.as_bytes()).map(|h| h.content_length)
+    }
+
+    #[test]
+    fn a_content_length_is_digits_only() {
+        assert!(matches!(length("5"), Ok(Some(5))));
+        assert!(matches!(length(" 5 "), Ok(Some(5))));
+        for bad in ["+5", "-5", "5a", "", "0x5", "5 5"] {
+            match length(bad) {
+                Err(ReadError::Reply(400, _)) => {}
+                _ => panic!("{bad:?} was taken as a length"),
+            }
+        }
+    }
 }

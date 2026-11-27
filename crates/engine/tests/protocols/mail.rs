@@ -79,7 +79,8 @@ fn starttls_submission_signs_in_and_sends_a_dot_stuffed_message() {
         !holds(&fake.plain_written, PASSWORD),
         "nothing secret in the clear"
     );
-    assert_eq!(fake.plain_written, b"EHLO localhost\r\nSTARTTLS\r\n");
+    // An address literal: a strict HELO check refuses `localhost`.
+    assert_eq!(fake.plain_written, b"EHLO [127.0.0.1]\r\nSTARTTLS\r\n");
     let (from, to, data) = &fake.peer.messages[0];
     assert_eq!(from, b"<me@example.com>");
     assert_eq!(to, &[b"<you@example.org>".to_vec()]);

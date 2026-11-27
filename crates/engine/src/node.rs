@@ -94,6 +94,13 @@ pub const MAX_FUTURE_MS: u64 = 60 * 1000;
 pub trait Clock {
     /// Now, Unix milliseconds.
     fn now_ms(&self) -> u64;
+
+    /// Now, Unix milliseconds, or `None` when the clock reads before the Unix epoch. A node
+    /// reads its clock with this and takes no act while it fails ([`Error::ClockBeforeEpoch`]):
+    /// a time read as 0 would make every expiry lie in the future. The default never fails.
+    fn checked_now_ms(&self) -> Option<u64> {
+        Some(self.now_ms())
+    }
 }
 
 /// Now by the system clock, Unix milliseconds: the time unit of every `_ms` value.
@@ -106,10 +113,14 @@ pub struct SystemClock;
 
 impl Clock for SystemClock {
     fn now_ms(&self) -> u64 {
+        self.checked_now_ms().unwrap_or(0)
+    }
+
+    fn checked_now_ms(&self) -> Option<u64> {
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
+            .ok()
             .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
-            .unwrap_or(0)
     }
 }
 
@@ -489,6 +500,8 @@ pub struct Node<S: LogSink, C: Clock> {
     /// Set, under the lock of `state`, when `State::handed_over` is: live loops read it
     /// without taking that lock. It never goes back to false, as `handed_over` never does.
     handed_over: AtomicBool,
+    /// The slots held for operations that may wait, while they run.
+    holds: park::Holds,
 }
 
 impl<S: LogSink, C: Clock> Node<S, C> {
@@ -597,7 +610,9 @@ impl<S: LogSink, C: Clock> Node<S, C> {
         clock: C,
     ) -> Self {
         let public = log.public_key();
-        let started_ms = clock.now_ms();
+        // A clock before the epoch at the start refuses, until a restart, every grant and
+        // authorization: none was made after this start.
+        let started_ms = clock.checked_now_ms().unwrap_or(u64::MAX);
         Self {
             public,
             identity: NodeIdentity {
@@ -609,6 +624,7 @@ impl<S: LogSink, C: Clock> Node<S, C> {
             clock,
             live: live::Slots::default(),
             handed_over: AtomicBool::new(false),
+            holds: park::Holds::default(),
             state: Mutex::new(State {
                 log,
                 sink,
@@ -786,6 +802,11 @@ impl<S: LogSink, C: Clock> Node<S, C> {
         Self::restore(key, sink, clock, entries)
     }
 
+    /// Now by the node's clock; fails while the clock reads before the Unix epoch.
+    fn now(&self) -> Result<u64> {
+        self.clock.checked_now_ms().ok_or(Error::ClockBeforeEpoch)
+    }
+
     /// The state, or [`Error::StateLost`] once a panic poisoned its lock. A panic part way
     /// through a change (in a sink, a dependency, an overflow) leaves sequence numbers,
     /// floors or counts half updated; the node is halted for good then, as a failed log
@@ -843,7 +864,7 @@ impl<S: LogSink, C: Clock> Node<S, C> {
 
     /// The head of the chain now, signed.
     pub fn checkpoint(&self) -> Result<SignedHead> {
-        let now = self.clock.now_ms();
+        let now = self.now()?;
         self.lock()?.log.checkpoint(now)
     }
 
@@ -881,7 +902,7 @@ impl<S: LogSink, C: Clock> Node<S, C> {
         for pin in &terms.pins {
             check_name(&pin.record_id)?;
         }
-        let now = self.clock.now_ms();
+        let now = self.now()?;
         let expires_ms = terms.expires_ms.min(now.saturating_add(MAX_GRANT_MS));
         if expires_ms <= now {
             return Err(Error::GrantExpired);
@@ -934,7 +955,7 @@ impl<S: LogSink, C: Clock> Node<S, C> {
                 rule: "endorsement for another node",
             });
         }
-        let now = self.clock.now_ms();
+        let now = self.now()?;
         let owner = endorsement.owner.as_str();
         let mut state = self.lock()?;
         state.grant_of(owner, now)?;
@@ -962,7 +983,7 @@ impl<S: LogSink, C: Clock> Node<S, C> {
                 rule: "retirement for another node",
             });
         }
-        let now = self.clock.now_ms();
+        let now = self.now()?;
         let owner = retirement.owner.as_str();
         let mut state = self.lock()?;
         let devices = state.devices(owner);
@@ -995,7 +1016,7 @@ impl<S: LogSink, C: Clock> Node<S, C> {
             });
         }
         revocation.verify()?;
-        let now = self.clock.now_ms();
+        let now = self.now()?;
         let owner = revocation.owner.as_str();
         let mut state = self.lock()?;
         if !state.devices(owner).contains(&revocation.device) {
@@ -1024,7 +1045,7 @@ impl<S: LogSink, C: Clock> Node<S, C> {
     /// Raises the lowest generation of a record this node accepts, as a device of the owner
     /// signed.
     pub fn pin(&self, pin: &Pin) -> Result<()> {
-        let now = self.clock.now_ms();
+        let now = self.now()?;
         let mut state = self.lock()?;
         state.grant_of(&pin.owner, now)?;
         pin.verify(&state.devices(&pin.owner))?;
@@ -1229,7 +1250,7 @@ impl<S: LogSink, C: Clock> Node<S, C> {
             .raise(&record.owner, &record.id, record.generation);
         // A typed item is checked against its kind each time, with the clock: an expired card
         // or a value that no longer equals its pin is refused before anything is logged.
-        crate::item::check_values(&record.policy.policy, &fields, Some(self.clock.now_ms()))?;
+        crate::item::check_values(&record.policy.policy, &fields, Some(self.now()?))?;
         Ok(fields)
     }
 
@@ -1238,7 +1259,7 @@ impl<S: LogSink, C: Clock> Node<S, C> {
     /// Any caller the policy lists may ask; the authorization is signed for the operation
     /// [`DESCRIBE`] with the payload [`Payload::Describe`]. The node logs it like a use.
     pub fn describe(&self, record: &Record, auth: &Authorization) -> Result<Description> {
-        let now = self.clock.now_ms();
+        let now = self.now()?;
         let delegated = self.delegation_of(record, auth)?;
         let (policy, _, checked) = self.check_auth(
             record,
@@ -1391,7 +1412,7 @@ impl<S: LogSink, C: Clock> Node<S, C> {
                 rule: "input larger than 1 MiB",
             });
         }
-        let now = self.clock.now_ms();
+        let now = self.now()?;
         let delegated = self.delegation_of(record, auth)?;
         let (policy, operation, checked) =
             self.check_call(record, delegated.as_deref(), name, auth, &payload, now)?;
@@ -1503,10 +1524,15 @@ impl<S: LogSink, C: Clock> Node<S, C> {
             start: 0,
             last: None,
             log_seqs: Vec::new(),
+            reserved: None,
         };
-        // An operation that may wait needs room to wait in, checked before anything is sent.
+        // An operation that may wait needs room to wait in, held before anything is sent.
         if operation.parks() {
-            self.lock()?.parked.room(&record.owner, now)?;
+            run.reserved = Some(
+                self.lock()?
+                    .parked
+                    .reserve(&self.holds, &record.owner, now)?,
+            );
         }
         // The owner's approval and the spending limits, before anything is sent.
         if let Some(pending) = self.gate(&mut run, payload, &input)? {
@@ -1993,7 +2019,8 @@ impl<S: LogSink, C: Clock> Node<S, C> {
             }
         };
         run.tainted.extend(built.tainted);
-        let parsed = Http::parse(&bytes).and_then(|http| {
+        let head = crate::response::is_head_request(built.wire.expose());
+        let parsed = Http::parse_reply(&bytes, head).and_then(|http| {
             if send.grpc {
                 live::grpc_answer(http)
             } else {
@@ -2437,6 +2464,8 @@ struct Run<'a> {
     last: Option<Http>,
     /// The log entries of the HTTPS requests so far.
     log_seqs: Vec<u64>,
+    /// The slot held for the operation to wait in, taken before anything is sent.
+    reserved: Option<park::Reservation<'a>>,
 }
 
 /// How the steps of an operation ended: done, or waiting at the `await` of this index.

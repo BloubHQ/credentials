@@ -604,6 +604,61 @@ fn policy_check_names_the_rule() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+#[test]
+fn json_with_a_byte_order_mark_is_read_and_utf16_names_the_fix() {
+    let dir = temp_dir("bom");
+    let policy = dir.join("policy.json");
+    let text = r#"{"fields": [{"name": "k", "secret": true}], "callers": [],
+        "operations": [{"name": "d", "steps": [{"do": "return", "template": "x"}]}]}"#;
+    // UTF-8 with a byte order mark, as `Set-Content -Encoding utf8` writes it.
+    let mut bom = vec![0xEF, 0xBB, 0xBF];
+    bom.extend_from_slice(text.as_bytes());
+    std::fs::write(&policy, &bom).unwrap();
+    // The document is read: the check gets as far as the rules (it has no caller).
+    let out = run(&["policy", "check", s(&policy)]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("policy invalid at callers"), "{stderr}");
+    // UTF-16LE with its mark, as `>` writes it in Windows PowerShell 5.1.
+    let mut utf16 = vec![0xFF, 0xFE];
+    utf16.extend(text.encode_utf16().flat_map(u16::to_le_bytes));
+    std::fs::write(&policy, &utf16).unwrap();
+    let out = run(&["policy", "check", s(&policy)]);
+    assert_eq!(out.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("UTF-16") && stderr.contains("--out"),
+        "{stderr}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn policy_errors_name_the_place_in_the_document() {
+    let dir = temp_dir("where");
+    let policy = dir.join("bad.json");
+    let check = |text: &str| {
+        std::fs::write(&policy, text).unwrap();
+        let out = run(&["policy", "check", s(&policy)]);
+        assert_eq!(out.status.code(), Some(1));
+        String::from_utf8_lossy(&out.stderr).into_owned()
+    };
+    // A caller key of 4 bytes: the message names the key.
+    let stderr = check(
+        r#"{"fields": [], "callers": [{"name": "app", "key": "AAAAAA", "operations": ["d"]}],
+            "operations": [{"name": "d", "steps": [{"do": "return", "template": "x"}]}]}"#,
+    );
+    assert!(stderr.contains("callers[0].key"), "{stderr}");
+    // A template that does not parse: the message says where in it.
+    let stderr = check(
+        r#"{"fields": [{"name": "k", "secret": true}], "callers": [],
+            "operations": [{"name": "d", "steps": [{"do": "return",
+                                                    "template": "ab{{ hex(sha257(k)) "}]}]}"#,
+    );
+    assert!(stderr.contains("template syntax"), "{stderr}");
+    assert!(stderr.contains("byte 2"), "{stderr}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A GET of /identity on a raw connection; the status, or None when no answer came in time.
 fn get_identity(port: u16, timeout: Duration) -> Option<u16> {
     let mut stream = TcpStream::connect(("127.0.0.1", port)).ok()?;
@@ -675,15 +730,28 @@ fn connections_beyond_the_cap_are_refused() {
     let slow: Vec<TcpStream> = (0..2).map(|_| slow_client(port)).collect();
     // The server counts a connection once it has accepted it; on a loaded host that can take
     // longer than a fixed pause, so the check is repeated until the cap is reached.
+    // A probe waits up to 3 s for its answer (a loaded host answers late) but never past the
+    // deadline, which is checked before each probe. The slow clients send nothing after their
+    // head, so the server drops them after `IO_TIMEOUT` (5 s): the cap holds about that long.
+    let probe = |deadline: Instant| {
+        let left = deadline.saturating_duration_since(Instant::now());
+        get_identity(port, left.min(Duration::from_secs(3)))
+    };
     let deadline = Instant::now() + Duration::from_secs(5);
-    while get_identity(port, Duration::from_secs(3)) != Some(503) {
+    loop {
         assert!(Instant::now() < deadline, "the cap was not reached");
+        if probe(deadline) == Some(503) {
+            break;
+        }
         std::thread::sleep(Duration::from_millis(100));
     }
     drop(slow);
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while get_identity(port, Duration::from_secs(3)) != Some(200) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
         assert!(Instant::now() < deadline, "the slots were not freed");
+        if probe(deadline) == Some(200) {
+            break;
+        }
         std::thread::sleep(Duration::from_millis(100));
     }
     let _ = std::fs::remove_dir_all(&dir);

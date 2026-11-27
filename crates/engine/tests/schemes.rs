@@ -1059,6 +1059,39 @@ fn acme_jws_with_jwk_kid_and_chained_nonces() {
     assert_eq!(checked, 2);
 }
 
+/// A server that answers `HEAD /acme/new-nonce` with the `Content-Length` a GET would have
+/// (as static file servers do), and a `204` and a `304` that carry one: none of them has a
+/// body (RFC 9112 section 6.3).
+#[test]
+fn head_204_and_304_answers_have_no_body_whatever_their_length_says() {
+    let clock = TestClock::at(NOW);
+    let s = setup(
+        &clock,
+        vec![FieldSpec::secret("key")],
+        vec![doc("acme-new-account")],
+        &[("key", &unhex(P256_KEY))],
+    );
+    let body = br#"{"termsOfServiceAgreed":true}"#;
+    for (status, last) in [("204 No Content", 204), ("304 Not Modified", 304)] {
+        let mut server = FakeServer::new(&[
+            b"HTTP/1.1 200 OK\r\nReplay-Nonce: nonce-A\r\nContent-Length: 12\r\n\r\n".to_vec(),
+            format!("HTTP/1.1 {status}\r\nContent-Length: 7\r\n\r\n").into_bytes(),
+        ]);
+        let req = request(
+            Method::Post,
+            "acme.example.com",
+            443,
+            "/acme/new-account",
+            body,
+        );
+        let response = call(&s, "acme-new-account", Some(&req), &mut server)
+            .result
+            .unwrap();
+        assert_eq!(response.status(), last);
+        assert!(response.body().is_empty());
+    }
+}
+
 /// JWS beyond ACME: RFC 7515 appendix A.1 (HS256, the header and payload with their CRLFs)
 /// and RFC 8037 appendix A.4 (EdDSA with Ed25519), whole compact serializations byte for
 /// byte, from operations with no connection.
