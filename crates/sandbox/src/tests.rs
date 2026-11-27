@@ -391,6 +391,28 @@ fn memory_is_wiped_on_every_path() {
     }
 }
 
+/// A panic inside wasmi (#95: these two bytes as a script, given to the engine module past the
+/// UTF-8 check of `run_script`) ends the run with `Interpreter`, and the memory, which held the
+/// inputs, is still wiped afterwards through the store.
+#[test]
+fn memory_is_wiped_after_a_panic_inside_wasmi() {
+    let module = library(JS).unwrap();
+    let limits = Limits {
+        fuel: 40_000_000,
+        memory: 16 * 1024 * 1024,
+        time: Duration::from_secs(2),
+        ..Limits::default()
+    };
+    let mut seen = None;
+    let result = run_observed(module, "run", &[b"\n\xb0", b"f"], limits, &mut |memory| {
+        seen = memory.map(<[u8]>::to_vec);
+    });
+    assert_eq!(result.map(|_| ()), Err(Error::Interpreter));
+    let memory = seen.expect("the run had a memory");
+    assert!(!memory.is_empty(), "the memory has pages");
+    assert!(memory.iter().all(|b| *b == 0), "the memory is not wiped");
+}
+
 #[test]
 fn stack_overflow_traps() {
     let module = wasm(
