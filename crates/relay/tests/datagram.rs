@@ -16,8 +16,8 @@ use std::time::{Duration, Instant};
 use engine::egress::Stream;
 use engine::readbuf::ReadBuf;
 use relay::datagram::{
-    self, Egress, RelayDatagramConnector, read_datagram, read_egress_request, take_datagram,
-    write_datagram,
+    self, Egress, RelayDatagramConnector, peek_datagram, read_datagram, read_egress_request,
+    take_datagram, write_datagram,
 };
 use relay::{RelayError, answer_tunnel};
 use transport::Socket;
@@ -40,6 +40,10 @@ fn frames_round_trip_and_bad_lengths_are_refused() {
     assert_eq!(take_datagram(&mut pending).unwrap().unwrap(), b"one");
     assert_eq!(take_datagram(&mut pending).unwrap().unwrap().len(), 300);
     assert!(pending.pending().is_empty());
+    // Borrowed: the datagram of the first frame, without taking it.
+    assert_eq!(peek_datagram(&wire).unwrap(), Some(&b"one"[..]));
+    assert_eq!(peek_datagram(&wire[..4]).unwrap(), None);
+    assert!(peek_datagram(&[0, 0]).is_err());
     // An empty datagram, and one too long, are not frames.
     assert!(write_datagram(&mut Vec::new(), b"").is_err());
     assert!(write_datagram(&mut Vec::new(), &vec![0u8; datagram::MAX_DATAGRAM + 1]).is_err());

@@ -111,16 +111,22 @@ fn frame_len(pending: &[u8]) -> io::Result<Option<usize>> {
     Ok(Some(len))
 }
 
-/// Takes a whole frame off the front of `pending`, when one is there.
-pub fn take_datagram(pending: &mut ReadBuf) -> io::Result<Option<Vec<u8>>> {
-    let Some(len) = frame_len(pending.pending())? else {
+/// The datagram of the whole frame at the start of `pending`, when one is there, borrowed:
+/// the frame is `2 + datagram.len()` bytes, for the caller to skip once it is done with it.
+pub fn peek_datagram(pending: &[u8]) -> io::Result<Option<&[u8]>> {
+    let Some(len) = frame_len(pending)? else {
         return Ok(None);
     };
-    if pending.pending().len() < 2 + len {
+    Ok(pending.get(2..2 + len))
+}
+
+/// Takes a whole frame off the front of `pending`, when one is there.
+pub fn take_datagram(pending: &mut ReadBuf) -> io::Result<Option<Vec<u8>>> {
+    let Some(datagram) = peek_datagram(pending.pending())?.map(<[u8]>::to_vec) else {
         return Ok(None);
-    }
-    pending.skip(2);
-    Ok(Some(std::mem::take(&mut *pending.take(len))))
+    };
+    pending.skip(2 + datagram.len());
+    Ok(Some(datagram))
 }
 
 /// Reads one frame; `None` at the end of the stream before a frame starts.
@@ -309,10 +315,13 @@ pub fn serve_datagrams(
         if done.load(Ordering::SeqCst) {
             break Ok(());
         }
-        match take_datagram(&mut pending) {
+        // Sent straight from the buffer: no copy of each datagram.
+        match peek_datagram(pending.pending()) {
             Ok(Some(datagram)) => {
                 // A datagram the network drops is the node's to send again.
-                let _ = udp.send(&datagram);
+                let _ = udp.send(datagram);
+                let frame = 2 + datagram.len();
+                pending.skip(frame);
                 if let Ok(mut at) = last.lock() {
                     *at = Instant::now();
                 }
