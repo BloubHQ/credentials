@@ -434,9 +434,14 @@ fn fuel_and_memory_exhaustion_stop_the_module() {
             replies: VecDeque::from([http_200(&module)]),
             ..FakeTransport::default()
         };
-        assert_eq!(
-            call(&s, &mut transport).result.unwrap_err(),
-            Error::Sandbox(expected)
+        let error = call(&s, &mut transport).result.unwrap_err();
+        // The loop runs 10^9 fuel (1.25 s in release on the measured host); a debug build
+        // among parallel tests may reach the 5 s time limit first.
+        assert!(
+            error == Error::Sandbox(expected)
+                || (expected == sandbox::Error::Fuel
+                    && error == Error::Sandbox(sandbox::Error::Time)),
+            "{error:?}"
         );
         assert_eq!(transport.sent.len(), 1, "the login never went out");
     }
