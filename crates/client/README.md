@@ -55,6 +55,7 @@ Rust names; Swift and Kotlin use the same names in camel case (`verifyNode`), Ja
 | `policy_json_schema()` | `String` | The JSON Schema of the policy format |
 | `item_kinds()` | `String` | The reviewed kinds of item |
 | `sign_kind(device_key, kind_json)` | signed kind JSON | A custom kind of item |
+| `approval_lines(summary_json)` | `[String]` | What to show the owner before `approve`, one line per field of the summary (or of the pending reply): a delegated call first says the caller acts for a delegate, not for the owner |
 | `approval_hash(summary_json)` | `String` | The SHA-256 an approval signs (of a summary, or of the pending reply that carries it) |
 | `approve(device_key, identity_json, summary_json)` | approval JSON | Approves a summary that node built (or the `approval_required` reply as the node sent it), while it is open; for `POST /approve` |
 | `answer_challenge(device_key, owner, identity_json, pending_json, code)` | sealed answer JSON | Answers a code challenge the node handed back, signed by the device and sealed to the node; the code is erased once sealed; for `POST /answer` |
@@ -73,7 +74,9 @@ then the app resumes:
 ```kotlin
 val reply = http.post("$url/call", signCall(callerKey, "app", identity, record, "pay", """{"kind": "http"}"""))
 val pending = reply.ok                                     // {"kind": "approval_required", "id", "summary"}
-// On the owner's device, after showing the summary:
+// On the owner's device: show every line (a delegated call says whom the caller acts for),
+// then approve.
+approvalLines(pending).forEach { ui.addLine(it) }
 http.post("$url/approve", approve(deviceKey, identity, pending))
 // Back in the app:
 http.post("$url/call", signResumeCall(callerKey, "app", identity, record, "pay", pending.id))

@@ -801,6 +801,64 @@ fn a_typed_fill_is_made_from_roles() {
 }
 
 #[test]
+fn approval_lines_show_every_field_and_a_delegate_first() {
+    use engine::approval::{Amount, ApprovalSummary};
+    let now = now_ms();
+    let mut summary = ApprovalSummary {
+        id: [7; 16],
+        node: a_node().identity().log_key,
+        owner: "alice".into(),
+        record_id: "card".into(),
+        generation: 3,
+        caller: "agent".into(),
+        delegate: None,
+        operation: "pay".into(),
+        destination: Some("pay.example:443".into()),
+        origin: Some("https://shop.example".into()),
+        amount: Some(Amount {
+            value: "12.50".into(),
+            currency: "EUR".into(),
+        }),
+        item: None,
+        lines: vec!["Order 4711".into()],
+        created_ms: now - 1000,
+        expires_ms: now + 60_000,
+    };
+    let lines = approval_lines(serde_json::to_string(&summary).unwrap()).unwrap();
+    assert_eq!(
+        lines,
+        [
+            "agent asks to run pay",
+            "Item: card (generation 3)",
+            "Connects to: pay.example:443",
+            "For: https://shop.example",
+            "Amount: 12.50 EUR",
+            "Order 4711",
+        ]
+    );
+    // Delegated: the first line says whom the caller acts for, also from the pending reply.
+    summary.delegate = Some("bob".into());
+    let pending = serde_json::json!({
+        "kind": "approval_required",
+        "id": URL_SAFE_NO_PAD.encode(summary.id),
+        "summary": summary,
+    });
+    let lines = approval_lines(pending.to_string()).unwrap();
+    assert_eq!(
+        lines[0],
+        "Delegated: agent acts for bob, whom you delegated to, not for you"
+    );
+    assert_eq!(lines[1], "agent asks to run pay");
+    assert_eq!(lines.len(), 7);
+    // A malformed summary shows nothing.
+    summary.delegate = Some("bob/agent".into());
+    assert_eq!(
+        code(approval_lines(serde_json::to_string(&summary).unwrap())),
+        "refused"
+    );
+}
+
+#[test]
 fn an_approval_is_of_one_summary_for_one_node() {
     use engine::approval::{Amount, Approval, ApprovalSummary};
     let node = a_node();
