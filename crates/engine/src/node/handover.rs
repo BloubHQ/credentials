@@ -296,7 +296,7 @@ impl<S: LogSink, C: Clock> Node<S, C> {
     /// with another, it fails with [`Error::HandedOver`].
     pub fn hand_over(&self, successor: &Successor) -> Result<HandOver> {
         let now = self.clock.now_ms();
-        let mut guard = self.lock();
+        let mut guard = self.lock()?;
         let state = &mut *guard;
         if let Some(done) = &state.handed_over {
             return match &done.hand_over {
@@ -354,6 +354,8 @@ impl<S: LogSink, C: Clock> Node<S, C> {
         state.handed_over = Some(Done {
             hand_over: Some((successor.identity, hand_over.clone())),
         });
+        self.handed_over
+            .store(true, std::sync::atomic::Ordering::Release);
         // The user keys stay only in the package now; operations that wait are dropped.
         let owners: Vec<String> = state.grants.keys().cloned().collect();
         state.grants.clear();
@@ -434,7 +436,7 @@ impl<S: LogSink, C: Clock> Node<S, C> {
             }
         }
         let now = self.clock.now_ms();
-        let mut guard = self.lock();
+        let mut guard = self.lock()?;
         let state = &mut *guard;
         if !state.log.is_empty()
             || !state.owners.is_empty()
@@ -517,7 +519,11 @@ impl<S: LogSink, C: Clock> Node<S, C> {
     }
 
     /// True once this node handed over to a successor.
+    ///
+    /// It reads a flag set under the state lock with the hand-over itself, without taking
+    /// that lock: the live loops ask every few milliseconds, and a write to the log (under
+    /// the lock) does not hold them up. Every write still checks the state under the lock.
     pub fn is_handed_over(&self) -> bool {
-        self.lock().handed_over.is_some()
+        self.handed_over.load(std::sync::atomic::Ordering::Acquire)
     }
 }

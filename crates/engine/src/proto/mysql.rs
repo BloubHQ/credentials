@@ -769,6 +769,50 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
     use super::*;
 
+    /// 64 KiB of 10-byte packets (a 4-byte header, 6 bytes of payload) in one read.
+    fn small_packets() -> (usize, Vec<u8>) {
+        let count = 64 * 1024 / 10;
+        let mut bytes = Vec::with_capacity(count * 10);
+        for i in 0..count {
+            bytes.extend_from_slice(&[6, 0, 0, i as u8]);
+            bytes.extend_from_slice(b"abcdef");
+        }
+        (count, bytes)
+    }
+
+    /// Parses every packet of `bytes`; the bytes the buffer moved.
+    fn parse_all(count: usize, bytes: &[u8]) -> u64 {
+        use crate::proto::io::testing::{Fed, wide};
+        let mut stream = Fed(std::collections::VecDeque::from([bytes.to_vec()]));
+        let mut io = Io::new(&mut stream, wide());
+        for _ in 0..count {
+            let (_, payload) = packet(&mut io).unwrap();
+            assert_eq!(payload.len(), 6);
+        }
+        assert!(io.buffered().is_empty());
+        io.copied
+    }
+
+    #[test]
+    fn packets_parse_in_linear_copies() {
+        let (count, bytes) = small_packets();
+        let copied = parse_all(count, &bytes);
+        // Each byte is copied out once, plus at most one compaction of the buffer.
+        assert!(copied <= 2 * bytes.len() as u64, "copied {copied} bytes");
+    }
+
+    /// `cargo test --release -p engine --lib -- --ignored --nocapture measure_`
+    #[test]
+    #[ignore = "a measurement, run in release"]
+    fn measure_mysql_small_packets() {
+        let (count, bytes) = small_packets();
+        let (us, copied) = crate::proto::io::testing::median_us(9, || parse_all(count, &bytes));
+        println!(
+            "mysql: {count} packets in {} bytes: median {us} us, {copied} bytes copied",
+            bytes.len()
+        );
+    }
+
     #[test]
     fn scramble_is_the_documented_one() {
         // Computed independently: SHA256("pw") XOR SHA256(SHA256(SHA256("pw")) || nonce).

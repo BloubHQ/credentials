@@ -7,6 +7,22 @@ before 1.0, minor versions may break formats and APIs.
 
 ### Changed
 
+- **Protocol reads are linear.** `proto::io::Io::take` copied every byte left in the read
+  buffer on each take; MySQL packets and AMQP 1.0 frames are read take by take, so 64 KiB of
+  small ones cost a copy of the buffer per packet. The buffer now keeps a read offset and is
+  compacted (the taken bytes wiped) only before more bytes are appended. Measured in release,
+  64 KiB of 10-byte packets in one read, median of 9 runs: MySQL 6,553 packets 65.9 ms and
+  429,457,408 bytes copied before, 1.9 ms and 65,530 bytes after; AMQP 1.0 6,553 frames
+  39.9 ms and 214,741,810 bytes before, 1.5 ms and 65,530 bytes after. The bounds (deadline,
+  idle time, bytes) are checked on every take, also when the bytes are buffered already.
+- Live loops (WebSockets, protocol relays, browser fills) read whether the node handed over
+  from a flag set with the hand-over under the state lock, without taking that lock every
+  10 ms; every write to the log still checks the hand-over under the lock.
+- Release builds check integer overflow (`overflow-checks = true`); `panic` stays `unwind`, so
+  a panic in a connection still ends only that connection. Measured (`cargo build --release
+  -p cli --locked`, Windows x86-64): `credentials.exe` 17,839,104 bytes before, 18,059,264
+  after (+220,160, +1.2%).
+
 - **An operation on a streaming call no longer waits.** A WebSocket, an SSH shell or
   forward, a live MQTT relay and an HTTPS operation whose response streams are refused
   `"approval": true`, a `payment` and an item kind that waits for approval when the policy is
@@ -777,6 +793,14 @@ before 1.0, minor versions may break formats and APIs.
 
 ### Security
 
+- A panic while the node's state is locked halts the node for good, as a failed log append
+  halts it, instead of serving on from a half-updated state (sequence numbers, floors, rate
+  counts): every act, checkpoint and reconcile fails with the new `Error::StateLost` (503 in
+  the server), `Node::is_halted` and the new `Node::is_state_lost` are true, live loops end,
+  and `Node::with_sink` still reads the sink so the node can restart from its log. A
+  poisoned lock of the connection counts refuses new connections (`StateLost`); a poisoned
+  transport pool lends no transport; a checkpoint hook that panicked halts the server's acts
+  (503), since what it stored is unknown.
 - An approved operation on a protocol connection (SSH and SFTP, PostgreSQL, MySQL, Redis,
   SMTP, IMAP, POP3, FTP, MQTT, AMQP 0-9-1 and 1.0) never went on: the caller's commands and
   messages were not kept with the waiting operation, so the resume failed

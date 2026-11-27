@@ -812,6 +812,7 @@ impl<S: LogSink, C: Clock> Node<S, C> {
             let text = core::str::from_utf8(&value)
                 .map_err(|_| refused("a fill value that is not UTF-8"))?;
             // A node that handed over acts no more: no value is typed after its chain ended.
+            self.alive()?;
             if self.is_handed_over() {
                 return Err(refused("the node handed over"));
             }

@@ -17,6 +17,7 @@
 //! A node is shared between threads: every method takes `&self`.
 
 use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -485,6 +486,9 @@ pub struct Node<S: LogSink, C: Clock> {
     state: Mutex<State<S>>,
     /// The connections open now (WebSockets, streamed responses).
     live: live::Slots,
+    /// Set, under the lock of `state`, when `State::handed_over` is: live loops read it
+    /// without taking that lock. It never goes back to false, as `handed_over` never does.
+    handed_over: AtomicBool,
 }
 
 impl<S: LogSink, C: Clock> Node<S, C> {
@@ -604,6 +608,7 @@ impl<S: LogSink, C: Clock> Node<S, C> {
             state_key,
             clock,
             live: live::Slots::default(),
+            handed_over: AtomicBool::new(false),
             state: Mutex::new(State {
                 log,
                 sink,
@@ -635,7 +640,7 @@ impl<S: LogSink, C: Clock> Node<S, C> {
         let state_key = crate::limits::StateKey::of(&key);
         let node = Self::with_log(Log::resume(key, entries)?, seal, state_key, sink, clock);
         {
-            let mut state = node.lock();
+            let mut state = node.lock()?;
             // Something signed in the very millisecond of the restart may predate it.
             state.started_ms = state.started_ms.saturating_add(1);
             for signed in entries {
@@ -734,6 +739,7 @@ impl<S: LogSink, C: Clock> Node<S, C> {
                     Event::HandOver { .. } => {
                         // The chain of this node ended there: it stays stopped.
                         state.handed_over = Some(handover::Done::restored(signed.hash()?));
+                        node.handed_over.store(true, Ordering::Release);
                     }
                     Event::Continue { .. } => {}
                     Event::Carry(carried) => {
@@ -780,10 +786,28 @@ impl<S: LogSink, C: Clock> Node<S, C> {
         Self::restore(key, sink, clock, entries)
     }
 
-    fn lock(&self) -> MutexGuard<'_, State<S>> {
-        self.state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    /// The state, or [`Error::StateLost`] once a panic poisoned its lock. A panic part way
+    /// through a change (in a sink, a dependency, an overflow) leaves sequence numbers,
+    /// floors or counts half updated; the node is halted for good then, as a failed log
+    /// append halts it, but no reconcile ends this halt: the node must restart from its log.
+    fn lock(&self) -> Result<MutexGuard<'_, State<S>>> {
+        self.state.lock().map_err(|_| Error::StateLost)
+    }
+
+    /// True once a panic interrupted a change of the state ([`Error::StateLost`]): the node
+    /// takes no act any more and must be restarted from its log.
+    pub fn is_state_lost(&self) -> bool {
+        self.state.is_poisoned()
+    }
+
+    /// Fails with [`Error::StateLost`] once the state was lost. Live loops ask it with
+    /// [`Node::is_handed_over`]; neither takes the state lock.
+    fn alive(&self) -> Result<()> {
+        if self.is_state_lost() {
+            Err(Error::StateLost)
+        } else {
+            Ok(())
+        }
     }
 
     /// The key that verifies the log of this node.
@@ -796,26 +820,33 @@ impl<S: LogSink, C: Clock> Node<S, C> {
         self.identity
     }
 
-    /// Runs `f` with the log sink.
+    /// Runs `f` with the log sink. It reaches the sink also after a panic lost the state
+    /// ([`Node::is_state_lost`]), so the entries can be read back to restart the node; the
+    /// node itself takes no act then.
     pub fn with_sink<R>(&self, f: impl FnOnce(&mut S) -> R) -> R {
-        f(&mut self.lock().sink)
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        f(&mut state.sink)
     }
 
     /// The head of the chain now, signed.
     pub fn checkpoint(&self) -> Result<SignedHead> {
         let now = self.clock.now_ms();
-        self.lock().log.checkpoint(now)
+        self.lock()?.log.checkpoint(now)
     }
 
-    /// True after an unconfirmed entry, until [`Node::reconcile`].
+    /// True after an unconfirmed entry, until [`Node::reconcile`], and for good once the
+    /// state was lost to a panic ([`Node::is_state_lost`]).
     pub fn is_halted(&self) -> bool {
-        self.lock().log.is_halted()
+        self.lock().map_or(true, |state| state.log.is_halted())
     }
 
     /// Ends a halt of the log; `stored` is the last entry the sink holds now. See
     /// [`Log::reconcile`].
     pub fn reconcile(&self, stored: Option<&SignedEntry>) -> Result<()> {
-        self.lock().log.reconcile(stored)
+        self.lock()?.log.reconcile(stored)
     }
 
     /// Opens a grant sealed to this node and takes the user key it carries.
@@ -846,7 +877,7 @@ impl<S: LogSink, C: Clock> Node<S, C> {
             return Err(Error::GrantExpired);
         }
         let owner = terms.owner.as_str();
-        let mut state = self.lock();
+        let mut state = self.lock()?;
         state.check_issued(owner, terms.issued_ms, now)?;
         // Once an owner has devices, a new one joins only through an endorsement by a known
         // device: the user key alone does not make a device known, or a retired device could
@@ -895,7 +926,7 @@ impl<S: LogSink, C: Clock> Node<S, C> {
         }
         let now = self.clock.now_ms();
         let owner = endorsement.owner.as_str();
-        let mut state = self.lock();
+        let mut state = self.lock()?;
         state.grant_of(owner, now)?;
         endorsement.verify(&state.devices(owner))?;
         state.check_issued(owner, endorsement.issued_ms, now)?;
@@ -923,7 +954,7 @@ impl<S: LogSink, C: Clock> Node<S, C> {
         }
         let now = self.clock.now_ms();
         let owner = retirement.owner.as_str();
-        let mut state = self.lock();
+        let mut state = self.lock()?;
         let devices = state.devices(owner);
         retirement.verify(&devices)?;
         if !devices.contains(&retirement.device) {
@@ -956,7 +987,7 @@ impl<S: LogSink, C: Clock> Node<S, C> {
         revocation.verify()?;
         let now = self.clock.now_ms();
         let owner = revocation.owner.as_str();
-        let mut state = self.lock();
+        let mut state = self.lock()?;
         if !state.devices(owner).contains(&revocation.device) {
             return Err(Error::GrantDenied);
         }
@@ -984,7 +1015,7 @@ impl<S: LogSink, C: Clock> Node<S, C> {
     /// signed.
     pub fn pin(&self, pin: &Pin) -> Result<()> {
         let now = self.clock.now_ms();
-        let mut state = self.lock();
+        let mut state = self.lock()?;
         state.grant_of(&pin.owner, now)?;
         pin.verify(&state.devices(&pin.owner))?;
         state.commit(
@@ -1030,7 +1061,7 @@ impl<S: LogSink, C: Clock> Node<S, C> {
         // The state of the owner (grant, floor) is told only to a caller whose signature
         // verifies; anyone else learns nothing about the owner's grants or records.
         let (grant, floor, devices) = {
-            let mut state = self.lock();
+            let mut state = self.lock()?;
             let grant = state
                 .grant_of(&record.owner, now)
                 .map(|g| g.user_key.clone());
@@ -1144,7 +1175,7 @@ impl<S: LogSink, C: Clock> Node<S, C> {
         who.update([0]);
         who.update(caller.key.to_b64().as_bytes());
         let who: [u8; 32] = who.finalize().into();
-        let mut state = self.lock();
+        let mut state = self.lock()?;
         if auth.time_ms < state.since(now) {
             // The replay cache of calls before a restart is gone.
             return Err(Error::CallerInvalid {
@@ -1184,7 +1215,7 @@ impl<S: LogSink, C: Clock> Node<S, C> {
 
     fn open(&self, record: &Record, keys: &RecordKeys) -> Result<Fields> {
         let fields = record.open(&keys.record)?;
-        self.lock()
+        self.lock()?
             .raise(&record.owner, &record.id, record.generation);
         // A typed item is checked against its kind each time, with the clock: an expired card
         // or a value that no longer equals its pin is refused before anything is logged.
@@ -1212,7 +1243,7 @@ impl<S: LogSink, C: Clock> Node<S, C> {
         }
         let fields = self.open(record, &checked.keys)?;
         let description = crate::item::describe(policy, &fields)?;
-        self.lock().commit(
+        self.lock()?.commit(
             now,
             (&record.owner, &record.id, &checked.caller),
             Event::Describe {
@@ -1465,7 +1496,7 @@ impl<S: LogSink, C: Clock> Node<S, C> {
         };
         // An operation that may wait needs room to wait in, checked before anything is sent.
         if operation.parks() {
-            self.lock().parked.room(&record.owner, now)?;
+            self.lock()?.parked.room(&record.owner, now)?;
         }
         // The owner's approval and the spending limits, before anything is sent.
         if let Some(pending) = self.gate(&mut run, payload, &input)? {
@@ -1901,7 +1932,7 @@ impl<S: LogSink, C: Clock> Node<S, C> {
             generation: updated.as_ref().unwrap_or(run.record).generation,
             detail: detail.seal(&run.user_key, &run.record.owner, &run.record.id)?,
         };
-        let (seq, confirmed) = self.lock().commit(now, run.who, event)?;
+        let (seq, confirmed) = self.lock()?.commit(now, run.who, event)?;
         Ok(live::Prepared {
             seq,
             confirmed,
@@ -2014,7 +2045,7 @@ impl<S: LogSink, C: Clock> Node<S, C> {
             generation: run.record.generation,
             detail: detail.seal(&run.user_key, &run.record.owner, &run.record.id)?,
         };
-        let (seq, confirmed) = self.lock().commit(now, who, event)?;
+        let (seq, confirmed) = self.lock()?.commit(now, who, event)?;
         let opened = match open.connection {
             Connection::Udp => crate::egress::open_datagrams(confirmed, transport, destination),
             Connection::Dtls => {
@@ -2162,7 +2193,7 @@ impl<S: LogSink, C: Clock> Node<S, C> {
                         generation: run.record.generation,
                         detail: detail.seal(&run.user_key, &run.record.owner, &run.record.id)?,
                     };
-                    self.lock().commit(run.now, run.who, event)?;
+                    self.lock()?.commit(run.now, run.who, event)?;
                     if let Some(expires_ms) = vended {
                         self.log_vend(run, expires_ms)?;
                     }
@@ -2185,13 +2216,15 @@ impl<S: LogSink, C: Clock> Node<S, C> {
             generation: run.record.generation,
             expires_ms,
         };
-        self.lock().commit(run.now, run.who, event).map(|_| ())
+        self.lock()?.commit(run.now, run.who, event).map(|_| ())
     }
 
     /// Records how an act ended. A failure halts the log, so the next act fails; the result of
     /// this one is already decided.
     fn done(&self, now: u64, who: (&str, &str, &str), of: u64, status: Option<u16>, ok: bool) {
-        let _ = self.lock().commit(now, who, Event::Done { of, status, ok });
+        if let Ok(mut state) = self.lock() {
+            let _ = state.commit(now, who, Event::Done { of, status, ok });
+        }
     }
 
     /// Logs the fields an operation changed and seals them into a new record.
@@ -2211,7 +2244,7 @@ impl<S: LogSink, C: Clock> Node<S, C> {
             generation,
             fields: core::mem::take(&mut run.captured.changed),
         };
-        let mut state = self.lock();
+        let mut state = self.lock()?;
         state.commit(run.now, run.who, event)?;
         state.raise(&record.owner, &record.id, generation);
         *updated = Some(next);

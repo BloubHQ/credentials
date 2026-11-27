@@ -318,6 +318,10 @@ pub enum Error {
     /// This node handed its state over to a successor: it takes no act any more.
     #[error("this node handed over to its successor and takes no act")]
     HandedOver,
+    /// A panic interrupted a change of the node's state, so what the state holds is unknown:
+    /// the node takes no act until it is restarted from its log ([`crate::node::Node::restore`]).
+    #[error("the node's state was lost to a panic; the node takes no act until it restarts")]
+    StateLost,
     /// A hand-over was refused: the package, its entry or the state of the node.
     #[error("hand-over refused: {rule}")]
     HandOverInvalid {

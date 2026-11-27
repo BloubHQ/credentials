@@ -151,17 +151,18 @@ pub(crate) struct Slot<'n> {
 }
 
 impl Slots {
-    fn counts(&self) -> std::sync::MutexGuard<'_, Counts> {
-        self.0
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    /// The counts, or [`Error::StateLost`] once a panic poisoned their lock: counts a panic
+    /// left half updated could let more connections open than the bounds allow, so no new
+    /// one opens then. The rest of the node goes on: the counts only bound connections.
+    fn counts(&self) -> Result<std::sync::MutexGuard<'_, Counts>> {
+        self.0.lock().map_err(|_| Error::StateLost)
     }
 
     /// Takes a slot for a connection of `caller` (its name in `policy`) on `owner`'s record,
     /// or fails with [`Error::StreamsFull`].
     pub(crate) fn take(&self, owner: &str, caller: &str, policy: &Policy) -> Result<Slot<'_>> {
         let caller = policy.caller(caller)?.key.to_b64();
-        let mut counts = self.counts();
+        let mut counts = self.counts()?;
         let owned = counts.owners.get(owner).copied().unwrap_or(0);
         let called = counts.callers.get(&caller).copied().unwrap_or(0);
         if counts.total >= MAX_STREAMS {
@@ -186,10 +187,12 @@ impl Slots {
 
 impl Drop for Slot<'_> {
     fn drop(&mut self) {
-        let mut counts = self.slots.counts();
-        counts.total = counts.total.saturating_sub(1);
-        release(&mut counts.owners, &self.owner);
-        release(&mut counts.callers, &self.caller);
+        // Poisoned counts are not used again, so there is nothing to give back to.
+        if let Ok(mut counts) = self.slots.counts() {
+            counts.total = counts.total.saturating_sub(1);
+            release(&mut counts.owners, &self.owner);
+            release(&mut counts.callers, &self.caller);
+        }
     }
 }
 
@@ -438,7 +441,9 @@ impl<S: LogSink, C: Clock> Node<S, C> {
             to_caller: meter.to_caller,
             duration_ms: meter.elapsed_ms(),
         };
-        let logged = self.lock().commit(self.clock.now_ms(), run.who, event);
+        let logged = self
+            .lock()
+            .and_then(|mut state| state.commit(self.clock.now_ms(), run.who, event));
         let end = end.map_err(|(_, error)| error)?;
         logged?;
         Ok(Closed {
@@ -636,6 +641,7 @@ impl<S: LogSink, C: Clock> Node<S, C> {
                 return Ok(End::of(reason, false));
             }
             // A node that handed over acts no more: its chain ended at the hand-over.
+            self.alive()?;
             if self.is_handed_over() {
                 return Ok(End::of("handed_over", false));
             }
@@ -932,6 +938,7 @@ impl<S: LogSink, C: Clock> Node<S, C> {
             }
             // A node that handed over acts no more: no frame of the caller is written after
             // its chain ended.
+            self.alive()?;
             if self.is_handed_over() {
                 let _ = stream.write(&websocket::encode(
                     websocket::OP_CLOSE,
@@ -964,6 +971,7 @@ impl<S: LogSink, C: Clock> Node<S, C> {
                     expected += 1;
                     // Checked again here: the hand-over may have happened while the caller's
                     // frame was awaited, and its template may read a secret.
+                    self.alive()?;
                     if self.is_handed_over() {
                         let _ = stream.write(&websocket::encode(
                             websocket::OP_CLOSE,
@@ -1075,4 +1083,33 @@ pub(super) fn frame_bytes(
     Err(Error::FrameRefused {
         rule: "a frame of the caller matches no rule of the policy",
     })
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::panic)]
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    use super::*;
+
+    #[test]
+    fn poisoned_counts_open_no_connection() {
+        let slots = Slots::default();
+        let open = Slot {
+            slots: &slots,
+            owner: "owner".into(),
+            caller: "caller".into(),
+        };
+        slots.counts().unwrap().total = 1;
+        let poisoned = catch_unwind(AssertUnwindSafe(|| {
+            let mut counts = slots.counts().unwrap();
+            counts.total = 2;
+            panic!("a panic part way through a count");
+        }));
+        assert!(poisoned.is_err());
+        assert_eq!(slots.counts().err(), Some(Error::StateLost));
+        // A connection that ends after it gives back nothing, and does not panic.
+        drop(open);
+        assert_eq!(slots.counts().err(), Some(Error::StateLost));
+    }
 }

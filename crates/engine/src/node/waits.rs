@@ -235,10 +235,11 @@ enum Polled {
 }
 
 impl<S: LogSink, C: Clock> Node<S, C> {
-    /// How many operations wait on this node now.
+    /// How many operations wait on this node now: none once its state was lost to a panic
+    /// ([`Node::is_state_lost`]), as none of them goes on.
     pub fn waiting(&self) -> usize {
         let now = self.clock.now_ms();
-        self.lock().parked.len(now)
+        self.lock().map_or(0, |mut state| state.parked.len(now))
     }
 
     /// The owner's approval and the spending limits, before the operation sends anything. A
@@ -288,7 +289,7 @@ impl<S: LogSink, C: Clock> Node<S, C> {
             }
         };
         if let Some(spend) = &spend {
-            let mut state = self.lock();
+            let mut state = self.lock()?;
             let verdict = state
                 .limits
                 .entry((run.record.owner.clone(), run.record.id.clone()))
@@ -391,7 +392,7 @@ impl<S: LogSink, C: Clock> Node<S, C> {
             saved: None,
             pending: pending.clone(),
         };
-        self.lock().parked.insert(id, parked, now)?;
+        self.lock()?.parked.insert(id, parked, now)?;
         Ok(Some(pending))
     }
 
@@ -445,7 +446,7 @@ impl<S: LogSink, C: Clock> Node<S, C> {
             saved: Some(save(run)),
             pending: pending.clone(),
         };
-        self.lock().parked.insert(id, parked, now)?;
+        self.lock()?.parked.insert(id, parked, now)?;
         Ok(pending)
     }
 
@@ -480,7 +481,7 @@ impl<S: LogSink, C: Clock> Node<S, C> {
             _ => None,
         };
         let parked = {
-            let mut state = self.lock();
+            let mut state = self.lock()?;
             let Some(parked) = state.parked.get_mut(id, now) else {
                 return Err(Error::ParkedUnknown);
             };
@@ -569,7 +570,7 @@ impl<S: LogSink, C: Clock> Node<S, C> {
             }
             Wait::Approval { .. } => {
                 if let Some(spend) = spend {
-                    let mut state = self.lock();
+                    let mut state = self.lock()?;
                     count(
                         &mut state,
                         &self.state_key,
@@ -611,7 +612,7 @@ impl<S: LogSink, C: Clock> Node<S, C> {
                         saved: Some(save(&mut run)),
                         pending: pending.clone(),
                     };
-                    self.lock().parked.insert(*id, parked, now)?;
+                    self.lock()?.parked.insert(*id, parked, now)?;
                     return Ok(Output::Pending(pending));
                 }
             },
@@ -749,7 +750,7 @@ impl<S: LogSink, C: Clock> Node<S, C> {
     pub fn answer(&self, sealed: &SealedAnswer) -> Result<()> {
         let opened = sealed.open(&self.seal, &self.public)?;
         let now = self.clock.now_ms();
-        let mut state = self.lock();
+        let mut state = self.lock()?;
         if !state.devices(&opened.owner).contains(&opened.device) {
             return Err(Error::GrantDenied);
         }
@@ -810,7 +811,7 @@ impl<S: LogSink, C: Clock> Node<S, C> {
     /// device of the owner over exactly the summary this node built, while it is open.
     pub fn approve(&self, approval: &Approval) -> Result<()> {
         let now = self.clock.now_ms();
-        let mut state = self.lock();
+        let mut state = self.lock()?;
         let summary = match state.parked.get_mut(&approval.id, now).map(|p| &p.wait) {
             Some(Wait::Approval {
                 summary,
@@ -855,7 +856,7 @@ impl<S: LogSink, C: Clock> Node<S, C> {
         limits.validate()?;
         let now = self.clock.now_ms();
         let (owner, record_id) = (limits.owner.as_str(), limits.record_id.as_str());
-        let mut state = self.lock();
+        let mut state = self.lock()?;
         state.grant_of(owner, now)?;
         if !state.devices(owner).contains(&limits.device) {
             return Err(Error::GrantDenied);
