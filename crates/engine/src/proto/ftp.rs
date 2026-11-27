@@ -5,9 +5,12 @@
 //!
 //! Data connections are passive only (`EPSV` of RFC 2428, else `PASV`); active mode, in which
 //! the server connects to the node, is never used. A data connection goes to the same server
-//! the control connection reached, never to an address a reply names: a `PASV` reply naming
-//! another address than the control connection's peer is refused (FTP bounce, and a server
-//! steering the node at another host), and so is a data port below 1024. Over TLS the data
+//! the control connection reached, never to an address a reply names: the address of a `PASV`
+//! reply is ignored and only its port is used (a server behind NAT names its private address;
+//! FTP bounce and a server steering the node at another host have nothing to steer), and a
+//! data port below 1024 is refused. When the data connection to an `EPSV` port cannot be
+//! made (a firewall that passes only the `PASV` range), the node asks again with `PASV` and
+//! stays with it for the session. Over TLS the data
 //! connection makes TLS to the same server name and resumes the control connection's session
 //! when the server allows it (RFC 4217 section 10); it must end with a TLS `close_notify`, so
 //! a cut connection is not taken for a whole file.
@@ -22,7 +25,6 @@
 //! 10,000 entries), and what goes back of a reply is scrubbed of the user name and password
 //! ([`Scrub`]).
 
-use std::net::IpAddr;
 use std::time::Duration;
 
 use zeroize::Zeroizing;
@@ -199,14 +201,6 @@ pub fn parse_pasv(text: &[u8]) -> Option<(std::net::Ipv4Addr, u16)> {
         std::net::Ipv4Addr::new(a, b, c, d),
         u16::from(p1) << 8 | u16::from(p2),
     ))
-}
-
-/// True when the address a `PASV` reply names is the server the control connection reached.
-fn same_host(named: std::net::Ipv4Addr, peer: IpAddr) -> bool {
-    match peer {
-        IpAddr::V4(peer) => peer == named,
-        IpAddr::V6(peer) => peer.to_ipv4_mapped() == Some(named),
-    }
 }
 
 /// One entry of a listing.
@@ -411,50 +405,48 @@ impl<'s> Client<'s> {
         }
     }
 
-    /// Asks for a passive data connection and opens it to the same server.
+    /// Asks for a passive data connection and opens it to the same server: `EPSV` while the
+    /// server takes it, else `PASV`. A data connection to an `EPSV` port that cannot be made
+    /// is asked again with `PASV`, once, and `PASV` is used from then on.
     fn passive(&mut self) -> Result<Box<dyn Stream>> {
-        let mut port = None;
         if self.epsv {
             self.io.write(b"EPSV\r\n")?;
             let r = self.reply()?;
             match r.code {
                 229 => {
-                    port = Some(
-                        r.lines
-                            .first()
-                            .and_then(|l| parse_epsv(l))
-                            .ok_or(invalid("an EPSV reply without a port"))?,
-                    );
+                    let port = r
+                        .lines
+                        .first()
+                        .and_then(|l| parse_epsv(l))
+                        .ok_or(invalid("an EPSV reply without a port"))?;
+                    match self.open_data(port) {
+                        Err(Error::Transport(fault)) if fault.kind == TransportKind::Connect => {
+                            self.epsv = false;
+                        }
+                        other => return other,
+                    }
                 }
                 500..=599 => self.epsv = false,
                 _ => return Err(invalid("an unexpected answer to EPSV")),
             }
         }
-        let port = match port {
-            Some(port) => port,
-            None => {
-                self.io.write(b"PASV\r\n")?;
-                let r = self.reply()?;
-                if r.code != 227 {
-                    return Err(invalid("the server opens no passive data connection"));
-                }
-                let (named, port) = r
-                    .lines
-                    .first()
-                    .and_then(|l| parse_pasv(l))
-                    .ok_or(invalid("a PASV reply without an address"))?;
-                // The data connection goes to the control connection's server whatever the
-                // reply names; a reply naming another host is refused outright.
-                if let Some(peer) = self.io.peer_ip()
-                    && !same_host(named, peer)
-                {
-                    return Err(untrusted(
-                        "a passive reply names another host than the control connection",
-                    ));
-                }
-                port
-            }
-        };
+        self.io.write(b"PASV\r\n")?;
+        let r = self.reply()?;
+        if r.code != 227 {
+            return Err(invalid("the server opens no passive data connection"));
+        }
+        // Only the port is used: the data connection goes to the control connection's server
+        // whatever address the reply names.
+        let (_named, port) = r
+            .lines
+            .first()
+            .and_then(|l| parse_pasv(l))
+            .ok_or(invalid("a PASV reply without an address"))?;
+        self.open_data(port)
+    }
+
+    /// Opens a data connection to `port` of the control connection's server.
+    fn open_data(&mut self, port: u16) -> Result<Box<dyn Stream>> {
         if port < MIN_DATA_PORT {
             return Err(untrusted("a passive reply names a data port below 1024"));
         }
@@ -677,14 +669,6 @@ mod tests {
         assert_eq!(parse_pasv(b"Entering Passive Mode (192,0,2,10,19)"), None);
         assert_eq!(parse_pasv(b"(192,0,2,10,19,137,1)"), None);
         assert_eq!(parse_pasv(b"(192,0,2,300,19,137)"), None);
-        assert!(same_host(
-            std::net::Ipv4Addr::new(192, 0, 2, 10),
-            "::ffff:192.0.2.10".parse().unwrap()
-        ));
-        assert!(!same_host(
-            std::net::Ipv4Addr::new(10, 0, 0, 1),
-            "192.0.2.10".parse().unwrap()
-        ));
     }
 
     #[test]
