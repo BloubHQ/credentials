@@ -47,9 +47,11 @@ before 1.0, minor versions may break formats and APIs.
   smallest frames, in the reads each one makes, in release builds (mean of 200 runs, 50 for
   SFTP): HTTP/2, 10-byte frames in 16 KiB reads, 14.7-16.5 ms before, 0.35-0.37 ms now; SFTP,
   10-byte packets, 13.9-14.9 ms before and 0.38-0.42 ms now in 16 KiB reads, 50.7-54.0 ms
-  before and 0.42 ms now in 64 KiB reads (an SSH packet carries up to 256 KiB); relay
-  datagrams, 10-byte frames in 4 KiB reads, 517-534 us before, 355-380 us now; caller
-  streams, 77-byte frames in 16 KiB reads, 109 us before, 12-13 us now.
+  before and 0.42 ms now in 64 KiB reads (an SSH packet carries up to 256 KiB); caller
+  streams, 77-byte frames in 16 KiB reads, 109 us before, 12-13 us now. Relay datagrams
+  (median of 401 runs, old and new interleaved, a fresh buffer each, every frame used): 10-byte
+  frames, 514-543 us before and 368-383 us now in 4 KiB reads (what the links read), 918-977 us
+  and 382-397 us in 16 KiB reads; 1,202-byte frames in 4 KiB reads, 6.2-7.0 us and 5.5-6.2 us.
 - Log files: one writer per log. `credentials serve` and `credentials host` hold an exclusive
   lock on each log file while they write it (`flock` on Unix; on Windows the file is opened
   sharing reads only), so a second process on the same file fails at start with "the log is
