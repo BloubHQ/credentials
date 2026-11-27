@@ -118,9 +118,10 @@ fn openssh_rekeys_while_a_command_prints_and_nothing_is_lost() {
         .authenticate(user.as_bytes(), &Auth::Key(&client_key))
         .expect("sign-in");
 
-    // About 109 KB of output, many times the server's RekeyLimit.
-    let out = client.exec(b"seq 1 20000", 1 << 20).expect("exec");
-    let want: String = (1..=20_000).map(|i| format!("{i}\n")).collect();
+    // About 1.2 MB of output, many times the server's RekeyLimit: dozens of re-exchanges,
+    // some of them between two parts of one pipe read.
+    let out = client.exec(b"seq 1 200000", 4 << 20).expect("exec");
+    let want: String = (1..=200_000).map(|i| format!("{i}\n")).collect();
     assert_eq!(out.exit, Some(0));
     assert_eq!(
         out.stdout.len(),
