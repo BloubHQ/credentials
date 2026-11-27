@@ -15,6 +15,21 @@ before 1.0, minor versions may break formats and APIs.
   callers, so the hash of a summary without a delegate is unchanged. A client from before
   this refuses a summary that has `delegate` (#53).
 
+- SSH: `chacha20-poly1305@openssh.com` works against OpenSSH. The node counted the 4-byte
+  packet length in the block alignment of its padding, as in the clear; OpenSSH leaves it
+  out for every AEAD, as for AES-GCM, so sshd refused the node's first encrypted packet
+  (`padding error`), and the node would have refused sshd's. The node picks its first cipher
+  the server offers (AES-256-GCM, AES-128-GCM, then ChaCha20-Poly1305), so this hit only a
+  server that offers no AES-GCM: a `Ciphers` limited to ChaCha20, or an SSH server built
+  with ChaCha20-Poly1305 alone (TinySSH, by its documentation; not tested). Every
+  connection to such a server failed at its first encrypted packet. Found by the new interop
+  matrix against OpenSSH 10.2; the fake server now checks the alignment as OpenSSH does (#106).
+- SSH: a key re-exchange keeps the strict key exchange the first exchange agreed. OpenSSH
+  sends the strict markers in its first KEXINIT only, so with ChaCha20-Poly1305 the node
+  refused the server's first re-exchange as "chacha20-poly1305 without strict key
+  exchange". The node now sends its own marker in the first KEXINIT only, too. Found by the
+  same interop matrix; the fake server now leaves the marker out of a re-exchange (#106).
+
 - DTLS: a server issued through an intermediate CA (almost every public CA) can be reached:
   the `open` step of a `dtls` operation takes `intermediates` (at most 8, each the padded
   standard base64 of a DER certificate of at most 8 KiB), which the certificate check uses as
