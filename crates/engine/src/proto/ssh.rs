@@ -13,7 +13,10 @@
 //!
 //! SHA-1 (`diffie-hellman-group*-sha1`, `ssh-rsa` signatures, `hmac-sha1`) and CBC are never
 //! offered, so a server that offers only them is refused before anything secret is sent. A
-//! key re-exchange the server starts is refused: the connection ends.
+//! key re-exchange the server starts (RFC 4253, 9: servers rekey after a volume or a time) is
+//! carried out: the server must prove the same host key as in the first exchange, the
+//! session identifier stays the first exchange hash, and strict key exchange, when it was
+//! agreed, resets the sequence numbers again. At most [`MAX_REKEYS`] per connection.
 //!
 //! A channel the server opens is refused (`SSH_OPEN_ADMINISTRATIVELY_PROHIBITED`), unless it
 //! is the `forwarded-tcpip` channel of the one remote forward the node asked for
@@ -106,6 +109,10 @@ const MAX_ROUNDS: usize = 8;
 const WAIT: Duration = Duration::from_millis(50);
 /// Most channels the server may open that the node refuses before the connection ends.
 pub const MAX_REFUSED_OPENS: usize = 16;
+/// Most key re-exchanges the server may start on one connection. Servers rekey after a
+/// volume (OpenSSH `RekeyLimit`, Dropbear at 1 GiB) or a time (an hour, 8 hours); past this
+/// count the server is taken to burn the node's CPU and the connection ends.
+pub const MAX_REKEYS: u32 = 256;
 /// Most bytes of output kept for later reads while a write waits for the server's window.
 /// The node's own window does not bound this: it is given back as data arrives
 /// (`adjust`), not as the caller reads it, so a server that holds the node's write back can
@@ -874,6 +881,13 @@ pub struct Client<'s> {
     queued: VecDeque<Event>,
     /// Bytes of channel data each way: to the server, from it.
     pub data: (u64, u64),
+    /// The server's identification line and the pinned host keys, for a key re-exchange.
+    server_version: Vec<u8>,
+    pinned: Vec<HostKey>,
+    /// The host key blob the server proved in the first exchange.
+    host_key: Vec<u8>,
+    /// Key re-exchanges the server started.
+    pub rekeys: u32,
 }
 
 impl<'s> Client<'s> {
@@ -903,10 +917,14 @@ impl<'s> Client<'s> {
             refused_opens: 0,
             queued: VecDeque::new(),
             data: (0, 0),
+            server_version: Vec::new(),
+            pinned: pinned.to_vec(),
+            host_key: Vec::new(),
+            rekeys: 0,
         };
         client.io.write(VERSION)?;
-        let server_version = client.read_version()?;
-        client.exchange(&server_version, pinned)?;
+        client.server_version = client.read_version()?;
+        client.exchange(None)?;
         Ok(client)
     }
 
@@ -958,31 +976,47 @@ impl<'s> Client<'s> {
         Ok(put.into_bytes())
     }
 
-    /// The key exchange (RFC 4253, 7 and 8; RFC 5656 and RFC 8731 for ECDH).
-    fn exchange(&mut self, server_version: &[u8], pinned: &[HostKey]) -> Result<()> {
+    /// A key exchange (RFC 4253, 7 and 8; RFC 5656 and RFC 8731 for ECDH): the first one, or
+    /// a re-exchange the server started with `rekey`, its KEXINIT (RFC 4253, 9).
+    fn exchange(&mut self, rekey: Option<Zeroizing<Vec<u8>>>) -> Result<()> {
+        let first = rekey.is_none();
+        let pinned = self.pinned.clone();
         let host_algs: Vec<&str> = pinned
             .iter()
             .flat_map(|k| k.algorithms().iter().copied())
             .collect();
         let ours = Self::kexinit(&host_algs)?;
         self.send(&ours)?;
-        // Before the server's KEXINIT, only messages that strict key exchange forbids may come;
-        // they are counted and refused once strict mode is known.
+        // Before the server's first KEXINIT, only messages that strict key exchange forbids
+        // may come; they are counted and refused once strict mode is known.
         let mut early = 0usize;
-        let theirs = loop {
-            let packet = self.recv_raw()?;
-            match packet.first() {
-                Some(&KEXINIT) => break packet,
-                Some(&IGNORE | &DEBUG) => early += 1,
-                Some(&DISCONNECT) => return Err(Error::transport(TransportKind::Closed, true)),
-                _ => return Err(invalid("expected KEXINIT")),
-            }
+        let theirs = match rekey {
+            Some(theirs) => theirs,
+            None => loop {
+                let packet = self.recv_raw()?;
+                match packet.first() {
+                    Some(&KEXINIT) => break packet,
+                    Some(&IGNORE | &DEBUG) => early += 1,
+                    Some(&DISCONNECT) => {
+                        return Err(Error::transport(TransportKind::Closed, true));
+                    }
+                    _ => return Err(invalid("expected KEXINIT")),
+                }
+            },
         };
         let server = parse_kexinit(&theirs)?;
-        let agreed = negotiate(&server, pinned)?;
+        let mut agreed = negotiate(&server, &pinned)?;
+        if !first {
+            // Strict key exchange is agreed in the first exchange and holds for the connection
+            // (it resets the sequence numbers at every NEWKEYS); its markers are not looked at
+            // again.
+            agreed.strict = self.agreed.strict;
+        }
         if agreed.strict && early > 0 {
             return Err(untrusted("strict key exchange: a message before KEXINIT"));
         }
+        // Only the first exchange forbids stray messages; a re-exchange takes IGNORE and DEBUG.
+        let strict_kex = first && agreed.strict;
         // A guess the server sent for another method is skipped (RFC 4253, 7).
         let skip_guess = server.follows
             && (server.kex.first() != Some(&agreed.kex)
@@ -992,9 +1026,9 @@ impl<'s> Client<'s> {
         init.string(&q_c);
         self.send(init.bytes())?;
         if skip_guess {
-            self.recv_kex(agreed.strict)?;
+            self.recv_kex(strict_kex)?;
         }
-        let reply = self.recv_kex(agreed.strict)?;
+        let reply = self.recv_kex(strict_kex)?;
         let mut p = Parse::new(&reply);
         if p.u8()? != KEX_ECDH_REPLY {
             return Err(invalid("expected the key exchange reply"));
@@ -1007,11 +1041,15 @@ impl<'s> Client<'s> {
         if !pinned.iter().any(|k| k.blob == host_key) {
             return Err(untrusted("host key not pinned by the policy"));
         }
+        // In a re-exchange, the host key must be the one the server proved first.
+        if !first && host_key != self.host_key.as_slice() {
+            return Err(untrusted("a key re-exchange with another host key"));
+        }
         let k = ephemeral.agree(agreed.kex, q_s)?;
         let k_mpint = mpint_bytes(&k);
         let h = hash.digest(&[
             &string_bytes(b"SSH-2.0-credentials"),
-            &string_bytes(server_version),
+            &string_bytes(&self.server_version),
             &string_bytes(&ours),
             &string_bytes(&theirs),
             &string_bytes(host_key),
@@ -1020,7 +1058,11 @@ impl<'s> Client<'s> {
             &k_mpint,
         ]);
         verify_host_signature(agreed.host_key, host_key, &h, signature)?;
-        self.session = h.clone();
+        // The session identifier is the hash of the first exchange, for the whole connection.
+        if first {
+            self.session = h.clone();
+            self.host_key = host_key.to_vec();
+        }
         self.send(&[NEWKEYS])?;
         let (out_key, out_iv) = key_sizes(agreed.cipher_out);
         let (in_key, in_iv) = key_sizes(agreed.cipher_in);
@@ -1032,7 +1074,7 @@ impl<'s> Client<'s> {
         if agreed.strict {
             self.out.seq = 0;
         }
-        let newkeys = self.recv_kex(agreed.strict)?;
+        let newkeys = self.recv_kex(strict_kex)?;
         if newkeys.as_slice() != [NEWKEYS] {
             return Err(invalid("expected NEWKEYS"));
         }
@@ -1186,7 +1228,14 @@ impl<'s> Client<'s> {
         match packet.first() {
             Some(&IGNORE | &DEBUG | &UNIMPLEMENTED | &EXT_INFO) => Ok(true),
             Some(&DISCONNECT) => Err(Error::transport(TransportKind::Closed, true)),
-            Some(&KEXINIT) => Err(untrusted("key re-exchange is not supported")),
+            Some(&KEXINIT) => {
+                self.rekeys = self.rekeys.saturating_add(1);
+                if self.rekeys > MAX_REKEYS {
+                    return Err(untrusted("too many key re-exchanges"));
+                }
+                self.exchange(Some(Zeroizing::new(packet.to_vec())))?;
+                Ok(true)
+            }
             Some(&GLOBAL_REQUEST) => {
                 let mut p = Parse::new(packet);
                 p.u8()?;

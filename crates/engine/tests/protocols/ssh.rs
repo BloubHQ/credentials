@@ -274,13 +274,74 @@ fn a_packet_before_key_exchange_under_strict_kex_is_refused() {
 }
 
 #[test]
-fn a_key_re_exchange_is_refused() {
+fn a_key_re_exchange_the_server_starts_is_carried_out() {
+    // Right after sign-in, with and without strict key exchange (which resets the sequence
+    // numbers at every NEWKEYS).
+    for strict in [true, false] {
+        let s = basic(json!({}));
+        let mut peer = server();
+        peer.strict = strict;
+        peer.misbehave = Misbehave::Rekey;
+        let mut fake = Fake::new(peer);
+        let out = session_output(run_session(
+            &s,
+            &mut fake,
+            vec![command("id", &[]), command("echo", &["hello"])],
+        ));
+        assert!(out.error.is_none(), "strict {strict}: {:?}", out.error);
+        assert_eq!(out.results.len(), 2);
+        assert_eq!(out.results[0].data, b"uid=1000(deploy)\n");
+        assert_eq!(fake.peer.rekeys, 1, "strict {strict}");
+    }
+}
+
+#[test]
+fn a_key_re_exchange_in_the_middle_of_output_loses_nothing() {
     let s = basic(json!({}));
     let mut peer = server();
+    peer.rekey_mid_exec = true;
+    let mut fake = Fake::new(peer);
+    let out = session_output(run_session(
+        &s,
+        &mut fake,
+        vec![command("id", &[]), command("echo", &["hello world"])],
+    ));
+    assert!(out.error.is_none(), "{:?}", out.error);
+    assert_eq!(out.results[0].data, b"uid=1000(deploy)\n");
+    assert_eq!(out.results[1].data, b"ran: echo 'hello world'");
+    assert_eq!(fake.peer.rekeys, 2);
+}
+
+#[test]
+fn a_key_re_exchange_with_another_host_key_is_refused() {
+    // Both keys are pinned: a re-exchange must still prove the key of the first exchange.
+    let other = HostKind::Ed25519([12; 32]);
+    let s = setup(
+        &[password_field()],
+        vec![ssh_operation(
+            "ssh",
+            open(
+                vec![host().line(), other.line()],
+                password_login(),
+                json!({}),
+            ),
+            None,
+        )],
+    );
+    let mut peer = server();
     peer.misbehave = Misbehave::Rekey;
+    peer.rekey_host = Some(other);
     let mut fake = Fake::new(peer);
     let result = run_session(&s, &mut fake, vec![command("id", &[])]);
-    assert!(result.is_err() || session_output(result).error.is_some());
+    let error = match result {
+        Err(e) => Some(e),
+        Ok(out) => session_output(Ok(out)).error,
+    };
+    assert!(
+        matches!(error, Some(engine::Error::ServerUntrusted { .. })),
+        "{error:?}"
+    );
+    assert!(fake.peer.execs.is_empty(), "no command ran");
 }
 
 #[test]

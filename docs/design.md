@@ -491,8 +491,11 @@ design left open, and the more secure option taken:
 - **Algorithms:** key exchange `curve25519-sha256`, `ecdh-sha2-nistp256/384/521` and strict
   KEX (Terrapin); ciphers `aes256-gcm`, `aes128-gcm`, and `chacha20-poly1305` only under
   strict KEX; host keys only of the pinned types, RSA only as `rsa-sha2-256/512`. SHA-1, CBC,
-  CTR with a MAC, DSA and finite-field groups are never offered. A rekey is refused: the node's
-  connections are short and bounded by their limits.
+  CTR with a MAC, DSA and finite-field groups are never offered. A rekey the server starts is carried out
+  (servers rekey after a volume or a time, and a long transfer or shell would otherwise end):
+  the server must prove the host key of the first exchange, the session identifier stays the
+  first exchange hash, strict key exchange holds for every NEWKEYS, and at most 256 rekeys
+  are taken on one connection.
 - **SSH host keys are pinned in the signed policy** and checked before any credential is
   sent; there is no trust on first use.
 - **PostgreSQL takes SCRAM-SHA-256 only** (no MD5 or cleartext even over TLS) with 4096 to

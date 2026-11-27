@@ -7,6 +7,13 @@ before 1.0, minor versions may break formats and APIs.
 
 ### Changed
 
+- SSH: a key re-exchange the server starts is carried out instead of ending the connection.
+  Servers rekey after a volume or a time (Dropbear at 1 GiB or 8 hours, Paramiko at 512 MB,
+  OpenSSH with `RekeyLimit`), so a long SFTP transfer or shell failed. The server must prove
+  the host key of the first exchange; the session identifier stays the first exchange hash;
+  strict key exchange, when agreed, resets the sequence numbers at every NEWKEYS; at most
+  256 re-exchanges per connection (#82).
+
 - FTP: the address of a `PASV` reply is ignored and only its port is used. The data
   connection still goes to the control connection's server; a port below 1024 is still
   refused. Before, a server behind NAT that names its private address (vsftpd without

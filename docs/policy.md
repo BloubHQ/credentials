@@ -741,8 +741,8 @@ What each kind does with them:
 - **SSH** (own client on ring): key exchange `curve25519-sha256`, `ecdh-sha2-nistp256/384/521`
   with strict key exchange (Terrapin); ciphers `aes256-gcm`, `aes128-gcm` and
   `chacha20-poly1305` (only under strict key exchange). SHA-1, CBC, CTR with a MAC, `ssh-rsa`
-  signatures, DSA and the finite-field groups are never offered. A rekey is refused (the
-  connection is short). A command line is the rule's text, then each parameter as one POSIX
+  signatures, DSA and the finite-field groups are never offered. A rekey the server starts is
+  carried out with the host key of the first exchange; another key ends the connection. A command line is the rule's text, then each parameter as one POSIX
   single-quoted word, so `x; rm -rf /` stays an argument. The result is the output, the error
   output and the exit status.
 - **PostgreSQL**: TLS, then SCRAM-SHA-256 only. A server that asks for cleartext or MD5, says
