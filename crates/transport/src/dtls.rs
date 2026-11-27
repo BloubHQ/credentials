@@ -14,8 +14,10 @@
 //! before the handshake is complete and the certificate accepted.
 //!
 //! `dimpl` hands over the server's leaf certificate only, not the intermediates the server
-//! sent: a certificate must be issued by one of the roots directly, or be pinned and
-//! self-signed. A certificate under an intermediate is refused (it fails closed).
+//! sent, so the intermediates come from the policy (`intermediates` of the `open` step): a
+//! certificate must chain to one of the roots directly or through them, or be pinned and
+//! self-signed. An intermediate widens nothing: the chain must still end at a root. A
+//! certificate under an intermediate the policy does not list is refused (it fails closed).
 //!
 //! The record layer of `dimpl` drops records that fail authentication or that replay one
 //! within the window of RFC 6347 section 4.1.2.6 (RFC 9147 section 4.5.1); the handshake
@@ -118,6 +120,7 @@ pub struct Trust {
     roots: Arc<RootCertStore>,
     host: String,
     pins: Vec<[u8; 32]>,
+    intermediates: Vec<CertificateDer<'static>>,
 }
 
 impl fmt::Debug for Trust {
@@ -126,19 +129,30 @@ impl fmt::Debug for Trust {
             .field("roots", &self.roots.len())
             .field("host", &self.host)
             .field("pins", &self.pins.len())
+            .field("intermediates", &self.intermediates.len())
             .finish()
     }
 }
 
 impl Trust {
-    /// A certificate for `host` that chains to `roots` directly, and, when `pins` is not
-    /// empty, whose key's SHA-256 (of its DER `SubjectPublicKeyInfo`) is one of them; a
-    /// self-signed certificate with a pinned key is accepted as its own root.
-    pub fn new(roots: Arc<RootCertStore>, host: &str, pins: &[[u8; 32]]) -> Self {
+    /// A certificate for `host` that chains to `roots`, directly or through `intermediates`
+    /// (DER), and, when `pins` is not empty, whose key's SHA-256 (of its DER
+    /// `SubjectPublicKeyInfo`) is one of them; a self-signed certificate with a pinned key is
+    /// accepted as its own root.
+    pub fn new(
+        roots: Arc<RootCertStore>,
+        host: &str,
+        pins: &[[u8; 32]],
+        intermediates: &[Vec<u8>],
+    ) -> Self {
         Self {
             roots,
             host: host.to_string(),
             pins: pins.to_vec(),
+            intermediates: intermediates
+                .iter()
+                .map(|der| CertificateDer::from(der.clone()))
+                .collect(),
         }
     }
 
@@ -161,7 +175,7 @@ impl Trust {
             }
             true
         };
-        if verify(self.roots.clone(), &leaf, &name, now).is_ok() {
+        if verify(self.roots.clone(), &leaf, &self.intermediates, &name, now).is_ok() {
             return Ok(());
         }
         if pinned {
@@ -173,17 +187,18 @@ impl Trust {
             let own = RootCertStore {
                 roots: vec![anchor],
             };
-            return verify(Arc::new(own), &leaf, &name, now);
+            return verify(Arc::new(own), &leaf, &[], &name, now);
         }
         Err(DtlsError::Certificate)
     }
 }
 
 /// The verifier of a `tls` connection: rustls' WebPKI server verifier with the ring
-/// provider, no intermediates, no OCSP.
+/// provider, the `intermediates` the policy lists, no OCSP.
 fn verify(
     roots: Arc<RootCertStore>,
     leaf: &CertificateDer<'_>,
+    intermediates: &[CertificateDer<'_>],
     name: &ServerName<'_>,
     now: UnixTime,
 ) -> Result<(), DtlsError> {
@@ -194,7 +209,7 @@ fn verify(
     .build()
     .map_err(|_| DtlsError::Certificate)?;
     verifier
-        .verify_server_cert(leaf, &[], name, &[], now)
+        .verify_server_cert(leaf, intermediates, name, &[], now)
         .map(|_| ())
         .map_err(|_| DtlsError::Certificate)
 }

@@ -443,10 +443,11 @@ needs it.
 with the verifier of a `tls` connection (`rustls::client::WebPkiServerVerifier` over the
 transport's roots: chain, validity, server-authentication usage, host name) and, with
 `open.pins`, its key against the pins; a pinned self-signed certificate is checked with
-itself as the only root. Because the intermediates the server sends are not handed over, a
-certificate under an intermediate fails closed; a public-PKI DTLS server needs its key
-pinned and a certificate issued by a root directly, or a private root in the transport's
-roots. Nothing is written before the certificate is accepted; a handshake that completes
+itself as the only root. Because the intermediates the server sends are not handed over,
+the policy lists them (`open.intermediates`, DER, at most 4) and the verifier gets them as
+the chain; they widen nothing, since the chain must still end at a root. A certificate under
+an intermediate the policy does not list fails closed. Exposing the server's chain from
+`dimpl` would make the list unnecessary. Nothing is written before the certificate is accepted; a handshake that completes
 without one is refused. The client presents no certificate: its key signs nothing, so a
 server that asks for one fails the handshake.
 

@@ -7,6 +7,13 @@ before 1.0, minor versions may break formats and APIs.
 
 ### Changed
 
+- DTLS: a server issued through an intermediate CA (almost every public CA) can be reached:
+  the `open` step of a `dtls` operation takes `intermediates` (at most 4, each the base64 of
+  a DER certificate of at most 8 KiB), which the certificate check uses as the chain. They
+  widen nothing: the chain must still end at one of the node's roots. Before, only a
+  certificate issued by a root directly, or a pinned self-signed one, was accepted.
+  `Transport::open_dtls` and `transport::dtls::Trust::new` take the intermediates (#80).
+
 - SSH: a key re-exchange the server starts is carried out instead of ending the connection.
   Servers rekey after a volume or a time (Dropbear at 1 GiB or 8 hours, Paramiko at 512 MB,
   OpenSSH with `RekeyLimit`), so a long SFTP transfer or shell failed. The server must prove
