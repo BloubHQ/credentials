@@ -818,6 +818,7 @@ fn an_approval_is_of_one_summary_for_one_node() {
         record_id: "card".into(),
         generation: 1,
         caller: "app".into(),
+        delegate: None,
         operation: "pay".into(),
         destination: Some("https://pay.example".into()),
         origin: None,

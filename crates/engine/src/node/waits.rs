@@ -351,13 +351,15 @@ impl<S: LogSink, C: Clock> Node<S, C> {
             .map(fit);
         let id = random_id();
         let expires_ms = now.saturating_add(MAX_APPROVAL_MS);
+        let (delegate, caller) = super::split_label(run.who.2);
         let summary = ApprovalSummary {
             id,
             node: self.public,
             owner: run.record.owner.clone(),
             record_id: run.record.id.clone(),
             generation: run.record.generation,
-            caller: run.who.2.to_string(),
+            caller: caller.to_string(),
+            delegate: delegate.map(str::to_string),
             operation: run.name.to_string(),
             destination: destination.map(|d| fit(format!("{}:{}", d.host, d.port))),
             origin,

@@ -72,8 +72,13 @@ pub struct ApprovalSummary {
     pub record_id: String,
     /// Its generation.
     pub generation: u64,
-    /// The caller that asked for the operation.
+    /// The caller that asked for the operation: its name in the policy it called under.
     pub caller: String,
+    /// The delegate the caller acted through, when the call was delegated: the caller is then
+    /// one of the delegate's callers, under the policy the owner delegated, and the owner's
+    /// device shows who acted for whom. Absent for the owner's own callers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delegate: Option<String>,
     /// The operation.
     pub operation: String,
     /// Where the operation connects, `host:port`.
@@ -107,9 +112,10 @@ impl ApprovalSummary {
         check_name(&self.owner)?;
         check_name(&self.record_id)?;
         if !is_token(&self.caller)
+            || !self.delegate.as_deref().is_none_or(is_token)
             || !(is_token(&self.operation) || self.operation.starts_with(':'))
         {
-            return Err(invalid("caller and operation are names"));
+            return Err(invalid("caller, delegate and operation are names"));
         }
         if self.expires_ms <= self.created_ms || self.expires_ms - self.created_ms > MAX_APPROVAL_MS
         {
@@ -251,6 +257,7 @@ mod tests {
             record_id: "card".into(),
             generation: 3,
             caller: "agent".into(),
+            delegate: None,
             operation: "pay".into(),
             destination: Some("pay.example:443".into()),
             origin: Some("https://shop.example".into()),

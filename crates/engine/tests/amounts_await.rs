@@ -392,6 +392,7 @@ fn the_amount_counted_and_shown_is_the_amount_sent() {
         &mut site,
     ));
     assert_eq!(summary.amount, amount("12.34"));
+    assert_eq!(summary.delegate, None, "the owner's own caller");
     assert!(site.sent.is_empty(), "nothing is sent before the approval");
     w.node
         .approve(&w.device.approve(&summary, w.now()).unwrap())

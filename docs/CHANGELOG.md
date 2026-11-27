@@ -7,6 +7,14 @@ before 1.0, minor versions may break formats and APIs.
 
 ### Changed
 
+- Delegation: a delegated call that waits for the owner's approval (an operation marked
+  `approval`, a card, a payment over the limits) works. Its summary named the caller as the
+  label `delegate/caller`, which is no name, so every such call failed with
+  `approval_invalid`; only payments within the limits went through. The summary now has
+  `caller` (the delegate's caller) and a new `delegate` field, absent for the owner's own
+  callers, so the hash of a summary without a delegate is unchanged. A client from before
+  this refuses a summary that has `delegate` (#53).
+
 - DTLS: a server issued through an intermediate CA (almost every public CA) can be reached:
   the `open` step of a `dtls` operation takes `intermediates` (at most 8, each the padded
   standard base64 of a DER certificate of at most 8 KiB), which the certificate check uses as
