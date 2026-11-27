@@ -123,35 +123,50 @@ fn summary(json: &str) -> Result<ApprovalSummary> {
 /// summary itself must show the same fields, `delegate` above all.
 #[cfg_attr(not(target_arch = "wasm32"), uniffi::export)]
 pub fn approval_lines(summary_json: String) -> Result<Vec<String>> {
-    let s = summary(&summary_json)?;
+    // Every field, named: one added to the summary fails to compile here until it is shown
+    // (or said to need no showing).
+    let ApprovalSummary {
+        id: _,
+        node: _,
+        owner: _,
+        record_id,
+        generation,
+        caller,
+        delegate,
+        operation,
+        destination,
+        origin,
+        amount,
+        item,
+        lines,
+        created_ms: _,
+        expires_ms: _,
+    } = summary(&summary_json)?;
     let mut out = Vec::new();
-    if let Some(delegate) = &s.delegate {
+    if let Some(delegate) = &delegate {
         out.push(format!(
-            "Delegated: {} acts for {delegate}, whom you delegated to, not for you",
-            s.caller
+            "Delegated: {caller} acts for {delegate}, whom you delegated to, not for you"
         ));
     }
-    out.push(format!("{} asks to run {}", s.caller, s.operation));
-    out.push(format!(
-        "Item: {} (generation {})",
-        s.record_id, s.generation
-    ));
-    if let Some(destination) = &s.destination {
+    out.push(format!("{caller} asks to run {operation}"));
+    out.push(format!("Item: {record_id} (generation {generation})"));
+    if let Some(destination) = &destination {
         out.push(format!("Connects to: {destination}"));
     }
-    if let Some(origin) = &s.origin {
+    if let Some(origin) = &origin {
         out.push(format!("For: {origin}"));
     }
-    if let Some(amount) = &s.amount {
+    if let Some(amount) = &amount {
         out.push(format!("Amount: {} {}", amount.value, amount.currency));
     }
-    if let Some(item) = &s.item {
+    if let Some(item) = &item {
         out.push(format!("Kind: {}", item.kind));
         for field in &item.fields {
             out.push(format!("{}: {}", field.name, field.value));
         }
     }
-    out.extend(s.lines.iter().cloned());
+    // The node's own notes (why it asks), marked so none reads as one of the lines above.
+    out.extend(lines.iter().map(|line| format!("Note: {line}")));
     Ok(out)
 }
 

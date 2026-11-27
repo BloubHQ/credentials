@@ -833,7 +833,7 @@ fn approval_lines_show_every_field_and_a_delegate_first() {
             "Connects to: pay.example:443",
             "For: https://shop.example",
             "Amount: 12.50 EUR",
-            "Order 4711",
+            "Note: Order 4711",
         ]
     );
     // Delegated: the first line says whom the caller acts for, also from the pending reply.

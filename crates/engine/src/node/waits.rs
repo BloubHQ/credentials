@@ -323,6 +323,9 @@ impl<S: LogSink, C: Clock> Node<S, C> {
             return Err(Error::RequestInvalid { rule: NO_WAIT });
         }
         let given = given_of(payload, input)?;
+        // Every line is the node's own: a fixed text with the policy's or the limits' values
+        // in it (an origin the signed policy names, an ISO 4217 code, a decimal amount),
+        // never text a caller or a destination chose.
         let mut lines: Vec<String> = lines.into_iter().map(fit).collect();
         lines.truncate(MAX_LINES);
         let item = match policy.item {
