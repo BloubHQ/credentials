@@ -18,8 +18,11 @@ before 1.0, minor versions may break formats and APIs.
   - Redis: the budget counted string bytes, so `:1` cost one byte. Each element now costs its
     line with the CRLF, a reply has at most 1,048,576 elements in all (it was that many per
     array), and its JSON is written straight into bytes held to the limit
-    (`Reply::json_bytes` replaces `Reply::json`). 16 arrays of 1,000,000 `:1`: 61 MiB received
-    and a peak of 1,033 MiB before, refused after 3.9 MiB with a peak of 30.8 MiB now.
+    (`Reply::json_bytes` replaces `Reply::json`). An array header no longer reserves room for
+    the elements it announces, only for those that arrive. 16 arrays of 1,000,000 `:1`: 61 MiB
+    received and a peak of 1,033 MiB before, refused after 3.9 MiB with a peak of 32.2 MiB
+    now; 17 nested headers of about 1,048,575 elements (about 170 bytes): a peak of 544 MiB
+    before, 0.5 MiB now.
   - WebSocket: the decoder copied the rest of its buffer for every frame. It now keeps an
     offset, as the protocol reader does (#46), through one buffer type both use, and refuses a
     message of more than 64 empty fragments. 1 MiB of one-byte fragments in 16 KiB pushes:

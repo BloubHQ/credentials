@@ -205,7 +205,9 @@ fn read_at(source: &mut dyn Source, depth: usize, budget: &mut Budget) -> Result
                         true,
                     ));
                 }
-                let mut items = Vec::with_capacity(n);
+                // The header is a claim, not elements: room grows as they arrive, so nested
+                // headers cannot reserve memory the bytes never pay for (#112).
+                let mut items = Vec::with_capacity(n.min(1024));
                 for _ in 0..n {
                     items.push(read_at(source, depth + 1, budget)?);
                 }
