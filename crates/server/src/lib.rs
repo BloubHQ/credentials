@@ -28,7 +28,7 @@ pub mod stream;
 use std::io;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use engine::Error;
 use engine::approval::Approval;
@@ -256,14 +256,22 @@ impl<T> Pool<T> {
         }
     }
 
+    /// The receiving end of the pool, or `None` once a panic poisoned its lock. Nothing is
+    /// recovered from a poisoned lock: the server refuses the act rather than reason about
+    /// what a panic left behind.
+    fn receiver(&self) -> Option<MutexGuard<'_, Receiver<T>>> {
+        match self.take.lock() {
+            Ok(guard) => Some(guard),
+            Err(_) => {
+                eprintln!("error: the transport pool was poisoned by a panic; acts are refused");
+                None
+            }
+        }
+    }
+
     /// A free transport, without waiting.
     fn try_lease(&self) -> Option<Lease<'_, T>> {
-        let transport = self
-            .take
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .try_recv()
-            .ok()?;
+        let transport = self.receiver()?.try_recv().ok()?;
         Some(Lease {
             pool: self,
             transport: Some(transport),
@@ -272,12 +280,7 @@ impl<T> Pool<T> {
 
     /// Waits for a free transport.
     fn lease(&self) -> Option<Lease<'_, T>> {
-        let transport = self
-            .take
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .recv()
-            .ok()?;
+        let transport = self.receiver()?.recv().ok()?;
         Some(Lease {
             pool: self,
             transport: Some(transport),
@@ -310,10 +313,12 @@ impl<S: Sink, T: Transport> Shared<S, T> {
         if before.is_some_and(|before| before == self.confirmed()) {
             return;
         }
-        let _guard = self
-            .head_lock
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
+        // A panic while a checkpoint was handed over poisons the lock: what the hooks stored
+        // is unknown then, and [`Shared::halted`] refuses every act from that point.
+        let Ok(_guard) = self.head_lock.lock() else {
+            eprintln!("error: a checkpoint hook panicked; no checkpoint is written any more");
+            return;
+        };
         match self.node.checkpoint() {
             Ok(head) => self.hooks.checkpoint(&head),
             Err(e) => eprintln!("warning: cannot sign a checkpoint: {e}"),
@@ -323,6 +328,18 @@ impl<S: Sink, T: Transport> Shared<S, T> {
     /// `None` when the log takes entries; else the reply. A halted log is reconciled first
     /// when the sink knows what the store ends with.
     fn halted(&self) -> Option<Reply> {
+        if self.node.is_state_lost() {
+            return Some((
+                503,
+                json!({"error": "the node's state was lost to a panic; the node takes no act until it restarts from its log", "record": null}),
+            ));
+        }
+        if self.head_lock.is_poisoned() {
+            return Some((
+                503,
+                json!({"error": "a checkpoint hook panicked; the node takes no act until it restarts", "record": null}),
+            ));
+        }
         if !self.node.is_halted() {
             return None;
         }
@@ -530,7 +547,7 @@ fn status_of(error: &Error) -> u16 {
         | Error::RecordUnpinned
         | Error::RecordStale { .. }
         | Error::PolicySignature => 403,
-        Error::LogUnconfirmed | Error::LogHalted => 503,
+        Error::LogUnconfirmed | Error::LogHalted | Error::StateLost { .. } => 503,
         Error::Transport(_) | Error::ServerUntrusted { .. } | Error::AuthRefused { .. } => 502,
         Error::RateLimited | Error::ParkedFull | Error::StreamsFull { .. } => 429,
         e if e.is_caller_error() => 400,
@@ -604,6 +621,7 @@ pub fn output_json(output: &Output) -> Value {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used, clippy::panic)]
     use super::*;
 
     fn request(query: &str) -> Request {
@@ -633,5 +651,115 @@ mod tests {
         assert!(Slot::take(&open, 1).is_none());
         drop(first);
         assert!(Slot::take(&open, 1).is_some());
+    }
+
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    use engine::keys::NodeKey;
+    use engine::log::MemorySink;
+    use engine::policy::Destination;
+
+    /// A sink in memory that knows what it holds.
+    #[derive(Default)]
+    struct TestSink(MemorySink);
+
+    impl LogSink for TestSink {
+        fn append(&mut self, entry: &SignedEntry) -> engine::Result<()> {
+            self.0.append(entry)
+        }
+    }
+
+    impl Sink for TestSink {
+        fn confirmed(&self) -> u64 {
+            self.0.entries().len() as u64
+        }
+
+        fn stored(&mut self) -> Option<Option<SignedEntry>> {
+            Some(self.0.entries().last().cloned())
+        }
+    }
+
+    /// A transport that sends nothing.
+    struct NoTransport;
+
+    impl Transport for NoTransport {
+        fn send(
+            &mut self,
+            _: &Destination,
+            _: Option<&engine::egress::ClientIdentity>,
+            _: &[u8],
+            _: usize,
+        ) -> engine::Result<Vec<u8>> {
+            Err(Error::transport(
+                engine::error::TransportKind::Unsupported,
+                true,
+            ))
+        }
+    }
+
+    /// Hooks whose checkpoint panics.
+    struct PanickingHooks;
+
+    impl Hooks for PanickingHooks {
+        fn checkpoint(&self, _: &SignedHead) {
+            panic!("a checkpoint hook failed");
+        }
+    }
+
+    fn server(hooks: impl Hooks + 'static) -> Server<TestSink, NoTransport> {
+        let node = Node::new(NodeKey::generate(), TestSink::default(), SystemClock);
+        Server::new(node, || NoTransport, Options::default(), hooks)
+    }
+
+    fn get(path: &str) -> Request {
+        Request {
+            method: "GET".into(),
+            path: path.into(),
+            query: String::new(),
+            body: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_poisoned_pool_lends_no_transport() {
+        let pool = Pool::new(vec![1u8, 2]);
+        let poisoned = catch_unwind(AssertUnwindSafe(|| {
+            let _guard = pool.take.lock().unwrap();
+            panic!("a panic while the pool is locked");
+        }));
+        assert!(poisoned.is_err());
+        assert!(pool.try_lease().is_none());
+        assert!(pool.lease().is_none());
+    }
+
+    #[test]
+    fn a_panicked_checkpoint_hook_halts_the_server() {
+        let server = server(PanickingHooks);
+        assert!(server.shared.halted().is_none());
+        assert!(catch_unwind(AssertUnwindSafe(|| server.checkpoint())).is_err());
+        let (status, _) = server.shared.halted().unwrap();
+        assert_eq!(status, 503);
+        // No checkpoint is handed over again (this call would panic).
+        server.checkpoint();
+        assert_eq!(server.shared.halted().unwrap().0, 503);
+    }
+
+    #[test]
+    fn a_node_state_poisoned_by_a_panic_halts_the_server() {
+        let server = server(NoHooks);
+        assert!(server.shared.halted().is_none());
+        assert_eq!(server.shared.route(&get("/checkpoint")).0, 200);
+        let poisoned = catch_unwind(AssertUnwindSafe(|| {
+            server
+                .node()
+                .with_sink(|_| panic!("a panic while the state is locked"))
+        }));
+        assert!(poisoned.is_err());
+        assert!(server.node().is_state_lost());
+        let (status, body) = server.shared.halted().unwrap();
+        assert_eq!(status, 503);
+        assert!(body.to_string().contains("lost to a panic"));
+        // No checkpoint of the lost state is signed either.
+        assert_ne!(server.shared.route(&get("/checkpoint")).0, 200);
     }
 }

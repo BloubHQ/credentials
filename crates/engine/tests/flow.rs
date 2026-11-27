@@ -905,6 +905,68 @@ fn nothing_is_sent_without_a_confirmed_entry() {
 }
 
 #[test]
+fn a_panic_while_the_state_is_locked_halts_the_node_for_good() {
+    let clock = TestClock::at(NOW);
+    let policy = request_policy(
+        vec![secret("token")],
+        vec![header("X-Api-Key", "{{token}}")],
+    );
+    let s = setup(&clock, policy, &[("token", TOKEN)]);
+    let mut transport = FakeTransport::default();
+    let _ = forward(&s.node, &s.record, &get("/"), &mut transport);
+    let sent = transport.sent.len();
+    let entries = s.node.with_sink(|k| k.entries().len());
+    // A panic in the sink, with the state locked, as an append that panics would.
+    let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        s.node.with_sink(|_| panic!("a panic in the sink"))
+    }));
+    assert!(poisoned.is_err());
+    assert!(s.node.is_state_lost());
+    assert!(s.node.is_halted());
+    // Nothing more is served from the state: no call, no grant, no checkpoint.
+    assert_eq!(
+        forward(&s.node, &s.record, &get("/"), &mut transport),
+        Err(Error::StateLost { sent: false })
+    );
+    assert_eq!(
+        transport.sent.len(),
+        sent,
+        "nothing is sent after the panic"
+    );
+    assert_eq!(
+        grant_on(&s.node, &s.device, [7u8; 32], NOW + DAY, &[("rec-1", 1)]),
+        Err(Error::StateLost { sent: false })
+    );
+    assert_eq!(
+        s.node.checkpoint().err(),
+        Some(Error::StateLost { sent: false })
+    );
+    assert_eq!(s.node.waiting(), 0);
+    // Unlike a failed append, no reconcile ends it.
+    let last = s.node.with_sink(|k| k.entries().last().cloned());
+    assert_eq!(
+        s.node.reconcile(last.as_ref()),
+        Err(Error::StateLost { sent: false })
+    );
+    assert!(s.node.is_halted());
+    // The sink can still be read back to restart the node, and holds no entry more.
+    assert_eq!(s.node.with_sink(|k| k.entries().len()), entries);
+}
+
+#[test]
+fn the_hand_over_flag_is_read_without_the_state_lock() {
+    let clock = TestClock::at(NOW);
+    let policy = request_policy(
+        vec![secret("token")],
+        vec![header("X-Api-Key", "{{token}}")],
+    );
+    let s = setup(&clock, policy, &[("token", TOKEN)]);
+    // `with_sink` holds the state lock: asking for the hand-over within it would deadlock
+    // if the flag were read under that lock.
+    assert!(!s.node.with_sink(|_| s.node.is_handed_over()));
+}
+
+#[test]
 fn grants_end_and_revokes_erase() {
     let clock = TestClock::at(NOW);
     let policy = request_policy(
