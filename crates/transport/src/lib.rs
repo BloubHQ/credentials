@@ -705,6 +705,7 @@ impl Transport for TlsTransport {
         &mut self,
         destination: &Destination,
         pins: &[[u8; 32]],
+        intermediates: &[Vec<u8>],
     ) -> Result<Box<dyn Stream + '_>> {
         let deadline = Instant::now() + self.total_timeout;
         // The name is checked before anything is opened.
@@ -714,7 +715,7 @@ impl Transport for TlsTransport {
             .datagrams
             .open(&destination.host, destination.port, deadline)
             .map_err(|e| fault(io_kind(&e), false))?;
-        let trust = dtls::Trust::new(self.roots.clone(), &destination.host, pins);
+        let trust = dtls::Trust::new(self.roots.clone(), &destination.host, pins, intermediates);
         let stream =
             dtls::DtlsStream::connect(socket, trust, self.io_timeout.min(udp::READ_WAIT), deadline)
                 .map_err(|e| e.into_engine(false))?;

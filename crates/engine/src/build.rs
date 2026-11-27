@@ -470,6 +470,7 @@ impl Operation {
                 login: None,
                 host_keys: Vec::new(),
                 pins: Vec::new(),
+                intermediates: Vec::new(),
                 tls: None,
                 version: None,
                 browser: None,
@@ -567,6 +568,16 @@ impl Operation {
     pub fn pin(mut self, pin: &str) -> Self {
         if let Some(Step::Open(open)) = self.steps.first_mut() {
             open.pins.push(pin.into());
+        }
+        self
+    }
+
+    /// Adds an intermediate certificate (the standard base64 of its DER) to the `open` step:
+    /// a CA between the certificate of a DTLS server and the transport's roots.
+    #[must_use]
+    pub fn intermediate(mut self, cert: &str) -> Self {
+        if let Some(Step::Open(open)) = self.steps.first_mut() {
+            open.intermediates.push(cert.into());
         }
         self
     }

@@ -87,6 +87,7 @@ fn the_shape_of_an_operation_is_checked() {
                 login: None,
                 host_keys: Vec::new(),
                 pins: Vec::new(),
+                intermediates: Vec::new(),
                 tls: None,
                 version: None,
                 browser: None,

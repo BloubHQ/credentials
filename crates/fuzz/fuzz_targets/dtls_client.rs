@@ -52,6 +52,7 @@ fuzz_target!(|data: &[u8]| {
         Arc::new(RootCertStore::empty()),
         "coap.example.com",
         &[[0u8; 32]],
+        &[],
     );
     assert!(trust.check(data).is_err());
     let socket = Scripted(datagrams(data));

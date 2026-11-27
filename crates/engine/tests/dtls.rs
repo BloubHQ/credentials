@@ -60,6 +60,7 @@ struct FakeTransport {
     datagrams: usize,
     /// The pins of each DTLS connection.
     dtls: Vec<Vec<[u8; 32]>>,
+    intermediates: Vec<Vec<Vec<u8>>>,
 }
 
 impl Transport for FakeTransport {
@@ -82,8 +83,10 @@ impl Transport for FakeTransport {
         &mut self,
         _: &Destination,
         pins: &[[u8; 32]],
+        intermediates: &[Vec<u8>],
     ) -> engine::Result<Box<dyn Stream + '_>> {
         self.dtls.push(pins.to_vec());
+        self.intermediates.push(intermediates.to_vec());
         Ok(Box::new(FakeStream(self)))
     }
 }
@@ -330,6 +333,69 @@ fn pins_read_and_belong_to_dtls() {
     assert_eq!(refused(vec![tls]), "pins are for a DTLS connection");
 }
 
+/// A DER `SEQUENCE` the policy check takes as an intermediate; the transport parses it.
+const CA: &str = "MAMBAgM=";
+
+#[test]
+fn intermediates_read_and_belong_to_dtls() {
+    let with = |certs: &[&str]| {
+        let mut op = Operation::dtls("call", coap());
+        for cert in certs {
+            op = op.intermediate(cert);
+        }
+        op.then(Send::write("ping")).then(Return::relay(["[a-z]+"]))
+    };
+    let rule = "an intermediate is the base64 of a DER certificate of at most 8 KiB, each once";
+    assert!(sign(vec![with(&[CA])]).is_ok());
+    assert_eq!(refused(vec![with(&["not base64"])]), rule);
+    assert_eq!(refused(vec![with(&[CA, CA])]), rule);
+    // Not a DER SEQUENCE, not the one spelling, more than 8 KiB.
+    assert_eq!(refused(vec![with(&["AQID"])]), rule);
+    assert_eq!(refused(vec![with(&["MAMBAgM"])]), rule);
+    let mut big = vec![0x30u8];
+    big.resize(8 * 1024 + 1, 0);
+    assert_eq!(refused(vec![with(&[&b64(&big)])]), rule);
+    let mut most = vec![0x30u8];
+    most.resize(8 * 1024, 0);
+    assert!(sign(vec![with(&[&b64(&most)])]).is_ok());
+    let nine: Vec<String> = (0..9u8).map(|i| b64(&[0x30, 1, i])).collect();
+    let nine: Vec<&str> = nine.iter().map(String::as_str).collect();
+    assert_eq!(refused(vec![with(&nine)]), "1 to 8 intermediates");
+    assert!(sign(vec![with(&nine[..8])]).is_ok());
+    // Another connection takes none.
+    let tls = Operation::tls("call", coap())
+        .intermediate(CA)
+        .then(Send::write("ping\n"))
+        .then(Return::relay(["[a-z]+\n"]));
+    assert_eq!(
+        refused(vec![tls]),
+        "intermediates are for a DTLS connection"
+    );
+}
+
+#[test]
+fn the_policys_intermediates_reach_the_transport() {
+    let clock = clock();
+    let op = Operation::dtls("call", coap())
+        .pin(PIN)
+        .intermediate(CA)
+        .then(Send::write("ping"))
+        .then(Return::relay(["[a-z]{1,16}"]));
+    let s = setup(&clock, vec![op]);
+    let mut transport = FakeTransport {
+        replies: VecDeque::from([b"pong".to_vec()]),
+        ..FakeTransport::default()
+    };
+    let exchanges = [CallerExchange {
+        send: b"ping".to_vec(),
+        until: vec![],
+    }];
+    let outcome = call_stream(&s, &coap(), &exchanges, &mut transport);
+    assert!(outcome.result.is_ok(), "{:?}", outcome.result.err());
+    assert_eq!(transport.dtls, vec![vec![parse_pin(PIN).unwrap()]]);
+    assert_eq!(transport.intermediates, vec![vec![vec![0x30, 3, 1, 2, 3]]]);
+}
+
 #[test]
 fn a_dtls_operation_exchanges_records_and_searches_every_read() {
     let clock = clock();
@@ -465,7 +531,7 @@ fn the_summary_and_the_diff_name_a_dtls_operation_and_its_pins() {
 }
 
 /// Standard, padded base64 of 32 bytes.
-fn b64(bytes: &[u8; 32]) -> String {
+fn b64(bytes: &[u8]) -> String {
     const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::new();
     for chunk in bytes.chunks(3) {
