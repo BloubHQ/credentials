@@ -40,10 +40,15 @@ fn decode(text: &str) -> Result<Zeroizing<[u8; 32]>> {
 }
 
 fn encode(bytes: &[u8; 32]) -> String {
-    let mut text = Zeroizing::new(String::with_capacity(43));
-    URL_SAFE_NO_PAD.encode_string(bytes, &mut text);
-    // The caller of the client takes this copy; the buffer it was built in is erased.
-    String::from(text.as_str())
+    // Straight into a buffer of its own, which is erased: `encode_string` goes through a
+    // 1 KiB buffer on the stack that keeps the text after it returns (on the web, in the
+    // module's memory, where the smoke test found it).
+    let mut text = Zeroizing::new([0u8; 43]);
+    let written = URL_SAFE_NO_PAD
+        .encode_slice(bytes, text.as_mut_slice())
+        .unwrap_or(0);
+    // The caller of the client takes this copy.
+    String::from_utf8_lossy(text.get(..written).unwrap_or_default()).into_owned()
 }
 
 /// Reads a device key and erases the text.

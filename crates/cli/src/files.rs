@@ -133,8 +133,14 @@ fn warn_if_shared(_path: &Path) {}
 
 /// A 32-byte key as base64url text with a final newline, in an erased buffer.
 pub fn key_text(bytes: &[u8; 32]) -> Zeroizing<String> {
-    let mut text = Zeroizing::new(String::with_capacity(48));
-    URL_SAFE_NO_PAD.encode_string(bytes, &mut text);
+    // Straight into a buffer of its own, which is erased: `encode_string` goes through a
+    // 1 KiB buffer on the stack that keeps the text after it returns.
+    let mut raw = Zeroizing::new([0u8; 43]);
+    let written = URL_SAFE_NO_PAD
+        .encode_slice(bytes, raw.as_mut_slice())
+        .unwrap_or(0);
+    let mut text = Zeroizing::new(String::with_capacity(44));
+    text.push_str(std::str::from_utf8(raw.get(..written).unwrap_or_default()).unwrap_or_default());
     text.push('\n');
     text
 }

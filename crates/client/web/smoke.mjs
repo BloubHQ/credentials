@@ -49,10 +49,13 @@ const devicePublic = client.publicKey(KeyKind.Device, device);
 const callerPublic = client.publicKey(KeyKind.Caller, caller);
 assert.deepEqual(code(() => client.publicKey(KeyKind.User, user)), ["invalid_key", undefined]);
 
+// After each part below, no key is left in the module's memory: the client erases its
+// copies, also those a buffer or the stack would keep (#55). (The JavaScript strings are
+// another matter: they stay in the JavaScript heap until garbage-collected.)
 const tracked = { device, user, caller };
 function track(label) {
-  const counts = Object.entries(tracked).map(([name, key]) => [name, inMemory(key)]);
-  console.log(`TRACK after ${label}: ${JSON.stringify(Object.fromEntries(counts))}`);
+  const counts = Object.fromEntries(Object.entries(tracked).map(([name, key]) => [name, inMemory(key)]));
+  assert.ok(Object.values(counts).every((n) => n === 0), `key text in wasm memory after ${label}: ${JSON.stringify(counts)}`);
 }
 track("keys");
 
@@ -259,17 +262,14 @@ const keys = JSON.stringify([
   { kind: "user", key: user },
 ]);
 const backupKey = client.generateBackupKey();
-track("generateBackupKey");
+tracked.backupKey = backupKey;
 const blob = client.wrapKeys(backupKey, "alice", keys);
 track("wrapKeys");
 assert.equal(JSON.parse(blob).format, "credentials-key-backup/v1");
 assert.ok(!blob.includes(device) && !blob.includes(user));
 assert.deepEqual(JSON.parse(client.unwrapKeys(backupKey, "alice", blob)), JSON.parse(keys));
-track("unwrapKeys");
 assert.deepEqual(code(() => client.unwrapKeys(client.generateBackupKey(), "alice", blob)), ["backup_refused", undefined]);
-track("unwrapKeys, other key");
 assert.deepEqual(code(() => client.unwrapKeys(backupKey, "bob", blob)), ["backup_refused", undefined]);
-track("unwrapKeys, other owner");
 
 track("backup");
 
@@ -282,7 +282,6 @@ assert.ok(!sealedKeys.includes(device) && !sealedKeys.includes(user));
 const moved = JSON.parse(receiver.open(sealedKeys));
 assert.equal(moved.owner, "alice");
 assert.deepEqual(moved.keys, JSON.parse(keys));
-tracked.backupKey = backupKey;
 track("transfer");
 
 // ...and wrong codes are counted until the code is dead.
@@ -297,13 +296,8 @@ assert.deepEqual(code(() => guarded.offer()), ["transfer_refused", undefined]);
 
 track("wrong codes");
 
-// Every key above went in and out of the module as text, through every call that takes one
-// (#55): none is left in its memory. (The JavaScript strings are another matter: they stay in
-// the JavaScript heap until garbage-collected.)
-const left = Object.fromEntries(
-  Object.entries({ device, user, caller, backupKey }).map(([name, key]) => [name, inMemory(key)]),
-);
-console.log("key text left in wasm memory:", JSON.stringify(left));
-assert.deepEqual(left, { device: 0, user: 0, caller: 0, backupKey: 0 });
+const blobOpened = client.unwrapKeys(backupKey, "alice", blob);
+track("a last unwrapKeys");
+assert.ok(blobOpened.length > 0);
 
 console.log("web package: smoke test passed");
