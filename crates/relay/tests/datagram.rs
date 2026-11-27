@@ -14,6 +14,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use engine::egress::Stream;
+use engine::readbuf::ReadBuf;
 use relay::datagram::{
     self, Egress, RelayDatagramConnector, read_datagram, read_egress_request, take_datagram,
     write_datagram,
@@ -32,16 +33,19 @@ fn frames_round_trip_and_bad_lengths_are_refused() {
     assert_eq!(read_datagram(&mut reader).unwrap().unwrap(), vec![9u8; 300]);
     assert!(read_datagram(&mut reader).unwrap().is_none());
     // The same frames taken off a buffer, also when they arrive in pieces.
-    let mut pending = wire[..4].to_vec();
+    let mut pending = ReadBuf::new();
+    pending.push(&wire[..4]);
     assert!(take_datagram(&mut pending).unwrap().is_none());
-    pending.extend_from_slice(&wire[4..]);
+    pending.push(&wire[4..]);
     assert_eq!(take_datagram(&mut pending).unwrap().unwrap(), b"one");
     assert_eq!(take_datagram(&mut pending).unwrap().unwrap().len(), 300);
-    assert!(pending.is_empty());
+    assert!(pending.pending().is_empty());
     // An empty datagram, and one too long, are not frames.
     assert!(write_datagram(&mut Vec::new(), b"").is_err());
     assert!(write_datagram(&mut Vec::new(), &vec![0u8; datagram::MAX_DATAGRAM + 1]).is_err());
-    assert!(take_datagram(&mut vec![0, 0]).is_err());
+    let mut empty = ReadBuf::new();
+    empty.push(&[0, 0]);
+    assert!(take_datagram(&mut empty).is_err());
     assert!(read_datagram(&mut Cursor::new(vec![0xff, 0xff])).is_err());
     // A frame cut short.
     assert!(read_datagram(&mut Cursor::new(vec![0, 5, 1])).is_err());

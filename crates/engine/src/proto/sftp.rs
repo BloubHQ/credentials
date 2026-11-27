@@ -25,6 +25,7 @@ use zeroize::Zeroizing;
 
 use super::ssh::{Client, Event};
 use super::wire::{Parse, Put};
+use crate::readbuf::ReadBuf;
 use crate::{Error, Result};
 
 /// Longest SFTP packet accepted, in bytes.
@@ -228,10 +229,28 @@ fn parent(path: &[u8]) -> &[u8] {
     }
 }
 
+/// Takes the first whole packet out of `buf`: its type and the bytes after it.
+fn split(buf: &mut ReadBuf) -> Result<Option<(u8, Zeroizing<Vec<u8>>)>> {
+    let pending = buf.pending();
+    let Some(head) = pending.get(..4) else {
+        return Ok(None);
+    };
+    let len = usize::try_from(Parse::new(head).u32()?).map_err(|_| invalid("len"))?;
+    if !(1..=MAX_PACKET).contains(&len) {
+        return Err(invalid("an SFTP packet length out of bounds"));
+    }
+    if pending.len() < 4 + len {
+        return Ok(None);
+    }
+    let kind = pending.get(4).copied().unwrap_or(0);
+    buf.skip(5);
+    Ok(Some((kind, buf.take(len - 1))))
+}
+
 /// An SFTP session on its own channel.
 pub struct Sftp<'c, 's> {
     ssh: &'c mut Client<'s>,
-    buf: Zeroizing<Vec<u8>>,
+    buf: ReadBuf,
     next_id: u32,
 }
 
@@ -241,7 +260,7 @@ impl<'c, 's> Sftp<'c, 's> {
         ssh.subsystem(b"sftp")?;
         let mut sftp = Sftp {
             ssh,
-            buf: Zeroizing::new(Vec::new()),
+            buf: ReadBuf::new(),
             next_id: 1,
         };
         let mut init = Put::new();
@@ -264,22 +283,11 @@ impl<'c, 's> Sftp<'c, 's> {
     /// The next packet: its type and the bytes after it.
     fn packet(&mut self) -> Result<(u8, Zeroizing<Vec<u8>>)> {
         loop {
-            if let Some(head) = self.buf.get(..4) {
-                let len = usize::try_from(Parse::new(head).u32()?).map_err(|_| invalid("len"))?;
-                if !(1..=MAX_PACKET).contains(&len) {
-                    return Err(invalid("an SFTP packet length out of bounds"));
-                }
-                if self.buf.len() >= 4 + len {
-                    let body =
-                        Zeroizing::new(self.buf.get(5..4 + len).unwrap_or_default().to_vec());
-                    let kind = self.buf.get(4).copied().unwrap_or(0);
-                    let rest = Zeroizing::new(self.buf.get(4 + len..).unwrap_or_default().to_vec());
-                    self.buf = rest;
-                    return Ok((kind, body));
-                }
+            if let Some(packet) = split(&mut self.buf)? {
+                return Ok(packet);
             }
             match self.ssh.poll_event(WAIT)? {
-                Some(Event::Data(data)) => self.buf.extend_from_slice(&data),
+                Some(Event::Data(data)) => self.buf.push(&data),
                 Some(Event::Stderr(_) | Event::Exit(_) | Event::Forwarded { .. }) | None => {}
                 Some(Event::Closed) => {
                     return Err(Error::transport(crate::error::TransportKind::Closed, true));
@@ -586,6 +594,35 @@ impl<'c, 's> Sftp<'c, 's> {
 mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
+
+    #[test]
+    fn packets_are_split_in_linear_time() {
+        // 64 KiB of the smallest packets (10 bytes), arriving 16 KiB at a time and split
+        // across reads: each byte is copied a bounded number of times (#46).
+        let unit = [0u8, 0, 0, 6, 101, 1, 2, 3, 4, 5];
+        let wire: Vec<u8> = unit
+            .iter()
+            .copied()
+            .cycle()
+            .take(64 * 1024 / 10 * 10)
+            .collect();
+        let mut buf = ReadBuf::new();
+        let mut packets = 0;
+        for chunk in wire.chunks(16 * 1024) {
+            buf.push(chunk);
+            while let Some((kind, body)) = split(&mut buf).unwrap() {
+                assert_eq!((kind, body.as_slice()), (101, &[1u8, 2, 3, 4, 5][..]));
+                packets += 1;
+            }
+        }
+        assert_eq!(packets, wire.len() / 10);
+        assert!(buf.pending().is_empty());
+        assert!(buf.copied < 2 * wire.len() as u64, "copied {}", buf.copied);
+        // A length out of bounds is refused before the packet arrives.
+        let mut bad = ReadBuf::new();
+        bad.push(&[0, 0, 0, 0]);
+        assert!(split(&mut bad).is_err());
+    }
 
     #[test]
     fn traversal_is_refused_before_anything_is_sent() {

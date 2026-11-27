@@ -5,6 +5,9 @@
 //!
 //! Taken bytes are wiped when the buffer is compacted or emptied, and all of it when it is
 //! dropped; the buffer never lets `Vec` reallocate it, which would free an allocation unwiped.
+//!
+//! Every reader of a framed stream uses it: the engine's protocol clients, the HTTP/2
+//! transport, the relay's datagram links and the node's caller streams.
 
 use zeroize::{Zeroize, Zeroizing};
 
@@ -12,7 +15,8 @@ use zeroize::{Zeroize, Zeroizing};
 const MIN_BUFFER: usize = 16 * 1024;
 
 /// Bytes pushed at the back and taken from the front.
-pub(crate) struct ReadBuf {
+#[derive(Default)]
+pub struct ReadBuf {
     /// The bytes pushed; those before `pos` were taken.
     buf: Zeroizing<Vec<u8>>,
     /// Where the bytes not taken yet start in `buf`.
@@ -24,17 +28,12 @@ pub(crate) struct ReadBuf {
 
 impl ReadBuf {
     /// An empty buffer.
-    pub(crate) fn new() -> Self {
-        Self {
-            buf: Zeroizing::new(Vec::new()),
-            pos: 0,
-            #[cfg(test)]
-            copied: 0,
-        }
+    pub fn new() -> Self {
+        Self::default()
     }
 
     /// The bytes not taken yet.
-    pub(crate) fn pending(&self) -> &[u8] {
+    pub fn pending(&self) -> &[u8] {
         self.buf.get(self.pos..).unwrap_or_default()
     }
 
@@ -45,14 +44,14 @@ impl ReadBuf {
     }
 
     /// Appends `bytes`, after moving the bytes not taken yet to the front.
-    pub(crate) fn push(&mut self, bytes: &[u8]) {
+    pub fn push(&mut self, bytes: &[u8]) {
         self.compact();
         self.grow(bytes.len());
         self.buf.extend_from_slice(bytes);
     }
 
     /// Takes the first `n` pending bytes (fewer when fewer are pending).
-    pub(crate) fn take(&mut self, n: usize) -> Zeroizing<Vec<u8>> {
+    pub fn take(&mut self, n: usize) -> Zeroizing<Vec<u8>> {
         let head = Zeroizing::new(self.pending().get(..n).unwrap_or(self.pending()).to_vec());
         #[cfg(test)]
         {
@@ -63,7 +62,7 @@ impl ReadBuf {
     }
 
     /// Drops the first `n` pending bytes (fewer when fewer are pending).
-    pub(crate) fn skip(&mut self, n: usize) {
+    pub fn skip(&mut self, n: usize) {
         self.pos = self.pos.saturating_add(n).min(self.buf.len());
         if self.pos >= self.buf.len() {
             // All taken: wipe what it holds (its spare capacity holds nothing: `compact`

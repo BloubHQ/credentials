@@ -104,7 +104,7 @@ pub mod node;
 pub mod policy;
 mod primitives;
 pub mod proto;
-mod readbuf;
+pub mod readbuf;
 pub mod record;
 pub mod reflection;
 pub mod request;

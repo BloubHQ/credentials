@@ -19,6 +19,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use engine::readbuf::ReadBuf;
 use transport::Socket;
 use transport::udp::{DatagramConnector, DatagramSocket};
 
@@ -111,16 +112,15 @@ fn frame_len(pending: &[u8]) -> io::Result<Option<usize>> {
 }
 
 /// Takes a whole frame off the front of `pending`, when one is there.
-pub fn take_datagram(pending: &mut Vec<u8>) -> io::Result<Option<Vec<u8>>> {
-    let Some(len) = frame_len(pending)? else {
+pub fn take_datagram(pending: &mut ReadBuf) -> io::Result<Option<Vec<u8>>> {
+    let Some(len) = frame_len(pending.pending())? else {
         return Ok(None);
     };
-    let Some(datagram) = pending.get(2..2 + len) else {
+    if pending.pending().len() < 2 + len {
         return Ok(None);
-    };
-    let datagram = datagram.to_vec();
-    pending.drain(..2 + len);
-    Ok(Some(datagram))
+    }
+    pending.skip(2);
+    Ok(Some(std::mem::take(&mut *pending.take(len))))
 }
 
 /// Reads one frame; `None` at the end of the stream before a frame starts.
@@ -146,7 +146,7 @@ pub fn read_datagram<R: Read>(stream: &mut R) -> io::Result<Option<Vec<u8>>> {
 /// The node side: datagrams to one destination over a link to the relay.
 struct RelayDatagrams {
     link: Box<dyn Socket>,
-    pending: Vec<u8>,
+    pending: ReadBuf,
 }
 
 impl DatagramSocket for RelayDatagrams {
@@ -168,9 +168,7 @@ impl DatagramSocket for RelayDatagrams {
             self.link.set_timeouts(Some(left))?;
             match self.link.read(&mut chunk) {
                 Ok(0) => return Err(io::ErrorKind::UnexpectedEof.into()),
-                Ok(n) => self
-                    .pending
-                    .extend_from_slice(chunk.get(..n).unwrap_or_default()),
+                Ok(n) => self.pending.push(chunk.get(..n).unwrap_or_default()),
                 Err(e)
                     if matches!(
                         e.kind(),
@@ -182,7 +180,8 @@ impl DatagramSocket for RelayDatagrams {
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
                 Err(e) => return Err(e),
             }
-            if self.pending.len() > MAX_DATAGRAM + 2 && frame_len(&self.pending)?.is_none() {
+            let held = self.pending.pending();
+            if held.len() > MAX_DATAGRAM + 2 && frame_len(held)?.is_none() {
                 return Err(io::Error::new(io::ErrorKind::InvalidData, "frame"));
             }
         }
@@ -229,7 +228,7 @@ impl DatagramConnector for RelayDatagramConnector {
         })?;
         Ok(Box::new(RelayDatagrams {
             link,
-            pending: Vec::new(),
+            pending: ReadBuf::new(),
         }))
     }
 }
@@ -304,7 +303,7 @@ pub fn serve_datagrams(
             })?
     };
     let tick = Duration::from_millis(250);
-    let mut pending = Vec::new();
+    let mut pending = ReadBuf::new();
     let mut chunk = [0u8; 4096];
     let result = loop {
         if done.load(Ordering::SeqCst) {
@@ -325,7 +324,7 @@ pub fn serve_datagrams(
         let _ = link.set_timeouts(Some(tick));
         match link.read(&mut chunk) {
             Ok(0) => break Ok(()),
-            Ok(n) => pending.extend_from_slice(chunk.get(..n).unwrap_or_default()),
+            Ok(n) => pending.push(chunk.get(..n).unwrap_or_default()),
             Err(e)
                 if matches!(
                     e.kind(),
