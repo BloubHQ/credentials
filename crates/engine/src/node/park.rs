@@ -225,6 +225,8 @@ struct Counts {
 }
 
 impl Holds {
+    /// A poisoned lock is recovered on purpose, unlike the node's state (#96): these are plain
+    /// counters, and a panic between two of their updates leaves a count one off at worst.
     fn counts(&self) -> MutexGuard<'_, Counts> {
         self.0.lock().unwrap_or_else(PoisonError::into_inner)
     }

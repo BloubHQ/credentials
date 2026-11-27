@@ -283,6 +283,8 @@ pub(crate) enum Framing {
 
 /// True when `wire`, a request in HTTP/1.1 form, is a `HEAD` request: its response has no
 /// body, whatever its length headers say.
+// Methods are case-sensitive (RFC 9110 section 9.1) and the node writes the request line
+// from `policy::Method`, whose only spelling is upper case.
 pub fn is_head_request(wire: &[u8]) -> bool {
     wire.starts_with(b"HEAD ")
 }
@@ -954,6 +956,21 @@ Transfer-Encoding: chunked\r\n\r\n\
             .capture(&source)
             .unwrap()
             .map(|v| v.to_vec())
+    }
+
+    #[test]
+    fn only_the_upper_case_head_method_exists() {
+        assert_eq!(crate::policy::Method::Head.as_str(), "HEAD");
+        assert!(serde_json::from_str::<crate::policy::Method>("\"HEAD\"").is_ok());
+        assert!(serde_json::from_str::<crate::policy::Method>("\"head\"").is_err());
+        assert!(is_head_request(
+            b"HEAD / HTTP/1.1
+"
+        ));
+        assert!(!is_head_request(
+            b"head / HTTP/1.1
+"
+        ));
     }
 
     #[test]
