@@ -834,7 +834,9 @@ What each kind does with them:
   each goes to the address the control connection reached, whatever address a `PASV` reply
   names (only its port is used, so the classic FTP bounce has nothing to steer, and a server
   behind NAT that names its private address works), to a port of at least 1024 (when the
-  `EPSV` port cannot be reached, the node asks again with `PASV` for the rest of the session), over TLS to the same name, resuming the control connection's TLS session (RFC
+  `EPSV` port cannot be reached, the node asks again with `PASV` for the rest of the session;
+  a firewall that drops rather than rejects that port costs the first transfer the whole
+  connect timeout, once, which a short `time` limit may not leave room for), over TLS to the same name, resuming the control connection's TLS session (RFC
   4217 section 10, which servers that require it check), and must end with a TLS
   `close_notify`: a cut is an error, never the end of a file. A path is absolute UTF-8 of at
   most 4096 bytes with no control byte (so no CR, LF or NUL), DEL or `0xFF`, and no empty,
