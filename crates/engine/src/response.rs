@@ -963,14 +963,8 @@ Transfer-Encoding: chunked\r\n\r\n\
         assert_eq!(crate::policy::Method::Head.as_str(), "HEAD");
         assert!(serde_json::from_str::<crate::policy::Method>("\"HEAD\"").is_ok());
         assert!(serde_json::from_str::<crate::policy::Method>("\"head\"").is_err());
-        assert!(is_head_request(
-            b"HEAD / HTTP/1.1
-"
-        ));
-        assert!(!is_head_request(
-            b"head / HTTP/1.1
-"
-        ));
+        assert!(is_head_request(b"HEAD / HTTP/1.1\r\n"));
+        assert!(!is_head_request(b"head / HTTP/1.1\r\n"));
     }
 
     #[test]

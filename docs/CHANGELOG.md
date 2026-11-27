@@ -14,6 +14,13 @@ before 1.0, minor versions may break formats and APIs.
   strict key exchange, when agreed, resets the sequence numbers at every NEWKEYS; at most
   256 re-exchanges per connection (#82).
 
+- FTP: the address of a `PASV` reply is ignored and only its port is used. The data
+  connection still goes to the control connection's server; a port below 1024 is still
+  refused. Before, a server behind NAT that names its private address (vsftpd without
+  `pasv_address`, IIS on a cloud VM) was refused. When the data connection to an `EPSV`
+  port cannot be made, the node asks again with `PASV` and keeps to it for the session;
+  before, it fell back only when `EPSV` was refused with a 5xx (#83).
+
 - `credentials verify` takes a node key or user key that starts with `--` (one key in 4,096
   in URL-safe base64) as a key; before, it failed as an unknown option with exit code 2,
   unless it came after `--`. An argument of a key's shape (43 URL-safe base64 characters)

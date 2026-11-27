@@ -129,6 +129,34 @@ fn a_remote_forward_relays_the_one_connection_to_its_bind() {
 }
 
 #[test]
+fn a_channel_opened_while_a_write_waits_for_window_is_refused_at_once() {
+    // The forwarded channel opens with a window of 16 bytes: the write of 300 sends 16 and
+    // waits. Then the server opens a second channel to the bind, and only after that opens
+    // the window. The second channel is refused while the write waits (a channel is open, and
+    // a forward serves one connection), not kept for later and not left unanswered; the
+    // write then goes on.
+    let s = remote_setup();
+    let mut server = server();
+    server.remote_window = Some(16);
+    server.open_while_waiting = Some(("forwarded-tcpip", "127.0.0.1", 8080));
+    let sent: &[u8] = &[b'q'; 300];
+    let (fake, _caller, result) = forward(&s, server, vec![command("web", &[])], &[sent]);
+    assert!(matches!(result, Ok(Output::Closed(_))), "{result:?}");
+    let peer = &fake.peer;
+    assert!(
+        peer.open_while_waiting.is_none(),
+        "the second channel opened during the write"
+    );
+    assert_eq!(peer.open_answers, [(100, None), (101, Some(1))]);
+    assert_eq!(
+        peer.answered_after,
+        [0, 16],
+        "refused while the write waited, after its first 16 bytes"
+    );
+    assert_eq!(peer.forwarded, sent, "the whole write went through");
+}
+
+#[test]
 fn a_channel_not_asked_for_or_to_another_bind_is_refused() {
     let s = remote_setup();
     for opens in [

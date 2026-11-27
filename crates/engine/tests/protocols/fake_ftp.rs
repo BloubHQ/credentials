@@ -69,8 +69,12 @@ pub struct FtpServer {
     /// The address its PASV replies name, and the address the transport reached.
     pub pasv_ip: [u8; 4],
     pub peer: Option<IpAddr>,
-    /// The port its passive replies name.
+    /// The port its passive replies name, and the port of its EPSV replies when that differs
+    /// (`None`: the same).
     pub data_port: u16,
+    pub epsv_port: Option<u16>,
+    /// Ports a data connection cannot reach (a firewall in front of the server).
+    pub unreachable: Vec<u16>,
     /// Appended to the text of every reply after the sign-in (an echo).
     pub echo: String,
     /// The data connections end in a cut.
@@ -117,6 +121,8 @@ impl FtpServer {
             pasv_ip: [192, 0, 2, 10],
             peer: Some("192.0.2.10".parse().unwrap()),
             data_port: 50_000,
+            epsv_port: None,
+            unreachable: Vec::new(),
             echo: String::new(),
             cut: false,
             feat_lines: 0,
@@ -195,7 +201,7 @@ impl FtpServer {
             "EPSV" if self.epsv => {
                 let text = format!(
                     "229 Entering Extended Passive Mode (|||{}|)",
-                    self.data_port
+                    self.epsv_port.unwrap_or(self.data_port)
                 );
                 self.reply(&text);
             }
@@ -333,6 +339,9 @@ impl Peer for FtpServer {
 
     fn data(&mut self, port: u16) -> engine::Result<Box<dyn Stream>> {
         self.opened_data.push(port);
+        if self.unreachable.contains(&port) {
+            return Err(engine::Error::transport(TransportKind::Connect, false));
+        }
         let pipe = Rc::new(RefCell::new(Pipe::default()));
         self.data = Some(pipe.clone());
         Ok(Box::new(DataStream(pipe)))

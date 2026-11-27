@@ -586,11 +586,12 @@ the tree). Choices, and the more secure option taken:
   the day a kind has the private-address sign-off, not before.
 - **FTP data connections are passive, to the same address, over resumed TLS.** Active mode
   (`PORT`, `EPRT`) would have the server connect to the node; it is never sent. `EPSV` gives
-  only a port; a `PASV` address must equal the address the control connection reached (the
-  transport's `peer_ip`), and the transport connects to that exact address
-  (`Connector::connect_again`), so a reply naming another host (FTP bounce, SSRF into the
-  node's network) is refused before anything connects, and DNS is not asked again. Ports
-  below 1024 are refused. The data connection uses the control connection's TLS client
+  only a port, and of a `PASV` reply only the port is used: the transport connects to the
+  exact address the control connection reached (`Connector::connect_again`), whatever the
+  reply names, so a reply naming another host (FTP bounce, SSRF into the node's network) has
+  nothing to steer, a server behind NAT that names its private address still works, and DNS
+  is not asked again. Ports below 1024 are refused. A data connection to an `EPSV` port that
+  cannot be made is asked again with `PASV`, which the session then keeps to. The data connection uses the control connection's TLS client
   configuration, so rustls resumes the session (RFC 4217 section 10: servers may require
   that reuse), and verifies the same name. `PROT P` is required before any data connection
   opens.

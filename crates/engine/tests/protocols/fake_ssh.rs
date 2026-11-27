@@ -240,11 +240,18 @@ pub struct SshServer {
     pub binds: Vec<String>,
     pub cancels: Vec<String>,
     pub open_answers: Vec<(u32, Option<u32>)>,
+    /// How many bytes had come on forwarded channels when each answer of `open_answers` came.
+    pub answered_after: Vec<usize>,
     /// A session channel opens with a window of 0; after the shell's prompt the server sends
     /// more output, error output and an exit status, and only then opens the window.
     pub hold_window: bool,
     /// Told once a silent command or a remote forward is set up: the connection is open.
     pub ready: Option<std::sync::mpsc::Sender<()>>,
+    /// Remote forwarding: the window of the channels it opens (1 MiB when `None`), and a
+    /// channel it opens when the first data comes on a forwarded channel, before it opens the
+    /// window further: it reaches the client while the client waits to write.
+    pub remote_window: Option<u32>,
+    pub open_while_waiting: Option<(&'static str, &'static str, u32)>,
     sftp: bool,
     sftp_in: Vec<u8>,
     forwarding: bool,
@@ -307,8 +314,11 @@ impl SshServer {
             binds: Vec::new(),
             cancels: Vec::new(),
             open_answers: Vec::new(),
+            answered_after: Vec::new(),
             hold_window: false,
             ready: None,
+            remote_window: None,
+            open_while_waiting: None,
             sftp: false,
             sftp_in: Vec::new(),
             forwarding: false,
@@ -668,6 +678,7 @@ impl SshServer {
                 let ours = r.u32();
                 let theirs = r.u32();
                 self.open_answers.push((ours, None));
+                self.answered_after.push(self.forwarded.len());
                 self.channel = Some(theirs);
                 self.forwarding = true;
                 self.sent_close = false;
@@ -676,6 +687,7 @@ impl SshServer {
                 let ours = r.u32();
                 let reason = r.u32();
                 self.open_answers.push((ours, Some(reason)));
+                self.answered_after.push(self.forwarded.len());
             }
             98 => {
                 let _recipient = r.u32();
@@ -765,6 +777,9 @@ impl SshServer {
             94 if self.forwarding => {
                 let _recipient = r.u32();
                 let data = r.string().to_vec();
+                if let Some(open) = self.open_while_waiting.take() {
+                    self.open_then_widen(open);
+                }
                 self.forwarded.extend_from_slice(&data);
                 let mut echo = b"echo:".to_vec();
                 echo.extend_from_slice(&data);
@@ -1070,7 +1085,7 @@ impl SshServer {
             let mut open = vec![90];
             open.extend(string(kind.as_bytes()));
             open.extend((100 + i as u32).to_be_bytes());
-            open.extend((1u32 << 20).to_be_bytes());
+            open.extend(self.remote_window.unwrap_or(1 << 20).to_be_bytes());
             open.extend(16384u32.to_be_bytes());
             open.extend(string(address.as_bytes()));
             open.extend(port.to_be_bytes());
@@ -1078,6 +1093,26 @@ impl SshServer {
             open.extend((40_000 + i as u32).to_be_bytes());
             self.send(&open);
         }
+    }
+
+    /// Opens `open_while_waiting`, numbered after `remote_opens`, then opens the window of
+    /// the current channel by 1 MiB.
+    fn open_then_widen(&mut self, (kind, address, port): (&'static str, &'static str, u32)) {
+        let number = 100 + self.remote_opens.len() as u32;
+        let mut open = vec![90];
+        open.extend(string(kind.as_bytes()));
+        open.extend(number.to_be_bytes());
+        open.extend((1u32 << 20).to_be_bytes());
+        open.extend(16384u32.to_be_bytes());
+        open.extend(string(address.as_bytes()));
+        open.extend(port.to_be_bytes());
+        open.extend(string(b"203.0.113.9"));
+        open.extend(41_000u32.to_be_bytes());
+        self.send(&open);
+        let mut adjust = vec![93];
+        adjust.extend(self.channel.unwrap().to_be_bytes());
+        adjust.extend((1u32 << 20).to_be_bytes());
+        self.send(&adjust);
     }
 
     fn data(&mut self, bytes: &[u8], stderr: bool) {

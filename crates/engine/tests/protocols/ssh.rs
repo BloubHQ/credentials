@@ -513,31 +513,16 @@ fn a_shell_relays_signed_frames_and_its_output() {
         session("box.example.com", 22, Vec::new(), Vec::new()),
     );
     let mut caller = TestCaller::default();
-    caller.sends.push_back(frame(
-        &call, 0, b"ls
-",
-    ));
-    caller.sends.push_back(frame(
-        &call, 1, b"exit
-",
-    ));
+    caller.sends.push_back(frame(&call, 0, b"ls\n"));
+    caller.sends.push_back(frame(&call, 1, b"exit\n"));
     let closed = match s.node.relay(&call, &mut fake, &mut caller).result {
         Ok(engine::call::Output::Closed(closed)) => closed,
         Ok(_) => panic!("not closed"),
         Err(e) => panic!("relay failed: {e}"),
     };
     assert_eq!(closed.reason, "server");
-    assert_eq!(
-        caller.output(),
-        b"$ ls
-"
-    );
-    assert_eq!(
-        fake.peer.shell_input,
-        b"ls
-exit
-"
-    );
+    assert_eq!(caller.output(), b"$ ls\n");
+    assert_eq!(fake.peer.shell_input, b"ls\nexit\n");
     assert_eq!(last_closed(&s), (true, "server".into()));
 }
 
@@ -580,14 +565,7 @@ fn a_secret_echoed_by_a_shell_ends_the_relay_before_it_goes_back() {
     let s = setup(&[password_field()], vec![shell_operation()]);
     let mut peer = server();
     peer.exec = |input| match input {
-        b"show
-" => (
-            b"pw: hunter2-pass
-"
-            .to_vec(),
-            Vec::new(),
-            0,
-        ),
+        b"show\n" => (b"pw: hunter2-pass\n".to_vec(), Vec::new(), 0),
         other => (other.to_vec(), Vec::new(), 0),
     };
     let mut fake = Fake::new(peer);
@@ -597,18 +575,9 @@ fn a_secret_echoed_by_a_shell_ends_the_relay_before_it_goes_back() {
         session("box.example.com", 22, Vec::new(), Vec::new()),
     );
     let mut caller = TestCaller::default();
-    caller.sends.push_back(frame(
-        &call, 0, b"ls
-",
-    ));
-    caller.sends.push_back(frame(
-        &call, 1, b"show
-",
-    ));
-    caller.sends.push_back(frame(
-        &call, 2, b"exit
-",
-    ));
+    caller.sends.push_back(frame(&call, 0, b"ls\n"));
+    caller.sends.push_back(frame(&call, 1, b"show\n"));
+    caller.sends.push_back(frame(&call, 2, b"exit\n"));
     let result = s.node.relay(&call, &mut fake, &mut caller).result;
     assert!(matches!(result, Err(engine::Error::Reflection)));
     assert!(

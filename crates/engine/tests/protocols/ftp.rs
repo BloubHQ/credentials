@@ -190,46 +190,73 @@ fn a_data_connection_without_prot_p_is_never_opened() {
 }
 
 #[test]
-fn a_passive_reply_naming_another_host_is_refused() {
+fn the_address_of_a_passive_reply_is_ignored() {
+    // A server behind NAT names its private address, or any other: only the port is used, and
+    // the data connection goes to the control connection's server (the transport has no way
+    // to go elsewhere). A port below 1024 is still refused.
     let s = ftp_setup("implicit");
-    for (ip, port) in [
-        ([10, 0, 0, 5], 50_000),
-        ([127, 0, 0, 1], 50_000),
-        ([192, 0, 2, 10], 25),
-    ] {
+    for ip in [[10, 0, 0, 5], [127, 0, 0, 1], [192, 0, 2, 10]] {
         let mut srv = server(true);
         srv.epsv = false;
         srv.pasv_ip = ip;
-        srv.data_port = port;
         let mut fake = Fake::new(srv);
         let out = session_output(run(
             &s,
             &mut fake,
             vec![command("get", &["/srv/reports/a.csv"])],
         ));
-        assert!(
-            matches!(out.error, Some(engine::Error::ServerUntrusted { .. })),
-            "{ip:?}:{port} {:?}",
-            out.error
-        );
-        assert!(
-            fake.peer.opened_data.is_empty(),
-            "no data connection opened"
-        );
-        assert!(!fake.peer.commands.iter().any(|c| c.starts_with("RETR")));
+        assert!(out.error.is_none(), "{ip:?}: {:?}", out.error);
+        assert!(fake.peer.commands.contains(&"PASV".to_string()));
+        assert_eq!(fake.peer.opened_data, [50_000], "{ip:?}");
     }
-    // PASV naming the control connection's own address is taken.
     let mut srv = server(true);
     srv.epsv = false;
+    srv.data_port = 25;
     let mut fake = Fake::new(srv);
     let out = session_output(run(
         &s,
         &mut fake,
         vec![command("get", &["/srv/reports/a.csv"])],
     ));
+    assert!(
+        matches!(out.error, Some(engine::Error::ServerUntrusted { .. })),
+        "{:?}",
+        out.error
+    );
+    assert!(
+        fake.peer.opened_data.is_empty(),
+        "no data connection opened"
+    );
+    assert!(!fake.peer.commands.iter().any(|c| c.starts_with("RETR")));
+}
+
+#[test]
+fn an_epsv_port_that_cannot_be_reached_falls_back_to_pasv_for_the_session() {
+    // EPSV is answered, but a firewall passes only the PASV range: the node asks again with
+    // PASV and keeps to it for the next transfer.
+    let s = ftp_setup("implicit");
+    let mut srv = server(true);
+    srv.epsv_port = Some(6446);
+    srv.unreachable = vec![6446];
+    let mut fake = Fake::new(srv);
+    let out = session_output(run(
+        &s,
+        &mut fake,
+        vec![
+            command("get", &["/srv/reports/a.csv"]),
+            command("get", &["/srv/reports/a.csv"]),
+        ],
+    ));
     assert!(out.error.is_none(), "{:?}", out.error);
-    assert!(fake.peer.commands.contains(&"PASV".to_string()));
-    assert_eq!(fake.peer.opened_data, [50_000]);
+    assert_eq!(fake.peer.opened_data, [6446, 50_000, 50_000]);
+    let asked: Vec<&str> = fake
+        .peer
+        .commands
+        .iter()
+        .map(String::as_str)
+        .filter(|c| matches!(*c, "EPSV" | "PASV"))
+        .collect();
+    assert_eq!(asked, ["EPSV", "PASV", "PASV"]);
 }
 
 #[test]
