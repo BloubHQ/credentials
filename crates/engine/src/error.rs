@@ -320,8 +320,15 @@ pub enum Error {
     HandedOver,
     /// A panic interrupted a change of the node's state, so what the state holds is unknown:
     /// the node takes no act until it is restarted from its log ([`crate::node::Node::restore`]).
-    #[error("the node's state was lost to a panic; the node takes no act until it restarts")]
-    StateLost,
+    /// `sent` is true when the request of this act may already have gone to its destination
+    /// (the state was lost after it), as for [`TransportFault::sent`].
+    #[error(
+        "the node's state was lost to a panic; the node takes no act until it restarts (sent: {sent})"
+    )]
+    StateLost {
+        /// The request may already have gone to its destination.
+        sent: bool,
+    },
     /// A hand-over was refused: the package, its entry or the state of the node.
     #[error("hand-over refused: {rule}")]
     HandOverInvalid {

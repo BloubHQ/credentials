@@ -791,7 +791,16 @@ impl<S: LogSink, C: Clock> Node<S, C> {
     /// floors or counts half updated; the node is halted for good then, as a failed log
     /// append halts it, but no reconcile ends this halt: the node must restart from its log.
     fn lock(&self) -> Result<MutexGuard<'_, State<S>>> {
-        self.state.lock().map_err(|_| Error::StateLost)
+        self.state
+            .lock()
+            .map_err(|_| Error::StateLost { sent: false })
+    }
+
+    /// [`Node::lock`] for a step after the act's request went out: a lost state says `sent`.
+    fn lock_sent(&self) -> Result<MutexGuard<'_, State<S>>> {
+        self.state
+            .lock()
+            .map_err(|_| Error::StateLost { sent: true })
     }
 
     /// True once a panic interrupted a change of the state ([`Error::StateLost`]): the node
@@ -803,8 +812,9 @@ impl<S: LogSink, C: Clock> Node<S, C> {
     /// Fails with [`Error::StateLost`] once the state was lost. Live loops ask it with
     /// [`Node::is_handed_over`]; neither takes the state lock.
     fn alive(&self) -> Result<()> {
+        // Live loops ask between exchanges, after bytes went out.
         if self.is_state_lost() {
-            Err(Error::StateLost)
+            Err(Error::StateLost { sent: true })
         } else {
             Ok(())
         }
@@ -2244,7 +2254,8 @@ impl<S: LogSink, C: Clock> Node<S, C> {
             generation,
             fields: core::mem::take(&mut run.captured.changed),
         };
-        let mut state = self.lock()?;
+        // The changed fields came back in a response: the request went out.
+        let mut state = self.lock_sent()?;
         state.commit(run.now, run.who, event)?;
         state.raise(&record.owner, &record.id, generation);
         *updated = Some(next);

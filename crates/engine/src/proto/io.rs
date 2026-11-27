@@ -11,6 +11,8 @@ use crate::{Error, Result};
 
 /// Most bytes read from the stream at once.
 const READ: usize = 64 * 1024;
+/// The smallest read buffer allocated, so that small reads do not move it often.
+const MIN_BUFFER: usize = 16 * 1024;
 
 /// The bounds of one connection.
 #[derive(Clone, Copy, Debug)]
@@ -120,6 +122,7 @@ impl<'s> Io<'s> {
                 let bytes = Zeroizing::new(bytes);
                 self.read = self.read.saturating_add(bytes.len() as u64);
                 self.compact();
+                self.grow(bytes.len());
                 self.buf.extend_from_slice(&bytes);
                 self.last = Instant::now();
                 self.check()?;
@@ -156,6 +159,26 @@ impl<'s> Io<'s> {
         self.pos = 0;
     }
 
+    /// Makes room for `more` bytes without letting `Vec` reallocate in place of us: a
+    /// reallocation would free the old allocation unwiped. The buffer moves to a new one at
+    /// least twice as large (so growing stays linear), and the old one is wiped as it drops.
+    fn grow(&mut self, more: usize) {
+        let need = self.buf.len().saturating_add(more);
+        if need <= self.buf.capacity() {
+            return;
+        }
+        let capacity = need
+            .max(self.buf.capacity().saturating_mul(2))
+            .max(MIN_BUFFER);
+        let mut grown = Zeroizing::new(Vec::with_capacity(capacity));
+        grown.extend_from_slice(&self.buf);
+        #[cfg(test)]
+        {
+            self.copied = self.copied.saturating_add(self.buf.len() as u64);
+        }
+        self.buf = grown;
+    }
+
     /// Waits until at least `n` bytes are buffered. The bounds are checked first, also when
     /// the bytes are buffered already, so a server that sent many small frames at once is
     /// held to the deadline while they are read.
@@ -177,8 +200,8 @@ impl<'s> Io<'s> {
             self.copied = self.copied.saturating_add(head.len() as u64);
         }
         if self.pos >= self.buf.len() {
-            // All taken: wipe what it holds (its spare capacity holds nothing, as `compact`
-            // wipes what it leaves behind) and start again at the front.
+            // All taken: wipe what it holds (its spare capacity holds nothing: `compact`
+            // wipes what it leaves behind, and `grow` never lets an allocation go unwiped) and start again at the front.
             self.buf.as_mut_slice().zeroize();
             self.buf.clear();
             self.pos = 0;

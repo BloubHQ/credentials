@@ -155,7 +155,7 @@ impl Slots {
     /// left half updated could let more connections open than the bounds allow, so no new
     /// one opens then. The rest of the node goes on: the counts only bound connections.
     fn counts(&self) -> Result<std::sync::MutexGuard<'_, Counts>> {
-        self.0.lock().map_err(|_| Error::StateLost)
+        self.0.lock().map_err(|_| Error::StateLost { sent: false })
     }
 
     /// Takes a slot for a connection of `caller` (its name in `policy`) on `owner`'s record,
@@ -1107,9 +1107,9 @@ mod tests {
             panic!("a panic part way through a count");
         }));
         assert!(poisoned.is_err());
-        assert_eq!(slots.counts().err(), Some(Error::StateLost));
+        assert_eq!(slots.counts().err(), Some(Error::StateLost { sent: false }));
         // A connection that ends after it gives back nothing, and does not panic.
         drop(open);
-        assert_eq!(slots.counts().err(), Some(Error::StateLost));
+        assert_eq!(slots.counts().err(), Some(Error::StateLost { sent: false }));
     }
 }

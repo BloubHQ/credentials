@@ -547,7 +547,7 @@ fn status_of(error: &Error) -> u16 {
         | Error::RecordUnpinned
         | Error::RecordStale { .. }
         | Error::PolicySignature => 403,
-        Error::LogUnconfirmed | Error::LogHalted | Error::StateLost => 503,
+        Error::LogUnconfirmed | Error::LogHalted | Error::StateLost { .. } => 503,
         Error::Transport(_) | Error::ServerUntrusted { .. } | Error::AuthRefused { .. } => 502,
         Error::RateLimited | Error::ParkedFull | Error::StreamsFull { .. } => 429,
         e if e.is_caller_error() => 400,

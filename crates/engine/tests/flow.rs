@@ -926,7 +926,7 @@ fn a_panic_while_the_state_is_locked_halts_the_node_for_good() {
     // Nothing more is served from the state: no call, no grant, no checkpoint.
     assert_eq!(
         forward(&s.node, &s.record, &get("/"), &mut transport),
-        Err(Error::StateLost)
+        Err(Error::StateLost { sent: false })
     );
     assert_eq!(
         transport.sent.len(),
@@ -935,13 +935,19 @@ fn a_panic_while_the_state_is_locked_halts_the_node_for_good() {
     );
     assert_eq!(
         grant_on(&s.node, &s.device, [7u8; 32], NOW + DAY, &[("rec-1", 1)]),
-        Err(Error::StateLost)
+        Err(Error::StateLost { sent: false })
     );
-    assert_eq!(s.node.checkpoint().err(), Some(Error::StateLost));
+    assert_eq!(
+        s.node.checkpoint().err(),
+        Some(Error::StateLost { sent: false })
+    );
     assert_eq!(s.node.waiting(), 0);
     // Unlike a failed append, no reconcile ends it.
     let last = s.node.with_sink(|k| k.entries().last().cloned());
-    assert_eq!(s.node.reconcile(last.as_ref()), Err(Error::StateLost));
+    assert_eq!(
+        s.node.reconcile(last.as_ref()),
+        Err(Error::StateLost { sent: false })
+    );
     assert!(s.node.is_halted());
     // The sink can still be read back to restart the node, and holds no entry more.
     assert_eq!(s.node.with_sink(|k| k.entries().len()), entries);
