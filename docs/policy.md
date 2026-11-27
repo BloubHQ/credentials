@@ -1139,7 +1139,7 @@ encrypts or packages a password before the login call) in the sandbox of layer 3
 | `into` | A new token name for the output; never a field. |
 | `destination` | For a library only: the destination its output may go to. |
 | `script` | For the library `js` only: `{"url": "https://host[:port]/path", "sha256": "<64 hex>"}`, both required. |
-| `limits` | Optional bounds lower than the node's: `fuel` (1 to 10⁹), `memory` (bytes, 1 to 67,108,864), `time_ms` (1 to 5,000), `source` (the script's largest size in bytes, 1 to 262,144; only with a `script`). A bound left out is the node's. |
+| `limits` | Optional bounds lower than the node's: `fuel` (1 to 10⁹), `memory` (bytes, 1 to 67,108,864), `time_ms` (1 to 5,000; checked at every host call and when the run ends, so between two host calls only `fuel` bounds the run: set `fuel` too when `time_ms` is small), `source` (the script's largest size in bytes, 1 to 262,144; only with a `script`). A bound left out is the node's. |
 
 A site's JavaScript runs on the engine module:
 

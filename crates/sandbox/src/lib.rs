@@ -204,15 +204,26 @@ pub fn check(module: &[u8]) -> Result<(), Error> {
     compile(&Engine::new(&config()), module).map(|_| ())
 }
 
+/// Tests only: the import of [`tests::PANIC`] is linked too.
+#[cfg(test)]
+fn test_import(module: &str, name: &str) -> bool {
+    (module, name) == tests::PANIC
+}
+
+#[cfg(not(test))]
+fn test_import(_module: &str, _name: &str) -> bool {
+    false
+}
+
 fn compile(engine: &Engine, bytes: &[u8]) -> Result<Module, Error> {
     if bytes.len() > MAX_MODULE {
         return Err(Error::ModuleTooLarge);
     }
     let module = Module::new(engine, bytes).map_err(|_| Error::ModuleInvalid)?;
     let imports_ok = module.imports().all(|import| {
-        import.module() == HOST
-            && IMPORTS.contains(&import.name())
-            && matches!(import.ty(), ExternType::Func(_))
+        let named = (import.module() == HOST && IMPORTS.contains(&import.name()))
+            || test_import(import.module(), import.name());
+        named && matches!(import.ty(), ExternType::Func(_))
     });
     if !imports_ok {
         return Err(Error::Import);
@@ -503,6 +514,12 @@ fn linker(engine: &Engine) -> Result<Linker<Host>, Error> {
                 Ok(())
             },
         )
+        .map_err(|_| Error::Import)?;
+    // Tests only: a host function that panics, so that a panic unwinding through wasmi is
+    // tested on the path a panic inside the interpreter takes.
+    #[cfg(test)]
+    linker
+        .func_wrap(tests::PANIC.0, tests::PANIC.1, tests::panic_inside)
         .map_err(|_| Error::Import)?;
     Ok(linker)
 }

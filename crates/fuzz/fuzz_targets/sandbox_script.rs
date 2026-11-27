@@ -1,8 +1,8 @@
 //! Runs arbitrary JavaScript sources on the engine module (`js`) in the sandbox. The bytes up
 //! to the first 0xff are the script; the rest, split on 0xff, are the arguments of its
 //! function `f`. Limits are small so that each run is quick: a script never crashes the host,
-//! never exceeds its limits, and fails only with a fixed error (a panic inside the
-//! interpreter is caught and comes back as `Interpreter`).
+//! never exceeds its limits, and fails only with a fixed error. `Interpreter` (a panic inside
+//! wasmi, caught in production) is a finding here, so that fuzzing still reports such bugs.
 
 #![no_main]
 
@@ -32,8 +32,7 @@ fuzz_target!(|data: &[u8]| {
             | Error::Memory
             | Error::Output
             | Error::Time
-            | Error::Refused
-            | Error::Interpreter,
+            | Error::Refused,
         ) => {}
         Err(other) => panic!("unexpected error {other:?}"),
     }
