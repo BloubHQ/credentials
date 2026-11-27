@@ -3,7 +3,7 @@
 //! The string API hands a key to JavaScript as a string on every call, and every copy of that
 //! string lives in the JavaScript heap until it is garbage-collected. A key object holds the
 //! key in wasm memory instead: JavaScript holds only a reference, the key is wiped when the
-//! object is freed (`free()`, or the finalizer), and it becomes a JavaScript string only when
+//! object is freed (`free()`), and it becomes a JavaScript string only when
 //! the app asks for it with `exportKey()`, to store it. Each object signs or seals with the
 //! same functions as the string API, so the two give the same results.
 //!

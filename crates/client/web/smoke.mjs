@@ -296,6 +296,34 @@ assert.deepEqual(code(() => guarded.offer()), ["transfer_refused", undefined]);
 
 track("wrong codes");
 
+// Key objects: a key that stays in wasm memory while the object lives, used by reference,
+// and wiped by free().
+const deviceObject = client.DeviceKey.generate();
+const deviceText = deviceObject.exportKey();
+assert.equal(deviceText.length, 43);
+assert.equal(inMemory(deviceText), 1, "the object holds its key, once");
+assert.equal(deviceObject.publicKey(), client.publicKey(KeyKind.Device, deviceText));
+const userObject = client.UserKey.fromString(user + "\n");
+assert.equal(userObject.exportKey(), user);
+const callerObject = client.CallerKey.fromString(caller);
+assert.equal(callerObject.publicKey(), callerPublic);
+assert.deepEqual(code(() => client.UserKey.fromString("nope")), ["invalid_key", undefined]);
+const signedByObject = deviceObject.signPolicy(policy);
+const objectRecord = userObject.sealRecord(signedByObject, "mac", "alice", fields);
+assert.equal(JSON.parse(objectRecord).generation, 1);
+assert.equal(JSON.parse(userObject.rewrapRecord(objectRecord, signedByObject)).generation, 2);
+assert.equal(JSON.parse(deviceObject.pinRecord(objectRecord)).generation, 1);
+assert.equal(JSON.parse(deviceObject.revoke("alice", identity)).owner, "alice");
+const objectCall = JSON.parse(
+  callerObject.signDeriveCall("app", identity, objectRecord, "mac", new TextEncoder().encode("hi")),
+);
+assert.equal(objectCall.operation, "mac");
+assert.equal(JSON.parse(callerObject.signDescribeCall("app", identity, objectRecord)).operation, ":describe");
+for (const object of [deviceObject, userObject, callerObject]) object.free();
+assert.equal(inMemory(deviceText), 0, "free() wipes the key");
+assert.throws(() => deviceObject.exportKey(), "a freed object is gone");
+track("key objects");
+
 const blobOpened = client.unwrapKeys(backupKey, "alice", blob);
 track("a last unwrapKeys");
 assert.ok(blobOpened.length > 0);

@@ -236,8 +236,9 @@ heap until the garbage collector frees them, and nothing can erase them there. A
 keeps a key keeps it in the JavaScript heap, and in whatever storage it writes it to.
 
 The key objects keep a key out of the JavaScript heap while the page uses it. `DeviceKey`,
-`UserKey` and `CallerKey` hold the key in wasm memory and wipe it when freed (`free()`, or
-the finalizer); JavaScript holds only a reference. They are made with `generate()` or
+`UserKey` and `CallerKey` hold the key in wasm memory and wipe it when `free()` is called;
+JavaScript holds only a reference. Call `free()` when done: an object the page only drops
+keeps its key in wasm memory until the module's finalizer runs, if it runs at all. They are made with `generate()` or
 `fromString(text)`, and give the key as a string only through `exportKey()`, to store it.
 Each has the calls of its kind as methods, which take the other key by reference where a
 call needs two:
