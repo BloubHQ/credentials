@@ -4,6 +4,10 @@
 //!
 //! Numbers of seconds and milliseconds are JavaScript numbers; record fields are a
 //! `Map<string, Uint8Array>`.
+//!
+//! A secret key handed to JavaScript is a JavaScript string made from a borrow of the key in
+//! wasm memory, which is then wiped ([`secret`]). The JavaScript string itself lives in the
+//! JavaScript heap until it is garbage-collected: nothing in wasm can reach or erase it.
 
 use std::sync::Arc;
 
@@ -30,6 +34,14 @@ impl From<ClientError> for JsValue {
 }
 
 type Result<T> = std::result::Result<T, JsValue>;
+
+/// A secret for JavaScript: the JavaScript string is decoded from a borrow of `text`, and
+/// `text` is wiped as it drops. Returning a `String` instead would leave wasm-bindgen to free
+/// it from wasm memory unwiped.
+fn secret(text: impl Into<zeroize::Zeroizing<String>>) -> js_sys::JsString {
+    let text = text.into();
+    js_sys::JsString::from(text.as_str())
+}
 
 /// A random nonce for one attestation request (see [`crate::Nonce`]).
 #[wasm_bindgen(js_name = Nonce)]
@@ -105,14 +117,14 @@ impl JsVerifiedNode {
 
 /// See [`crate::generate_key`].
 #[wasm_bindgen(js_name = generateKey)]
-pub fn generate_key(kind: KeyKind) -> String {
-    crate::generate_key(kind)
+pub fn generate_key(kind: KeyKind) -> js_sys::JsString {
+    secret(crate::generate_key(kind))
 }
 
 /// See [`crate::import_key`].
 #[wasm_bindgen(js_name = importKey)]
-pub fn import_key(kind: KeyKind, text: String) -> Result<String> {
-    Ok(crate::import_key(kind, text)?)
+pub fn import_key(kind: KeyKind, text: String) -> Result<js_sys::JsString> {
+    Ok(secret(crate::import_key(kind, text)?))
 }
 
 /// See [`crate::public_key`].
@@ -252,15 +264,17 @@ fn keys_from_json(mut keys_json: String) -> Result<Vec<crate::BackedUpKey>> {
     Ok(keys?)
 }
 
-fn keys_to_json(keys: Vec<crate::BackedUpKey>) -> Result<String> {
+fn keys_to_json(keys: Vec<crate::BackedUpKey>) -> Result<zeroize::Zeroizing<String>> {
     let json = crate::backup::encode_keys(keys)?;
-    Ok(String::from_utf8_lossy(&json).into_owned())
+    let text = std::str::from_utf8(&json)
+        .map_err(|_| JsValue::from(ClientError::input("the keys did not encode as UTF-8")))?;
+    Ok(zeroize::Zeroizing::new(text.to_owned()))
 }
 
 /// [`crate::generate_backup_key`].
 #[wasm_bindgen(js_name = generateBackupKey)]
-pub fn generate_backup_key() -> Result<String> {
-    Ok(crate::generate_backup_key()?)
+pub fn generate_backup_key() -> Result<js_sys::JsString> {
+    Ok(secret(crate::generate_backup_key()?))
 }
 
 /// [`crate::wrap_keys`], with the keys as JSON (`[{"kind", "key"}]`).
@@ -275,8 +289,10 @@ pub fn wrap_keys(backup_key: String, owner: String, keys_json: String) -> Result
 
 /// [`crate::unwrap_keys`]; the keys come back as JSON (`[{"kind", "key"}]`).
 #[wasm_bindgen(js_name = unwrapKeys)]
-pub fn unwrap_keys(backup_key: String, owner: String, blob: String) -> Result<String> {
-    keys_to_json(crate::unwrap_keys(backup_key, owner, blob)?)
+pub fn unwrap_keys(backup_key: String, owner: String, blob: String) -> Result<js_sys::JsString> {
+    Ok(secret(keys_to_json(crate::unwrap_keys(
+        backup_key, owner, blob,
+    )?)?))
 }
 
 /// The old device's side of a transfer (see [`crate::TransferSender`]).
@@ -321,13 +337,22 @@ impl JsTransferReceiver {
     }
 
     /// Message 4: `{"owner": ..., "keys": [{"kind", "key"}]}` as JSON.
-    pub fn open(&self, sealed_json: String) -> Result<String> {
+    pub fn open(&self, sealed_json: String) -> Result<js_sys::JsString> {
         let opened = self.0.open(sealed_json)?;
         let keys = keys_to_json(opened.keys)?;
         let owner = serde_json::to_string(&opened.owner).map_err(|e| {
             JsValue::from(ClientError::input(format!("cannot encode the owner: {e}")))
         })?;
-        Ok(format!("{{\"owner\":{owner},\"keys\":{keys}}}"))
+        // Sized up front, so no reallocation leaves a copy of the keys behind.
+        let mut out = zeroize::Zeroizing::new(String::with_capacity(
+            owner.len().saturating_add(keys.len()).saturating_add(20),
+        ));
+        out.push_str("{\"owner\":");
+        out.push_str(&owner);
+        out.push_str(",\"keys\":");
+        out.push_str(&keys);
+        out.push('}');
+        Ok(secret(out))
     }
 }
 

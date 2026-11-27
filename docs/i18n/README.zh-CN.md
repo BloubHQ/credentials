@@ -568,6 +568,8 @@ credentials verify old.jsonl <旧节点密钥> --next new.jsonl --head new.jsonl
   （`await` 步骤），而不是节点或调用方。
 - **网页弱于应用。** [`client`](../../crates/client) 包在网页中执行与应用相同的检查，但网页的服务器每次加载都可以
   发送别的代码；请尽量从应用发出授权。其密钥也不是硬件密钥（Secure Enclave 和 StrongBox 只能保存 P-256 密钥）。
+  在网页中密钥是 JavaScript 字符串：客户端会擦除自己的副本，但这些字符串在被垃圾回收之前一直留在
+  JavaScript 堆中。
 
 ## Crates
 

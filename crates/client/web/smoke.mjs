@@ -5,6 +5,7 @@
 // revocations, device changes, calls, policy summaries, the JSON Schema, kinds of item and
 // approvals. Randomness and time come from JavaScript here
 // (crypto.getRandomValues, Date.now), which is what this test checks beyond the host tests.
+// At the end it looks for the keys in the module's memory: the client erases its copies.
 
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
@@ -13,7 +14,16 @@ import { pathToFileURL } from "node:url";
 
 const dir = resolve(process.argv[2] ?? "pkg");
 const client = await import(pathToFileURL(join(dir, "client.js")).href);
-await client.default({ module_or_path: await readFile(join(dir, "client_bg.wasm")) });
+const wasm = await client.default({ module_or_path: await readFile(join(dir, "client_bg.wasm")) });
+
+/// How many times `text` is in the module's linear memory.
+function inMemory(text) {
+  const memory = Buffer.from(wasm.memory.buffer);
+  const needle = Buffer.from(text);
+  let count = 0;
+  for (let at = memory.indexOf(needle); at !== -1; at = memory.indexOf(needle, at + 1)) count++;
+  return count;
+}
 
 const { KeyKind } = client;
 
@@ -39,6 +49,16 @@ const devicePublic = client.publicKey(KeyKind.Device, device);
 const callerPublic = client.publicKey(KeyKind.Caller, caller);
 assert.deepEqual(code(() => client.publicKey(KeyKind.User, user)), ["invalid_key", undefined]);
 
+// After each part below, no key is left in the module's memory: the client erases its
+// copies, also those a buffer or the stack would keep (#55). (The JavaScript strings are
+// another matter: they stay in the JavaScript heap until garbage-collected.)
+const tracked = { device, user, caller };
+function track(label) {
+  const counts = Object.fromEntries(Object.entries(tracked).map(([name, key]) => [name, inMemory(key)]));
+  assert.ok(Object.values(counts).every((n) => n === 0), `key text in wasm memory after ${label}: ${JSON.stringify(counts)}`);
+}
+track("keys");
+
 // A nonce, and a document that is not one.
 const nonce = client.nonce();
 assert.equal(nonce.bytes().length, 32);
@@ -58,6 +78,8 @@ assert.deepEqual(
   code(() => client.verifyNode(new Uint8Array([0, 1]), nonce, measurements, identity)),
   ["nonce_rejected", undefined],
 );
+
+track("nonce");
 
 // The owner's documents.
 const policy = JSON.stringify({
@@ -87,6 +109,8 @@ const other = client.publicKey(KeyKind.Device, client.generateKey(KeyKind.Device
 assert.equal(JSON.parse(client.endorseDevice(device, "alice", identity, other)).device, other);
 assert.equal(JSON.parse(client.retireDevice(device, "alice", identity, other)).device, other);
 
+track("owner documents");
+
 // A call.
 const call = JSON.parse(
   client.signDeriveCall(caller, "app", identity, record, "mac", new TextEncoder().encode("hi")),
@@ -97,6 +121,8 @@ const generic = JSON.parse(
   client.signCall(caller, "app", identity, record, "mac", JSON.stringify({ kind: "derive", input: "aGk" })),
 );
 assert.equal(generic.body.input, "aGk");
+
+track("call");
 
 // A summary of a policy in the step language, with its risk flags: any bytes in, and the
 // whole response body of a wildcard destination back.
@@ -133,6 +159,8 @@ assert.deepEqual(token.uses[0].form, { in: "header", name: "Authorization" });
 assert.equal(JSON.parse(client.summarize(policy)).flags.length, 0);
 assert.deepEqual(code(() => client.summarize("{")), ["invalid_input", undefined]);
 
+track("summary");
+
 // The schema, the reviewed kinds, a custom kind.
 assert.equal(JSON.parse(client.policyJsonSchema()).$defs.Policy.type, "object");
 const kinds = JSON.parse(client.itemKinds()).kinds.map((k) => k.name);
@@ -148,6 +176,8 @@ assert.deepEqual(
   code(() => client.signKind(device, JSON.stringify({ ...kind, name: "card" }))),
   ["refused", undefined],
 );
+
+track("kinds");
 
 // A describe call, and an approval of a summary of this node, now.
 const describe = JSON.parse(client.signDescribeCall(caller, "app", identity, record));
@@ -169,6 +199,8 @@ assert.equal(client.approvalHash(open).length, 43);
 const approval = JSON.parse(client.approve(device, identity, open));
 assert.equal(approval.device, devicePublic);
 assert.ok(Math.abs(approval.issued_ms - Date.now()) < 60_000);
+
+track("describe and approve");
 
 // Operations that wait: the pending operation the node hands back is approved as is, a code
 // challenge is answered by the device (sealed to the node), the app resumes with the id, the
@@ -207,6 +239,8 @@ assert.deepEqual(
 const renewed = client.updateRecord(user, record, new Map([["key", new TextEncoder().encode("fedcba9876543210fedcba9876543210")]]));
 assert.equal(JSON.parse(renewed).generation, 2);
 
+track("waiting operations");
+
 // Node continuity: a successor statement that is not one is refused, and spends the nonce.
 const successorNonce = client.nonce();
 assert.deepEqual(
@@ -220,18 +254,24 @@ assert.deepEqual(
   ["nonce_rejected", undefined],
 );
 
+track("continuity");
+
 // Key backup: a blob that opens only with its backup key, for its owner.
 const keys = JSON.stringify([
   { kind: "device", key: device },
   { kind: "user", key: user },
 ]);
 const backupKey = client.generateBackupKey();
+tracked.backupKey = backupKey;
 const blob = client.wrapKeys(backupKey, "alice", keys);
+track("wrapKeys");
 assert.equal(JSON.parse(blob).format, "credentials-key-backup/v1");
 assert.ok(!blob.includes(device) && !blob.includes(user));
 assert.deepEqual(JSON.parse(client.unwrapKeys(backupKey, "alice", blob)), JSON.parse(keys));
 assert.deepEqual(code(() => client.unwrapKeys(client.generateBackupKey(), "alice", blob)), ["backup_refused", undefined]);
 assert.deepEqual(code(() => client.unwrapKeys(backupKey, "bob", blob)), ["backup_refused", undefined]);
+
+track("backup");
 
 // Device transfer with a 6-digit code (SPAKE2): the right code moves the keys...
 const sender = client.startTransfer();
@@ -242,6 +282,8 @@ assert.ok(!sealedKeys.includes(device) && !sealedKeys.includes(user));
 const moved = JSON.parse(receiver.open(sealedKeys));
 assert.equal(moved.owner, "alice");
 assert.deepEqual(moved.keys, JSON.parse(keys));
+track("transfer");
+
 // ...and wrong codes are counted until the code is dead.
 const guarded = client.startTransfer();
 const wrong = guarded.code() === "000000" ? "000001" : "000000";
@@ -251,5 +293,11 @@ for (let left = 2; left >= 0; left--) {
   assert.equal(guarded.attemptsLeft(), left);
 }
 assert.deepEqual(code(() => guarded.offer()), ["transfer_refused", undefined]);
+
+track("wrong codes");
+
+const blobOpened = client.unwrapKeys(backupKey, "alice", blob);
+track("a last unwrapKeys");
+assert.ok(blobOpened.length > 0);
 
 console.log("web package: smoke test passed");

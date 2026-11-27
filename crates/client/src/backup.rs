@@ -109,9 +109,16 @@ pub(crate) fn encode_keys(keys: Vec<BackedUpKey>) -> Result<Zeroizing<Vec<u8>>> 
             })
         })
         .collect::<Result<Vec<_>>>()?;
-    serde_json::to_vec(&plain)
-        .map(Zeroizing::new)
-        .map_err(|_| ClientError::input("cannot encode the keys"))
+    // Sized up front: a buffer that grew would free a copy of the keys before it, unwiped.
+    // Each key is `{"kind":"...","key":"..."}` and a comma, with nothing to escape.
+    let size = plain
+        .iter()
+        .map(|k| k.kind.len().saturating_add(k.key.len()).saturating_add(24))
+        .fold(2usize, usize::saturating_add);
+    let mut out = Zeroizing::new(Vec::with_capacity(size));
+    serde_json::to_writer(&mut *out, &plain)
+        .map_err(|_| ClientError::input("cannot encode the keys"))?;
+    Ok(out)
 }
 
 /// The keys of the plain JSON of a backup or a transfer.

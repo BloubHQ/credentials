@@ -7,6 +7,18 @@ before 1.0, minor versions may break formats and APIs.
 
 ### Changed
 
+- Web client: a secret key returned to JavaScript (`generateKey`, `importKey`,
+  `generateBackupKey`, `unwrapKeys`, `TransferReceiver.open`) is decoded from a borrow of the
+  key in wasm memory, which is then wiped. Before, the returned `String` was freed from wasm
+  memory unwiped. The JavaScript types are unchanged (`string`). Two more copies are gone: the
+  keys' JSON of a backup or a transfer is written into a buffer sized up front (a buffer that
+  grew freed a copy unwiped), and keys are encoded with `encode_slice` (base64's
+  `encode_string` goes through a 1 KiB stack buffer, which on the web is in the module's
+  memory). Measured by the web smoke test, which now scans the module's memory for every key
+  after each of its 16 parts: before, a device and a user key were left after the backup and
+  transfer parts; now none at any point. The READMEs say that on the web the key strings live
+  in the JavaScript heap until garbage-collected, where nothing can erase them (#55, first
+  step).
 - Hostile destinations cannot make the node use far more memory or CPU than they send (#52).
   Measured in release builds with a counting allocator, on the inputs of the report:
   - PostgreSQL: NULL values counted for nothing against the 16 MiB result limit. The rows are
