@@ -141,6 +141,12 @@ JavaScript) and a JSON parse-and-stringify loop. Both modules ran the same prelu
 | Guest code | Rust | C |
 | Licence | `Unlicense OR MIT` (boa); the module's other dependencies are in the allow list of `.github/deny.toml` but for `foldhash` 0.2.0 (`Zlib`, through hashbrown; `foldhash` 0.1.5, also `Zlib`, is already in the node's Cargo.lock) | MIT (QuickJS-NG, rquickjs); wasi-libc MIT and Apache-2.0 |
 
+A second run of `measure` on the final module (SHA-256 `07caa809…`) gave the same fuel to
+the unit and times of 68.6 ms (cold start), 132.6 ms (HMAC), 164.7 ms (JWT), 716 ms (JSON)
+and 1.54 s (chain × 40): wall times vary by up to a quarter between runs, fuel does not. The
+node's release binary (`credentials.exe`, `x86_64-pc-windows-msvc`) grew from 13,692,928 to
+17,140,736 bytes (+3,447,808) with the engine module in it.
+
 An HMAC chain of 1,000 iterations, as the plan asked, does not fit one run on either engine:
 on boa each further HMAC costs about 23 M fuel (from the ×10 and ×40 runs), so 1,000 would
 take about 2.3·10¹⁰ fuel, 23 times the cap (derived, not run). Within the cap boa runs about
