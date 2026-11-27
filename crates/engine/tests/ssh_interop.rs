@@ -1,8 +1,15 @@
 //! The SSH client against a real OpenSSH server, an implementation independent of the fake
-//! one the protocol tests use. CI starts `sshd` with a small `RekeyLimit` and points
-//! `CREDENTIALS_SSH_INTEROP_DIR` at a directory holding `port`, `host_key.pub` (the server's
-//! public host key), `id_ed25519` (an unencrypted client key the server authorizes) and
-//! `user`. Without that variable the test does nothing.
+//! one the protocol tests use. The test is ignored by default: the `ssh-interop` CI job
+//! starts `sshd` with a small `RekeyLimit` and one key exchange, cipher and host key
+//! algorithm each, and runs it with `--ignored`, pointing `CREDENTIALS_SSH_INTEROP_DIR` at a
+//! directory that holds:
+//!
+//! - `port`, `user`, `host_key.pub` (the server's public host key), `id` (an unencrypted
+//!   client key the server authorizes);
+//! - `expect_kex`, `expect_cipher`, `expect_host_key`: what the client must agree on;
+//! - `sftp_dir`: an absolute directory the SFTP transfer writes into.
+//!
+//! A missing variable or file fails the test: a job whose setup drifted does not pass.
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -19,6 +26,7 @@ use std::time::Duration;
 use engine::egress::{Arrived, Stream};
 use engine::error::TransportKind;
 use engine::proto::io::{Bounds, Io};
+use engine::proto::sftp::Sftp;
 use engine::proto::ssh::{Auth, Client, ClientKey, HostKey};
 
 /// A plain TCP connection.
@@ -92,28 +100,41 @@ fn read(dir: &std::path::Path, name: &str) -> String {
         .to_string()
 }
 
+/// 1 MiB that no two offsets repeat within a packet.
+fn blob() -> Vec<u8> {
+    (0u32..1 << 18)
+        .flat_map(|i| i.wrapping_mul(2_654_435_761).to_be_bytes())
+        .collect()
+}
+
 #[test]
-fn openssh_rekeys_while_a_command_prints_and_nothing_is_lost() {
-    let Some(dir) = std::env::var_os("CREDENTIALS_SSH_INTEROP_DIR").map(PathBuf::from) else {
-        eprintln!("CREDENTIALS_SSH_INTEROP_DIR is not set: skipped");
-        return;
-    };
+#[ignore = "needs the sshd of the ssh-interop CI job"]
+fn openssh_agrees_rekeys_and_loses_nothing() {
+    let dir = PathBuf::from(
+        std::env::var_os("CREDENTIALS_SSH_INTEROP_DIR")
+            .expect("CREDENTIALS_SSH_INTEROP_DIR names the directory the job prepared"),
+    );
     let port: u16 = read(&dir, "port").parse().unwrap();
     let host_key = HostKey::parse(&read(&dir, "host_key.pub")).expect("host key");
-    let client_key = ClientKey::parse(read(&dir, "id_ed25519").as_bytes()).expect("client key");
+    let client_key = ClientKey::parse(read(&dir, "id").as_bytes()).expect("client key");
     let user = read(&dir, "user");
 
     let mut tcp = Tcp {
         sock: TcpStream::connect(("127.0.0.1", port)).unwrap(),
         ahead: Vec::new(),
     };
-    let io = Io::new(&mut tcp, Bounds::new(30_000, 120_000, 64 << 20));
+    let io = Io::new(&mut tcp, Bounds::new(30_000, 300_000, 256 << 20));
     let mut client = Client::connect(io, &[host_key]).expect("key exchange");
     eprintln!("agreed: {:?}", client.agreed);
+    assert_eq!(client.agreed.kex, read(&dir, "expect_kex"));
+    assert_eq!(client.agreed.cipher_out, read(&dir, "expect_cipher"));
+    assert_eq!(client.agreed.cipher_in, read(&dir, "expect_cipher"));
+    assert_eq!(client.agreed.host_key, read(&dir, "expect_host_key"));
     assert!(
         client.agreed.strict,
         "OpenSSH agrees on strict key exchange"
     );
+    eprintln!("client key: {}", client_key.algorithm());
     client
         .authenticate(user.as_bytes(), &Auth::Key(&client_key))
         .expect("sign-in");
@@ -132,12 +153,35 @@ fn openssh_rekeys_while_a_command_prints_and_nothing_is_lost() {
         out.stdout.as_slice() == want.as_bytes(),
         "the output is intact"
     );
-    let after_first = client.rekeys;
-    eprintln!("rekeys during the first command: {after_first}");
-    assert!(after_first >= 2, "the server rekeyed: {after_first}");
+    let after_exec = client.rekeys;
+    eprintln!("rekeys during the command: {after_exec}");
+    assert!(after_exec >= 2, "the server rekeyed: {after_exec}");
 
-    // A second channel on the same connection, after the re-exchanges.
-    let out = client.exec(b"echo done", 1024).expect("second exec");
-    assert_eq!(out.stdout.as_slice(), b"done\n");
+    // 1 MiB up and back over SFTP: re-exchanges in the middle of a transfer, with writes
+    // that wait for window.
+    let data = blob();
+    let path = format!("{}/blob", read(&dir, "sftp_dir"));
+    {
+        let mut sftp = Sftp::start(&mut client).expect("sftp");
+        sftp.write_file(path.as_bytes(), &data).expect("put");
+        let back = sftp.read_file(path.as_bytes(), 2 << 20).expect("get");
+        assert_eq!(back.len(), data.len(), "every byte came back");
+        assert!(back.as_slice() == data.as_slice(), "the file is intact");
+        sftp.finish().expect("sftp end");
+    }
+    let during_sftp = client.rekeys - after_exec;
+    eprintln!("rekeys during the transfer: {during_sftp}");
+    assert!(during_sftp >= 2, "the server rekeyed: {during_sftp}");
+
+    // The server's own view of the file, on a channel after all of it.
+    let digest = ring::digest::digest(&ring::digest::SHA256, &data);
+    let hex: String = digest.as_ref().iter().map(|b| format!("{b:02x}")).collect();
+    let out = client
+        .exec(format!("sha256sum {path}").as_bytes(), 1024)
+        .expect("sha256sum");
+    assert!(
+        out.stdout.starts_with(hex.as_bytes()),
+        "the server holds the same bytes"
+    );
     eprintln!("rekeys in all: {}", client.rekeys);
 }

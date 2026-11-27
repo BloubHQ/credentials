@@ -276,11 +276,17 @@ fn a_packet_before_key_exchange_under_strict_kex_is_refused() {
 #[test]
 fn a_key_re_exchange_the_server_starts_is_carried_out() {
     // Right after sign-in, with and without strict key exchange (which resets the sequence
-    // numbers at every NEWKEYS).
-    for strict in [true, false] {
+    // numbers at every NEWKEYS), and with ChaCha20-Poly1305, which needs strict key exchange:
+    // the re-exchange's KEXINIT carries no strict marker, as OpenSSH sends it.
+    for (strict, cipher) in [
+        (true, "aes256-gcm@openssh.com"),
+        (false, "aes256-gcm@openssh.com"),
+        (true, "chacha20-poly1305@openssh.com"),
+    ] {
         let s = basic(json!({}));
         let mut peer = server();
         peer.strict = strict;
+        peer.ciphers = vec![cipher];
         peer.misbehave = Misbehave::Rekey;
         let mut fake = Fake::new(peer);
         let out = session_output(run_session(
@@ -288,10 +294,14 @@ fn a_key_re_exchange_the_server_starts_is_carried_out() {
             &mut fake,
             vec![command("id", &[]), command("echo", &["hello"])],
         ));
-        assert!(out.error.is_none(), "strict {strict}: {:?}", out.error);
+        assert!(
+            out.error.is_none(),
+            "strict {strict} {cipher}: {:?}",
+            out.error
+        );
         assert_eq!(out.results.len(), 2);
         assert_eq!(out.results[0].data, b"uid=1000(deploy)\n");
-        assert_eq!(fake.peer.rekeys, 1, "strict {strict}");
+        assert_eq!(fake.peer.rekeys, 1, "strict {strict} {cipher}");
     }
 }
 

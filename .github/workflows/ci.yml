@@ -116,11 +116,55 @@ jobs:
           node "$GITHUB_WORKSPACE/.github/interop/openpgp.mjs" openpgp/package/dist/node/openpgp.mjs "$DIR"
 
   # The SSH client against OpenSSH, an implementation independent of the fake server the
-  # protocol tests use: strict key exchange, and key re-exchanges the server starts (a small
-  # RekeyLimit) while a command prints, with every byte of the output checked.
+  # protocol tests use: one run per key exchange, cipher and host key algorithm the node
+  # offers (sshd is limited to that one), with an Ed25519, ECDSA or RSA client key; strict
+  # key exchange; key re-exchanges the server starts (a small RekeyLimit) while a command
+  # prints and during a 1 MiB SFTP transfer each way, with every byte checked. The test is
+  # ignored elsewhere and fails here if the setup is missing.
   ssh-interop:
+    name: ssh-interop (${{ matrix.name }})
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: curve25519 aes256-gcm ed25519
+            kex: curve25519-sha256
+            cipher: aes256-gcm@openssh.com
+            host: ed25519
+            host_alg: ssh-ed25519
+            client: ed25519
+          - name: libssh-curve25519 chacha20 rsa-sha2-512
+            kex: curve25519-sha256@libssh.org
+            cipher: chacha20-poly1305@openssh.com
+            host: rsa
+            host_alg: rsa-sha2-512
+            client: ed25519
+          - name: nistp256 aes128-gcm ecdsa-p256
+            kex: ecdh-sha2-nistp256
+            cipher: aes128-gcm@openssh.com
+            host: ecdsa-256
+            host_alg: ecdsa-sha2-nistp256
+            client: ecdsa-256
+          - name: nistp384 chacha20 ecdsa-p384
+            kex: ecdh-sha2-nistp384
+            cipher: chacha20-poly1305@openssh.com
+            host: ecdsa-384
+            host_alg: ecdsa-sha2-nistp384
+            client: ecdsa-384
+          - name: nistp521 aes256-gcm ecdsa-p521
+            kex: ecdh-sha2-nistp521
+            cipher: aes256-gcm@openssh.com
+            host: ecdsa-521
+            host_alg: ecdsa-sha2-nistp521
+            client: rsa
+          - name: curve25519 aes128-gcm rsa-sha2-256
+            kex: curve25519-sha256
+            cipher: aes128-gcm@openssh.com
+            host: rsa
+            host_alg: rsa-sha2-256
+            client: rsa
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -129,17 +173,37 @@ jobs:
       - name: Start sshd
         env:
           DIR: ${{ runner.temp }}/ssh
+          KEX: ${{ matrix.kex }}
+          CIPHER: ${{ matrix.cipher }}
+          HOST: ${{ matrix.host }}
+          HOST_ALG: ${{ matrix.host_alg }}
+          CLIENT: ${{ matrix.client }}
         run: |
-          mkdir -m 700 "$DIR"
-          ssh-keygen -q -t ed25519 -N '' -C host -f "$DIR/host_key"
-          ssh-keygen -q -t ed25519 -N '' -C client -f "$DIR/id_ed25519"
-          cp "$DIR/id_ed25519.pub" "$DIR/authorized_keys"
+          keygen() { # type, file
+            case "$1" in
+              ed25519) ssh-keygen -q -t ed25519 -N '' -C test -f "$2" ;;
+              ecdsa-*) ssh-keygen -q -t ecdsa -b "${1#ecdsa-}" -N '' -C test -f "$2" ;;
+              # PKCS#1 PEM: the client reads RSA keys as PKCS#1 or PKCS#8.
+              rsa) ssh-keygen -q -t rsa -b 3072 -m PEM -N '' -C test -f "$2" ;;
+            esac
+          }
+          mkdir -m 700 "$DIR" "$DIR/sftp"
+          keygen "$HOST" "$DIR/host_key"
+          keygen "$CLIENT" "$DIR/id"
+          cp "$DIR/id.pub" "$DIR/authorized_keys"
           id -un > "$DIR/user"
           echo 2222 > "$DIR/port"
+          echo "$KEX" > "$DIR/expect_kex"
+          echo "$CIPHER" > "$DIR/expect_cipher"
+          echo "$HOST_ALG" > "$DIR/expect_host_key"
+          echo "$DIR/sftp" > "$DIR/sftp_dir"
           cat > "$DIR/sshd_config" <<EOF
           Port 2222
           ListenAddress 127.0.0.1
           HostKey $DIR/host_key
+          HostKeyAlgorithms $HOST_ALG
+          KexAlgorithms $KEX
+          Ciphers $CIPHER
           AuthorizedKeysFile $DIR/authorized_keys
           PubkeyAuthentication yes
           PasswordAuthentication no
@@ -147,6 +211,7 @@ jobs:
           StrictModes no
           UsePAM yes
           RekeyLimit 4K
+          Subsystem sftp internal-sftp
           PidFile $DIR/sshd.pid
           EOF
           sudo mkdir -p /run/sshd
@@ -156,7 +221,7 @@ jobs:
       - name: The engine's SSH client against it
         env:
           CREDENTIALS_SSH_INTEROP_DIR: ${{ runner.temp }}/ssh
-        run: cargo test --locked -p engine --test ssh_interop -- --nocapture
+        run: cargo test --locked -p engine --test ssh_interop -- --ignored --nocapture
       - name: The server's log
         if: failure()
         env:

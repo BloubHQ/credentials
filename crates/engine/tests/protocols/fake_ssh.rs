@@ -352,7 +352,8 @@ impl SshServer {
 
     fn kexinit(&self) -> Vec<u8> {
         let mut kex = self.kex.clone();
-        if self.strict {
+        // As OpenSSH: the strict marker is in the first KEXINIT only.
+        if self.strict && self.session_id.is_empty() {
             kex.push("kex-strict-s-v00@openssh.com");
         }
         let mut p = vec![KEXINIT];
@@ -389,9 +390,11 @@ impl SshServer {
             return;
         }
         let dir = &mut self.out;
+        // As OpenSSH: an AEAD leaves the length out of the blocks.
         let (block, counted) = match dir.cipher {
             Cipher::Gcm { .. } => (16, 1 + payload.len()),
-            Cipher::Clear | Cipher::Chacha(_) => (8, 5 + payload.len()),
+            Cipher::Chacha(_) => (8, 1 + payload.len()),
+            Cipher::Clear => (8, 5 + payload.len()),
         };
         let mut padding = block - counted % block;
         if padding < 4 {
@@ -443,6 +446,14 @@ impl SshServer {
             Cipher::Clear => 0,
             _ => 16,
         };
+        // OpenSSH refuses a packet out of block alignment ("padding error"): an AEAD's
+        // length is left out of the blocks.
+        let aligned = match self.inn.cipher {
+            Cipher::Gcm { .. } => length.is_multiple_of(16),
+            Cipher::Chacha(_) => length.is_multiple_of(8),
+            Cipher::Clear => (length + 4).is_multiple_of(8),
+        };
+        assert!(aligned, "padding error: a packet of {length} bytes");
         if self.inbuf.len() < 4 + length + tag {
             return None;
         }
@@ -493,10 +504,13 @@ impl SshServer {
                     .cloned();
                 self.agreed_kex = kex.unwrap_or_default();
                 self.agreed_cipher = cipher.unwrap_or_default();
-                self.strict_on = self.strict
-                    && client_kex
-                        .iter()
-                        .any(|k| k == "kex-strict-c-v00@openssh.com");
+                // Strict key exchange is agreed once, in the first exchange.
+                if self.session_id.is_empty() {
+                    self.strict_on = self.strict
+                        && client_kex
+                            .iter()
+                            .any(|k| k == "kex-strict-c-v00@openssh.com");
+                }
             }
             30 => {
                 // KEX_ECDH_INIT.

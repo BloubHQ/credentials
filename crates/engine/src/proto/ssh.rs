@@ -336,9 +336,16 @@ pub fn parse_kexinit(payload: &[u8]) -> Result<ServerInit<'_>> {
     })
 }
 
-/// Agrees on the algorithms from the server's offer and the pinned host keys. Fails when the
-/// server offers nothing the node accepts: the node never falls back to a weaker one.
+/// Agrees on the algorithms from the server's offer and the pinned host keys, in the first key
+/// exchange of a connection. Fails when the server offers nothing the node accepts: the node
+/// never falls back to a weaker one.
 pub fn negotiate(server: &ServerInit<'_>, pinned: &[HostKey]) -> Result<Agreed> {
+    negotiate_with(server, pinned, server.kex.contains(&STRICT_SERVER))
+}
+
+/// [`negotiate`] with `strict` given: a key re-exchange keeps what the first exchange agreed,
+/// as the strict markers are sent in the first KEXINIT only (OpenSSH leaves them out after).
+fn negotiate_with(server: &ServerInit<'_>, pinned: &[HostKey], strict: bool) -> Result<Agreed> {
     let host_algs: Vec<&'static str> = pinned
         .iter()
         .flat_map(|k| k.algorithms().iter().copied())
@@ -354,7 +361,6 @@ pub fn negotiate(server: &ServerInit<'_>, pinned: &[HostKey]) -> Result<Agreed> 
     if !server.compression.0.contains(&"none") || !server.compression.1.contains(&"none") {
         return Err(untrusted("the server insists on compression"));
     }
-    let strict = server.kex.contains(&STRICT_SERVER);
     let chacha = "chacha20-poly1305@openssh.com";
     if !strict && (cipher_out == chacha || cipher_in == chacha) {
         return Err(untrusted(
@@ -952,13 +958,16 @@ impl<'s> Client<'s> {
         Err(invalid("no SSH identification line"))
     }
 
-    /// The node's KEXINIT, offering `host` as host key algorithms.
-    fn kexinit(host: &[&str]) -> Result<Zeroizing<Vec<u8>>> {
+    /// The node's KEXINIT, offering `host` as host key algorithms; the strict marker only in
+    /// the `first` exchange, as OpenSSH sends it.
+    fn kexinit(host: &[&str], first: bool) -> Result<Zeroizing<Vec<u8>>> {
         let mut cookie = [0u8; 16];
         ring::rand::SecureRandom::fill(&SystemRandom::new(), &mut cookie)
             .map_err(|_| Error::Encoding)?;
         let mut kex: Vec<&str> = KEX.to_vec();
-        kex.push(STRICT_CLIENT);
+        if first {
+            kex.push(STRICT_CLIENT);
+        }
         let mut put = Put::message(KEXINIT);
         put.raw(&cookie)
             .names(&kex)
@@ -985,7 +994,7 @@ impl<'s> Client<'s> {
             .iter()
             .flat_map(|k| k.algorithms().iter().copied())
             .collect();
-        let ours = Self::kexinit(&host_algs)?;
+        let ours = Self::kexinit(&host_algs, first)?;
         self.send(&ours)?;
         // Before the server's first KEXINIT, only messages that strict key exchange forbids
         // may come; they are counted and refused once strict mode is known.
@@ -1005,13 +1014,14 @@ impl<'s> Client<'s> {
             },
         };
         let server = parse_kexinit(&theirs)?;
-        let mut agreed = negotiate(&server, &pinned)?;
-        if !first {
-            // Strict key exchange is agreed in the first exchange and holds for the connection
-            // (it resets the sequence numbers at every NEWKEYS); its markers are not looked at
-            // again.
-            agreed.strict = self.agreed.strict;
-        }
+        // Strict key exchange is agreed in the first exchange and holds for the connection (it
+        // resets the sequence numbers at every NEWKEYS); a re-exchange's KEXINIT carries no
+        // markers.
+        let agreed = if first {
+            negotiate(&server, &pinned)?
+        } else {
+            negotiate_with(&server, &pinned, self.agreed.strict)?
+        };
         if agreed.strict && early > 0 {
             return Err(untrusted("strict key exchange: a message before KEXINIT"));
         }
@@ -1105,10 +1115,11 @@ impl<'s> Client<'s> {
     fn send(&mut self, payload: &[u8]) -> Result<()> {
         let dir = &mut self.out;
         let block = dir.cipher.block();
-        // AES-GCM leaves the length out of the blocks; the others count it.
+        // An AEAD (AES-GCM, ChaCha20-Poly1305) leaves the length out of the blocks, as OpenSSH
+        // does (its `aadlen`); in the clear it is counted.
         let counted = match dir.cipher {
-            Cipher::Gcm { .. } => 1 + payload.len(),
-            _ => 4 + 1 + payload.len(),
+            Cipher::Gcm { .. } | Cipher::Chacha { .. } => 1 + payload.len(),
+            Cipher::Clear => 4 + 1 + payload.len(),
         };
         let mut padding = block - counted % block;
         if padding < 4 {
@@ -1165,8 +1176,8 @@ impl<'s> Client<'s> {
         let length = usize::try_from(u32::from_be_bytes(length)).map_err(|_| Error::Encoding)?;
         let block = dir.cipher.block();
         let counted = match dir.cipher {
-            Cipher::Gcm { .. } => length,
-            _ => length + 4,
+            Cipher::Gcm { .. } | Cipher::Chacha { .. } => length,
+            Cipher::Clear => length + 4,
         };
         if !(5..=MAX_PACKET).contains(&length) || counted % block != 0 {
             return Err(invalid("packet length invalid"));
