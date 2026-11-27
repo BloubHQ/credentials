@@ -13,9 +13,11 @@ on:
 permissions:
   contents: read
 
+# Scheduled and dispatched runs share the ref of main with pushes: the event name keeps them in
+# their own group, and only pull requests cancel a run in progress.
 concurrency:
-  group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  group: ci-${{ github.ref }}-${{ github.event_name }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always
@@ -205,13 +207,22 @@ jobs:
       # rust-toolchain.toml.
       - run: cargo +1.88 test --workspace --exclude enclave --locked
 
-  fuzz:
+  fuzz-shard:
+    # The targets are split over SHARDS jobs that run side by side (target i in shard i mod
+    # SHARDS). Seconds per target: 10 on a pull request, 60 on main, 300 in the daily or
+    # on-demand run; with 32 targets that is 4 targets, about 1, 4 and 20 minutes per job
+    # plus the build.
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5, 6, 7]
+    name: fuzz (${{ matrix.shard }})
     runs-on: ubuntu-latest
-    # Seconds per target: 10 on a pull request, 60 on main, 300 in the daily run. With 30
-    # targets that is about 5, 30 and 150 minutes plus the build.
-    timeout-minutes: ${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && 180 || github.event_name == 'push' && 75 || 30 }}
+    timeout-minutes: ${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && 60 || github.event_name == 'push' && 30 || 20 }}
     env:
       FUZZ_SECONDS: ${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && 300 || github.event_name == 'push' && 60 || 10 }}
+      SHARD: ${{ matrix.shard }}
+      SHARDS: 8
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -231,7 +242,10 @@ jobs:
           # Real attestation documents seed the parser target.
           mkdir -p corpus/attestation
           cp ../attest/tests/fixtures/*.cbor corpus/attestation/
+          i=0
           for target in $(cargo +nightly fuzz list --fuzz-dir .); do
+            i=$((i + 1))
+            if [ $(((i - 1) % SHARDS)) -ne "$SHARD" ]; then continue; fi
             echo "::group::$target"
             cargo +nightly fuzz run --fuzz-dir . --target x86_64-unknown-linux-gnu "$target" -- -max_total_time="$FUZZ_SECONDS"
             echo "::endgroup::"
@@ -240,9 +254,21 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: fuzz-artifacts
+          name: fuzz-artifacts-${{ matrix.shard }}
           path: crates/fuzz/artifacts
           if-no-files-found: ignore
+
+  # The required check: passes only when every fuzz shard passed.
+  fuzz:
+    needs: fuzz-shard
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Every shard passed
+        env:
+          RESULT: ${{ needs.fuzz-shard.result }}
+        run: test "$RESULT" = success
 
   supply-chain:
     runs-on: ubuntu-latest
