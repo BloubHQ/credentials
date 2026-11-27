@@ -367,9 +367,17 @@ node offers DTLS 1.3 and takes 1.2 when the server offers only that.
   -pubin -outform der | openssl dgst -sha256 -binary | base64` prints it) the key must also
   be one of them; a self-signed certificate is accepted only with a pinned key, as its own
   root, and must still be valid and name the host. `pins` are for `dtls` only. The DTLS
-  library hands over the leaf only, not the intermediates the server sends: a certificate
-  must be issued by a root directly, or be pinned and self-signed; one under an
-  intermediate is refused.
+  library hands over the leaf only, not the intermediates the server sends, so a server
+  issued through an intermediate (almost every public CA) needs it in `intermediates`: at
+  most 8, each the padded standard base64 of a DER certificate of at most 8 KiB, the body of
+  its PEM as `openssl x509 -outform der | base64 -w0` prints it (not the unpadded URL-safe
+  base64 of the protocol's byte fields). They widen nothing: the chain must still end at one
+  of the node's roots. A certificate under an intermediate the policy does not list is
+  refused. List every current intermediate of the issuer for the server's key type, not only
+  the one its certificate has today: a CA can issue from several at once and pick one per
+  certificate (Let's Encrypt does, from an RSA set and an ECDSA set, and rotates them), so a
+  renewal on the server can move to another with no change on the owner's side. A node from
+  before `intermediates` refuses a policy that lists them.
 - Suites: ECDHE (X25519, P-256, P-384) with ECDSA and AES-GCM or ChaCha20-Poly1305 on 1.2,
   `TLS_AES_128_GCM_SHA256`, `TLS_AES_256_GCM_SHA384` and `TLS_CHACHA20_POLY1305_SHA256` on
   1.3; server signatures ECDSA P-256 with SHA-256 or P-384 with SHA-384. No PSK suite, no

@@ -2086,16 +2086,31 @@ impl<S: LogSink, C: Clock> Node<S, C> {
         let opened = match open.connection {
             Connection::Udp => crate::egress::open_datagrams(confirmed, transport, destination),
             Connection::Dtls => {
-                // The policy check read every pin; one that does not read is a policy
-                // this node does not know.
+                // The policy check read every pin and intermediate; one that does not read
+                // is a policy this node does not know.
                 let pins = open
                     .pins
                     .iter()
                     .map(|p| crate::policy::parse_pin(p).ok_or_else(|| operation.unknown()))
                     .collect::<Result<Vec<_>>>();
-                pins.and_then(|pins| {
-                    crate::egress::open_dtls(confirmed, transport, destination, &pins)
-                })
+                let intermediates = open
+                    .intermediates
+                    .iter()
+                    .map(|c| {
+                        crate::policy::parse_intermediate(c).ok_or_else(|| operation.unknown())
+                    })
+                    .collect::<Result<Vec<_>>>();
+                pins.and_then(|pins| Ok((pins, intermediates?))).and_then(
+                    |(pins, intermediates)| {
+                        crate::egress::open_dtls(
+                            confirmed,
+                            transport,
+                            destination,
+                            &pins,
+                            &intermediates,
+                        )
+                    },
+                )
             }
             _ => open_stream(confirmed, transport, destination, client.as_ref()),
         };

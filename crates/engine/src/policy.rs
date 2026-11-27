@@ -765,6 +765,14 @@ pub struct Open {
     /// accepted only with a pinned key.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pins: Vec<String>,
+    /// CA certificates between a DTLS server's certificate and the transport's roots, each
+    /// the standard base64 of its DER, for a server issued through an intermediate (almost
+    /// every public CA): the DTLS stack hands over the server's own certificate, not the
+    /// chain the server sent. They widen nothing: the chain must still end at a root.
+    /// Padded standard base64, unlike the unpadded URL-safe base64 of the protocol's byte
+    /// fields ([`crate::encoding`]): it is the body of a PEM certificate, so one can be pasted.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub intermediates: Vec<String>,
     /// How SMTP and IMAP reach TLS (implicit by default).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tls: Option<TlsMode>,
@@ -1421,6 +1429,10 @@ fn check_destinations(at: &str, destinations: &[Destination]) -> Checked {
 
 /// Most certificate pins of one `dtls` operation.
 pub const MAX_CERTIFICATE_PINS: usize = 16;
+/// Most intermediate certificates of a `dtls` connection.
+pub const MAX_INTERMEDIATES: usize = 8;
+/// Largest DER of an intermediate certificate.
+pub const MAX_INTERMEDIATE_BYTES: usize = 8 * 1024;
 
 /// The SHA-256 of a `SubjectPublicKeyInfo` that a pin names: `sha256/` and the standard,
 /// padded base64 of 32 bytes, in its one canonical spelling. `None` for anything else.
@@ -1457,6 +1469,45 @@ fn check_pins(at: &str, open: &Open) -> Checked {
             parse_pin(pin).is_some() && !open.pins.iter().take(i).any(|p| p == pin),
             || format!("{at}.pins[{i}]"),
             "a pin is sha256/ and the base64 of 32 bytes, each once",
+        )?;
+    }
+    Ok(())
+}
+
+/// The DER of an intermediate certificate a policy lists: the standard, padded base64 of at
+/// most [`MAX_INTERMEDIATE_BYTES`] bytes that begin a DER `SEQUENCE`, in its one canonical
+/// spelling. `None` for anything else; the transport parses the certificate itself.
+pub fn parse_intermediate(text: &str) -> Option<Vec<u8>> {
+    use base64::Engine as _;
+    let der = base64::engine::general_purpose::STANDARD
+        .decode(text)
+        .ok()?;
+    let canonical = base64::engine::general_purpose::STANDARD.encode(&der) == text;
+    (canonical && der.len() <= MAX_INTERMEDIATE_BYTES && der.first() == Some(&0x30)).then_some(der)
+}
+
+/// Intermediates are for a `dtls` connection: at most 8, each a [`parse_intermediate`] and
+/// none twice.
+fn check_intermediates(at: &str, open: &Open) -> Checked {
+    if open.intermediates.is_empty() {
+        return Ok(());
+    }
+    ensure(
+        open.connection == Connection::Dtls,
+        || format!("{at}.intermediates"),
+        "intermediates are for a DTLS connection",
+    )?;
+    ensure(
+        open.intermediates.len() <= MAX_INTERMEDIATES,
+        || format!("{at}.intermediates"),
+        "1 to 8 intermediates",
+    )?;
+    for (i, cert) in open.intermediates.iter().enumerate() {
+        ensure(
+            parse_intermediate(cert).is_some()
+                && !open.intermediates.iter().take(i).any(|c| c == cert),
+            || format!("{at}.intermediates[{i}]"),
+            "an intermediate is the base64 of a DER certificate of at most 8 KiB, each once",
         )?;
     }
     Ok(())
@@ -2211,6 +2262,7 @@ impl Policy {
                         "a DTLS connection takes no identity, protocol or limits",
                     )?;
                     check_pins(&at, open)?;
+                    check_intermediates(&at, open)?;
                     ensure(
                         open.protocol.is_none() || open.connection == Connection::Https,
                         || format!("{at}.protocol"),

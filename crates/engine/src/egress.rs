@@ -246,16 +246,18 @@ pub trait Transport {
 
     /// Opens DTLS (1.2 or 1.3) over UDP datagrams to `destination` (a `dtls` operation) and
     /// returns once the handshake is complete and the server's certificate accepted: for the
-    /// host of `destination`, as [`Transport::open`] checks it, and, when `pins` is not empty,
-    /// holding a key whose SHA-256 (of its DER `SubjectPublicKeyInfo`) is one of them. Each
-    /// [`Stream::write`] then sends one record, each [`Stream::read_until`] with no delimiter
-    /// reads one. The default refuses.
+    /// host of `destination`, as [`Transport::open`] checks it, through the `intermediates`
+    /// (DER CA certificates the policy lists, since the server's own chain is not at hand),
+    /// and, when `pins` is not empty, holding a key whose SHA-256 (of its DER
+    /// `SubjectPublicKeyInfo`) is one of them. Each [`Stream::write`] then sends one record,
+    /// each [`Stream::read_until`] with no delimiter reads one. The default refuses.
     fn open_dtls(
         &mut self,
         destination: &Destination,
         pins: &[[u8; 32]],
+        intermediates: &[Vec<u8>],
     ) -> Result<Box<dyn Stream + '_>> {
-        let _ = (destination, pins);
+        let _ = (destination, pins, intermediates);
         Err(Error::transport(TransportKind::Unsupported, false))
     }
 }
@@ -353,9 +355,10 @@ pub(crate) fn open_dtls<'t, T: Transport>(
     transport: &'t mut T,
     destination: &Destination,
     pins: &[[u8; 32]],
+    intermediates: &[Vec<u8>],
 ) -> Result<(u64, Box<dyn Stream + 't>)> {
     let seq = confirmed.seq();
-    let stream = transport.open_dtls(destination, pins)?;
+    let stream = transport.open_dtls(destination, pins, intermediates)?;
     Ok((seq, stream))
 }
 

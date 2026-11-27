@@ -299,7 +299,7 @@ fn answers_pending(dtls: &mut Dtls, buffer: &mut [u8], socket: &mut MemorySocket
 }
 
 fn trust(pki: &Pki, host: &str, pins: &[[u8; 32]]) -> Trust {
-    Trust::new(roots_of(pki), host, pins)
+    Trust::new(roots_of(pki), host, pins, &[])
 }
 
 fn connect(client: MemorySocket, trust: Trust, wait: Duration) -> Result<DtlsStream, DtlsError> {
@@ -366,7 +366,7 @@ fn the_transport_opens_dtls_through_its_datagram_connector() {
         TlsTransport::with_roots(roots).datagrams(OneSocket(Mutex::new(Some(client))));
     {
         let mut stream = transport
-            .open_dtls(&Destination::new(HOST, PORT), &[])
+            .open_dtls(&Destination::new(HOST, PORT), &[], &[])
             .unwrap();
         stream.write(b"ping").unwrap();
         assert_eq!(stream.read_until(&[], 1024).unwrap(), b"pong:ping");
@@ -418,6 +418,62 @@ fn a_certificate_of_an_untrusted_authority_is_refused() {
         refusal(leaf, trust(&pki, HOST, &[])),
         DtlsError::Certificate
     );
+}
+
+/// A CA that `pki` issued: its `root` field holds the intermediate's own certificate.
+fn intermediate(pki: &Pki) -> Pki {
+    let mut params = CertificateParams::new(Vec::<String>::new()).unwrap();
+    params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    let key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
+    let issuer = CertifiedIssuer::signed_by(params, key, &pki.issuer).unwrap();
+    Pki {
+        root: issuer.der().clone(),
+        issuer,
+    }
+}
+
+#[test]
+fn a_certificate_under_an_intermediate_is_accepted_through_the_listed_one() {
+    for version in [Version::V12, Version::V13] {
+        let pki = authority();
+        let ca = intermediate(&pki);
+        let (client, server, _) = pair(Box::new(every), Box::new(every));
+        let seen = Server::new(version, issued(&ca, params(HOST))).spawn(server);
+        let trust = Trust::new(roots_of(&pki), HOST, &[], &[ca.root.to_vec()]);
+        let mut stream = connect(client, trust, Duration::from_secs(10)).unwrap();
+        stream.write(b"ping").unwrap();
+        assert_eq!(stream.read_until(&[], 1024).unwrap(), b"pong:ping");
+        drop(stream);
+        assert_eq!(seen.join().unwrap().records, vec![b"ping".to_vec()]);
+    }
+}
+
+#[test]
+fn a_certificate_under_an_intermediate_that_is_not_listed_is_refused() {
+    let pki = authority();
+    let ca = intermediate(&pki);
+    let leaf = issued(&ca, params(HOST));
+    assert_eq!(
+        refusal(leaf, trust(&pki, HOST, &[])),
+        DtlsError::Certificate
+    );
+}
+
+#[test]
+fn an_intermediate_of_an_untrusted_authority_widens_nothing() {
+    // The chain must still end at one of the roots: a listed intermediate that a stranger
+    // issued does not make its certificates trusted.
+    let pki = authority();
+    let stranger = authority();
+    let ca = intermediate(&stranger);
+    let leaf = issued(&ca, params(HOST));
+    let trust = Trust::new(
+        roots_of(&pki),
+        HOST,
+        &[],
+        &[ca.root.to_vec(), stranger.root.to_vec()],
+    );
+    assert_eq!(refusal(leaf, trust), DtlsError::Certificate);
 }
 
 #[test]
