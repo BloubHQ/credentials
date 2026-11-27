@@ -16,15 +16,17 @@ for (const name of ["rsa", "eddsa", "v6"]) {
     const signature = await openpgp.readSignature({
       armoredSignature: await readFile(join(dir, `${name}.asc`), "utf8"),
     });
+    // The test signs at a fixed time (2027-01-15), so the check is made at that time.
+    const date = signature.packets[0].created;
     const message = await openpgp.createMessage({ binary: data });
     const { signatures } = await openpgp.verify({
-      message, signature, verificationKeys: key, expectSigned: true, format: "binary",
+      message, signature, verificationKeys: key, expectSigned: true, format: "binary", date,
     });
     await signatures[0].verified;
     console.log(`${name}: good signature, key version ${key.keyPacket.version}`);
     // The same signature over other data must not verify.
     const other = await openpgp.createMessage({ binary: new Uint8Array([1, 2, 3]) });
-    const bad = await openpgp.verify({ message: other, signature, verificationKeys: key });
+    const bad = await openpgp.verify({ message: other, signature, verificationKeys: key, date });
     const refused = await bad.signatures[0].verified.then(() => false, () => true);
     if (!refused) throw new Error("a signature over other data verified");
     console.log(`${name}: refused over other data`);
