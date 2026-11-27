@@ -16,7 +16,7 @@
 //! - An app that uses a record: [`sign_call`], [`sign_derive_call`], [`sign_describe_call`].
 //! - Review: [`summarize`] a policy (and what a new version widens), [`policy_json_schema`],
 //!   [`item_kinds`]; the owner's device also signs custom kinds ([`sign_kind`]) and approves
-//!   summaries the node built ([`approve`], [`approval_hash`]).
+//!   summaries the node built ([`approval_lines`] to show, [`approve`], [`approval_hash`]).
 //! - Operations that wait for the owner: the device answers a challenge
 //!   ([`answer_challenge`]) or approves ([`approve`], which also takes the pending operation
 //!   the node handed back), sets spending limits ([`sign_limits`]) and renews a session the
@@ -92,7 +92,8 @@ pub use owner::{
     rewrap_record, seal_record, sign_policy, upgrade_policy,
 };
 pub use review::{
-    approval_hash, approve, item_fill, item_kinds, policy_json_schema, sign_kind, summarize,
+    approval_hash, approval_lines, approve, item_fill, item_kinds, policy_json_schema, sign_kind,
+    summarize,
 };
 pub use session::{answer_challenge, sign_limits, sign_resume_call, update_record};
 pub use transfer::{

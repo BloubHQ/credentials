@@ -1110,7 +1110,7 @@ impl<S: LogSink, C: Clock> Node<S, C> {
             None => record.policy.verify_any(&devices)?,
         };
         let label = match delegated {
-            Some(d) => format!("{}/{}", d.delegate, auth.caller),
+            Some(d) => delegated_label(&d.delegate, &auth.caller),
             None => auth.caller.clone(),
         };
         let operation = match payload {
@@ -2454,6 +2454,20 @@ fn check_exchanges(
         });
     }
     Ok(())
+}
+
+/// The label a delegated caller runs under on this node (log entries, waiting operations):
+/// `delegate/caller`. Both are tokens, which hold no `/`, so [`split_label`] reads it back.
+fn delegated_label(delegate: &str, caller: &str) -> String {
+    format!("{delegate}/{caller}")
+}
+
+/// The delegate (when the label is a delegated caller's) and the caller of a label.
+fn split_label(label: &str) -> (Option<&str>, &str) {
+    match label.split_once('/') {
+        Some((delegate, caller)) => (Some(delegate), caller),
+        None => (None, label),
+    }
 }
 
 /// The state of one operation while its steps run.

@@ -1917,7 +1917,10 @@ or the values (`docs/design.md`, section 8b). A device of the owner signs a `Del
   generation of the owner's record); its callers are the delegate's. A delegate's call
   names the delegation's id (signed with the call) and runs under this policy only; its
   log entries carry the caller as `delegate/caller`, under the owner, and the call costs the
-  owner's rate limits like any;
+  owner's rate limits like any. An approval it waits for (an operation marked `approval`, a
+  card, a payment over the limits) goes to the owner's device with the summary's `caller`
+  the delegate's caller and `delegate` the delegate, so the owner sees who acted for whom;
+  the delegate resumes it with the summary's id, as the owner's callers do;
 - **the record's policy, by hash**: if the owner changes the record's policy, the
   delegation no longer holds (`delegation_unknown`), and the owner delegates again;
 - **the record and log keys, sealed to the node** (HPKE), so the node runs a delegated call

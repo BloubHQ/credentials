@@ -116,6 +116,60 @@ fn summary(json: &str) -> Result<ApprovalSummary> {
     Ok(summary)
 }
 
+/// The lines an app shows the owner before [`approve`]: every field of a summary (or of the
+/// pending operation that carries it) the approval stands for, in English, one per line, so
+/// an app that renders this list cannot leave one out. A delegated call comes first: the
+/// caller acts for a delegate of the owner, not for the owner. An app that renders the
+/// summary itself must show the same fields, `delegate` above all.
+#[cfg_attr(not(target_arch = "wasm32"), uniffi::export)]
+pub fn approval_lines(summary_json: String) -> Result<Vec<String>> {
+    // Every field, named: one added to the summary fails to compile here until it is shown
+    // (or said to need no showing).
+    let ApprovalSummary {
+        id: _,
+        node: _,
+        owner: _,
+        record_id,
+        generation,
+        caller,
+        delegate,
+        operation,
+        destination,
+        origin,
+        amount,
+        item,
+        lines,
+        created_ms: _,
+        expires_ms: _,
+    } = summary(&summary_json)?;
+    let mut out = Vec::new();
+    if let Some(delegate) = &delegate {
+        out.push(format!(
+            "Delegated: {caller} acts for {delegate}, whom you delegated to, not for you"
+        ));
+    }
+    out.push(format!("{caller} asks to run {operation}"));
+    out.push(format!("Item: {record_id} (generation {generation})"));
+    if let Some(destination) = &destination {
+        out.push(format!("Connects to: {destination}"));
+    }
+    if let Some(origin) = &origin {
+        out.push(format!("For: {origin}"));
+    }
+    if let Some(amount) = &amount {
+        out.push(format!("Amount: {} {}", amount.value, amount.currency));
+    }
+    if let Some(item) = &item {
+        out.push(format!("Kind: {}", item.kind));
+        for field in &item.fields {
+            out.push(format!("{}: {}", field.name, field.value));
+        }
+    }
+    // The node's own notes (why it asks), marked so none reads as one of the lines above.
+    out.extend(lines.iter().map(|line| format!("Note: {line}")));
+    Ok(out)
+}
+
 /// The SHA-256 of an approval summary (unpadded base64url): what an approval signs, for an
 /// app that shows it beside the summary.
 #[cfg_attr(not(target_arch = "wasm32"), uniffi::export)]

@@ -323,6 +323,9 @@ impl<S: LogSink, C: Clock> Node<S, C> {
             return Err(Error::RequestInvalid { rule: NO_WAIT });
         }
         let given = given_of(payload, input)?;
+        // Every line is the node's own: a fixed text with the policy's or the limits' values
+        // in it (an origin the signed policy names, an ISO 4217 code, a decimal amount),
+        // never text a caller or a destination chose.
         let mut lines: Vec<String> = lines.into_iter().map(fit).collect();
         lines.truncate(MAX_LINES);
         let item = match policy.item {
@@ -351,13 +354,15 @@ impl<S: LogSink, C: Clock> Node<S, C> {
             .map(fit);
         let id = random_id();
         let expires_ms = now.saturating_add(MAX_APPROVAL_MS);
+        let (delegate, caller) = super::split_label(run.who.2);
         let summary = ApprovalSummary {
             id,
             node: self.public,
             owner: run.record.owner.clone(),
             record_id: run.record.id.clone(),
             generation: run.record.generation,
-            caller: run.who.2.to_string(),
+            caller: caller.to_string(),
+            delegate: delegate.map(str::to_string),
             operation: run.name.to_string(),
             destination: destination.map(|d| fit(format!("{}:{}", d.host, d.port))),
             origin,
