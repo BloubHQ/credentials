@@ -107,6 +107,10 @@ const WAIT: Duration = Duration::from_millis(50);
 /// Most channels the server may open that the node refuses before the connection ends.
 pub const MAX_REFUSED_OPENS: usize = 16;
 /// Most bytes of output kept for later reads while a write waits for the server's window.
+/// The node's own window does not bound this: it is given back as data arrives
+/// (`adjust`), not as the caller reads it, so a server that holds the node's write back can
+/// keep sending. One window's worth is kept; past it the channel fails rather than grow or
+/// drop output.
 const MAX_QUEUED_BYTES: usize = WINDOW as usize;
 /// Most events kept for later reads while a write waits for the server's window (output of
 /// one kind that follows output of the same kind joins it).
@@ -1641,8 +1645,8 @@ impl<'s> Client<'s> {
             };
             if room == 0 {
                 // Wait for the server to open its window. What comes meanwhile (output, an
-                // exit status, a forwarded channel the caller must accept or refuse, the
-                // close) is kept for the next reads.
+                // exit status, the close) is kept for the next reads. A channel the server
+                // opens meanwhile is refused at once (`server_open`: a channel is open).
                 match self.read_event(WAIT)? {
                     Some(Event::Closed) => {
                         self.queue(Event::Closed)?;
