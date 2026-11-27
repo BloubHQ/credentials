@@ -7,6 +7,14 @@
 
 use super::*;
 
+/// A host function linked in tests only: it panics, as the interpreter did in #95, so the
+/// panic unwinds through wasmi on the path a panic inside the interpreter takes.
+pub(super) const PANIC: (&str, &str) = ("test", "panic");
+
+pub(super) fn panic_inside(_caller: Caller<'_, Host>) {
+    panic!("a panic inside the run");
+}
+
 const IMPORTS_WAT: &str = r#"
   (import "credentials" "input_count" (func $input_count (result i32)))
   (import "credentials" "input_len" (func $input_len (param i32) (result i32)))
@@ -389,6 +397,56 @@ fn memory_is_wiped_on_every_path() {
             "{case}: the memory is not wiped"
         );
     }
+}
+
+/// A panic inside wasmi ends the run as `Interpreter`, and the memory the module filled is
+/// still wiped and observed.
+#[test]
+fn a_panic_inside_the_run_is_an_error_and_the_memory_is_wiped() {
+    let bytes = wat::parse_str(format!(
+        r#"(module {IMPORTS_WAT}
+             (import "test" "panic" (func $panic))
+             (memory (export "memory") 1)
+             (func (export "run") (call $input_read (i32.const 0) (i32.const 0)) (call $panic)))"#
+    ))
+    .unwrap();
+    let mut seen = None;
+    let result = run_observed(&bytes, "run", &[SECRET], Limits::default(), &mut |memory| {
+        seen = memory.map(<[u8]>::to_vec);
+    });
+    assert_eq!(result.map(|_| ()), Err(Error::Interpreter));
+    let memory = seen.expect("the run had a memory");
+    assert!(!memory.is_empty(), "the memory has pages");
+    assert!(memory.iter().all(|b| *b == 0), "the memory is not wiped");
+    // The next run is unaffected.
+    let bytes = echo();
+    assert_eq!(
+        run(&bytes, "run", &[b"next"]).unwrap().output.as_slice(),
+        b"next"
+    );
+}
+
+/// #95: these two bytes as a script, given to the engine module past the UTF-8 check of
+/// `run_script`, put a fuel slice boundary where resuming the call landed on an instruction
+/// parameter of wasmi 1.1.0 (a panic in debug builds, undefined behaviour in release). Runs are
+/// no longer resumed: the script ends in a fixed error of the engine, and the memory is wiped.
+#[test]
+fn the_input_of_issue_95_ends_without_a_resume() {
+    let module = library(JS).unwrap();
+    let limits = Limits {
+        fuel: 40_000_000,
+        memory: 16 * 1024 * 1024,
+        time: Duration::from_secs(2),
+        ..Limits::default()
+    };
+    let mut seen = None;
+    let result = run_observed(module, "run", &[b"\n\xb0", b"f"], limits, &mut |memory| {
+        seen = memory.map(<[u8]>::to_vec);
+    });
+    assert_eq!(result.map(|_| ()), Err(Error::Trap));
+    let memory = seen.expect("the run had a memory");
+    assert!(!memory.is_empty(), "the memory has pages");
+    assert!(memory.iter().all(|b| *b == 0), "the memory is not wiped");
 }
 
 #[test]
