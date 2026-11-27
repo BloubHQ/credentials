@@ -115,6 +115,54 @@ jobs:
           mkdir openpgp && tar -xzf "$tarball" -C openpgp
           node "$GITHUB_WORKSPACE/.github/interop/openpgp.mjs" openpgp/package/dist/node/openpgp.mjs "$DIR"
 
+  # The SSH client against OpenSSH, an implementation independent of the fake server the
+  # protocol tests use: strict key exchange, and key re-exchanges the server starts (a small
+  # RekeyLimit) while a command prints, with every byte of the output checked.
+  ssh-interop:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - name: Start sshd
+        env:
+          DIR: ${{ runner.temp }}/ssh
+        run: |
+          mkdir -m 700 "$DIR"
+          ssh-keygen -q -t ed25519 -N '' -C host -f "$DIR/host_key"
+          ssh-keygen -q -t ed25519 -N '' -C client -f "$DIR/id_ed25519"
+          cp "$DIR/id_ed25519.pub" "$DIR/authorized_keys"
+          id -un > "$DIR/user"
+          echo 2222 > "$DIR/port"
+          cat > "$DIR/sshd_config" <<EOF
+          Port 2222
+          ListenAddress 127.0.0.1
+          HostKey $DIR/host_key
+          AuthorizedKeysFile $DIR/authorized_keys
+          PubkeyAuthentication yes
+          PasswordAuthentication no
+          KbdInteractiveAuthentication no
+          StrictModes no
+          UsePAM yes
+          RekeyLimit 4K
+          PidFile $DIR/sshd.pid
+          EOF
+          sudo mkdir -p /run/sshd
+          ssh -V
+          sudo /usr/sbin/sshd -t -f "$DIR/sshd_config"
+          sudo /usr/sbin/sshd -f "$DIR/sshd_config" -E "$DIR/sshd.log"
+      - name: The engine's SSH client against it
+        env:
+          CREDENTIALS_SSH_INTEROP_DIR: ${{ runner.temp }}/ssh
+        run: cargo test --locked -p engine --test ssh_interop -- --nocapture
+      - name: The server's log
+        if: failure()
+        env:
+          DIR: ${{ runner.temp }}/ssh
+        run: sudo cat "$DIR/sshd.log"
+
   # The client crate for apps: the web package (wasm-bindgen, with a smoke test in Node), the
   # Android libraries with the Kotlin bindings, and an XCFramework with the Swift bindings
   # (build/client.sh). Not a required check.
