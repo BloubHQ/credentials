@@ -1958,7 +1958,7 @@ mod tests {
             assert_eq!(frame.body.len(), 2);
         }
         assert!(io.buffered().is_empty());
-        io.copied
+        io.copied()
     }
 
     #[test]

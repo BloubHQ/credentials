@@ -7,6 +7,23 @@ before 1.0, minor versions may break formats and APIs.
 
 ### Changed
 
+- Hostile destinations cannot make the node use far more memory or CPU than they send (#52).
+  Measured in release builds with a counting allocator, on the inputs of the report:
+  - PostgreSQL: NULL values counted for nothing against the 16 MiB result limit. The rows are
+    now written as JSON while they arrive and the JSON counts against the limit, and a result
+    of more than 1,664 columns (what PostgreSQL returns at most) is refused. 65,535 columns
+    of 200 NULL rows: 51.3 MiB received and a peak of 871 MiB before, refused at the row
+    description with a peak of 4.5 MiB now; 1,664 columns of 10,000 NULL rows: 63.6 MiB and
+    1,145 MiB before, refused after 12.8 MiB with a peak of 32.1 MiB now.
+  - Redis: the budget counted string bytes, so `:1` cost one byte. Each element now costs its
+    line with the CRLF, a reply has at most 1,048,576 elements in all (it was that many per
+    array), and its JSON is written straight into bytes held to the limit
+    (`Reply::json_bytes` replaces `Reply::json`). 16 arrays of 1,000,000 `:1`: 61 MiB received
+    and a peak of 1,033 MiB before, refused after 3.9 MiB with a peak of 30.8 MiB now.
+  - WebSocket: the decoder copied the rest of its buffer for every frame. It now keeps an
+    offset, as the protocol reader does (#46), through one buffer type both use, and refuses a
+    message of more than 64 empty fragments. 1 MiB of one-byte fragments in 16 KiB pushes:
+    774 ms before, 25 ms now; 1 MiB of empty fragments: 1.2 s before, refused in 8 us now.
 - Log files: one writer per log. `credentials serve` and `credentials host` hold an exclusive
   lock on each log file while they write it (`flock` on Unix; on Windows the file is opened
   sharing reads only), so a second process on the same file fails at start with "the log is

@@ -3,16 +3,15 @@
 
 use std::time::{Duration, Instant};
 
-use zeroize::{Zeroize, Zeroizing};
+use zeroize::Zeroizing;
 
 use crate::egress::{Arrived, Stream};
 use crate::error::TransportKind;
+use crate::readbuf::ReadBuf;
 use crate::{Error, Result};
 
 /// Most bytes read from the stream at once.
 const READ: usize = 64 * 1024;
-/// The smallest read buffer allocated, so that small reads do not move it often.
-const MIN_BUFFER: usize = 16 * 1024;
 
 /// The bounds of one connection.
 #[derive(Clone, Copy, Debug)]
@@ -42,11 +41,8 @@ impl Bounds {
 /// A connection with a read buffer, byte counts and bounds.
 pub struct Io<'s> {
     stream: &'s mut dyn Stream,
-    /// The bytes read; those before `pos` were taken. Taken bytes are wiped when the buffer
-    /// is compacted or emptied, and all of it when it is dropped.
-    buf: Zeroizing<Vec<u8>>,
-    /// Where the bytes not taken yet start in `buf`.
-    pos: usize,
+    /// The bytes read and not taken yet.
+    buf: ReadBuf,
     bounds: Bounds,
     last: Instant,
     started: Instant,
@@ -54,9 +50,6 @@ pub struct Io<'s> {
     pub read: u64,
     /// Bytes written to the server.
     pub written: u64,
-    /// Bytes moved inside the read buffer by takes (tests measure the cost of parsing).
-    #[cfg(test)]
-    pub(crate) copied: u64,
 }
 
 impl<'s> Io<'s> {
@@ -65,15 +58,12 @@ impl<'s> Io<'s> {
         let now = Instant::now();
         Self {
             stream,
-            buf: Zeroizing::new(Vec::new()),
-            pos: 0,
+            buf: ReadBuf::new(),
             bounds,
             last: now,
             started: now,
             read: 0,
             written: 0,
-            #[cfg(test)]
-            copied: 0,
         }
     }
 
@@ -121,9 +111,7 @@ impl<'s> Io<'s> {
             Arrived::Bytes(bytes) => {
                 let bytes = Zeroizing::new(bytes);
                 self.read = self.read.saturating_add(bytes.len() as u64);
-                self.compact();
-                self.grow(bytes.len());
-                self.buf.extend_from_slice(&bytes);
+                self.buf.push(&bytes);
                 self.last = Instant::now();
                 self.check()?;
                 Ok(!bytes.is_empty())
@@ -135,48 +123,13 @@ impl<'s> Io<'s> {
 
     /// The bytes read and not taken yet.
     pub fn buffered(&self) -> &[u8] {
-        self.buf.get(self.pos..).unwrap_or_default()
+        self.buf.pending()
     }
 
-    /// Moves the bytes not taken yet to the start of the buffer and wipes the taken ones, so
-    /// the buffer does not grow with what was taken. It runs before bytes are appended, and
-    /// only after a take, so each byte read is moved at most once per take.
-    fn compact(&mut self) {
-        let len = self.buf.len();
-        if self.pos == 0 || self.pos > len {
-            return;
-        }
-        let rest = len - self.pos;
-        self.buf.copy_within(self.pos.., 0);
-        if let Some(stale) = self.buf.get_mut(rest..) {
-            stale.zeroize();
-        }
-        self.buf.truncate(rest);
-        #[cfg(test)]
-        {
-            self.copied = self.copied.saturating_add(rest as u64);
-        }
-        self.pos = 0;
-    }
-
-    /// Makes room for `more` bytes without letting `Vec` reallocate in place of us: a
-    /// reallocation would free the old allocation unwiped. The buffer moves to a new one at
-    /// least twice as large (so growing stays linear), and the old one is wiped as it drops.
-    fn grow(&mut self, more: usize) {
-        let need = self.buf.len().saturating_add(more);
-        if need <= self.buf.capacity() {
-            return;
-        }
-        let capacity = need
-            .max(self.buf.capacity().saturating_mul(2))
-            .max(MIN_BUFFER);
-        let mut grown = Zeroizing::new(Vec::with_capacity(capacity));
-        grown.extend_from_slice(&self.buf);
-        #[cfg(test)]
-        {
-            self.copied = self.copied.saturating_add(self.buf.len() as u64);
-        }
-        self.buf = grown;
+    /// Bytes moved or copied inside the read buffer (tests measure the cost of parsing).
+    #[cfg(test)]
+    pub(crate) fn copied(&self) -> u64 {
+        self.buf.copied
     }
 
     /// Waits until at least `n` bytes are buffered. The bounds are checked first, also when
@@ -193,20 +146,7 @@ impl<'s> Io<'s> {
     /// Takes the first `n` bytes.
     pub fn take(&mut self, n: usize) -> Result<Zeroizing<Vec<u8>>> {
         self.need(n)?;
-        let head = Zeroizing::new(self.buffered().get(..n).unwrap_or_default().to_vec());
-        self.pos = self.pos.saturating_add(head.len());
-        #[cfg(test)]
-        {
-            self.copied = self.copied.saturating_add(head.len() as u64);
-        }
-        if self.pos >= self.buf.len() {
-            // All taken: wipe what it holds (its spare capacity holds nothing: `compact`
-            // wipes what it leaves behind, and `grow` never lets an allocation go unwiped) and start again at the front.
-            self.buf.as_mut_slice().zeroize();
-            self.buf.clear();
-            self.pos = 0;
-        }
-        Ok(head)
+        Ok(self.buf.take(n))
     }
 
     /// Takes one line ending in `\n` (with it), of at most `max` bytes.
@@ -400,7 +340,7 @@ mod tests {
         // Needs the next read: the taken bytes are dropped from the front first.
         assert_eq!(io.take(6).unwrap().as_slice(), b"cdefgh");
         assert_eq!(
-            io.buf.len(),
+            io.buf.held(),
             8,
             "the four bytes left were moved to the front"
         );
@@ -410,7 +350,7 @@ mod tests {
         assert!(io.expect_empty().is_err());
         assert_eq!(io.take(3).unwrap().as_slice(), b"nop");
         assert!(io.expect_empty().is_ok());
-        assert!(io.buf.is_empty());
+        assert_eq!(io.buf.held(), 0);
         assert_eq!(io.read, 17);
     }
 

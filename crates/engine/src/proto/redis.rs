@@ -12,8 +12,9 @@ use crate::{Error, Result};
 const MAX_DEPTH: usize = 16;
 /// Longest line of a reply.
 const MAX_LINE: usize = 64 * 1024;
-/// Most elements of one array.
-const MAX_ELEMENTS: usize = 1 << 20;
+/// Most elements of one reply, nested ones included. Each is a [`Reply`] in memory whatever
+/// its size on the wire, so the count is bounded apart from the bytes.
+pub const MAX_ELEMENTS: usize = 1 << 20;
 
 fn invalid(rule: &'static str) -> Error {
     Error::ResponseInvalid { rule }
@@ -46,24 +47,58 @@ pub enum Reply {
 }
 
 impl Reply {
-    /// As JSON: text as strings, bytes that are not UTF-8 as `{"base64": ...}`, an error as
-    /// `{"error": ...}`.
-    pub fn json(&self) -> serde_json::Value {
-        use serde_json::Value;
-        let text = |b: &[u8]| match std::str::from_utf8(b) {
-            Ok(s) => Value::String(s.to_string()),
-            Err(_) => serde_json::json!({
-                "base64": base64::engine::general_purpose::STANDARD.encode(b)
-            }),
-        };
-        match self {
-            Reply::Simple(s) => text(s),
-            Reply::Error(e) => serde_json::json!({"error": text(e)}),
-            Reply::Integer(i) => Value::from(*i),
-            Reply::Bulk(Some(b)) => text(b),
-            Reply::Bulk(None) | Reply::Array(None) => Value::Null,
-            Reply::Array(Some(items)) => Value::Array(items.iter().map(Reply::json).collect()),
+    /// As JSON of at most `max` bytes: text as strings, bytes that are not UTF-8 as
+    /// `{"base64": ...}`, an error as `{"error": ...}`. Written straight into the bytes, so
+    /// the node holds no JSON tree beside the reply.
+    pub fn json_bytes(&self, max: usize) -> Result<Zeroizing<Vec<u8>>> {
+        let mut out = Zeroizing::new(Vec::new());
+        self.write_json(&mut out, max)?;
+        Ok(out)
+    }
+
+    fn write_json(&self, out: &mut Vec<u8>, max: usize) -> Result<()> {
+        fn text(out: &mut Vec<u8>, b: &[u8]) -> Result<()> {
+            match std::str::from_utf8(b) {
+                Ok(s) => serde_json::to_writer(&mut *out, s).map_err(|_| Error::Encoding),
+                Err(_) => {
+                    out.extend_from_slice(b"{\"base64\":\"");
+                    out.extend_from_slice(
+                        base64::engine::general_purpose::STANDARD
+                            .encode(b)
+                            .as_bytes(),
+                    );
+                    out.extend_from_slice(b"\"}");
+                    Ok(())
+                }
+            }
         }
+        match self {
+            Reply::Simple(s) | Reply::Bulk(Some(s)) => text(out, s)?,
+            Reply::Error(e) => {
+                out.extend_from_slice(b"{\"error\":");
+                text(out, e)?;
+                out.push(b'}');
+            }
+            Reply::Integer(i) => out.extend_from_slice(i.to_string().as_bytes()),
+            Reply::Bulk(None) | Reply::Array(None) => out.extend_from_slice(b"null"),
+            Reply::Array(Some(items)) => {
+                out.push(b'[');
+                for (at, item) in items.iter().enumerate() {
+                    if at > 0 {
+                        out.push(b',');
+                    }
+                    item.write_json(out, max)?;
+                }
+                out.push(b']');
+            }
+        }
+        if out.len() > max {
+            return Err(Error::transport(
+                crate::error::TransportKind::TooLarge,
+                true,
+            ));
+        }
+        Ok(())
     }
 
     /// Every byte of the reply, for the reflection search.
@@ -108,10 +143,20 @@ impl Source for Io<'_> {
     }
 }
 
-/// Reads one reply of at most `max` bytes of strings.
+/// Reads one reply of at most `max` bytes, counted as they arrive (each line with its CRLF,
+/// each bulk string with its CRLF), and of at most [`MAX_ELEMENTS`] elements.
 pub fn read(source: &mut dyn Source, max: usize) -> Result<Reply> {
-    let mut budget = max;
+    let mut budget = Budget {
+        bytes: max,
+        elements: MAX_ELEMENTS,
+    };
     read_at(source, 0, &mut budget)
+}
+
+/// What a reply may still spend.
+struct Budget {
+    bytes: usize,
+    elements: usize,
 }
 
 fn number(bytes: &[u8]) -> Result<i64> {
@@ -121,21 +166,22 @@ fn number(bytes: &[u8]) -> Result<i64> {
         .ok_or(invalid("a RESP number"))
 }
 
-fn spend(budget: &mut usize, n: usize) -> Result<()> {
-    *budget = budget.checked_sub(n).ok_or(Error::transport(
+fn spend(left: &mut usize, n: usize) -> Result<()> {
+    *left = left.checked_sub(n).ok_or(Error::transport(
         crate::error::TransportKind::TooLarge,
         true,
     ))?;
     Ok(())
 }
 
-fn read_at(source: &mut dyn Source, depth: usize, budget: &mut usize) -> Result<Reply> {
+fn read_at(source: &mut dyn Source, depth: usize, budget: &mut Budget) -> Result<Reply> {
     if depth > MAX_DEPTH {
         return Err(invalid("a RESP reply nested too deep"));
     }
+    spend(&mut budget.elements, 1)?;
     let line = source.line()?;
+    spend(&mut budget.bytes, line.len().saturating_add(2))?;
     let (kind, rest) = line.split_first().ok_or(invalid("an empty RESP line"))?;
-    spend(budget, rest.len())?;
     Ok(match kind {
         b'+' => Reply::Simple(rest.to_vec()),
         b'-' => Reply::Error(rest.to_vec()),
@@ -144,7 +190,7 @@ fn read_at(source: &mut dyn Source, depth: usize, budget: &mut usize) -> Result<
             -1 => Reply::Bulk(None),
             n if n >= 0 => {
                 let n = usize::try_from(n).map_err(|_| invalid("length"))?;
-                spend(budget, n)?;
+                spend(&mut budget.bytes, n.saturating_add(2))?;
                 Reply::Bulk(Some(source.exact(n)?.to_vec()))
             }
             _ => return Err(invalid("a negative bulk length")),
@@ -153,10 +199,13 @@ fn read_at(source: &mut dyn Source, depth: usize, budget: &mut usize) -> Result<
             -1 => Reply::Array(None),
             n if n >= 0 => {
                 let n = usize::try_from(n).map_err(|_| invalid("length"))?;
-                if n > MAX_ELEMENTS {
-                    return Err(invalid("a RESP array too long"));
+                if n > budget.elements {
+                    return Err(Error::transport(
+                        crate::error::TransportKind::TooLarge,
+                        true,
+                    ));
                 }
-                let mut items = Vec::new();
+                let mut items = Vec::with_capacity(n);
                 for _ in 0..n {
                     items.push(read_at(source, depth + 1, budget)?);
                 }
@@ -253,12 +302,67 @@ mod tests {
     fn replies_parse_to_json() {
         let mut s = Bytes(b"*3\r\n$3\r\nfoo\r\n:42\r\n$-1\r\n".to_vec());
         let reply = read(&mut s, 1024).unwrap();
-        assert_eq!(reply.json(), serde_json::json!(["foo", 42, null]));
+        assert_eq!(json(&reply), serde_json::json!(["foo", 42, null]));
         let mut s = Bytes(b"-ERR wrong\r\n".to_vec());
         assert_eq!(
-            read(&mut s, 1024).unwrap().json(),
+            json(&read(&mut s, 1024).unwrap()),
             serde_json::json!({"error": "ERR wrong"})
         );
+        let mut s = Bytes(b"*2\r\n$2\r\n\xff\xfe\r\n+a\"b\r\n".to_vec());
+        assert_eq!(
+            json(&read(&mut s, 1024).unwrap()),
+            serde_json::json!([{"base64": "//4="}, "a\"b"])
+        );
+    }
+
+    fn json(reply: &Reply) -> serde_json::Value {
+        serde_json::from_slice(&reply.json_bytes(1024).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn each_element_is_charged_its_line_and_counted() {
+        // `:1` is four bytes on the wire, and so four of the budget.
+        let ones = |n: usize| format!("*{n}\r\n{}", ":1\r\n".repeat(n)).into_bytes();
+        assert!(read(&mut Bytes(ones(10)), 5 + 10 * 4).is_ok());
+        assert!(read(&mut Bytes(ones(10)), 5 + 10 * 4 - 1).is_err());
+        // Nested arrays share one count of elements: `MAX_ELEMENTS / 1024` arrays of 1024
+        // elements, plus the arrays themselves, are too many.
+        struct Nested {
+            inner: usize,
+            at: usize,
+        }
+        impl Source for Nested {
+            fn line(&mut self) -> Result<Zeroizing<Vec<u8>>> {
+                let at = self.at;
+                self.at += 1;
+                let line = if at == 0 {
+                    format!("*{}", MAX_ELEMENTS / self.inner)
+                } else if (at - 1).is_multiple_of(self.inner + 1) {
+                    format!("*{}", self.inner)
+                } else {
+                    ":1".to_string()
+                };
+                Ok(Zeroizing::new(line.into_bytes()))
+            }
+            fn exact(&mut self, _: usize) -> Result<Zeroizing<Vec<u8>>> {
+                Err(invalid("no bulk strings here"))
+            }
+        }
+        assert_eq!(
+            read(&mut Nested { inner: 1024, at: 0 }, usize::MAX).err(),
+            Some(Error::transport(
+                crate::error::TransportKind::TooLarge,
+                true
+            ))
+        );
+    }
+
+    #[test]
+    fn the_json_is_held_to_its_limit() {
+        let mut s = Bytes(b"*3\r\n:1\r\n:2\r\n:3\r\n".to_vec());
+        let reply = read(&mut s, 1024).unwrap();
+        assert_eq!(reply.json_bytes(7).unwrap().as_slice(), b"[1,2,3]");
+        assert!(reply.json_bytes(6).is_err());
     }
 
     #[test]

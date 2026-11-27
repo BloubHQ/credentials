@@ -724,6 +724,10 @@ came back (`between`, `regex` or `all`). `run`, `await` and HTTP requests are re
   1.0 `receive`: 1 to 256, default 16), `wait_ms` (MQTT `subscribe`, AMQP 1.0 `receive`: 1 to
   60,000, default 5,000), `settle` (AMQP 1.0: `settled`, `first` by default, or `second`) and
   `wildcard_bind` (SSH `tcpip-forward`: see remote forwarding below).
+  The result of one command is at most 16 MiB of JSON, counted as it is written: a PostgreSQL
+  NULL counts as its `null`. A PostgreSQL result has at most 1,664 columns (what PostgreSQL
+  itself returns); a Redis reply at most 16 MiB on the wire, each element counted with its
+  line and CRLF, and at most 1,048,576 elements, nested ones included.
 - `mail` (SMTP only, and the only relay of SMTP): `senders` and `recipients`, 1 to 16 patterns
   each that the whole envelope addresses must match, `max_recipients` (default and at most 100)
   and `max_bytes` (default and at most 8 MiB).
