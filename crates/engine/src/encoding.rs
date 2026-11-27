@@ -1,4 +1,7 @@
-//! Byte encodings of the protocol: unpadded URL-safe base64 for every byte field.
+//! Byte encodings of the protocol: unpadded URL-safe base64 for every byte field. Two policy
+//! fields hold padded standard base64 instead, the spelling their sources print: a DTLS
+//! pin (`sha256/`, as `openssl ... | base64` prints it) and a DTLS intermediate (the body of
+//! a PEM certificate).
 
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 

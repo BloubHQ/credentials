@@ -769,6 +769,8 @@ pub struct Open {
     /// the standard base64 of its DER, for a server issued through an intermediate (almost
     /// every public CA): the DTLS stack hands over the server's own certificate, not the
     /// chain the server sent. They widen nothing: the chain must still end at a root.
+    /// Padded standard base64, unlike the unpadded URL-safe base64 of the protocol's byte
+    /// fields ([`crate::encoding`]): it is the body of a PEM certificate, so one can be pasted.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub intermediates: Vec<String>,
     /// How SMTP and IMAP reach TLS (implicit by default).
@@ -1428,7 +1430,7 @@ fn check_destinations(at: &str, destinations: &[Destination]) -> Checked {
 /// Most certificate pins of one `dtls` operation.
 pub const MAX_CERTIFICATE_PINS: usize = 16;
 /// Most intermediate certificates of a `dtls` connection.
-pub const MAX_INTERMEDIATES: usize = 4;
+pub const MAX_INTERMEDIATES: usize = 8;
 /// Largest DER of an intermediate certificate.
 pub const MAX_INTERMEDIATE_BYTES: usize = 8 * 1024;
 
@@ -1484,7 +1486,7 @@ pub fn parse_intermediate(text: &str) -> Option<Vec<u8>> {
     (canonical && der.len() <= MAX_INTERMEDIATE_BYTES && der.first() == Some(&0x30)).then_some(der)
 }
 
-/// Intermediates are for a `dtls` connection: at most 4, each a [`parse_intermediate`] and
+/// Intermediates are for a `dtls` connection: at most 8, each a [`parse_intermediate`] and
 /// none twice.
 fn check_intermediates(at: &str, open: &Open) -> Checked {
     if open.intermediates.is_empty() {
@@ -1498,7 +1500,7 @@ fn check_intermediates(at: &str, open: &Open) -> Checked {
     ensure(
         open.intermediates.len() <= MAX_INTERMEDIATES,
         || format!("{at}.intermediates"),
-        "1 to 4 intermediates",
+        "1 to 8 intermediates",
     )?;
     for (i, cert) in open.intermediates.iter().enumerate() {
         ensure(

@@ -444,7 +444,7 @@ with the verifier of a `tls` connection (`rustls::client::WebPkiServerVerifier` 
 transport's roots: chain, validity, server-authentication usage, host name) and, with
 `open.pins`, its key against the pins; a pinned self-signed certificate is checked with
 itself as the only root. Because the intermediates the server sends are not handed over,
-the policy lists them (`open.intermediates`, DER, at most 4) and the verifier gets them as
+the policy lists them (`open.intermediates`, DER, at most 8) and the verifier gets them as
 the chain; they widen nothing, since the chain must still end at a root. A certificate under
 an intermediate the policy does not list fails closed. Exposing the server's chain from
 `dimpl` would make the list unnecessary. Nothing is written before the certificate is accepted; a handshake that completes

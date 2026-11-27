@@ -358,10 +358,10 @@ fn intermediates_read_and_belong_to_dtls() {
     let mut most = vec![0x30u8];
     most.resize(8 * 1024, 0);
     assert!(sign(vec![with(&[&b64(&most)])]).is_ok());
-    let five: Vec<String> = (0..5u8).map(|i| b64(&[0x30, 1, i])).collect();
-    let five: Vec<&str> = five.iter().map(String::as_str).collect();
-    assert_eq!(refused(vec![with(&five)]), "1 to 4 intermediates");
-    assert!(sign(vec![with(&five[..4])]).is_ok());
+    let nine: Vec<String> = (0..9u8).map(|i| b64(&[0x30, 1, i])).collect();
+    let nine: Vec<&str> = nine.iter().map(String::as_str).collect();
+    assert_eq!(refused(vec![with(&nine)]), "1 to 8 intermediates");
+    assert!(sign(vec![with(&nine[..8])]).is_ok());
     // Another connection takes none.
     let tls = Operation::tls("call", coap())
         .intermediate(CA)
