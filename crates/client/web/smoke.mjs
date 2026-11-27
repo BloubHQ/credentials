@@ -319,11 +319,15 @@ const objectCall = JSON.parse(
 );
 assert.equal(objectCall.operation, "mac");
 assert.equal(JSON.parse(callerObject.signDescribeCall("app", identity, objectRecord)).operation, ":describe");
-// What the glue does with a dropped object, and whether `using` frees one.
+// A dropped object is freed (and wiped) when it is collected, if the glue registers it with
+// a FinalizationRegistry; and `using` frees it at the end of its scope through Symbol.dispose.
 const glue = await readFile(join(dir, "client.js"), "utf8");
-console.log(
-  `glue: FinalizationRegistry ${glue.includes("FinalizationRegistry")}, Symbol.dispose ${glue.includes("Symbol.dispose")}`,
-);
+assert.match(glue, /DeviceKeyFinalization = \(typeof FinalizationRegistry/);
+const scoped = client.DeviceKey.generate();
+const scopedText = scoped.exportKey();
+assert.equal(inMemory(scopedText), 1);
+scoped[Symbol.dispose]();
+assert.equal(inMemory(scopedText), 0, "Symbol.dispose wipes the key");
 for (const object of [deviceObject, userObject, callerObject]) object.free();
 assert.equal(inMemory(deviceText), 0, "free() wipes the key");
 assert.throws(() => deviceObject.exportKey(), "a freed object is gone");
