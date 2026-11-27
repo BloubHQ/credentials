@@ -1,6 +1,19 @@
 //! A node log kept in files: an append-only JSONL file of signed entries ([`FileSink`]) and
 //! its latest checkpoint next to it ([`HeadFile`], [`head_path`]). `credentials serve` keeps
 //! its log this way, and `credentials host` keeps the log of each enclave node the same way.
+//!
+//! One writer per log: a [`FileSink`] holds an exclusive lock on its file while it lives
+//! (`flock` on Unix; on Windows the file is opened sharing reads only), so a second
+//! `credentials serve` on the same `--log` fails at start instead of writing over the first
+//! one's confirmed entries. A reader (`credentials verify`) can still read the file. On Unix
+//! the lock is advisory (it stops only processes that take it), and on a network filesystem
+//! its behaviour depends on the server and client: a log belongs on a local filesystem.
+//!
+//! Durability: every entry is `sync_data`'d before `append` returns. On Unix the directory is
+//! synced as well after the log file is created and after a checkpoint is renamed into place,
+//! so a power loss cannot lose the new file or the new name. Windows has no directory sync;
+//! there a new log file and a renamed checkpoint are as durable as the filesystem makes a
+//! rename (NTFS journals it).
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
@@ -36,6 +49,53 @@ pub enum Error {
     /// A document could not be encoded as JSON.
     #[error("cannot encode JSON: {0}")]
     Encode(#[source] serde_json::Error),
+    /// Another process holds the log: two nodes would write over each other's entries.
+    #[error("{path}: the log is in use by another process (another `credentials serve` on it?)")]
+    InUse {
+        /// The log file.
+        path: String,
+    },
+}
+
+/// True for the error of a lock or an open that another holder of the file refused.
+fn held_elsewhere(e: &io::Error) -> bool {
+    // ERROR_SHARING_VIOLATION and ERROR_LOCK_VIOLATION on Windows.
+    let windows_sharing = cfg!(windows) && matches!(e.raw_os_error(), Some(32 | 33));
+    e.kind() == io::ErrorKind::WouldBlock || windows_sharing
+}
+
+/// Opens the log file for reading and writing, created when missing, and takes the one
+/// writer's lock on it.
+fn open_exclusive(path: &Path) -> io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(false);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        // FILE_SHARE_READ: readers may open it, no other writer may.
+        options.share_mode(0x0000_0001);
+    }
+    let file = options.open(path)?;
+    #[cfg(unix)]
+    rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockExclusive)
+        .map_err(io::Error::from)?;
+    Ok(file)
+}
+
+/// Syncs the directory that holds `path`, so a file created or renamed in it keeps its name
+/// across a power loss. Nothing to do on Windows, which has no directory sync.
+fn sync_parent(path: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        let parent = match path.parent() {
+            Some(p) if !p.as_os_str().is_empty() => p,
+            _ => Path::new("."),
+        };
+        File::open(parent)?.sync_all()?;
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
 }
 
 /// An append-only JSONL file of signed entries. `append` returns `Ok` only after the line is
@@ -57,13 +117,19 @@ impl FileSink {
             context: path.display().to_string(),
             source,
         };
-        let mut file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(path)
-            .map_err(io)?;
+        let existed = path.exists();
+        let mut file = open_exclusive(path).map_err(|e| {
+            if held_elsewhere(&e) {
+                Error::InUse {
+                    path: path.display().to_string(),
+                }
+            } else {
+                io(e)
+            }
+        })?;
+        if !existed {
+            sync_parent(path).map_err(io)?;
+        }
         let mut bytes = Vec::new();
         file.read_to_end(&mut bytes).map_err(io)?;
         let complete = bytes
@@ -188,5 +254,60 @@ pub fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<(), Err
     fs::rename(&tmp, path).map_err(|source| Error::Io {
         context: format!("cannot replace {}", path.display()),
         source,
+    })?;
+    sync_parent(path).map_err(|source| Error::Io {
+        context: format!("cannot sync the directory of {}", path.display()),
+        source,
     })
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::panic)]
+mod tests {
+    use super::*;
+
+    /// A new, empty directory of its own under the system temp directory.
+    fn scratch(name: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "credentials-logfile-{name}-{}-{nanos}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn a_second_sink_on_the_same_log_is_refused_while_the_first_lives() {
+        let dir = scratch("lock");
+        let log = dir.join("node.log");
+        let (first, entries) = FileSink::open(&log).unwrap();
+        assert!(entries.is_empty());
+        match FileSink::open(&log) {
+            Err(Error::InUse { path }) => assert_eq!(path, log.display().to_string()),
+            Err(other) => panic!("expected InUse, got {other}"),
+            Ok(_) => panic!("a second writer opened a log in use"),
+        }
+        // A reader still can: `credentials verify` reads the live file.
+        assert!(fs::read(&log).is_ok());
+        drop(first);
+        assert!(FileSink::open(&log).is_ok());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_checkpoint_written_atomically_replaces_the_old_one() {
+        let dir = scratch("head");
+        let head = dir.join("node.head");
+        write_json_atomic(&head, &serde_json::json!({"size": 1})).unwrap();
+        write_json_atomic(&head, &serde_json::json!({"size": 2})).unwrap();
+        let text = fs::read_to_string(&head).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(value, serde_json::json!({"size": 2}));
+        assert!(!dir.join("node.head.tmp").exists());
+        fs::remove_dir_all(&dir).unwrap();
+    }
 }
