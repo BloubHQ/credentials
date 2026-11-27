@@ -171,7 +171,7 @@ let outcome = node.run(&call, &mut TlsTransport::new());
 ```
 
 一个操作是一条连接上的**步骤**列表：`open`（HTTPS、TLS 流、WebSocket、协议连接、UDP 数据报、通过 CDP 操作的浏览器，或无连接）、`send`、`receive`（含捕获）、
-`compute`（把模板的结果放入后续步骤可读的名字），以及决定返回给调用方什么的 `return`。
+`compute`（把模板的结果放入后续步骤可读的名字）、`run`（在沙箱中运行站点自己的代码，见下文），以及决定返回给调用方什么的 `return`。
 
 | 连接 | 作用 |
 | --- | --- |
@@ -314,6 +314,7 @@ credentials verify log.jsonl <node-public-key>                   # the whole cha
 credentials verify log.jsonl <node-public-key> --head head.json  # must end at a signed checkpoint
 credentials verify log.jsonl <node-public-key> --owner alice     # one owner's chain
 credentials verify log.jsonl <node-public-key> --owner alice --user-key key.txt   # with the details
+credentials verify old.jsonl <old-node-key> --next new.jsonl     # one chain across a hand-over
 ```
 
 ## 运行节点
@@ -342,7 +343,12 @@ credentials verify log.jsonl <node-public-key> --owner alice --user-key key.txt 
   所有者需要重新授权，重启前签发或签名的内容一律不被接受。请把 `Node::checkpoint()` 保存在运营方无法回滚的
   地方（封装存储、单调计数器），并用 `Node::restore_anchored` 重启，它会拒绝被截断的日志。
 - **命令行与服务器。** [`credentials`](../../crates/cli) 可生成密钥、签署策略、封装记录、生成授权和签名调用；
-  `credentials serve` 通过 HTTP 运行节点，并使用持久的 JSONL 日志。
+  `credentials serve` 通过 HTTP 运行节点，并使用持久的 JSONL 日志。`POST /answer`、`/approve` 和
+  `/limits` 接收所有者设备为等待中的操作签署的内容，`/delegate` 和 `/delegation/change` 接收其委托；
+  节点重启时仍在等待的操作会丢失。
+  `POST /stream` 以双向分帧消息的形式运行 WebSocket、流式响应或 SSH shell（`server::stream`），
+  每个打开的连接占用一个线程。
+  浏览器填写就是普通的 `POST /call`，应答为 `{"kind": "fill", ...}`。
 - **并发。** 每个方法都接受 `&self`；可在线程之间共享一个节点。传输 I/O 在节点的锁之外运行。
 
 ## 在 Nitro Enclave 中运行
@@ -371,7 +377,7 @@ flowchart LR
 
 - **启动。** 除非内核从 NSM（`nsm-hwrng`）获取随机数，否则程序拒绝启动；随后它生成一个全新的节点密钥。
   Nitro 上没有封装存储：**重启后的 enclave 就是一个新节点**，拥有新的身份和新的日志文件，所有者需要
-  重新向它授权（授权封装给单个节点的密钥，本来就不会在重启后保留）。
+  重新向它授权（授权封装给单个节点的密钥，本来就不会在重启后保留），除非旧节点已移交给它（见下文）。
 - **API。** 在 vsock 端口 5000 上提供 `credentials serve` 的 HTTP API（同一套服务器代码，来自
   [`server`](../../crates/server) crate），外加 `GET /attestation?nonce=<base64url>`，其应答为
   `{"identity": <NodeIdentity>, "document": <base64url>}`。该文档是经 COSE 签名的 NSM 证明文档，其
@@ -489,6 +495,8 @@ credentials verify old.jsonl <旧节点密钥> --next new.jsonl --head new.jsonl
 - 授权只能在其被封装给的节点上打开，只接受该节点已知属于该所有者的设备（首次使用即信任），
   且无法被重放。撤销需要已知设备。
 - 记录无法被回滚到固定或节点见过的代数之前。
+- 只有所有者的已知设备才能回答挑战、给出批准，且针对的正是节点生成的内容；等待中的操作只为启动它的
+  调用方恢复，其值绝不离开节点。所有者限额内的付款在发送任何内容之前计入；超过限额则由所有者批准。
 - 模板在签名之前被分析；派生无法交还密钥、针对密钥的预言机，或对可猜测字段的猜测验证手段。
 - 响应被严格解析（分帧、编码、大小）；捕获的密钥会被遮蔽；仍以已知形式包含任何密钥的响应会被丢弃。
 - 日志只追加、已签名、按节点和按所有者链接，并可离线检查。
@@ -549,6 +557,8 @@ credentials verify old.jsonl <旧节点密钥> --next new.jsonl --head new.jsonl
   脚本所能达到的范围内工作。gRPC 只支持一元调用（不支持客户端、服务器或双向流）。
 - **UDP 数据报不加密。** `udp` 操作收发的内容在路径上以及 enclave 的宿主机上都可读；策略只允许
   秘密经由单向函数进入其中；`dtls` 操作则会加密它们。
+- **站点代码与站点本身同等受信任。** `run` 模块在秘密上进行计算；它是否失败、耗时多久都可能取决于
+  秘密，而未固定哈希的模块可以是该源提供的任何内容。
 - **浏览器填写信任浏览器。** 节点无法通过 CDP 看到页面的 TLS；说谎的浏览器或其运营者可以把任何页面
   显示为任何源，并读取所填的值。页面会读取这些值（如同人工输入时一样），其脚本可以保留它们。通过 CDP，
   节点看不到连接在它所填页面上的第二个客户端：没有端点的独占许可（以 `browser_shared` 标出）时，代理的
@@ -571,7 +581,8 @@ credentials verify old.jsonl <旧节点密钥> --next new.jsonl --head new.jsonl
 | [`host`](../../crates/host) | 在 enclave 的父实例上运行的程序，以 `credentials host` 运行 |
 | [`verify`](../../crates/verify) | 节点日志验证器，以 `credentials verify` 运行 |
 | [`attest`](../../crates/attest) | AWS Nitro Enclaves 证明文档验证器，以 `credentials attest` 运行 |
-| [`client`](../../crates/client) | 面向 iOS、Android 和 Web 应用的库：密钥、节点证明验证、授权、记录和调用；通过 UniFFI 绑定 Swift 和 Kotlin，通过 wasm-bindgen 绑定 JavaScript |
+| [`client`](../../crates/client) | 面向 iOS、Android 和 Web 应用的库：密钥、节点证明验证、授权、记录和调用、向后继节点重新授权、密钥备份和 6 位验证码设备迁移；通过 UniFFI 绑定 Swift 和 Kotlin，通过 wasm-bindgen 绑定 JavaScript |
+| [`continuity`](../../crates/continuity) | 节点延续：用 Sigstore 无密钥签名签署并离线验证的后继声明，以及两个节点之间经证明的移交 |
 | [`sandbox`](../../crates/sandbox) | `run` 步骤的 WebAssembly 沙箱（wasmi）：燃料、内存与时间上限，接收输入、给出一个输出，经过审查的库模块，JavaScript 引擎模块（`crates/sandbox/js`） |
 | [`cli`](../../crates/cli) | `credentials` 工具：密钥、策略、记录、授权、调用、节点服务器和 `credentials host` |
 

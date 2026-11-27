@@ -175,7 +175,8 @@ let outcome = node.run(&call, &mut TlsTransport::new());
 ```
 
 オペレーションは 1 本の接続上の **ステップ** の列です: `open` (HTTPS、TLS ストリーム、WebSocket、プロトコル接続、UDP データグラム、CDP で操作するブラウザー、または接続なし)、
-`send`、`receive` (キャプチャ付き)、`compute` (テンプレートを後続ステップが読む名前に入れる)、そして
+`send`、`receive` (キャプチャ付き)、`compute` (テンプレートを後続ステップが読む名前に入れる)、`run`
+(サイト自身のコードをサンドボックスで実行する。後述)、そして
 呼び出し元に何を返すかを決める `return`。
 
 | 接続 | 役割 |
@@ -335,6 +336,7 @@ credentials verify log.jsonl <node-public-key>                   # the whole cha
 credentials verify log.jsonl <node-public-key> --head head.json  # must end at a signed checkpoint
 credentials verify log.jsonl <node-public-key> --owner alice     # one owner's chain
 credentials verify log.jsonl <node-public-key> --owner alice --user-key key.txt   # with the details
+credentials verify old.jsonl <old-node-key> --next new.jsonl     # one chain across a hand-over
 ```
 
 ## ノードの運用
@@ -365,7 +367,12 @@ credentials verify log.jsonl <node-public-key> --owner alice --user-key key.txt 
   `Node::restore_anchored` で再起動してください。切り詰められたログを拒否します。
 - **コマンドラインとサーバー。** [`credentials`](../../crates/cli) で鍵の生成、ポリシーの署名、レコードの封印、
   グラントと署名付き呼び出しの作成ができ、`credentials serve` は永続的な JSONL ログとともに HTTP でノードを
-  実行します。
+  実行します。`POST /answer`、`/approve`、`/limits` は待機する操作のために所有者のデバイスが署名したものを
+  受け取り、`/delegate` と `/delegation/change` はそのデバイスの委任を受け取ります。ノードの再起動時に
+  待機中だった操作は消えます。
+  `POST /stream` は WebSocket、ストリーミングのレスポンス、SSH シェルを双方向のフレーム化したメッセージ
+  として動かし (`server::stream`)、開いた接続ごとにスレッドを 1 本使います。
+  ブラウザーへの入力は通常の `POST /call` で、`{"kind": "fill", ...}` を返します。
 - **並行性。** すべてのメソッドは `&self` を取るので、1 つのノードをスレッド間で共有できます。
   トランスポートの I/O はノードのロックの外で実行されます。
 
@@ -397,7 +404,8 @@ flowchart LR
 - **起動。** カーネルが NSM (`nsm-hwrng`) から乱数を得ていなければプログラムは起動を拒否し、その後
   新しいノード鍵を生成します。Nitro には封印ストレージがありません。**再起動したエンクレーブは新しい
   ノード**であり、新しいアイデンティティと新しいログファイルを持ちます。所有者はそのノードにグラントを
-  与え直します (グラントは 1 つのノードの鍵に封印されるので、もともと再起動を越えて残りません)。
+  与え直します (グラントは 1 つのノードの鍵に封印されるので、もともと再起動を越えて残りません)。ただし、
+  旧ノードがこのノードへ引き継いだ場合は除きます (後述)。
 - **API。** vsock ポート 5000 で `credentials serve` の HTTP API ([`server`](../../crates/server)
   クレートの同じサーバーコード) を提供し、加えて `GET /attestation?nonce=<base64url>` があります。
   応答は `{"identity": <NodeIdentity>, "document": <base64url>}` です。document は COSE で署名された NSM
@@ -535,6 +543,9 @@ credentials verify old.jsonl <旧ノードの鍵> --next new.jsonl --head new.js
 - グラントは、封印された宛先のノード上でのみ、かつノードがその所有者について知っているデバイスから
   のみ開かれ (初回使用は信頼される)、リプレイできません。失効には既知のデバイスが必要です。
 - レコードは、ピンやノードが見た世代を超えてロールバックできません。
+- チャレンジへの回答と承認ができるのは所有者の既知のデバイスだけで、その対象はノードが組み立てた内容
+  そのものです。待機中の操作は、それを始めた呼び出し元に対してだけ再開し、その値がノードの外に出ることは
+  ありません。所有者の上限内の支払いは何かを送る前に計上され、上限を超えると所有者が承認します。
 - テンプレートは署名前に解析されます。導出は、シークレット、シークレットに対するオラクル、推測可能な
   フィールドの推測を照合する手段のいずれも返せません。
 - レスポンスは厳格に解析され (フレーミング、エンコーディング、サイズ)、キャプチャされたシークレットは
@@ -605,6 +616,9 @@ PKCS#1 v1.5 署名ができないので、`rsa_sign_pkcs1("sha1", …)` だけ�
 - **UDP データグラムは暗号化されません。** `udp` オペレーションが送受信する内容は経路上と
   enclave のホストから読めます。ポリシーは一方向関数を通した値以外のシークレットを入れさせません。
   `dtls` オペレーションは代わりにそれを暗号化します。
+- **サイトのコードはサイトと同じだけ信頼されます。** `run` モジュールはシークレットを使って計算します。
+  失敗するかどうか、どれだけ時間がかかるかはシークレットによって変わり得ます。ハッシュを固定しない
+  モジュールは、オリジンが配信するものなら何にでもなり得ます。
 - **ブラウザーへの入力はブラウザーを信頼します。** ノードは CDP からページの TLS を見られません。嘘をつく
   ブラウザーやその運用者は、どのページでもどのオリジンとして見せ、入力された値を読めます。ページは (人が
   入力したときと同じく) 値を読み、そのスクリプトは値を保持できます。ノードは CDP では、自分が埋めている
@@ -630,7 +644,8 @@ PKCS#1 v1.5 署名ができないので、`rsa_sign_pkcs1("sha1", …)` だけ�
 | [`host`](../../crates/host) | エンクレーブの親インスタンスで動くプログラム。`credentials host` として実行 |
 | [`verify`](../../crates/verify) | ノードログの検証ツール。`credentials verify` として実行 |
 | [`attest`](../../crates/attest) | AWS Nitro Enclaves のアテステーションドキュメントの検証ツール。`credentials attest` として実行 |
-| [`client`](../../crates/client) | iOS・Android・Web のアプリ側ライブラリ: 鍵、ノードのアテステーション検証、グラント、レコード、呼び出し。Swift と Kotlin (UniFFI)、JavaScript (wasm-bindgen) のバインディング |
+| [`client`](../../crates/client) | iOS・Android・Web のアプリ側ライブラリ: 鍵、ノードのアテステーション検証、グラント、レコード、呼び出し、後継ノードへの再グラント、鍵のバックアップと 6 桁のコードによるデバイス移行。Swift と Kotlin (UniFFI)、JavaScript (wasm-bindgen) のバインディング |
+| [`continuity`](../../crates/continuity) | ノードの継続性: Sigstore のキーレス署名で署名されオフラインで検証される後継ステートメントと、2 つのノード間のアテステーション付き引き継ぎ |
 | [`sandbox`](../../crates/sandbox) | `run` ステップの WebAssembly サンドボックス (wasmi): 燃料・メモリ・時間の上限、入力を受け取り出力を 1 つ返す、レビュー済みライブラリモジュール、JavaScript エンジンモジュール (`crates/sandbox/js`) |
 | [`cli`](../../crates/cli) | `credentials` ツール: 鍵、ポリシー、レコード、グラント、呼び出し、ノードサーバー、`credentials host` |
 
