@@ -557,13 +557,23 @@ impl<S: LogSink, C: Clock> Node<S, C> {
             Err(error) => return self.closed(run, seq, None, &meter, Err(("error", error))),
         };
         let mut status = None;
-        let end = self.stream_body(run, &mut *stream, projection, live, &mut meter, &mut status);
+        let head = response::is_head_request(prepared.wire.expose());
+        let end = self.stream_body(
+            run,
+            &mut *stream,
+            projection,
+            live,
+            &mut meter,
+            &mut status,
+            head,
+        );
         let _ = stream.close();
         let end = end.map_err(|error| (reason_of(&error), error));
         self.closed(run, seq, status, &meter, end)
     }
 
     /// Reads a streamed response: its head, then its body through the stream search.
+    #[allow(clippy::too_many_arguments)]
     fn stream_body(
         &self,
         run: &mut Run<'_>,
@@ -572,6 +582,7 @@ impl<S: LogSink, C: Clock> Node<S, C> {
         live: &mut Live<'_>,
         meter: &mut Meter,
         status_out: &mut Option<u16>,
+        head: bool,
     ) -> Result<End> {
         let mut buf = Zeroizing::new(Vec::new());
         let (status, headers, rest) = loop {
@@ -610,7 +621,7 @@ impl<S: LogSink, C: Clock> Node<S, C> {
             }
         };
         *status_out = Some(status);
-        let mut decoder = BodyDecoder::new(response::framing(status, &headers)?);
+        let mut decoder = BodyDecoder::new(response::framing(status, &headers, head)?);
         let mut scrubber = Self::scrubber(run)?;
         let head = {
             let secrets = Secrets {

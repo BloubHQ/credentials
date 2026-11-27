@@ -15,6 +15,25 @@ pub fn array_from_b64<const N: usize>(text: &str) -> Result<[u8; N]> {
     bytes.try_into().map_err(|_| Error::Encoding)
 }
 
+/// A decimal number written in ASCII digits only (RFC 9110 `1*DIGIT`), or `None` when `text`
+/// is empty, holds anything else or does not fit `T`. The standard parsers also take a
+/// leading `+`, which a peer may read differently.
+pub fn digits<T: core::str::FromStr>(text: &[u8]) -> Option<T> {
+    if text.is_empty() || !text.iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    core::str::from_utf8(text).ok()?.parse().ok()
+}
+
+/// A decimal number of ASCII digits with an optional leading `-`, as [`digits`].
+pub fn signed_digits<T: core::str::FromStr>(text: &[u8]) -> Option<T> {
+    let magnitude = text.strip_prefix(b"-").unwrap_or(text);
+    if magnitude.is_empty() || !magnitude.iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    core::str::from_utf8(text).ok()?.parse().ok()
+}
+
 /// The canonical bytes of a value: its JSON with fields in declaration order.
 pub(crate) fn canonical<T: serde::Serialize>(domain: &[u8], value: &T) -> Result<Vec<u8>> {
     let mut out = domain.to_vec();

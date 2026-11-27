@@ -2019,7 +2019,8 @@ impl<S: LogSink, C: Clock> Node<S, C> {
             }
         };
         run.tainted.extend(built.tainted);
-        let parsed = Http::parse(&bytes).and_then(|http| {
+        let head = crate::response::is_head_request(built.wire.expose());
+        let parsed = Http::parse_reply(&bytes, head).and_then(|http| {
             if send.grpc {
                 live::grpc_answer(http)
             } else {

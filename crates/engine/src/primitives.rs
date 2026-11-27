@@ -765,10 +765,7 @@ pub(super) fn aes_cbc(key: &[u8], iv: &[u8], message: &[u8]) -> Result<Bytes> {
 
 /// A decimal number as `bytes` bytes, big-endian or little-endian.
 fn fixed_width(text: &[u8], bytes: usize, little: bool) -> Result<Bytes> {
-    let value: u64 = core::str::from_utf8(text)
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .ok_or(bad("argument is not a number"))?;
+    let value: u64 = crate::encoding::digits(text).ok_or(bad("argument is not a number"))?;
     let all = value.to_be_bytes();
     let (high, low) = all.split_at(8usize.saturating_sub(bytes));
     if high.iter().any(|b| *b != 0) {
@@ -782,19 +779,13 @@ fn fixed_width(text: &[u8], bytes: usize, little: bool) -> Result<Bytes> {
 }
 
 fn signed(text: &[u8]) -> Result<i64> {
-    core::str::from_utf8(text)
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .ok_or(bad("argument is not a signed 64-bit integer"))
+    crate::encoding::signed_digits(text).ok_or(bad("argument is not a signed 64-bit integer"))
 }
 
 /// `length` bytes of `value` from byte `start`.
 fn slice(value: &[u8], start: &[u8], length: &[u8]) -> Result<Bytes> {
     let parse = |t: &[u8]| -> Result<usize> {
-        core::str::from_utf8(t)
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .ok_or(bad("argument is not a number"))
+        crate::encoding::digits(t).ok_or(bad("argument is not a number"))
     };
     let start = parse(start)?;
     let end = start

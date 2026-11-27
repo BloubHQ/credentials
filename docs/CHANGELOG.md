@@ -22,6 +22,12 @@ before 1.0, minor versions may break formats and APIs.
   a panic in a connection still ends only that connection. Measured (`cargo build --release
   -p cli --locked`, Windows x86-64): `credentials.exe` 17,839,104 bytes before, 18,059,264
   after (+220,160, +1.2%).
+- A response to `HEAD`, and any `204` or `304`, has no body whatever its length headers say
+  (RFC 9112 section 6.3, RFC 9113 section 8.1.1), over HTTP/1.1 and HTTP/2; before, one that
+  carried `Content-Length: N` (as static file servers send on `HEAD`) failed with "body
+  shorter than its length". The framing now knows the request method
+  (`response::is_head_request`).
+
 - An operation that may wait now holds its waiting slot from the room check until it parks
   (`node::park::Reservation`, released on drop); before, the room was only checked, so
   overlapping calls all sent their login or challenge request and the extra ones failed with
@@ -817,6 +823,12 @@ before 1.0, minor versions may break formats and APIs.
   poisoned lock of the connection counts refuses new connections (`StateLost`); a poisoned
   transport pool lends no transport; a checkpoint hook that panicked halts the server's acts
   (503), since what it stored is unknown.
+- Numbers on the wire and in templates are ASCII digits only (`engine::encoding::digits`,
+  `signed_digits`): the node's own `Content-Length` (server), a response's `Content-Length`
+  (HTTP/1.1 and HTTP/2) and the template functions `u8`, `be16` ... `le64`, `add` and `slice`
+  no longer take a leading `+` (RFC 9110 `1*DIGIT`), which a front proxy could read
+  differently.
+
 - Spending limits carried in a hand-over package are checked rule by rule
   (`LimitRule::fault`) and the package is refused when one is not valid; a rule whose bound
   is no amount (`"1e9"`, `"025"`) now reads as exceeded, so the payment waits for approval
