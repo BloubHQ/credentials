@@ -277,38 +277,48 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
     use super::*;
 
-    struct Bytes(Vec<u8>);
+    /// A whole reply, read the way `Io` reads one: off the front of a buffer.
+    struct Bytes(crate::readbuf::ReadBuf);
+
+    fn bytes(wire: impl AsRef<[u8]>) -> Bytes {
+        let mut buf = crate::readbuf::ReadBuf::new();
+        buf.push(wire.as_ref());
+        Bytes(buf)
+    }
 
     impl Source for Bytes {
         fn line(&mut self) -> Result<Zeroizing<Vec<u8>>> {
             let at = self
                 .0
+                .pending()
                 .windows(2)
                 .position(|w| w == b"\r\n")
                 .ok_or(invalid("eof"))?;
-            let line: Vec<u8> = self.0.drain(..at + 2).collect();
-            Ok(Zeroizing::new(line[..at].to_vec()))
+            let line = self.0.take(at);
+            self.0.skip(2);
+            Ok(line)
         }
         fn exact(&mut self, n: usize) -> Result<Zeroizing<Vec<u8>>> {
-            if self.0.len() < n + 2 {
+            if self.0.pending().len() < n + 2 {
                 return Err(invalid("eof"));
             }
-            let bytes: Vec<u8> = self.0.drain(..n + 2).collect();
-            Ok(Zeroizing::new(bytes[..n].to_vec()))
+            let bytes = self.0.take(n);
+            self.0.skip(2);
+            Ok(bytes)
         }
     }
 
     #[test]
     fn replies_parse_to_json() {
-        let mut s = Bytes(b"*3\r\n$3\r\nfoo\r\n:42\r\n$-1\r\n".to_vec());
+        let mut s = bytes(b"*3\r\n$3\r\nfoo\r\n:42\r\n$-1\r\n");
         let reply = read(&mut s, 1024).unwrap();
         assert_eq!(json(&reply), serde_json::json!(["foo", 42, null]));
-        let mut s = Bytes(b"-ERR wrong\r\n".to_vec());
+        let mut s = bytes(b"-ERR wrong\r\n");
         assert_eq!(
             json(&read(&mut s, 1024).unwrap()),
             serde_json::json!({"error": "ERR wrong"})
         );
-        let mut s = Bytes(b"*2\r\n$2\r\n\xff\xfe\r\n+a\"b\r\n".to_vec());
+        let mut s = bytes(b"*2\r\n$2\r\n\xff\xfe\r\n+a\"b\r\n");
         assert_eq!(
             json(&read(&mut s, 1024).unwrap()),
             serde_json::json!([{"base64": "//4="}, "a\"b"])
@@ -323,8 +333,8 @@ mod tests {
     fn each_element_is_charged_its_line_and_counted() {
         // `:1` is four bytes on the wire, and so four of the budget.
         let ones = |n: usize| format!("*{n}\r\n{}", ":1\r\n".repeat(n)).into_bytes();
-        assert!(read(&mut Bytes(ones(10)), 5 + 10 * 4).is_ok());
-        assert!(read(&mut Bytes(ones(10)), 5 + 10 * 4 - 1).is_err());
+        assert!(read(&mut bytes(ones(10)), 5 + 10 * 4).is_ok());
+        assert!(read(&mut bytes(ones(10)), 5 + 10 * 4 - 1).is_err());
         // Nested arrays share one count of elements: `MAX_ELEMENTS / 1024` arrays of 1024
         // elements, plus the arrays themselves, are too many.
         struct Nested {
@@ -359,7 +369,7 @@ mod tests {
 
     #[test]
     fn the_json_is_held_to_its_limit() {
-        let mut s = Bytes(b"*3\r\n:1\r\n:2\r\n:3\r\n".to_vec());
+        let mut s = bytes(b"*3\r\n:1\r\n:2\r\n:3\r\n");
         let reply = read(&mut s, 1024).unwrap();
         assert_eq!(reply.json_bytes(7).unwrap().as_slice(), b"[1,2,3]");
         assert!(reply.json_bytes(6).is_err());
@@ -368,11 +378,11 @@ mod tests {
     #[test]
     fn hostile_replies_are_refused() {
         let deep = "*1\r\n".repeat(40);
-        assert!(read(&mut Bytes(deep.into_bytes()), 1024).is_err());
-        assert!(read(&mut Bytes(b"$100\r\nshort\r\n".to_vec()), 1024).is_err());
-        assert!(read(&mut Bytes(b"$5\r\nhello\r\n".to_vec()), 3).is_err());
-        assert!(read(&mut Bytes(b"*-5\r\n".to_vec()), 1024).is_err());
-        assert!(read(&mut Bytes(b"%1\r\n".to_vec()), 1024).is_err());
+        assert!(read(&mut bytes(deep), 1024).is_err());
+        assert!(read(&mut bytes(b"$100\r\nshort\r\n"), 1024).is_err());
+        assert!(read(&mut bytes(b"$5\r\nhello\r\n"), 3).is_err());
+        assert!(read(&mut bytes(b"*-5\r\n"), 1024).is_err());
+        assert!(read(&mut bytes(b"%1\r\n"), 1024).is_err());
     }
 
     #[test]

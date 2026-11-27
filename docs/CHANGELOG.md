@@ -39,6 +39,17 @@ before 1.0, minor versions may break formats and APIs.
     offset, as the protocol reader does (#46), through one buffer type both use, and refuses a
     message of more than 64 empty fragments. 1 MiB of one-byte fragments in 16 KiB pushes:
     774 ms before, 25 ms now; 1 MiB of empty fragments: 1.2 s before, refused in 8 us now.
+- Every reader of a framed stream takes frames off the front of one buffer type
+  (`engine::readbuf::ReadBuf`) that keeps an offset, instead of copying or moving the rest of
+  its buffer for every frame (#46): the HTTP/2 transport, the SFTP client, the relay's
+  datagram links and the node's caller streams, as the protocol reader and the WebSocket
+  decoder already did. `relay::datagram::take_datagram` takes a `ReadBuf`. 64 KiB of the
+  smallest frames, in the reads each one makes, in release builds (mean of 200 runs, 50 for
+  SFTP): HTTP/2, 10-byte frames in 16 KiB reads, 14.7-16.5 ms before, 0.35-0.37 ms now; SFTP,
+  10-byte packets, 13.9-14.9 ms before and 0.38-0.42 ms now in 16 KiB reads, 50.7-54.0 ms
+  before and 0.42 ms now in 64 KiB reads (an SSH packet carries up to 256 KiB); relay
+  datagrams, 10-byte frames in 4 KiB reads, 517-534 us before, 355-380 us now; caller
+  streams, 77-byte frames in 16 KiB reads, 109 us before, 12-13 us now.
 - Log files: one writer per log. `credentials serve` and `credentials host` hold an exclusive
   lock on each log file while they write it (`flock` on Unix; on Windows the file is opened
   sharing reads only), so a second process on the same file fails at start with "the log is

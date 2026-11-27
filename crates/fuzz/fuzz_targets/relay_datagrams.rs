@@ -6,6 +6,7 @@
 
 use std::io::Cursor;
 
+use engine::readbuf::ReadBuf;
 use libfuzzer_sys::fuzz_target;
 use relay::datagram::{
     MAX_DATAGRAM, read_datagram, read_egress_request, take_datagram, write_datagram,
@@ -24,7 +25,8 @@ fuzz_target!(|data: &[u8]| {
         let again = read_datagram(&mut Cursor::new(written));
         assert!(matches!(again, Ok(Some(ref f)) if *f == frame));
     }
-    let mut pending = data.to_vec();
+    let mut pending = ReadBuf::new();
+    pending.push(data);
     while let Ok(Some(frame)) = take_datagram(&mut pending) {
         assert!(!frame.is_empty() && frame.len() <= MAX_DATAGRAM);
     }

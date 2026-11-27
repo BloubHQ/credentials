@@ -15,6 +15,7 @@
 use std::io::{self, Read, Write};
 use std::time::{Duration, Instant};
 
+use engine::readbuf::ReadBuf;
 use zeroize::Zeroize;
 
 use crate::hpack::{self, Decoder};
@@ -128,13 +129,14 @@ fn frame_bytes(kind: u8, flags: u8, stream: u32, payload: &[u8]) -> Vec<u8> {
 /// Splits the frames out of what was read, keeping a partial frame for the next read.
 #[derive(Default)]
 struct Reader {
-    buf: Vec<u8>,
+    /// Wiped as frames are taken and when dropped.
+    buf: ReadBuf,
 }
 
 impl Reader {
     fn next(&mut self) -> Result<Option<Frame>, H2Error> {
-        let Some([l0, l1, l2, kind, flags, s0, s1, s2, s3]) = self
-            .buf
+        let pending = self.buf.pending();
+        let Some([l0, l1, l2, kind, flags, s0, s1, s2, s3]) = pending
             .get(..9)
             .and_then(|head| <[u8; 9]>::try_from(head).ok())
         else {
@@ -145,25 +147,18 @@ impl Reader {
             return Err(protocol("frame larger than SETTINGS_MAX_FRAME_SIZE"));
         }
         let stream = u32::from_be_bytes([s0, s1, s2, s3]) & 0x7fff_ffff;
-        let Some(payload) = self.buf.get(9..9 + len) else {
+        if pending.len() < 9 + len {
             return Ok(None);
-        };
-        let payload = payload.to_vec();
-        let rest = self.buf.get(9 + len..).unwrap_or_default().to_vec();
-        self.buf.zeroize();
-        self.buf = rest;
+        }
+        self.buf.skip(9);
+        // The frame takes the bytes out; the buffer they were taken from is erased.
+        let payload = std::mem::take(&mut *self.buf.take(len));
         Ok(Some(Frame {
             kind,
             flags,
             stream,
             payload,
         }))
-    }
-}
-
-impl Drop for Reader {
-    fn drop(&mut self) {
-        self.buf.zeroize();
     }
 }
 
@@ -509,9 +504,7 @@ impl<S: Io> Conn<S> {
                 };
             }
         };
-        self.reader
-            .buf
-            .extend_from_slice(chunk.get(..n).unwrap_or_default());
+        self.reader.buf.push(chunk.get(..n).unwrap_or_default());
         chunk.zeroize();
         while let Some(frame) = self.reader.next()? {
             self.handle(frame)?;
@@ -904,6 +897,33 @@ mod tests {
 
     const WIRE: &[u8] = b"GET /v1/x?a=1 HTTP/1.1\r\nHost: api.example.com\r\nAuthorization: Bearer t0ken-value\r\nContent-Length: 0\r\nAccept-Encoding: identity\r\nConnection: close\r\n\r\n";
 
+    #[test]
+    fn many_small_frames_split_across_reads() {
+        // 64 KiB of the smallest frames (a 9-byte head and 1 byte), 16 KiB per read: every
+        // frame comes out once, whole, also those split between two reads (#46).
+        let unit = frame(DATA, 0, 1, b"x");
+        let wire: Vec<u8> = unit
+            .iter()
+            .copied()
+            .cycle()
+            .take(64 * 1024 / 10 * 10)
+            .collect();
+        let mut reader = Reader::default();
+        let mut frames = 0;
+        for chunk in wire.chunks(16 * 1024) {
+            reader.buf.push(chunk);
+            while let Some(f) = reader.next().unwrap() {
+                assert_eq!(
+                    (f.kind, f.stream, f.payload.as_slice()),
+                    (DATA, 1, &b"x"[..])
+                );
+                frames += 1;
+            }
+        }
+        assert_eq!(frames, wire.len() / 10);
+        assert!(reader.buf.pending().is_empty());
+    }
+
     fn settings() -> Vec<u8> {
         frame(SETTINGS, 0, 0, &[])
     }
@@ -975,9 +995,8 @@ mod tests {
         conn.finish_all(1024).unwrap();
         let written = conn.io.written.clone();
         assert!(written.starts_with(PREFACE));
-        let mut reader = Reader {
-            buf: written[PREFACE.len()..].to_vec(),
-        };
+        let mut reader = Reader::default();
+        reader.buf.push(&written[PREFACE.len()..]);
         let mut kinds = Vec::new();
         let mut decoded = None;
         while let Some(f) = reader.next().unwrap() {
@@ -1170,9 +1189,8 @@ mod tests {
         )
         .unwrap();
         conn.finish_all(1024).unwrap();
-        let mut reader = Reader {
-            buf: conn.io.written[PREFACE.len()..].to_vec(),
-        };
+        let mut reader = Reader::default();
+        reader.buf.push(&conn.io.written[PREFACE.len()..]);
         let mut sent = 0;
         while let Some(f) = reader.next().unwrap() {
             if f.kind == DATA {

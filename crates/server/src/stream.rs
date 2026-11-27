@@ -32,6 +32,7 @@ use engine::error::TransportKind;
 use engine::keys::CallerKey;
 use engine::node::{CallerFrame, FromCaller, Part, Relay};
 use engine::policy::FrameKind;
+use engine::readbuf::ReadBuf;
 
 use crate::http::Connection;
 
@@ -141,7 +142,7 @@ pub(crate) struct ConnectionRelay<'c, C: Connection> {
     conn: &'c mut C,
     /// True once the answer's head (`200`) was written.
     pub started: bool,
-    input: Vec<u8>,
+    input: ReadBuf,
     closed: bool,
 }
 
@@ -150,7 +151,7 @@ impl<'c, C: Connection> ConnectionRelay<'c, C> {
         Self {
             conn,
             started: false,
-            input: Vec::new(),
+            input: ReadBuf::new(),
             closed: false,
         }
     }
@@ -181,7 +182,8 @@ impl<'c, C: Connection> ConnectionRelay<'c, C> {
 
     /// A whole frame of the caller in what was read, if any.
     fn take(&mut self) -> Result<Option<FromCaller>, Error> {
-        let Some(head) = self.input.get(..5) else {
+        let input = self.input.pending();
+        let Some(head) = input.get(..5) else {
             return Ok(None);
         };
         let (kind, len) = match head {
@@ -193,11 +195,11 @@ impl<'c, C: Connection> ConnectionRelay<'c, C> {
                 rule: "caller frame too large",
             });
         }
-        let Some(payload) = self.input.get(5..5 + len) else {
+        let Some(payload) = input.get(5..5 + len) else {
             return Ok(None);
         };
         let frame = parse_caller(kind, payload)?;
-        self.input.drain(..5 + len);
+        self.input.skip(5 + len);
         Ok(Some(frame))
     }
 }
@@ -236,9 +238,8 @@ impl<C: Connection> Relay for ConnectionRelay<'_, C> {
                 Ok(Some(FromCaller::Close))
             }
             Ok(n) => {
-                self.input
-                    .extend_from_slice(buf.get(..n).unwrap_or_default());
-                if self.input.len() > MAX_CALLER_FRAME + 5 {
+                self.input.push(buf.get(..n).unwrap_or_default());
+                if self.input.pending().len() > MAX_CALLER_FRAME + 5 {
                     // Room for exactly one frame: a caller cannot fill the node's memory.
                     if let Some(frame) = self.take()? {
                         return Ok(Some(frame));
