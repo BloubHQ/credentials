@@ -276,7 +276,7 @@ impl<S: LogSink, C: Clock> Node<S, C> {
         state.issued(owner, change.issued_ms);
         if revoke {
             state.delegations.remove(&key);
-            let prefix = format!("{delegate}/");
+            let prefix = super::delegated_label(&delegate, "");
             state.parked.drop_callers(owner, &change.record_id, &prefix);
         } else if let Some(slot) = state.delegations.get_mut(&key) {
             slot.opens_ms = None;

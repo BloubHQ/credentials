@@ -27,6 +27,7 @@ use engine::node::{Clock, Node};
 use engine::policy::summary::FlagCode;
 use engine::policy::{Caller, Destination, FieldSpec, Operation, Policy, summarize};
 use engine::record::Record;
+use engine::session::Pending;
 use serde_json::{Value, json};
 
 const OWNER: &str = "alice";
@@ -310,6 +311,43 @@ fn a_delegate_uses_the_item_under_the_narrower_policy_and_both_logs_say_so() {
     assert_eq!(uses[0].entry.owner, OWNER);
     assert_eq!(uses[0].entry.caller, "bob/agent");
     verify_chain(&w.entries(), &w.node.public_key()).unwrap();
+}
+
+#[test]
+fn a_delegated_call_that_needs_approval_names_the_caller_and_the_delegate() {
+    // Before, the summary's caller was the label `bob/agent`, which is no name: every
+    // approval of a delegated call failed as ApprovalInvalid.
+    let w = World::new();
+    let mut read = fetch("read", "api.example.com", json!({"do": "return"}));
+    read.approval = true;
+    let policy = Policy::new()
+        .with_field(FieldSpec::secret("token"))
+        .with_operation(read)
+        .with_caller(caller("agent", &w.agent, &["read"]));
+    let d = w.delegate(policy, 0);
+    let mut site = Site::ok();
+    let call = w.delegated_call("read", Body::http_fixed(), d.id);
+    let summary = match w.run(&call, &mut site) {
+        Ok(Output::Pending(Pending::ApprovalRequired { summary, .. })) => *summary,
+        other => panic!("not an approval: {:?}", other.map(|_| ()).err()),
+    };
+    assert_eq!(summary.caller, "agent");
+    assert_eq!(summary.delegate.as_deref(), Some(DELEGATE));
+    assert_eq!(summary.owner, OWNER);
+    assert!(!site.carried_token(), "nothing is sent before the approval");
+    w.node
+        .approve(&w.device.approve(&summary, w.now()).unwrap())
+        .unwrap();
+    let resume = w.delegated_call("read", Body::resume(summary.id), d.id);
+    assert_eq!(status(w.run(&resume, &mut site)), 200);
+    assert!(site.carried_token(), "the approved call ran");
+    let uses: Vec<_> = w
+        .entries()
+        .into_iter()
+        .filter(|e| matches!(e.entry.event, Event::Use { .. }))
+        .collect();
+    assert_eq!(uses.len(), 1);
+    assert_eq!(uses[0].entry.caller, "bob/agent");
 }
 
 #[test]

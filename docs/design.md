@@ -198,8 +198,9 @@ taken:
 
 An item or policy can require the owner's approval per use: payments always, plus whatever
 the owner marks. The node returns `approval_required {id, summary}`; the summary is built by
-the node (merchant origin, amount, currency, item masked view), and the owner's device signs
-`approve(id, summary hash)`. The log records the approval.
+the node (merchant origin, amount, currency, item masked view, the caller, and for a delegated
+call the delegate it acted through), and the owner's device signs `approve(id, summary
+hash)`. The log records the approval.
 
 Done in part 5. The node asks before it sends anything (not between steps), so nothing
 reaches the site before the owner approved. Every use of a `card` waits, whatever the

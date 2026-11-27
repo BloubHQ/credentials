@@ -539,6 +539,12 @@ pub fn sign_kind(device_key: String, kind_json: String) -> Result<String> {
     Ok(crate::sign_kind(device_key, kind_json)?)
 }
 
+/// See [`crate::approval_lines`].
+#[wasm_bindgen(js_name = approvalLines)]
+pub fn approval_lines(summary_json: String) -> Result<Vec<String>> {
+    Ok(crate::approval_lines(summary_json)?)
+}
+
 /// See [`crate::approval_hash`].
 #[wasm_bindgen(js_name = approvalHash)]
 pub fn approval_hash(summary_json: String) -> Result<String> {

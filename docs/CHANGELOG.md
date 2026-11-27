@@ -15,6 +15,14 @@ before 1.0, minor versions may break formats and APIs.
   file is created and after a checkpoint is renamed into place, so a power loss cannot lose
   the new name; Windows has no directory sync (documented). New error variant
   `server::logfile::Error::InUse` (#54).
+- Delegation: a delegated call that waits for the owner's approval (an operation marked
+  `approval`, a card, a payment over the limits) works. Its summary named the caller as the
+  label `delegate/caller`, which is no name, so every such call failed with
+  `approval_invalid`; only payments within the limits went through. The summary now has
+  `caller` (the delegate's caller) and a new `delegate` field, absent for the owner's own
+  callers, so the hash of a summary without a delegate is unchanged. A client from before
+  this refuses a summary that has `delegate` (#53).
+
 - SSH: `chacha20-poly1305@openssh.com` works against OpenSSH. The node counted the 4-byte
   packet length in the block alignment of its padding, as in the clear; OpenSSH leaves it
   out for every AEAD, as for AES-GCM, so sshd refused the node's first encrypted packet
