@@ -7,6 +7,12 @@ before 1.0, minor versions may break formats and APIs.
 
 ### Changed
 
+- **An operation on a streaming call no longer waits.** A WebSocket, an SSH shell or
+  forward, a live MQTT relay and an HTTPS operation whose response streams are refused
+  `"approval": true`, a `payment` and an item kind that waits for approval when the policy is
+  signed: the resume is a call of its own, with no stream left to relay. The node checks it
+  again before it parks anything.
+
 - Every browser fill now ends by clearing the page's history and checking it holds one
   entry (a browser that keeps it refuses the fill after the values went in), so the
   back/forward cache cannot bring a filled document back; a fill is refused when any target
@@ -86,6 +92,28 @@ before 1.0, minor versions may break formats and APIs.
   (`sandbox::MAX_TIME`, checked between slices of 10⁷ fuel) and new errors `Time` and
   `Refused`; `sandbox::Limits` gained `time` and `script`.
 - Fuzz target `sandbox_script`: arbitrary JavaScript sources and arguments on the engine.
+- DTLS 1.2 and 1.3 (RFC 6347, RFC 9147) as the `dtls` connection (`docs/policy.md`, DTLS;
+  `docs/design.md` section 7b): `send` writes one record of 1 to 16,384 bytes, `receive`
+  reads one, over the datagram path of `udp` (a connected UDP socket, or the enclave's
+  datagram relay, `udp/host:port` in `--allow`). Nothing is written before the handshake is
+  complete and the server's certificate passes the verifier of a `tls` connection (WebPKI
+  chain to the transport's roots, validity, host name); `open.pins` (at most 16,
+  `sha256/` and the base64 of the SHA-256 of the `SubjectPublicKeyInfo`) also requires one
+  of those keys, and lets a self-signed certificate with a pinned key through. Sends may
+  hold secrets (encrypted, unlike `udp`); no client certificate, no PSK suite, no
+  `tls_exporter`. The caller's exchanges are at most 64 records with no delimiters, read
+  through the delimiter-safe reader and the stream search. A new pin, or dropping all pins,
+  widens a policy in its diff. The schema has `dtls` and `pins`; `Transport::open_dtls`
+  (default: refused); `transport::dtls` with `DtlsStream`, `Trust` and a `dimpl` crypto
+  provider on ring and rustls-webpki; the `dtls_client` fuzz target.
+- New dependency `dimpl` 0.8.0 (MIT OR Apache-2.0, `forbid(unsafe_code)`), built with no
+  crypto backend, and the provider `transport::dtls` gives it from ring, rustls-webpki and
+  `aes`: 11 new packages in `Cargo.lock` (276 to 287): `dimpl`, `arrayvec`, `nom` 8 (next to
+  7), `rand` 0.9, `rand_chacha` 0.9, `rand_core` 0.9 (next to 0.10), `ppv-lite86`,
+  `getrandom` 0.3 (next to 0.2 and 0.4), and `r-efi` 5.3 (next to 6.0), `wasip2`,
+  `wit-bindgen`, which build only for UEFI and WASI targets. No RustCrypto crate of the
+  previous generation; `credentials.exe` (release, Windows x86_64) grows from 13,692,928 to
+  14,379,008 bytes (+686,080, +5.0 %).
 
 - Typed browser fills and the agent's controller kept out of a fill (`docs/policy.md`,
   Browser fills and Typed browser fills; `docs/design.md` section 6, part 8):
@@ -749,6 +777,16 @@ before 1.0, minor versions may break formats and APIs.
 
 ### Security
 
+- An approved operation on a protocol connection (SSH and SFTP, PostgreSQL, MySQL, Redis,
+  SMTP, IMAP, POP3, FTP, MQTT, AMQP 0-9-1 and 1.0) never went on: the caller's commands and
+  messages were not kept with the waiting operation, so the resume failed
+  (`operation_unknown`, or `policy_invalid` on IMAP; measured: 13 of 13 approved sessions
+  failed, now 13 of 13 return what the same call returns unapproved, with nothing opened
+  before the approval). They are now kept as signed, counted against the 128 MiB of waiting
+  values, and wiped (as every kept caller payload now is) when the operation goes on, lapses
+  or is dropped. A resumed protocol or browser operation now takes a connection slot, as
+  the call that started it did. UDP exchanges and derivation input were already kept
+  (tested).
 - The delimiters of a caller's TLS exchanges were an oracle on a secret the server echoes:
   with `until` set to the bytes before the secret plus a guessed byte, the read ended there
   only when the guess was right (measured: 3 of 3 bytes learned). A match is now taken only

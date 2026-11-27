@@ -722,6 +722,11 @@ pub enum Connection {
     /// `receive` reads one. There is no TLS, so a send may not hold a secret in reversible
     /// form.
     Udp,
+    /// DTLS 1.2 or 1.3 (RFC 6347, RFC 9147) over UDP datagrams to one destination, for
+    /// request and response protocols over DTLS (CoAP, LwM2M): the server's certificate is
+    /// checked as for `tls` (and against `pins` when the policy gives them) before anything
+    /// is sent; then `send` writes one record and `receive` reads one.
+    Dtls,
     /// A browser, over the Chrome DevTools Protocol: a WebSocket to the CDP endpoint the
     /// policy fixes. The first `send` is the handshake, as for a WebSocket; each later one is
     /// a [`Fill`] the node runs itself. Nothing of the page goes back but the outcome and the
@@ -755,6 +760,11 @@ pub struct Open {
     /// The SSH host keys the server must prove it holds one of (`type base64`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub host_keys: Vec<String>,
+    /// The keys a DTLS server's certificate must hold one of, each `sha256/` and the
+    /// base64 of the SHA-256 of its DER `SubjectPublicKeyInfo`. A self-signed certificate is
+    /// accepted only with a pinned key.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pins: Vec<String>,
     /// How SMTP and IMAP reach TLS (implicit by default).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tls: Option<TlsMode>,
@@ -1127,6 +1137,27 @@ impl Operation {
         self.awaits().next().is_some()
     }
 
+    /// True when the operation runs on a streaming call: a WebSocket, an SSH shell or
+    /// forward, a live MQTT relay, or HTTPS whose `return` streams the body. Such an
+    /// operation holds the caller's connection for the call, so it never waits.
+    pub fn streams(&self) -> bool {
+        match self.connection() {
+            Some(Connection::Websocket) => true,
+            // An SSH shell or forward: the relay takes the caller's frames. MQTT: the relay
+            // hands back the messages of the subscriptions the policy keeps.
+            Some(Connection::Ssh | Connection::Mqtt) => self
+                .returns()
+                .and_then(|r| r.relay.as_ref())
+                .is_some_and(|r| !r.frames.is_empty() || r.server),
+            Some(Connection::Https) => self.returns().is_some_and(|r| {
+                r.response
+                    .as_ref()
+                    .is_some_and(|p| p.body == Some(BodyProjection::Stream))
+            }),
+            _ => false,
+        }
+    }
+
     /// The names of fields the templates of the operation read.
     pub(crate) fn field_reads(&self, policy: &Policy) -> Vec<String> {
         let mut out: Vec<String> = Vec::new();
@@ -1383,6 +1414,49 @@ fn check_destinations(at: &str, destinations: &[Destination]) -> Checked {
             d.is_valid_pattern(),
             || format!("{at}.destinations[{i}]"),
             "lowercase host name (or *. and at least two labels) and a port",
+        )?;
+    }
+    Ok(())
+}
+
+/// Most certificate pins of one `dtls` operation.
+pub const MAX_CERTIFICATE_PINS: usize = 16;
+
+/// The SHA-256 of a `SubjectPublicKeyInfo` that a pin names: `sha256/` and the standard,
+/// padded base64 of 32 bytes, in its one canonical spelling. `None` for anything else.
+pub fn parse_pin(pin: &str) -> Option<[u8; 32]> {
+    use base64::Engine as _;
+    let encoded = pin.strip_prefix("sha256/")?;
+    if encoded.len() != 44 {
+        return None;
+    }
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .ok()?;
+    let hash: [u8; 32] = bytes.try_into().ok()?;
+    (base64::engine::general_purpose::STANDARD.encode(hash) == encoded).then_some(hash)
+}
+
+/// Pins are for a `dtls` connection: at most 16, each a [`parse_pin`] and none twice.
+fn check_pins(at: &str, open: &Open) -> Checked {
+    if open.pins.is_empty() {
+        return Ok(());
+    }
+    ensure(
+        open.connection == Connection::Dtls,
+        || format!("{at}.pins"),
+        "pins are for a DTLS connection",
+    )?;
+    ensure(
+        open.pins.len() <= MAX_CERTIFICATE_PINS,
+        || format!("{at}.pins"),
+        "1 to 16 pins",
+    )?;
+    for (i, pin) in open.pins.iter().enumerate() {
+        ensure(
+            parse_pin(pin).is_some() && !open.pins.iter().take(i).any(|p| p == pin),
+            || format!("{at}.pins[{i}]"),
+            "a pin is sha256/ and the base64 of 32 bytes, each once",
         )?;
     }
     Ok(())
@@ -1958,7 +2032,7 @@ impl Policy {
                     self.check_proto_relay(at, kinds, c, relay, known)?;
                 }
             }
-            Some(Connection::Tls | Connection::Udp) => {
+            Some(Connection::Tls | Connection::Udp | Connection::Dtls) => {
                 ensure(
                     ret.response.is_none() && ret.template.is_none(),
                     || at.to_string(),
@@ -2123,6 +2197,15 @@ impl Policy {
                         || at.clone(),
                         "a UDP connection takes no identity, protocol or limits",
                     )?;
+                    ensure(
+                        open.connection != Connection::Dtls
+                            || (open.identity.is_none()
+                                && open.protocol.is_none()
+                                && open.limits.is_none()),
+                        || at.clone(),
+                        "a DTLS connection takes no identity, protocol or limits",
+                    )?;
+                    check_pins(&at, open)?;
                     ensure(
                         open.protocol.is_none() || open.connection == Connection::Https,
                         || format!("{at}.protocol"),
@@ -2306,6 +2389,29 @@ impl Policy {
                             "a UDP datagram is sent in clear: it may not depend on a guessable secret",
                         )?;
                     }
+                    Connection::Dtls => {
+                        ensure(
+                            send.request.is_none()
+                                && send.inject.is_empty()
+                                && !send.grpc
+                                && send.fill.is_none()
+                                && send.frame.is_none(),
+                            || at.clone(),
+                            "a DTLS send takes template only",
+                        )?;
+                        let Some(template) = &send.template else {
+                            return fail(at, "a DTLS send needs a template");
+                        };
+                        // A record is encrypted to the server whose certificate the
+                        // handshake checked, as a TLS write is; no exporter is offered.
+                        self.check_template(
+                            &format!("{at}.template"),
+                            &kinds,
+                            template,
+                            &known,
+                            Var::in_stream,
+                        )?;
+                    }
                 },
                 (Step::Receive(receive), Some(open)) => match open.connection {
                     Connection::Ssh
@@ -2353,6 +2459,14 @@ impl Policy {
                             receive.until.is_empty(),
                             || format!("{at}.until"),
                             "a UDP receive reads one datagram; until is for TLS streams",
+                        )?;
+                        self.check_captures(&at, &receive.capture, true, true, &mut known)?;
+                    }
+                    Connection::Dtls => {
+                        ensure(
+                            receive.until.is_empty(),
+                            || format!("{at}.until"),
+                            "a DTLS receive reads one record; until is for TLS streams",
                         )?;
                         self.check_captures(&at, &receive.capture, true, true, &mut known)?;
                     }
@@ -2521,6 +2635,20 @@ impl Policy {
             || format!("{at}.steps"),
             "the sends that take the caller's request declare the same body contract, or none",
         )?;
+        if operation.streams() {
+            // A waiting operation is resumed by a call of its own, after the streaming call
+            // that started it ended: there is no caller connection left to relay on.
+            let kind_waits = self
+                .item
+                .as_ref()
+                .and_then(|b| b.schema().ok())
+                .is_some_and(|k| k.shape.approval);
+            ensure(
+                !operation.approval && operation.payment.is_none() && !kind_waits,
+                || at.to_string(),
+                "an operation that streams does not wait for the owner's approval: no approval, no payment, no item kind that waits for approval",
+            )?;
+        }
         if let Some(payment) = &operation.payment {
             self.check_payment(&format!("{at}.payment"), operation, payment)?;
         }
@@ -3197,6 +3325,7 @@ fn summarize_operation(operation: &Operation, out: &mut Vec<String>) {
                 Connection::Ftp => "FTP over TLS",
                 Connection::Pop3 => "POP3",
                 Connection::Udp => "UDP datagrams (no TLS)",
+                Connection::Dtls => "DTLS records over UDP",
             },
             destination_names(&open.destinations),
             if open.identity.is_some() {
@@ -3402,7 +3531,7 @@ fn summarize_steps(operation: &Operation, steps: &[Step], out: &mut Vec<String>)
                     }
                 }
                 (None, None, None) => out.push(match operation.connection() {
-                    Some(Connection::Tls | Connection::Udp) => {
+                    Some(Connection::Tls | Connection::Udp | Connection::Dtls) => {
                         "  return: no caller exchanges".into()
                     }
                     _ => "  return: status".into(),

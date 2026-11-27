@@ -70,6 +70,8 @@ Why wasmi 1.1.0:
 - **Limits**: fuel metering, a resource limiter for memory and tables, structural limits for
   untrusted modules, and traps for every failure.
 
+Unsafe code, the one exception: the guest crate `crates/sandbox/js` (compiled to WebAssembly, never linked into the host) uses `unsafe` only as syntax in `src/abi.rs`, an `unsafe extern` block declaring the four host imports as `safe fn` and `#[unsafe(no_mangle)]` on the `run` export; it dereferences no pointer. Every host crate keeps `unsafe_code = "forbid"`.
+
 Unsafe code: the `sandbox` crate has none (`unsafe_code = "forbid"`). Its runtime
 dependencies do (files with `unsafe` in `src`, counted in the crates as published): `wasmi`
 1.1.0 (27: the executor, its value stack, linear memory), `wasmi_core` (2), `wasmi_ir` (1),

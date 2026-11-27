@@ -892,6 +892,7 @@ fn sign_in<'s>(
         | Connection::Tls
         | Connection::Websocket
         | Connection::Udp
+        | Connection::Dtls
         | Connection::Browser => {
             return Err(Error::transport(TransportKind::Unsupported, false));
         }

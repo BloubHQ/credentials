@@ -207,7 +207,7 @@
       "required": ["do", "connection", "destinations"],
       "properties": {
         "do": {"const": "open"},
-        "connection": {"enum": ["https", "tls", "websocket", "ssh", "postgres", "smtp", "imap", "redis", "mysql", "mqtt", "amqp", "amqp1", "ftp", "pop3", "udp", "browser"]},
+        "connection": {"enum": ["https", "tls", "websocket", "ssh", "postgres", "smtp", "imap", "redis", "mysql", "mqtt", "amqp", "amqp1", "ftp", "pop3", "udp", "dtls", "browser"]},
         "destinations": {"type": "array", "minItems": 1, "maxItems": 32, "items": {"$ref": "#/$defs/Destination"}},
         "identity": {
           "type": "object",
@@ -227,6 +227,7 @@
         },
         "login": {"$ref": "#/$defs/Login"},
         "host_keys": {"type": "array", "minItems": 1, "maxItems": 16, "items": {"type": "string", "minLength": 1}},
+        "pins": {"type": "array", "minItems": 1, "maxItems": 16, "items": {"type": "string", "pattern": "^sha256/[A-Za-z0-9+/]{43}=$"}},
         "tls": {"enum": ["implicit", "starttls"]},
         "version": {"enum": ["3.1.1", "5"]},
         "browser": {

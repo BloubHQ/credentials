@@ -20,6 +20,7 @@ sandbox = { path = "../sandbox" }
 transport = { path = "../transport" }
 relay = { path = "../relay" }
 libfuzzer-sys = "0.4"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 serde_json = "1"
 zeroize = "1"
 
@@ -236,6 +237,13 @@ bench = false
 [[bin]]
 name = "parameter_lists"
 path = "fuzz_targets/parameter_lists.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "dtls_client"
+path = "fuzz_targets/dtls_client.rs"
 test = false
 doc = false
 bench = false

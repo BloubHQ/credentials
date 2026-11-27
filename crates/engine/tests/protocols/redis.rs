@@ -212,3 +212,18 @@ fn a_wrong_password_is_an_auth_error() {
     assert!(matches!(result, Err(engine::Error::AuthRefused { .. })));
     assert_eq!(fake.peer.commands.len(), 1, "nothing after AUTH");
 }
+
+#[test]
+fn an_approved_session_runs_the_commands_it_was_signed_with() {
+    same_after_approval(
+        &redis_setup(),
+        "cache",
+        session(
+            "cache.example.com",
+            6380,
+            vec![command("get", &["greeting"]), command("user", &[])],
+            Vec::new(),
+        ),
+        || Fake::new(RedisServer::new(PASSWORD)),
+    );
+}

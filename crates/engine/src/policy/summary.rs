@@ -1406,6 +1406,15 @@ fn diff_operation(
                 "operation {name}: a new {kind} host key is trusted"
             ));
         }
+        let prev_pins: &[String] = prev_open.map(|o| o.pins.as_slice()).unwrap_or(&[]);
+        if open.pins.iter().any(|p| !prev_pins.contains(p)) {
+            wider.push(format!("operation {name}: a new certificate key is pinned"));
+        }
+        if open.pins.is_empty() && !prev_pins.is_empty() {
+            wider.push(format!(
+                "operation {name}: the certificate pins were removed"
+            ));
+        }
         if prev_open.and_then(|o| o.tls) != open.tls {
             wider.push(format!("operation {name}: how TLS starts changed"));
         }

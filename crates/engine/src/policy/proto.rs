@@ -237,6 +237,7 @@ impl Login {
             | Connection::Tls
             | Connection::Websocket
             | Connection::Udp
+            | Connection::Dtls
             | Connection::Browser => {
                 return None;
             }
@@ -415,6 +416,7 @@ impl Connection {
             Connection::Ftp => "ftp",
             Connection::Pop3 => "pop3",
             Connection::Udp => "udp",
+            Connection::Dtls => "dtls",
         }
     }
 }
@@ -451,6 +453,7 @@ fn mechanisms(connection: Connection) -> &'static [Mechanism] {
         | Connection::Tls
         | Connection::Websocket
         | Connection::Udp
+        | Connection::Dtls
         | Connection::Browser => &[],
     }
 }

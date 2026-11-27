@@ -536,3 +536,22 @@ fn a_secret_in_a_live_message_stops_the_relay() {
         "nothing of the message went back"
     );
 }
+
+#[test]
+fn an_approved_session_runs_the_commands_it_was_signed_with() {
+    same_after_approval(
+        &mqtt_setup("3.1.1"),
+        "sensors",
+        session(
+            "broker.example.com",
+            8883,
+            vec![command("set", &["42"]), command("read", &["sensors/door"])],
+            Vec::new(),
+        ),
+        || {
+            let mut broker = Broker::new(PASSWORD);
+            broker.deliver = vec![("sensors/door".into(), b"open".to_vec())];
+            Fake::new(broker)
+        },
+    );
+}

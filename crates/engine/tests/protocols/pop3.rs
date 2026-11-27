@@ -372,3 +372,18 @@ fn pop3_rules_are_checked_when_the_policy_is_signed() {
         assert!(policy.validate().is_err(), "{rule}");
     }
 }
+
+#[test]
+fn an_approved_session_runs_the_commands_it_was_signed_with() {
+    same_after_approval(
+        &pop3_setup("implicit", password_login("user")),
+        "mail",
+        session(
+            "pop.example.com",
+            995,
+            vec![command("stat", &[]), command("read", &["2"])],
+            Vec::new(),
+        ),
+        || Fake::new(server(true)),
+    );
+}

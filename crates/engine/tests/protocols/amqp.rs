@@ -470,3 +470,22 @@ fn the_payload_is_one_body_whatever_it_holds() {
     assert_eq!(fake.peer.published.len(), 1);
     assert_eq!(fake.peer.published[0].2, evil.as_bytes());
 }
+
+#[test]
+fn an_approved_session_runs_the_commands_it_was_signed_with() {
+    same_after_approval(
+        &amqp_setup(),
+        "orders",
+        session(
+            "mq.example.com",
+            5671,
+            vec![command("new", &["1234"]), command("next", &[])],
+            Vec::new(),
+        ),
+        || {
+            let mut broker = AmqpBroker::new(PASSWORD);
+            broker.queues = vec![("replies".into(), vec![b"one".to_vec()])];
+            Fake::new(broker)
+        },
+    );
+}

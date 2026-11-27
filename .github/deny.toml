@@ -22,6 +22,8 @@ allow = [
   "MPL-2.0",
   "Unicode-3.0",
   "Unlicense",
+  # foldhash (hashing in the boa engine module and in the host tree).
+  "Zlib",
 ]
 
 [licenses.private]

@@ -208,7 +208,12 @@ a member or field of a body contract (JSON or form), or the policy. The node wri
 under a contract again and reads the amount from the bytes it sends, by the parser that
 wrote them, so the amount counted is the amount sent; the canonical spelling only, at most
 2^53 − 1 as a JSON number, the currency the policy's (`docs/policy.md`, Payments and
-spending limits). Multipart and XML bodies carry no amount the node reads. A payment within the owner's limits is counted
+spending limits). Multipart and XML bodies carry no amount the node reads. What the caller
+signed (its request, input, TLS or UDP exchanges, protocol commands and SMTP messages) is
+kept with the waiting operation and run as signed once it is approved; an operation that
+runs on a streaming call (WebSocket, SSH shell or forward, live MQTT relay, streamed HTTPS
+response) is refused approval, payment and an item kind that waits when the policy is
+signed, since parking it would mean holding the caller's stream until the owner answers. A payment within the owner's limits is counted
 when the node decides to send it, under the same lock as the check, even if the request then
 fails: counting early can only make the owner approve sooner, never let a split payment
 through.
@@ -399,12 +404,68 @@ takes a `RelayDatagramConnector` in the enclave and a plain UDP socket elsewhere
 (no Linux target installed); the same functions run in `crates/relay/tests/datagram.rs` over a
 local TCP link.
 
-DTLS is not offered. The maintained synchronous candidate, `dimpl` 0.8/0.9 (Sans-IO, DTLS 1.2
-and 1.3, `forbid(unsafe_code)`), depends with its `rust-crypto` feature on the previous
-RustCrypto generation (`p256` 0.13, `aes-gcm` 0.10, `sha2` 0.10, `hmac` 0.12) next to the 0.14 /
-0.11 generation the engine uses, and leaves certificate validation to the caller; its size in
-`credentials.exe` was not measured. The HTTP/3, WireGuard, IPsec and SIP rows above stay
-protocol modules of later parts.
+**DTLS (`dtls`).** DTLS 1.2 and 1.3 run over the same datagram path (`docs/policy.md`, DTLS):
+the same `DatagramConnector` (a connected UDP socket, or the enclave's datagram relay), so
+the host relays only ciphertext. The candidates, from their crates.io metadata and sources
+(fetched by cargo only; "unsafe" counts `unsafe` in each crate's own `src`):
+
+| Crate | MSRV | DTLS | I/O | `unsafe` | License | Crypto | Verdict |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `dimpl` 0.8.0 | 1.85 | 1.2, 1.3 | Sans-IO, sync | none (`forbid`) | MIT OR Apache-2.0 | a `CryptoProvider` of traits; features `aws-lc-rs` (default) or `rust-crypto` (`p256` 0.13, `aes-gcm` 0.10, `sha2` 0.10, `hmac` 0.12), or neither | **taken, with no crypto feature** |
+| `dimpl` 0.9.0 | 1.89 | 1.2, 1.3 | Sans-IO, sync | none (`forbid`) | MIT OR Apache-2.0 | as 0.8 | MSRV above 1.88 |
+| `dimpl13` 0.10.2 | 1.88 | 1.3 only | Sans-IO, sync | none (`forbid`) | MIT OR Apache-2.0 | as `dimpl` | a fork; no 1.2 |
+| `ps-dimpl` 0.8.1 | 1.85 | 1.2, 1.3 | Sans-IO, sync | none (`forbid`) | MIT OR Apache-2.0 | ChaCha20-Poly1305 only | a fork; one AEAD |
+| `rtci-dtls` 0.2.0 | 1.89 | 1.2, 1.3 | Sans-IO | none | MIT OR Apache-2.0 | ring, rustls, rcgen | MSRV above 1.88 |
+| `rtc-dtls` 0.21.1 | not declared | 1.2 only | Sans-IO | none (but `rkyv`, `bytecheck`) | MIT/Apache-2.0 | ring, rustls, `x509-parser`, rcgen | no 1.3 |
+| `webrtc-dtls` 0.12.0, `dtls` 0.17.3 | 1.63 / not declared | 1.2 only | async, tokio | 1 | MIT/Apache-2.0 | `p256` 0.13 / 0.14, `aes-gcm` 0.10, `sha2` 0.10, rcgen 0.13 | tokio, no 1.3 |
+| `rusty-dtls` 0.1.0 | not declared | 1.3, PSK only | no_std | 1 | MIT | `aes-gcm`, `sha2`, `hkdf` | no certificates |
+| `brynja-dtls` 0.1.9 | 1.90 | | | | MIT OR Apache-2.0 | | MSRV above 1.88 |
+| `sipral-dtls` 1.3.2 | 1.95 | 1.2 only | | | AGPL-3.0-only | | license (`deny.toml`), MSRV |
+
+`dimpl` 0.8.0 is built with `default-features = false`: no `aws-lc-rs`, no `rust-crypto`,
+so none of the previous RustCrypto generation. Its `CryptoProvider` is filled by
+`transport::dtls::provider` from what the node already has: ring for ECDHE (X25519, P-256,
+P-384), AES-GCM and ChaCha20-Poly1305, SHA-256/384, HMAC and randomness; rustls-webpki
+for the server's signatures under its certificate (ECDSA P-256/SHA-256, P-384/SHA-384); the
+`aes` crate (the engine's 0.9) for the AES-ECB record number mask of DTLS 1.3, ring's QUIC
+header protection for the ChaCha20 one. `dimpl` checks a provider against its own test
+vectors when a configuration is built (AEAD, PRF, HKDF, record number masks, signatures,
+key exchange); this one passes (`the_provider_passes_the_checks_of_dimpl`). No PSK suite:
+`dimpl`'s only one is `PSK_AES128_CCM_8`, and a PSK would need a secret field fixed by the
+policy and a new path from the record to the transport; it is left out until a protocol
+needs it.
+
+`dimpl` hands the caller the server's leaf certificate and nothing else. The node checks it
+with the verifier of a `tls` connection (`rustls::client::WebPkiServerVerifier` over the
+transport's roots: chain, validity, server-authentication usage, host name) and, with
+`open.pins`, its key against the pins; a pinned self-signed certificate is checked with
+itself as the only root. Because the intermediates the server sends are not handed over, a
+certificate under an intermediate fails closed; a public-PKI DTLS server needs its key
+pinned and a certificate issued by a root directly, or a private root in the transport's
+roots. Nothing is written before the certificate is accepted; a handshake that completes
+without one is refused. The client presents no certificate: its key signs nothing, so a
+server that asks for one fails the handshake.
+
+`dimpl` has 205 `unwrap`, `expect`, `assert`, `panic` and `unreachable` sites outside its
+tests (counted in its `src`, the crypto backends left out); every call into it runs under
+`catch_unwind`, so a panic ends the connection with an error (the release profile unwinds).
+
+Measured on this Windows host (x86_64-pc-windows-msvc, Rust 1.97.1, `cargo build --release
+--locked -p cli`): `credentials.exe` 13,692,928 bytes before, 14,379,008 bytes after
+(+686,080 bytes, +5.0 %). `Cargo.lock` 276 packages before, 287 after: `dimpl`, `arrayvec`, `nom` 8 (next
+to 7), `rand` 0.9, `rand_chacha` 0.9, `rand_core` 0.9 (next to 0.10), `ppv-lite86`,
+`getrandom` 0.3 (next to 0.2 and 0.4), and `r-efi` 5.3 (next to 6.0), `wasip2`, `wit-bindgen`,
+compiled only for UEFI and WASI. `deny.toml` warns on duplicate versions
+(`multiple-versions = "warn"`), so the four duplicates pass and show as warnings. Each new
+license has an allowed choice (`deny.toml`): MIT OR Apache-2.0, `nom` MIT, `r-efi` also
+LGPL-2.1-or-later as a third choice, `wasip2` and `wit-bindgen` also Apache-2.0 WITH
+LLVM-exception. `cargo deny` and `cargo audit` were not
+installed on the host: CI runs them. `cargo +1.88` was not installed either (CI runs the MSRV
+job); `cargo` chose `dimpl` 0.8.0 for `rust-version = "1.88"` and flagged 0.9.0 as needing
+1.89. Real DTLS servers were not measured: the tests run against `dimpl`'s own server side on
+the same provider, DTLS 1.2 and 1.3, over in-memory sockets that lose and repeat datagrams.
+
+The HTTP/3, WireGuard, IPsec and SIP rows above stay protocol modules of later parts.
 
 ## 7c. Protocol connections (part 6, second half)
 
