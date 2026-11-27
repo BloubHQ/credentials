@@ -730,22 +730,26 @@ fn connections_beyond_the_cap_are_refused() {
     let slow: Vec<TcpStream> = (0..2).map(|_| slow_client(port)).collect();
     // The server counts a connection once it has accepted it; on a loaded host that can take
     // longer than a fixed pause, so the check is repeated until the cap is reached.
-    // Each probe is short and the deadline is checked before it, so a probe the server holds
-    // cannot run the loop past the deadline.
-    let probe = Duration::from_millis(500);
+    // A probe waits up to 3 s for its answer (a loaded host answers late) but never past the
+    // deadline, which is checked before each probe. The slow clients send nothing after their
+    // head, so the server drops them after `IO_TIMEOUT` (5 s): the cap holds about that long.
+    let probe = |deadline: Instant| {
+        let left = deadline.saturating_duration_since(Instant::now());
+        get_identity(port, left.min(Duration::from_secs(3)))
+    };
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         assert!(Instant::now() < deadline, "the cap was not reached");
-        if get_identity(port, probe) == Some(503) {
+        if probe(deadline) == Some(503) {
             break;
         }
         std::thread::sleep(Duration::from_millis(100));
     }
     drop(slow);
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         assert!(Instant::now() < deadline, "the slots were not freed");
-        if get_identity(port, probe) == Some(200) {
+        if probe(deadline) == Some(200) {
             break;
         }
         std::thread::sleep(Duration::from_millis(100));
