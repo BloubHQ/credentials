@@ -162,15 +162,46 @@ pub fn write_secret_file(path: &Path, contents: &[u8]) -> Res<()> {
 
 /// Reads a JSON document.
 pub fn read_json<T: DeserializeOwned>(path: &Path) -> Res<T> {
-    let value = read_json_value(path)?;
-    serde_json::from_value(value).map_err(|e| Failure::from(format!("{}: {e}", path.display())))
+    from_json_value(path, read_json_value(path)?)
+}
+
+/// A JSON value of the document at `path` as `T`. An error names where in the document it is
+/// (`operations[0].steps[0]: missing field ...`), in the path style of the semantic checks.
+pub fn from_json_value<T: DeserializeOwned>(path: &Path, value: serde_json::Value) -> Res<T> {
+    serde_path_to_error::deserialize(value).map_err(|e| {
+        let at = e.path().to_string();
+        let inner = e.into_inner();
+        if at == "." {
+            Failure::from(format!("{}: {inner}", path.display()))
+        } else {
+            Failure::from(format!("{}: {at}: {inner}", path.display()))
+        }
+    })
 }
 
 /// Reads a JSON document as a value.
 pub fn read_json_value(path: &Path) -> Res<serde_json::Value> {
     let text =
         fs::read(path).map_err(|e| Failure::io(format!("cannot read {}: {e}", path.display())))?;
-    serde_json::from_slice(&text).map_err(|e| Failure::from(format!("{}: {e}", path.display())))
+    serde_json::from_slice(json_text(path, &text)?)
+        .map_err(|e| Failure::from(format!("{}: {e}", path.display())))
+}
+
+/// The UTF-8 text of a document read from `path`, without a UTF-8 byte order mark (as
+/// `Set-Content -Encoding utf8` writes it on Windows). UTF-16, which `>` writes in Windows
+/// PowerShell 5.1, is refused with what to do instead.
+pub fn json_text<'a>(path: &Path, bytes: &'a [u8]) -> Res<&'a [u8]> {
+    let utf16 = bytes.starts_with(&[0xFF, 0xFE])
+        || bytes.starts_with(&[0xFE, 0xFF])
+        || matches!(bytes, [a, 0, ..] | [0, a, ..] if *a != 0);
+    if utf16 {
+        return Err(Failure::from(format!(
+            "{}: the file is UTF-16 (what `>` writes in Windows PowerShell); write it with \
+             `--out <file>` instead, or save it as UTF-8",
+            path.display()
+        )));
+    }
+    Ok(bytes.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(bytes))
 }
 
 /// A value as pretty JSON with a final newline.

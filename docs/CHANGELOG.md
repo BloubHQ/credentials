@@ -28,6 +28,44 @@ before 1.0, minor versions may break formats and APIs.
   -p cli --locked`, Windows x86-64): `credentials.exe` 17,839,104 bytes before, 18,059,264
   after (+220,160, +1.2%).
 
+- Windows: the CLI reads a JSON document that starts with a UTF-8 byte order mark (as
+  `Set-Content -Encoding utf8` writes it), and refuses UTF-16 (what `>` writes in Windows
+  PowerShell 5.1) with a message that suggests `--out`; before, both failed with "expected
+  value at line 1 column 1". The CLI walkthrough has a PowerShell section, and the README
+  quick start the PowerShell way to set the token.
+
+- The CLI names where in a JSON document a field fails, in the path style of the semantic
+  checks (``policy.json: operations[0].steps[0]: missing field `port` ``, `callers[0].key:
+  invalid base64 array`), through `serde_path_to_error` (MIT or Apache-2.0); before, the
+  message named no place. A template that does not parse says at which byte
+  (`policy invalid at operations[0].steps[0].template (byte 2): template syntax`).
+
+- Tests that failed under load wait for a signal instead of a fixed pause: the SSH slot
+  tests wait until each held connection reached the fake server (and hold it for 5 s, not
+  1.5 s), the TLS idle-timeout test expects `sent: true` only when the server read the
+  request (the timeout also covers the handshake), and the connection-cap test of the CLI
+  probes with 500 ms and checks its deadline before each probe. The host's log directory
+  test fails instead of passing silently when it cannot set up.
+
+- MQTT 3.1.1: a token or password without a user name now goes with a user name of zero
+  length, as [MQTT-3.1.2-22] requires (strict brokers closed the connection). MQTT 5: the
+  Server Keep Alive of the CONNACK sets the ping interval ([MQTT-3.2.2-21]); before, 60
+  seconds were fixed and a broker with a lower limit disconnected. SMTP says
+  `EHLO [127.0.0.1]` (an address literal) instead of `EHLO localhost`, which strict HELO
+  checks refuse.
+
+- A response to `HEAD`, and any `204` or `304`, has no body whatever its length headers say
+  (RFC 9112 section 6.3, RFC 9113 section 8.1.1), over HTTP/1.1 and HTTP/2; before, one that
+  carried `Content-Length: N` (as static file servers send on `HEAD`) failed with "body
+  shorter than its length". The framing now knows the request method
+  (`response::is_head_request`).
+
+- An operation that may wait now holds its waiting slot from the room check until it parks
+  (`node::park::Reservation`, released on drop); before, the room was only checked, so
+  overlapping calls all sent their login or challenge request and the extra ones failed with
+  `ParkedFull` after it. A resumed operation keeps the slot it leaves while it runs, so an
+  external challenge that is still pending is no longer dropped when it parks again.
+
 - **An operation on a streaming call no longer waits.** A WebSocket, an SSH shell or
   forward, a live MQTT relay and an HTTPS operation whose response streams are refused
   `"approval": true`, a `payment` and an item kind that waits for approval when the policy is
@@ -832,6 +870,21 @@ before 1.0, minor versions may break formats and APIs.
   poisoned lock of the connection counts refuses new connections (`StateLost`); a poisoned
   transport pool lends no transport; a checkpoint hook that panicked halts the server's acts
   (503), since what it stored is unknown.
+- Numbers on the wire and in templates are ASCII digits only (`engine::encoding::digits`,
+  `signed_digits`): the node's own `Content-Length` (server), a response's `Content-Length`
+  (HTTP/1.1 and HTTP/2) and the template functions `u8`, `be16` ... `le64`, `add` and `slice`
+  no longer take a leading `+` (RFC 9110 `1*DIGIT`), which a front proxy could read
+  differently.
+
+- Spending limits carried in a hand-over package are checked rule by rule
+  (`LimitRule::fault`) and the package is refused when one is not valid; a rule whose bound
+  is no amount (`"1e9"`, `"025"`) now reads as exceeded, so the payment waits for approval
+  (before, the bound was skipped and the payment came back within the limits). A node whose
+  clock reads before 1970 takes no act (`Error::ClockBeforeEpoch`, through the new
+  `Clock::checked_now_ms`) instead of reading the time as 0, which left every expiry in the
+  future; a node started with such a clock refuses what was granted before its start until
+  it restarts.
+
 - An approved operation on a protocol connection (SSH and SFTP, PostgreSQL, MySQL, Redis,
   SMTP, IMAP, POP3, FTP, MQTT, AMQP 0-9-1 and 1.0) never went on: the caller's commands and
   messages were not kept with the waiting operation, so the resume failed

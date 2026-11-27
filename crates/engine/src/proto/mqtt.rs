@@ -27,6 +27,12 @@ pub const MAX_PACKET: usize = 16 * 1024 * 1024;
 const KEEP_ALIVE: u16 = 60;
 /// Most messages held while the node waits for an acknowledgement.
 const MAX_PENDING: usize = 1024;
+/// What the node reads of the properties of an MQTT 5 packet.
+struct Properties {
+    alias: bool,
+    keep_alive: Option<u16>,
+}
+
 /// Longest wait for one read.
 const WAIT: Duration = Duration::from_millis(50);
 
@@ -210,9 +216,16 @@ impl<'a> Be<'a> {
 
     /// Skips the properties of an MQTT 5 packet; returns whether a topic alias was among them.
     fn properties(&mut self) -> Result<bool> {
+        Ok(self.read_properties()?.alias)
+    }
+
+    /// Reads the properties of an MQTT 5 packet: whether a topic alias was among them, and
+    /// the Server Keep Alive (`0x13`) of a CONNACK.
+    fn read_properties(&mut self) -> Result<Properties> {
         let len = self.varint()?;
         let mut p = Be(self.take(len)?);
         let mut alias = false;
+        let mut keep_alive = None;
         while !p.0.is_empty() {
             let id = p.varint()?;
             match id {
@@ -220,8 +233,12 @@ impl<'a> Be<'a> {
                 0x01 | 0x17 | 0x19 | 0x24 | 0x25 | 0x28 | 0x29 | 0x2a => {
                     p.take(1)?;
                 }
+                // Server Keep Alive.
+                0x13 => {
+                    keep_alive = Some(p.u16()?);
+                }
                 // Two-byte integer.
-                0x13 | 0x21 | 0x22 => {
+                0x21 | 0x22 => {
                     p.take(2)?;
                 }
                 0x23 => {
@@ -248,7 +265,7 @@ impl<'a> Be<'a> {
                 _ => return Err(invalid("an unknown MQTT property")),
             }
         }
-        Ok(alias)
+        Ok(Properties { alias, keep_alive })
     }
 }
 
@@ -260,6 +277,9 @@ pub struct Client<'s> {
     filters: Vec<String>,
     pending: VecDeque<Message>,
     last_write: Instant,
+    /// The keep-alive in force, in seconds: the one the node asked for, or the Server Keep
+    /// Alive of an MQTT 5 broker ([MQTT-3.2.2-21]). 0 turns pings off.
+    keep_alive: u16,
 }
 
 impl<'s> Client<'s> {
@@ -279,6 +299,7 @@ impl<'s> Client<'s> {
             filters: Vec::new(),
             pending: VecDeque::new(),
             last_write: Instant::now(),
+            keep_alive: KEEP_ALIVE,
         };
         let mut body = Zeroizing::new(Vec::new());
         string(&mut body, b"MQTT")?;
@@ -286,8 +307,11 @@ impl<'s> Client<'s> {
             Version::V311 => 4,
             Version::V5 => 5,
         });
+        // MQTT 3.1.1 allows a password only with a user name ([MQTT-3.1.2-22]): a token
+        // alone goes with a user name of zero length.
+        let with_user = !user.is_empty() || (version == Version::V311 && !password.is_empty());
         let mut flags = 0x02u8;
-        if !user.is_empty() {
+        if with_user {
             flags |= 0x80;
         }
         if !password.is_empty() {
@@ -303,7 +327,7 @@ impl<'s> Client<'s> {
             body.extend_from_slice(&props);
         }
         string(&mut body, client_id)?;
-        if !user.is_empty() {
+        if with_user {
             string(&mut body, user)?;
         }
         if !password.is_empty() {
@@ -317,8 +341,10 @@ impl<'s> Client<'s> {
         let mut p = Be(&ack);
         p.u8()?;
         let code = p.u8()?;
-        if version == Version::V5 {
-            p.properties()?;
+        if version == Version::V5
+            && let Some(keep_alive) = p.read_properties()?.keep_alive
+        {
+            client.keep_alive = keep_alive;
         }
         match (version, code) {
             (_, 0) => Ok(client),
@@ -550,7 +576,9 @@ impl<'s> Client<'s> {
         if let Some(message) = self.pending.pop_front() {
             return Ok(Some(message));
         }
-        if self.last_write.elapsed() >= Duration::from_secs(u64::from(KEEP_ALIVE / 2)) {
+        if self.keep_alive > 0
+            && self.last_write.elapsed() >= Duration::from_millis(u64::from(self.keep_alive) * 500)
+        {
             self.write(&[PINGREQ << 4, 0])?;
         }
         loop {

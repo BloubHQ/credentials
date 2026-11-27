@@ -2,6 +2,7 @@
 //! in bytes, and dropped when they lapse, when the owner revokes and when the node restarts.
 
 use std::collections::HashMap;
+use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use zeroize::{Zeroize as _, Zeroizing};
 
@@ -211,6 +212,46 @@ impl Parked {
     }
 }
 
+/// The slots held for operations that may wait and are still running. They have a lock of
+/// their own, taken after the lock of the node's state when both are taken, so a
+/// [`Reservation`] can be dropped anywhere.
+#[derive(Default)]
+pub(super) struct Holds(Mutex<Counts>);
+
+#[derive(Default)]
+struct Counts {
+    total: usize,
+    owners: HashMap<String, usize>,
+}
+
+impl Holds {
+    /// A poisoned lock is recovered on purpose, unlike the node's state (#96): these are plain
+    /// counters, and a panic between two of their updates leaves a count one off at worst.
+    fn counts(&self) -> MutexGuard<'_, Counts> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+/// One slot held for an operation that may wait, released when dropped.
+#[must_use]
+pub(super) struct Reservation<'n> {
+    holds: &'n Holds,
+    owner: String,
+}
+
+impl Drop for Reservation<'_> {
+    fn drop(&mut self) {
+        let mut counts = self.holds.counts();
+        counts.total = counts.total.saturating_sub(1);
+        if let Some(n) = counts.owners.get_mut(&self.owner) {
+            *n = n.saturating_sub(1);
+            if *n == 0 {
+                counts.owners.remove(&self.owner);
+            }
+        }
+    }
+}
+
 /// The operations that wait on a node.
 #[derive(Default)]
 pub(super) struct Registry {
@@ -233,26 +274,69 @@ impl Registry {
     }
 
     /// Fails with [`Error::ParkedFull`] when the owner, or the node, has no room for one more
-    /// operation that waits.
-    pub fn room(&mut self, owner: &str, now: u64) -> Result<()> {
+    /// operation that waits, counting the slots `held` for operations still running. `own` is
+    /// the slot the operation itself holds, if any: it is not counted against it.
+    fn room(&mut self, owner: &str, now: u64, held: &Counts, own: bool) -> Result<()> {
         self.sweep(now);
+        let mine = usize::from(own);
         let of_owner = self
             .entries
             .values()
             .filter(|(p, _)| p.owner == owner)
-            .count();
-        if self.entries.len() >= MAX_PARKED
-            || of_owner >= MAX_PARKED_PER_OWNER
-            || self.bytes >= MAX_PARKED_BYTES
+            .count()
+            .saturating_add(held.owners.get(owner).copied().unwrap_or(0))
+            .saturating_sub(mine);
+        let total = self
+            .entries
+            .len()
+            .saturating_add(held.total)
+            .saturating_sub(mine);
+        if total >= MAX_PARKED || of_owner >= MAX_PARKED_PER_OWNER || self.bytes >= MAX_PARKED_BYTES
         {
             return Err(Error::ParkedFull);
         }
         Ok(())
     }
 
-    /// Keeps an operation that waits under `id`.
-    pub fn insert(&mut self, id: [u8; 16], parked: Parked, now: u64) -> Result<()> {
-        self.room(&parked.owner, now)?;
+    /// Holds a slot for an operation of `owner` that may wait, before it sends anything: an
+    /// overlapping call then finds the room taken instead of failing after its requests. The
+    /// slot is released when the returned [`Reservation`] is dropped or used by
+    /// [`Registry::insert`].
+    pub fn reserve<'n>(
+        &mut self,
+        holds: &'n Holds,
+        owner: &str,
+        now: u64,
+    ) -> Result<Reservation<'n>> {
+        let mut held = holds.counts();
+        self.room(owner, now, &held, false)?;
+        held.total = held.total.saturating_add(1);
+        let n = held.owners.entry(owner.to_string()).or_insert(0);
+        *n = n.saturating_add(1);
+        Ok(Reservation {
+            holds,
+            owner: owner.to_string(),
+        })
+    }
+
+    /// Keeps an operation that waits under `id`, in the slot `reservation` holds for it, if
+    /// any. The slot is released either way.
+    pub fn insert(
+        &mut self,
+        id: [u8; 16],
+        parked: Parked,
+        now: u64,
+        holds: &Holds,
+        reservation: Option<Reservation<'_>>,
+    ) -> Result<()> {
+        let own = reservation
+            .as_ref()
+            .is_some_and(|r| r.owner == parked.owner);
+        {
+            let held = holds.counts();
+            self.room(&parked.owner, now, &held, own)?;
+        }
+        drop(reservation);
         let bytes = parked.bytes();
         if self.bytes.saturating_add(bytes) > MAX_PARKED_BYTES || self.entries.contains_key(&id) {
             return Err(Error::ParkedFull);

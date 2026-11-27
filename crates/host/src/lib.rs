@@ -421,6 +421,7 @@ mod linux {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod tests {
     use std::time::Duration;
 
@@ -467,9 +468,7 @@ mod tests {
                 .map(|d| d.as_nanos())
                 .unwrap_or_default()
         ));
-        let Ok(store) = LogDir::new(&dir) else {
-            return;
-        };
+        let store = LogDir::new(&dir).expect("a log directory");
         let node = Node::new(NodeKey::generate(), MemorySink::new(), SystemClock);
         let device = DeviceKey::generate();
         let terms = GrantTerms::new("alice", Duration::from_secs(60));
@@ -478,9 +477,7 @@ mod tests {
         let entries = node.with_sink(|sink| sink.entries().to_vec());
         let key = node.public_key();
 
-        let Some(first) = entries.first() else {
-            return;
-        };
+        let first = entries.first().expect("the grant is logged");
         assert!(store.append(&key, first).is_err(), "not open yet");
         assert_eq!(store.open(&key), Ok(None));
         for entry in &entries {

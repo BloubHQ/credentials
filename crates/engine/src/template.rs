@@ -2319,6 +2319,39 @@ mod tests {
     }
 
     #[test]
+    fn integer_functions_take_digits_only() {
+        let fields = Fields::new();
+        let temps = Temps::new();
+        let budget = Budget::default();
+        let ctx = Context {
+            fields: &fields,
+            temps: &temps,
+            vars: HashMap::new(),
+            headers: &[],
+            unix: 59,
+            budget: &budget,
+        };
+        let render = |t: &str| Template::parse(t).unwrap().render(&ctx);
+        assert_eq!(
+            render(r#"{{ hex(u8("7")) + add("-2", "5") }}"#)
+                .unwrap()
+                .to_vec(),
+            b"073"
+        );
+        for refused in [
+            r#"{{ u8("+7") }}"#,
+            r#"{{ be16("+7") }}"#,
+            r#"{{ le32(" 7") }}"#,
+            r#"{{ add("+2", "5") }}"#,
+            r#"{{ add("2", "--5") }}"#,
+            r#"{{ add("-", "5") }}"#,
+            r#"{{ slice("abc", "+1", "1") }}"#,
+        ] {
+            assert!(render(refused).is_err(), "{refused}");
+        }
+    }
+
+    #[test]
     fn aead_parts_split_where_the_algorithm_puts_the_tag() {
         let fields = Fields::new();
         let temps = Temps::new();

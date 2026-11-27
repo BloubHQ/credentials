@@ -240,23 +240,33 @@ fn a_forwarded_connection_takes_a_live_slot() {
     // the connection the server forwards to it finds the caller full and is refused.
     let s = setup(
         &[(FieldSpec::secret("password"), PASSWORD)],
-        vec![remote_operation(json!({"duration_ms": 1500}))],
+        vec![remote_operation(json!({"duration_ms": 5_000}))],
     );
     let node = &s.node;
     let held = engine::node::MAX_STREAMS_PER_CALLER - 1;
+    // Each held call tells when its server took the forward, so the check waits for a real
+    // signal instead of a fixed pause; the held calls last long enough not to end first.
+    let (ready, opened) = std::sync::mpsc::channel();
     std::thread::scope(|scope| {
         let threads: Vec<_> = (0..held)
             .map(|_| {
                 let call = call_of(&s, vec![command("web", &[])]);
+                let ready = ready.clone();
                 scope.spawn(move || {
                     // A server that never forwards a connection, and a caller that waits.
-                    let mut fake = Fake::new(SshServer::new(host()));
+                    let mut peer = SshServer::new(host());
+                    peer.ready = Some(ready);
+                    let mut fake = Fake::new(peer);
                     let mut caller = TestCaller::default();
                     node.relay(&call, &mut fake, &mut caller).result.is_ok()
                 })
             })
             .collect();
-        std::thread::sleep(std::time::Duration::from_millis(500));
+        for _ in 0..held {
+            opened
+                .recv_timeout(std::time::Duration::from_secs(30))
+                .expect("a held call set up its forward");
+        }
         let (fake, caller, result) = forward(&s, server(), vec![command("web", &[])], &[]);
         assert!(matches!(result, Ok(Output::Closed(_))), "{result:?}");
         // 4: SSH_OPEN_RESOURCE_SHORTAGE.

@@ -103,6 +103,8 @@ hmac = "0.13"
 p256 = { version = "0.14", features = ["ecdsa", "ecdh", "pkcs8", "pem"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["raw_value"] }
+# Where in a JSON document a field fails (CLI messages).
+serde_path_to_error = "0.1"
 memchr = "2"
 sha1 = { version = "0.11", features = ["oid"] }
 sha2 = "0.11"

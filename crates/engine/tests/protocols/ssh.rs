@@ -610,8 +610,11 @@ fn a_shell_operation_on_a_plain_call_is_refused() {
 fn open_connections_count_against_the_callers_slots() {
     // Four connections held open by a silent server fill the caller's slots; the fifth is
     // refused before anything is opened, and a slot comes back when one ends.
-    let s = basic(json!({"duration_ms": 1500}));
+    // Each held call tells when its server got the command, so the check waits for a real
+    // signal instead of a fixed pause; the held calls last long enough not to end first.
+    let s = basic(json!({"duration_ms": 5_000}));
     let node = &s.node;
+    let (ready, opened) = std::sync::mpsc::channel();
     std::thread::scope(|scope| {
         let held: Vec<_> = (0..engine::node::MAX_STREAMS_PER_CALLER)
             .map(|_| {
@@ -620,15 +623,21 @@ fn open_connections_count_against_the_callers_slots() {
                     "ssh",
                     session("box.example.com", 22, vec![command("id", &[])], Vec::new()),
                 );
+                let ready = ready.clone();
                 scope.spawn(move || {
                     let mut peer = server();
                     peer.misbehave = Misbehave::Silent;
+                    peer.ready = Some(ready);
                     let mut fake = Fake::new(peer);
                     node.run(&call, &mut fake).result.is_ok()
                 })
             })
             .collect();
-        std::thread::sleep(std::time::Duration::from_millis(500));
+        for _ in 0..engine::node::MAX_STREAMS_PER_CALLER {
+            opened
+                .recv_timeout(std::time::Duration::from_secs(30))
+                .expect("a held call opened its connection");
+        }
         let mut fake = Fake::new(server());
         let result = run_session(&s, &mut fake, vec![command("id", &[])]);
         assert!(matches!(
