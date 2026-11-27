@@ -35,6 +35,8 @@ server = { path = "crates/server" }
 relay = { path = "crates/relay" }
 host = { path = "crates/host" }
 sandbox = { path = "crates/sandbox" }
+# flock for the exclusive lock of a log file (already in the tree through tempfile).
+rustix = { version = "1.1", default-features = false, features = ["fs", "std"] }
 aes = "0.9.2"
 aes-gcm = "0.11"
 # AES modes and MACs (RustCrypto, cipher 0.5 generation): key wrap (RFC 3394, RFC 5649),

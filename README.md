@@ -437,7 +437,9 @@ flowchart LR
 - **Log.** Entries go to the host, which appends each to `<log-dir>/<node log key>.jsonl` and
   `sync_data`s it before it confirms; the node treats an entry as stored only after that
   confirmation, halts otherwise, and reconciles with what the host reports. Checkpoints go to
-  `<node log key>.jsonl.head.json`. Check the log with `credentials verify` as usual.
+  `<node log key>.jsonl.head.json`. Each log file is locked while its host holds it, so a
+  second `credentials host` on the same `--log-dir` cannot open a node's log the first one
+  writes. Check the log with `credentials verify` as usual.
 - **Clock.** The node uses the system clock of the enclave, which comes from the host
   hypervisor (see the [threat model](docs/threat-model.md)).
 

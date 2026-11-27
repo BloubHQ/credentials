@@ -488,7 +488,11 @@ mod tests {
         assert!(head.is_ok_and(|head| store.checkpoint(&key, &head).is_ok()));
         assert!(head_path(&store.path(&key)).exists());
 
-        // A new host process reads the file back.
+        // A second writer is refused while this one holds the log (#54) ...
+        let rival = LogDir::new(&dir);
+        assert!(rival.is_ok_and(|rival| rival.open(&key).is_err()));
+        // ... and a new host process, once this one is gone, reads the file back.
+        drop(store);
         let again = LogDir::new(&dir);
         assert!(again.is_ok_and(|again| again.open(&key) == Ok(entries.last().cloned())));
         let _ = std::fs::remove_dir_all(&dir);

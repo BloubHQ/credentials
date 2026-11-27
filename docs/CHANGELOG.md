@@ -7,6 +7,14 @@ before 1.0, minor versions may break formats and APIs.
 
 ### Changed
 
+- Log files: one writer per log. `credentials serve` and `credentials host` hold an exclusive
+  lock on each log file while they write it (`flock` on Unix; on Windows the file is opened
+  sharing reads only), so a second process on the same file fails at start with "the log is
+  in use by another process" instead of appending over entries the first one confirmed;
+  `credentials verify` can still read a live log. On Unix the directory is synced after a log
+  file is created and after a checkpoint is renamed into place, so a power loss cannot lose
+  the new name; Windows has no directory sync (documented). New error variant
+  `server::logfile::Error::InUse` (#54).
 - SSH: `chacha20-poly1305@openssh.com` works against OpenSSH. The node counted the 4-byte
   packet length in the block alignment of its padding, as in the clear; OpenSSH leaves it
   out for every AEAD, as for AES-GCM, so sshd refused the node's first encrypted packet
