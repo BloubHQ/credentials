@@ -127,7 +127,7 @@ js-sys = "0.3"
 # The trusted code sandbox (layer 3): an interpreter, no code generated at run time; no
 # memory64 or SIMD. The 1.x line, not 2.0: wasmi 2.0.3 crashed (access violation) when built
 # at a higher optimisation level than the crate embedding it (`docs/sandbox.md`).
-wasmi = { version = "1.1.0", default-features = false, features = ["std"] }
+wasmi = { version = "1.1.0", default-features = false, features = ["std", "extra-checks"] }
 # WebAssembly text, for the tests of the sandbox and its reviewed library modules.
 wat = "1"
 
