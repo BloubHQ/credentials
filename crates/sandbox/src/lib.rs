@@ -22,7 +22,7 @@
 //! randomness, no host state), so a module gives the same output for the same inputs on every
 //! node of a release. Execution costs fuel (wasmi's units, plus one per 64 bytes a host
 //! function copies) and stops at [`MAX_FUEL`]; the memory stops at [`MAX_MEMORY`]; the wall
-//! clock stops it at [`MAX_TIME`] (checked between slices of [`FUEL_SLICE`] fuel). Every
+//! clock stops it at [`MAX_TIME`] (checked at every host call and after the run). Every
 //! failure is a fixed [`Error`]: nothing the module computes reaches an error message. The
 //! memory is erased before it is freed.
 //!
@@ -32,12 +32,13 @@
 //! The choice of runtime and of the JavaScript engine, with their measurements, is in
 //! `docs/sandbox.md`.
 
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::time::{Duration, Instant};
 
 use wasmi::errors::{ErrorKind, InstantiationError};
 use wasmi::{
     Caller, CompilationMode, Config, EnforcedLimits, Engine, Extern, ExternType, Linker, Module,
-    Store, StoreLimits, StoreLimitsBuilder, TrapCode, TypedResumableCall,
+    Store, StoreLimits, StoreLimitsBuilder, TrapCode,
 };
 use zeroize::{Zeroize, Zeroizing};
 
@@ -63,13 +64,12 @@ pub const MAX_FUEL: u64 = 1_000_000_000;
 pub const MAX_MEMORY: usize = 64 * 1024 * 1024;
 /// Longest entry name.
 pub const MAX_ENTRY: usize = 64;
-/// Longest run by the wall clock. The interpreter checks it between slices of
-/// [`FUEL_SLICE`] fuel, so a run may overshoot it by one slice (about 12 ms on the measured
-/// host); fuel stays the bound that does not depend on the machine.
+/// Longest run by the wall clock, checked at every host call and after the run. A stretch
+/// without a host call is bounded by fuel alone, the bound that does not depend on the machine.
+/// The run is never paused and resumed to look at the clock: resuming a wasmi 1.1.0 call after
+/// it ran out of fuel can land on an instruction parameter, which is undefined behaviour in a
+/// release build (#95).
 pub const MAX_TIME: Duration = Duration::from_secs(5);
-/// The fuel a module runs between two looks at the clock: 12.5 ms of the interpreter on the
-/// measured host (`docs/sandbox.md`).
-pub const FUEL_SLICE: u64 = 10_000_000;
 /// Largest JavaScript source of [`run_script`], in bytes.
 pub const MAX_SCRIPT: usize = 256 * 1024;
 /// Most arguments of a JavaScript function: the inputs left after the source and the name.
@@ -114,14 +114,18 @@ pub enum Error {
     /// The run took longer than its time limit.
     #[error("module ran out of time")]
     Time,
-    /// A JavaScript source larger than its limit, or a library module whose bytes do not
-    /// match the hash compiled into the node.
+    /// A JavaScript source larger than its limit or not UTF-8, or a library module whose bytes
+    /// do not match the hash compiled into the node.
     #[error("script or library refused")]
     Refused,
     /// The module trapped (unreachable, out of bounds, division by zero, stack overflow, a bad
     /// call to a host function).
     #[error("module trapped")]
     Trap,
+    /// The interpreter itself failed (a panic inside wasmi, caught): the run is abandoned and
+    /// its memory wiped.
+    #[error("the interpreter failed")]
+    Interpreter,
 }
 
 /// The limits of one run. [`Limits::default`] is the most a node allows; a signed policy may
@@ -164,8 +168,8 @@ struct Host {
     limits: StoreLimits,
     /// A failure a host function saw, reported instead of the trap it causes.
     fault: Option<Error>,
-    /// Fuel of the run not yet given to the store: the store holds one slice at a time.
-    reserve: u64,
+    /// When the run must have ended by the wall clock.
+    deadline: Instant,
     /// The module's memory, once the instance or a host function has seen it. The handle
     /// stays valid in the store after an instance is lost to a failed start function.
     memory: Option<wasmi::Memory>,
@@ -200,15 +204,26 @@ pub fn check(module: &[u8]) -> Result<(), Error> {
     compile(&Engine::new(&config()), module).map(|_| ())
 }
 
+/// Tests only: the import of [`tests::PANIC`] is linked too.
+#[cfg(test)]
+fn test_import(module: &str, name: &str) -> bool {
+    (module, name) == tests::PANIC
+}
+
+#[cfg(not(test))]
+fn test_import(_module: &str, _name: &str) -> bool {
+    false
+}
+
 fn compile(engine: &Engine, bytes: &[u8]) -> Result<Module, Error> {
     if bytes.len() > MAX_MODULE {
         return Err(Error::ModuleTooLarge);
     }
     let module = Module::new(engine, bytes).map_err(|_| Error::ModuleInvalid)?;
     let imports_ok = module.imports().all(|import| {
-        import.module() == HOST
-            && IMPORTS.contains(&import.name())
-            && matches!(import.ty(), ExternType::Func(_))
+        let named = (import.module() == HOST && IMPORTS.contains(&import.name()))
+            || test_import(import.module(), import.name());
+        named && matches!(import.ty(), ExternType::Func(_))
     });
     if !imports_ok {
         return Err(Error::Import);
@@ -275,54 +290,36 @@ fn run_observed(
             .trap_on_grow_failure(true)
             .build(),
         fault: None,
-        reserve: 0,
+        deadline: started.checked_add(time).unwrap_or(started),
         memory: None,
     };
     let mut store = Store::new(&engine, host);
     store.limiter(|host| &mut host.limits);
-    // A start function runs with all the fuel; the entry then runs slice by slice, with a look
-    // at the clock between two slices.
+    // The start function and the entry share all the fuel, given once: a call is never resumed
+    // after it ran out (see `MAX_TIME`).
     store.set_fuel(fuel).map_err(|_| Error::Fuel)?;
     let linker = linker(&engine)?;
-    let called = linker
-        .instantiate_and_start(&mut store, &module)
-        .map_err(|error| stopped(&error, Error::ModuleInvalid))
-        .and_then(|instance| {
-            // The handle is kept in the store's data, outside this closure, before the entry
-            // can fail.
-            if let Some(memory) = instance.get_memory(&store, "memory") {
-                store.data_mut().memory = Some(memory);
-            }
-            let func = instance
-                .get_typed_func::<(), ()>(&store, entry)
-                .map_err(|_| Error::Entry)?;
-            refill(&mut store, 0)?;
-            let mut call = func
-                .call_resumable(&mut store, ())
-                .map_err(|error| stopped(&error, Error::Trap))?;
-            loop {
-                match call {
-                    TypedResumableCall::Finished(()) => break,
-                    TypedResumableCall::HostTrap(trap) => {
-                        return Err(stopped(trap.host_error(), Error::Trap));
-                    }
-                    TypedResumableCall::OutOfFuel(pending) => {
-                        if started.elapsed() > time {
-                            return Err(Error::Time);
-                        }
-                        refill(&mut store, pending.required_fuel())?;
-                        call = pending
-                            .resume(&mut store)
-                            .map_err(|error| stopped(&error, Error::Trap))?;
-                    }
+    // A panic inside the interpreter (one was found by fuzzing, in wasmi 1.1.0) ends this run
+    // with an error instead of unwinding into the node; the release profile unwinds.
+    let called = catch_unwind(AssertUnwindSafe(|| {
+        linker
+            .instantiate_and_start(&mut store, &module)
+            .map_err(|error| stopped(&error, Error::ModuleInvalid))
+            .and_then(|instance| {
+                // The handle is kept in the store's data, outside this closure, before the entry
+                // can fail.
+                if let Some(memory) = instance.get_memory(&store, "memory") {
+                    store.data_mut().memory = Some(memory);
                 }
-            }
-            Ok(())
-        });
-    let left = store
-        .get_fuel()
-        .unwrap_or(0)
-        .saturating_add(store.data().reserve);
+                let func = instance
+                    .get_typed_func::<(), ()>(&store, entry)
+                    .map_err(|_| Error::Entry)?;
+                func.call(&mut store, ())
+                    .map_err(|error| stopped(&error, Error::Trap))
+            })
+    }))
+    .unwrap_or(Err(Error::Interpreter));
+    let left = store.get_fuel().unwrap_or(0);
     let used = fuel.saturating_sub(left);
     // The memory may hold inputs and whatever the module derived from them: it is wiped on
     // every path, whether the run finished, trapped, ran out of fuel or time, or was refused.
@@ -331,33 +328,25 @@ fn run_observed(
         memory.data_mut(&mut store).zeroize();
     }
     observe(memory.map(|memory| memory.data(&store)));
+    let late = started.elapsed() > time;
     let host = store.data_mut();
     if let Some(fault) = host.fault {
         return Err(fault);
     }
-    called?;
+    match called {
+        // Between host calls only fuel stops a run: one that ran out of fuel after its time
+        // was up is reported as over its time.
+        Err(Error::Fuel) if late => return Err(Error::Time),
+        other => other?,
+    }
     // A run that finished within its fuel but past its time is refused too.
-    if started.elapsed() > time {
+    if late {
         return Err(Error::Time);
     }
     Ok(Ran {
         output: core::mem::take(&mut host.output),
         fuel: used,
     })
-}
-
-/// Pools the fuel left in the store with the reserve and gives the store the next slice of
-/// it: at least `need`, or [`Error::Fuel`] when the pool has less.
-fn refill(store: &mut Store<Host>, need: u64) -> Result<(), Error> {
-    let left = store.get_fuel().map_err(|_| Error::Fuel)?;
-    let pool = left.saturating_add(store.data().reserve);
-    if pool < need || pool == 0 {
-        return Err(Error::Fuel);
-    }
-    let slice = FUEL_SLICE.max(need).min(pool);
-    store.set_fuel(slice).map_err(|_| Error::Fuel)?;
-    store.data_mut().reserve = pool.saturating_sub(slice);
-    Ok(())
 }
 
 /// Runs the function `entry` of a JavaScript `script` on `args` with the reviewed engine
@@ -370,7 +359,8 @@ pub fn run_script(
     args: &[&[u8]],
     limits: Limits,
 ) -> Result<Ran, Error> {
-    if script.len() > limits.script.min(MAX_SCRIPT) {
+    // A source is UTF-8 text; any other bytes are refused before the engine sees them.
+    if script.len() > limits.script.min(MAX_SCRIPT) || core::str::from_utf8(script).is_err() {
         return Err(Error::Refused);
     }
     if !is_token(entry) {
@@ -431,30 +421,30 @@ fn fail(caller: &mut Caller<'_, Host>, error: Error) -> wasmi::Error {
     wasmi::Error::from(TrapCode::UnreachableCodeReached)
 }
 
-/// Charges the fuel of copying `len` bytes, from the store's slice and then the reserve.
+/// Charges the fuel of copying `len` bytes, and looks at the clock.
 fn charge(caller: &mut Caller<'_, Host>, len: usize) -> Result<(), wasmi::Error> {
+    if Instant::now() > caller.data().deadline {
+        return Err(fail(caller, Error::Time));
+    }
     let cost = u64::try_from(len / COPY_PER_FUEL)
         .unwrap_or(u64::MAX)
         .saturating_add(1);
     let left = caller.get_fuel().unwrap_or(0);
-    if let Some(left) = left.checked_sub(cost) {
-        return caller.set_fuel(left).map_err(|_| fail(caller, Error::Fuel));
-    }
-    let pool = left.saturating_add(caller.data().reserve);
-    match pool.checked_sub(cost) {
-        Some(pool) => {
-            let slice = pool.min(FUEL_SLICE);
-            caller.data_mut().reserve = pool.saturating_sub(slice);
-            caller
-                .set_fuel(slice)
-                .map_err(|_| fail(caller, Error::Fuel))
-        }
+    match left.checked_sub(cost) {
+        Some(left) => caller.set_fuel(left).map_err(|_| fail(caller, Error::Fuel)),
         None => {
             let _ = caller.set_fuel(0);
-            caller.data_mut().reserve = 0;
             Err(fail(caller, Error::Fuel))
         }
     }
+}
+
+/// Looks at the clock in a host function that copies nothing.
+fn on_time(caller: &mut Caller<'_, Host>) -> Result<(), wasmi::Error> {
+    if Instant::now() > caller.data().deadline {
+        return Err(fail(caller, Error::Time));
+    }
+    Ok(())
 }
 
 fn input_index(caller: &Caller<'_, Host>, index: i32) -> Option<usize> {
@@ -466,20 +456,26 @@ fn input_index(caller: &Caller<'_, Host>, index: i32) -> Option<usize> {
 fn linker(engine: &Engine) -> Result<Linker<Host>, Error> {
     let mut linker = Linker::<Host>::new(engine);
     linker
-        .func_wrap(HOST, "input_count", |mut caller: Caller<'_, Host>| -> i32 {
-            remember_memory(&mut caller);
-            i32::try_from(caller.data().inputs.len()).unwrap_or(i32::MAX)
-        })
+        .func_wrap(
+            HOST,
+            "input_count",
+            |mut caller: Caller<'_, Host>| -> Result<i32, wasmi::Error> {
+                remember_memory(&mut caller);
+                on_time(&mut caller)?;
+                Ok(i32::try_from(caller.data().inputs.len()).unwrap_or(i32::MAX))
+            },
+        )
         .map_err(|_| Error::Import)?;
     linker
         .func_wrap(
             HOST,
             "input_len",
-            |mut caller: Caller<'_, Host>, index: i32| -> i32 {
+            |mut caller: Caller<'_, Host>, index: i32| -> Result<i32, wasmi::Error> {
                 remember_memory(&mut caller);
-                input_index(&caller, index)
+                on_time(&mut caller)?;
+                Ok(input_index(&caller, index)
                     .and_then(|i| caller.data().inputs.get(i))
-                    .map_or(-1, |input| i32::try_from(input.len()).unwrap_or(-1))
+                    .map_or(-1, |input| i32::try_from(input.len()).unwrap_or(-1)))
             },
         )
         .map_err(|_| Error::Import)?;
@@ -524,6 +520,12 @@ fn linker(engine: &Engine) -> Result<Linker<Host>, Error> {
                 Ok(())
             },
         )
+        .map_err(|_| Error::Import)?;
+    // Tests only: a host function that panics, so that a panic unwinding through wasmi is
+    // tested on the path a panic inside the interpreter takes.
+    #[cfg(test)]
+    linker
+        .func_wrap(tests::PANIC.0, tests::PANIC.1, tests::panic_inside)
         .map_err(|_| Error::Import)?;
     Ok(linker)
 }
