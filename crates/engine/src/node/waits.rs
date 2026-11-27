@@ -392,7 +392,9 @@ impl<S: LogSink, C: Clock> Node<S, C> {
             saved: None,
             pending: pending.clone(),
         };
-        self.lock()?.parked.insert(id, parked, now)?;
+        self.lock()?
+            .parked
+            .insert(id, parked, now, &self.holds, run.reserved.take())?;
         Ok(Some(pending))
     }
 
@@ -446,7 +448,9 @@ impl<S: LogSink, C: Clock> Node<S, C> {
             saved: Some(save(run)),
             pending: pending.clone(),
         };
-        self.lock()?.parked.insert(id, parked, now)?;
+        self.lock()?
+            .parked
+            .insert(id, parked, now, &self.holds, run.reserved.take())?;
         Ok(pending)
     }
 
@@ -480,7 +484,7 @@ impl<S: LogSink, C: Clock> Node<S, C> {
             }
             _ => None,
         };
-        let parked = {
+        let (parked, reserved) = {
             let mut state = self.lock()?;
             let Some(parked) = state.parked.get_mut(id, now) else {
                 return Err(Error::ParkedUnknown);
@@ -502,7 +506,11 @@ impl<S: LogSink, C: Clock> Node<S, C> {
             if !ready {
                 return Ok(Output::Pending(parked.pending.clone()));
             }
-            state.parked.remove(id).ok_or(Error::ParkedUnknown)?
+            let parked = state.parked.remove(id).ok_or(Error::ParkedUnknown)?;
+            // The slot it leaves stays held while it runs, so it can wait again (on the same
+            // challenge, or at a later `await`) without losing the race to another call.
+            let reserved = state.parked.reserve(&self.holds, &record.owner, now)?;
+            (parked, reserved)
         };
         let Parked {
             at,
@@ -538,6 +546,7 @@ impl<S: LogSink, C: Clock> Node<S, C> {
                 start: at.saturating_add(1),
                 last: saved.last,
                 log_seqs: saved.log_seqs,
+                reserved: Some(reserved),
             },
             None => {
                 let fields = self.open(record, &user_key)?;
@@ -557,6 +566,7 @@ impl<S: LogSink, C: Clock> Node<S, C> {
                     start: 0,
                     last: None,
                     log_seqs: Vec::new(),
+                    reserved: Some(reserved),
                 }
             }
         };
@@ -612,7 +622,13 @@ impl<S: LogSink, C: Clock> Node<S, C> {
                         saved: Some(save(&mut run)),
                         pending: pending.clone(),
                     };
-                    self.lock()?.parked.insert(*id, parked, now)?;
+                    self.lock()?.parked.insert(
+                        *id,
+                        parked,
+                        now,
+                        &self.holds,
+                        run.reserved.take(),
+                    )?;
                     return Ok(Output::Pending(pending));
                 }
             },
@@ -730,6 +746,7 @@ impl<S: LogSink, C: Clock> Node<S, C> {
                 start: 0,
                 last: None,
                 log_seqs: Vec::new(),
+                reserved: None,
             };
             let flow = self.run_https(&mut nested, None, transport, updated);
             run.fields = core::mem::replace(&mut nested.fields, Fields::new());

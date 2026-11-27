@@ -426,6 +426,51 @@ fn a_flood_of_waiting_operations_hits_the_cap_before_anything_is_sent() {
     challenge_of(bob.run("login", Body::http_fixed(), &mut other));
 }
 
+/// While its request is out, runs one more call of the same owner on the same node.
+struct Overlap<'w> {
+    world: &'w World,
+    inner: Option<engine::Result<Output>>,
+    inner_sent: usize,
+}
+
+impl Transport for Overlap<'_> {
+    fn send(
+        &mut self,
+        _: &Destination,
+        _: Option<&ClientIdentity>,
+        _: &[u8],
+        _: usize,
+    ) -> engine::Result<Vec<u8>> {
+        if self.inner.is_none() {
+            let mut t = Script::default();
+            self.inner = Some(self.world.run("login", Body::http_fixed(), &mut t));
+            self.inner_sent = t.sent.len();
+        }
+        Ok(http(200, "", "{}"))
+    }
+}
+
+#[test]
+fn the_last_waiting_slot_is_held_while_the_request_is_out() {
+    let w = bank_world();
+    let mut t = Script::default();
+    for _ in 0..MAX_PARKED_PER_OWNER - 1 {
+        challenge_of(w.run("login", Body::http_fixed(), &mut t));
+    }
+    // One slot is left: the call that took it holds it while its login is out, so a call that
+    // overlaps it is refused before it sends anything, not after.
+    let mut overlap = Overlap {
+        world: &w,
+        inner: None,
+        inner_sent: 0,
+    };
+    let call = w.call_as(&w.agent, "agent", &w.record, "login", Body::http_fixed());
+    challenge_of(w.node.run(&call, &mut overlap).result);
+    assert_eq!(overlap.inner, Some(Err(Error::ParkedFull)));
+    assert_eq!(overlap.inner_sent, 0);
+    assert_eq!(w.node.waiting(), MAX_PARKED_PER_OWNER);
+}
+
 #[test]
 fn waiting_operations_lapse_and_are_dropped_on_revoke_and_restart() {
     let w = bank_world();

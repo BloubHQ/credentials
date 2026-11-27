@@ -489,6 +489,8 @@ pub struct Node<S: LogSink, C: Clock> {
     /// Set, under the lock of `state`, when `State::handed_over` is: live loops read it
     /// without taking that lock. It never goes back to false, as `handed_over` never does.
     handed_over: AtomicBool,
+    /// The slots held for operations that may wait, while they run.
+    holds: park::Holds,
 }
 
 impl<S: LogSink, C: Clock> Node<S, C> {
@@ -609,6 +611,7 @@ impl<S: LogSink, C: Clock> Node<S, C> {
             clock,
             live: live::Slots::default(),
             handed_over: AtomicBool::new(false),
+            holds: park::Holds::default(),
             state: Mutex::new(State {
                 log,
                 sink,
@@ -1503,10 +1506,15 @@ impl<S: LogSink, C: Clock> Node<S, C> {
             start: 0,
             last: None,
             log_seqs: Vec::new(),
+            reserved: None,
         };
-        // An operation that may wait needs room to wait in, checked before anything is sent.
+        // An operation that may wait needs room to wait in, held before anything is sent.
         if operation.parks() {
-            self.lock()?.parked.room(&record.owner, now)?;
+            run.reserved = Some(
+                self.lock()?
+                    .parked
+                    .reserve(&self.holds, &record.owner, now)?,
+            );
         }
         // The owner's approval and the spending limits, before anything is sent.
         if let Some(pending) = self.gate(&mut run, payload, &input)? {
@@ -2437,6 +2445,8 @@ struct Run<'a> {
     last: Option<Http>,
     /// The log entries of the HTTPS requests so far.
     log_seqs: Vec<u64>,
+    /// The slot held for the operation to wait in, taken before anything is sent.
+    reserved: Option<park::Reservation<'a>>,
 }
 
 /// How the steps of an operation ended: done, or waiting at the `await` of this index.

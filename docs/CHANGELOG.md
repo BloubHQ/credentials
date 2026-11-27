@@ -22,6 +22,11 @@ before 1.0, minor versions may break formats and APIs.
   a panic in a connection still ends only that connection. Measured (`cargo build --release
   -p cli --locked`, Windows x86-64): `credentials.exe` 17,839,104 bytes before, 18,059,264
   after (+220,160, +1.2%).
+- An operation that may wait now holds its waiting slot from the room check until it parks
+  (`node::park::Reservation`, released on drop); before, the room was only checked, so
+  overlapping calls all sent their login or challenge request and the extra ones failed with
+  `ParkedFull` after it. A resumed operation keeps the slot it leaves while it runs, so an
+  external challenge that is still pending is no longer dropped when it parks again.
 
 - **An operation on a streaming call no longer waits.** A WebSocket, an SSH shell or
   forward, a live MQTT relay and an HTTPS operation whose response streams are refused
