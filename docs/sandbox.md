@@ -15,7 +15,7 @@ is `run` (`docs/policy.md`, `run`); the crate is `crates/sandbox`.
 | Inputs | At most 16, 1 MiB together: the rendered templates of the step. |
 | Output | At most 64 KiB, in one or more `output` calls. |
 | Fuel | 10⁹ units per run (wasmi's units, plus one per 64 bytes a host function copies). |
-| Time | 5 s of wall clock per run, checked between slices of 10⁷ fuel (the entry runs as a resumable call), so a run may overshoot by one slice. |
+| Time | 5 s of wall clock per run, checked at every host call and after the run. A run is never paused to look at the clock (resuming a wasmi 1.1.0 call after it ran out of fuel is unsound, #95), so a stretch without a host call is bounded by fuel alone: 981,852,254 fuel of the JavaScript engine took 1.53 to 2.15 s on the measured host (8 release runs). |
 | Memory | 64 MiB of linear memory, one memory, at most 16 tables. |
 | Lower bounds | A signed policy may lower fuel, memory, time and the size of a script (`limits`), never raise them. |
 | Structure | wasmi's strict limits: at most 10,000 functions, 1,000 globals, 100 tables, 1,000 element and data segments, 32 parameters and results, functions of 40 bytes on average once the code exceeds 1,000 bytes. |

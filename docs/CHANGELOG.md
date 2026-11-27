@@ -89,7 +89,7 @@ before 1.0, minor versions may break formats and APIs.
   `btoa`; the output is confined to the script's origin like a module's.
 - `run` steps take `limits` (`fuel`, `memory`, `time_ms`, `source`), each at most the node's,
   and a library may be pinned by `sha256`. The sandbox has a wall-clock limit of 5 s per run
-  (`sandbox::MAX_TIME`, checked between slices of 10⁷ fuel) and new errors `Time` and
+  (`sandbox::MAX_TIME`, checked at every host call and after the run) and new errors `Time` and
   `Refused`; `sandbox::Limits` gained `time` and `script`.
 - Fuzz target `sandbox_script`: arbitrary JavaScript sources and arguments on the engine.
 - DTLS 1.2 and 1.3 (RFC 6347, RFC 9147) as the `dtls` connection (`docs/policy.md`, DTLS;
@@ -783,6 +783,14 @@ before 1.0, minor versions may break formats and APIs.
   now runs under `catch_unwind`: a panic ends the run with the new error `Interpreter`, and
   the memory is still wiped. `run_script` refuses a source that is not UTF-8 before the
   engine sees it (#95).
+- **The sandbox no longer resumes a run after it ran out of fuel.** Resuming a wasmi 1.1.0
+  call after `OutOfFuel` can land on an instruction parameter instead of an instruction:
+  a panic in a debug build, undefined behaviour (a segfault) in a release build, so
+  `catch_unwind` alone does not cover it. The entry now gets all its fuel at once and runs
+  as one call; the wall clock is checked at every host call instead of between slices, and
+  `sandbox::FUEL_SLICE` is removed. wasmi is built with `extra-checks`, which turns its
+  unchecked instruction decoding into a panic in release too; across 4 release runs each of
+  the JavaScript benchmark, its cost was below the run-to-run spread (#95).
 - The sandbox now wipes a module's memory when a run fails (trap, fuel, time, output limit,
   a start function that traps, an entry it refuses), not only when it succeeds: the memory
   handle is kept outside the run, by the instance or by the first host call, so a lost

@@ -391,11 +391,12 @@ fn memory_is_wiped_on_every_path() {
     }
 }
 
-/// A panic inside wasmi (#95: these two bytes as a script, given to the engine module past the
-/// UTF-8 check of `run_script`) ends the run with `Interpreter`, and the memory, which held the
-/// inputs, is still wiped afterwards through the store.
+/// #95: these two bytes as a script, given to the engine module past the UTF-8 check of
+/// `run_script`, put a fuel slice boundary where resuming the call landed on an instruction
+/// parameter of wasmi 1.1.0 (a panic in debug builds, undefined behaviour in release). Runs are
+/// no longer resumed: the script ends in a fixed error of the engine, and the memory is wiped.
 #[test]
-fn memory_is_wiped_after_a_panic_inside_wasmi() {
+fn the_input_of_issue_95_ends_without_a_resume() {
     let module = library(JS).unwrap();
     let limits = Limits {
         fuel: 40_000_000,
@@ -407,7 +408,7 @@ fn memory_is_wiped_after_a_panic_inside_wasmi() {
     let result = run_observed(module, "run", &[b"\n\xb0", b"f"], limits, &mut |memory| {
         seen = memory.map(<[u8]>::to_vec);
     });
-    assert_eq!(result.map(|_| ()), Err(Error::Interpreter));
+    assert_eq!(result.map(|_| ()), Err(Error::Trap));
     let memory = seen.expect("the run had a memory");
     assert!(!memory.is_empty(), "the memory has pages");
     assert!(memory.iter().all(|b| *b == 0), "the memory is not wiped");
