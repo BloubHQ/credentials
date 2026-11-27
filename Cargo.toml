@@ -94,7 +94,7 @@ x448 = { version = "=0.14.0-pre.12", default-features = false }
 # DSA (FIPS 186-4), deterministic nonces (RFC 6979). Signing sits behind the crate's `hazmat`
 # feature since FIPS 186-5 withdrew DSA signature generation; legacy protocols still ask for it.
 dsa = { version = "0.7", features = ["hazmat"] }
-base64 = "0.22"
+base64 = "0.23"
 chacha20poly1305 = "0.11"
 clap = { version = "4.5", default-features = false, features = ["std", "derive", "help", "usage", "error-context"] }
 ed25519-dalek = { version = "3", features = ["rand_core", "zeroize", "pkcs8", "pem"] }
