@@ -35,6 +35,8 @@ impl From<ClientError> for JsValue {
 
 type Result<T> = std::result::Result<T, JsValue>;
 
+pub mod handles;
+
 /// A secret for JavaScript: the JavaScript string is decoded from a borrow of `text`, and
 /// `text` is wiped as it drops. Returning a `String` instead would leave wasm-bindgen to free
 /// it from wasm memory unwiped.
