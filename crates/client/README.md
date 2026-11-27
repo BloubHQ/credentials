@@ -216,7 +216,9 @@ locally: `wasm-bindgen` was not installed on the machine these were measured on)
 
 The web build exposes the same functions in camel case (`generateKey`, `verifyNode`,
 `verifyAttestationReply`, `grant`, `sealRecord`, ...), with `Nonce` and `VerifiedNode`
-classes. Bytes are `Uint8Array`, `valid_for_secs` a number of seconds, millisecond times
+classes, and the key objects `DeviceKey`, `UserKey` and `CallerKey` (see
+[Keeping the keys](#keeping-the-keys)). Bytes are `Uint8Array`, `valid_for_secs` a number of
+seconds, millisecond times
 numbers, and the fields of `sealRecord` and `updateRecord` a `Map<string, Uint8Array>`. A failure throws an
 `Error` with `code` (and `reason` for `attestation_refused`). Randomness comes from
 `crypto.getRandomValues`, the time from `Date.now()`.
@@ -232,6 +234,33 @@ memory (a key it returns is decoded from a borrow and then wiped, and a key the 
 in is wiped after the call), but the JavaScript strings themselves live in the JavaScript
 heap until the garbage collector frees them, and nothing can erase them there. A page that
 keeps a key keeps it in the JavaScript heap, and in whatever storage it writes it to.
+
+The key objects keep a key out of the JavaScript heap while the page uses it. `DeviceKey`,
+`UserKey` and `CallerKey` hold the key in wasm memory and wipe it when freed; JavaScript
+holds only a reference. Free an object when done, with `using` where the runtime has it
+(`using device = DeviceKey.fromString(stored)` frees it at the end of the scope), or with
+`free()` in a `finally`. An object the page only drops is freed when the garbage collector
+collects it (the package registers each with a `FinalizationRegistry`), which may be much
+later, or never before the page closes. Export a key once, when it is made, to store it:
+each `exportKey()` makes a new JavaScript string, which only the garbage collector removes. They are made with `generate()` or
+`fromString(text)`, and give the key as a string only through `exportKey()`, to store it.
+Each has the calls of its kind as methods, which take the other key by reference where a
+call needs two:
+
+```js
+const device = DeviceKey.generate();
+const user = UserKey.generate();
+const stored = device.exportKey(); // a JavaScript string: store it, then drop it
+const grant = device.grant(user, node, "alice", 3600, []);
+const record = user.sealRecord(signedPolicy, "card", "alice", fields);
+device.free();
+user.free();
+```
+
+The methods give the same results as the functions of the string API. WebCrypto holds no
+key here: its non-extractable keys sign through an asynchronous call outside wasm, and the
+engine signs its own structures with the key bytes; only an Ed25519 or P-256 device key
+could be one, and only with the signing done in JavaScript.
 
 - **Device key** (Ed25519): signs grants, revocations, policies, pins and device changes. It
   never needs to leave the device.
