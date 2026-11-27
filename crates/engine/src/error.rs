@@ -329,6 +329,10 @@ pub enum Error {
         /// The request may already have gone to its destination.
         sent: bool,
     },
+    /// The node's clock reads before the Unix epoch: the node takes no act until it reads a
+    /// real time (and refuses what was granted before its start until it restarts).
+    #[error("the node's clock reads before 1970 and the node takes no act")]
+    ClockBeforeEpoch,
     /// A hand-over was refused: the package, its entry or the state of the node.
     #[error("hand-over refused: {rule}")]
     HandOverInvalid {

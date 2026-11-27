@@ -817,6 +817,15 @@ before 1.0, minor versions may break formats and APIs.
   poisoned lock of the connection counts refuses new connections (`StateLost`); a poisoned
   transport pool lends no transport; a checkpoint hook that panicked halts the server's acts
   (503), since what it stored is unknown.
+- Spending limits carried in a hand-over package are checked rule by rule
+  (`LimitRule::fault`) and the package is refused when one is not valid; a rule whose bound
+  is no amount (`"1e9"`, `"025"`) now reads as exceeded, so the payment waits for approval
+  (before, the bound was skipped and the payment came back within the limits). A node whose
+  clock reads before 1970 takes no act (`Error::ClockBeforeEpoch`, through the new
+  `Clock::checked_now_ms`) instead of reading the time as 0, which left every expiry in the
+  future; a node started with such a clock refuses what was granted before its start until
+  it restarts.
+
 - An approved operation on a protocol connection (SSH and SFTP, PostgreSQL, MySQL, Redis,
   SMTP, IMAP, POP3, FTP, MQTT, AMQP 0-9-1 and 1.0) never went on: the caller's commands and
   messages were not kept with the waiting operation, so the resume failed

@@ -169,7 +169,7 @@ impl<S: LogSink, C: Clock> Node<S, C> {
         if policy_sha256(&record.policy)? != delegation.base_sha256 {
             return Err(invalid("the record's policy is not the one delegated"));
         }
-        let now = self.clock.now_ms();
+        let now = self.now()?;
         if delegation.expires_ms <= now {
             return Err(invalid("the delegation has ended"));
         }
@@ -244,7 +244,7 @@ impl<S: LogSink, C: Clock> Node<S, C> {
             return Err(invalid("change for another node"));
         }
         change.verify()?;
-        let now = self.clock.now_ms();
+        let now = self.now()?;
         if change.issued_ms.abs_diff(now) > MAX_SKEW_MS {
             return Err(invalid("issued too long ago or in the future"));
         }

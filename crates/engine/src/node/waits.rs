@@ -238,7 +238,7 @@ impl<S: LogSink, C: Clock> Node<S, C> {
     /// How many operations wait on this node now: none once its state was lost to a panic
     /// ([`Node::is_state_lost`]), as none of them goes on.
     pub fn waiting(&self) -> usize {
-        let now = self.clock.now_ms();
+        let now = self.clock.checked_now_ms().unwrap_or(0);
         self.lock().map_or(0, |mut state| state.parked.len(now))
     }
 
@@ -465,7 +465,7 @@ impl<S: LogSink, C: Clock> Node<S, C> {
         transport: &mut T,
         updated: &mut Option<Record>,
     ) -> Result<Output> {
-        let now = self.clock.now_ms();
+        let now = self.now()?;
         let delegated = self.delegation_of(record, auth)?;
         let (policy, operation, checked) = self.check_call(
             record,
@@ -766,7 +766,7 @@ impl<S: LogSink, C: Clock> Node<S, C> {
     /// names. The code is kept in memory with the waiting operation and logged nowhere.
     pub fn answer(&self, sealed: &SealedAnswer) -> Result<()> {
         let opened = sealed.open(&self.seal, &self.public)?;
-        let now = self.clock.now_ms();
+        let now = self.now()?;
         let mut state = self.lock()?;
         if !state.devices(&opened.owner).contains(&opened.device) {
             return Err(Error::GrantDenied);
@@ -827,7 +827,7 @@ impl<S: LogSink, C: Clock> Node<S, C> {
     /// Takes the owner's approval of the summary of a waiting operation: signed by a known
     /// device of the owner over exactly the summary this node built, while it is open.
     pub fn approve(&self, approval: &Approval) -> Result<()> {
-        let now = self.clock.now_ms();
+        let now = self.now()?;
         let mut state = self.lock()?;
         let summary = match state.parked.get_mut(&approval.id, now).map(|p| &p.wait) {
             Some(Wait::Approval {
@@ -871,7 +871,7 @@ impl<S: LogSink, C: Clock> Node<S, C> {
             return Err(invalid("limits for another node"));
         }
         limits.validate()?;
-        let now = self.clock.now_ms();
+        let now = self.now()?;
         let (owner, record_id) = (limits.owner.as_str(), limits.record_id.as_str());
         let mut state = self.lock()?;
         state.grant_of(owner, now)?;

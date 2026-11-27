@@ -443,7 +443,7 @@ impl<S: LogSink, C: Clock> Node<S, C> {
         };
         let logged = self
             .lock()
-            .and_then(|mut state| state.commit(self.clock.now_ms(), run.who, event));
+            .and_then(|mut state| state.commit(self.clock.checked_now_ms().unwrap_or(run.now), run.who, event));
         let end = end.map_err(|(_, error)| error)?;
         logged?;
         Ok(Closed {

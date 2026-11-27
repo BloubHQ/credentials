@@ -44,9 +44,17 @@ const CODE: &str = "493817";
 #[derive(Clone)]
 struct SharedClock(Arc<AtomicU64>);
 
+/// Set to this, the clock reads before the Unix epoch.
+const BEFORE_EPOCH: u64 = u64::MAX;
+
 impl Clock for SharedClock {
     fn now_ms(&self) -> u64 {
-        self.0.load(Ordering::SeqCst)
+        self.checked_now_ms().unwrap_or(0)
+    }
+
+    fn checked_now_ms(&self) -> Option<u64> {
+        let now = self.0.load(Ordering::SeqCst);
+        (now != BEFORE_EPOCH).then_some(now)
     }
 }
 
@@ -424,6 +432,27 @@ fn a_flood_of_waiting_operations_hits_the_cap_before_anything_is_sent() {
     let mut other = Script::default();
     let bob = bank_world();
     challenge_of(bob.run("login", Body::http_fixed(), &mut other));
+}
+
+#[test]
+fn a_clock_before_1970_halts_the_node() {
+    let w = bank_world();
+    let mut t = Script::default();
+    let (id, _) = challenge_of(w.run("login", Body::http_fixed(), &mut t));
+    let sent = t.sent.len();
+    let call = w.call_as(&w.agent, "agent", &w.record, "login", Body::http_fixed());
+    let sealed = w
+        .device
+        .answer_challenge(&w.node.identity(), "alice", id, CODE.as_bytes(), w.now())
+        .unwrap();
+    w.clock.store(BEFORE_EPOCH, Ordering::SeqCst);
+    // Read as 0, the time would leave the grant and the waiting operation unexpired.
+    assert_eq!(
+        w.node.run(&call, &mut t).result,
+        Err(Error::ClockBeforeEpoch)
+    );
+    assert_eq!(w.node.answer(&sealed), Err(Error::ClockBeforeEpoch));
+    assert_eq!(t.sent.len(), sent);
 }
 
 /// While its request is out, runs one more call of the same owner on the same node.
