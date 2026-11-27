@@ -159,14 +159,15 @@ fn fuel_memory_and_time_stop_a_script() {
     assert!(matches!(stopped, Error::Fuel | Error::Time), "{stopped:?}");
     assert!(started.elapsed() < Duration::from_secs(30));
     // A short time limit: the loop makes no host call, so nothing looks at the clock while it
-    // runs (runs are not paused and resumed, #95); fuel ends it, or the check after the run.
+    // runs (runs are not paused and resumed, #95); fuel ends it, and a run out of fuel past
+    // its time is reported as `Time`.
     let quick = Limits {
         time: Duration::from_millis(100),
         ..Limits::default()
     };
     let started = Instant::now();
     let stopped = run_script(spin.as_bytes(), "f", &[], quick).unwrap_err();
-    assert!(matches!(stopped, Error::Fuel | Error::Time), "{stopped:?}");
+    assert_eq!(stopped, Error::Time);
     assert!(started.elapsed() < Duration::from_secs(30));
     // Memory: a script that keeps allocating stops at the cap.
     let hog = "function f() { const keep = []; for (;;) { keep.push(new Uint8Array(1 << 20)); } }";

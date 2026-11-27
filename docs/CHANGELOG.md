@@ -788,7 +788,8 @@ before 1.0, minor versions may break formats and APIs.
   a panic in a debug build, undefined behaviour (a segfault) in a release build, so
   `catch_unwind` alone does not cover it. The entry now gets all its fuel at once and runs
   as one call; the wall clock is checked at every host call instead of between slices, and
-  `sandbox::FUEL_SLICE` is removed. wasmi is built with `extra-checks`, which turns its
+  `sandbox::FUEL_SLICE` is removed. A run that runs out of fuel after its time was up fails
+  with `Time`, as a run that finishes late does. wasmi is built with `extra-checks`, which turns its
   unchecked instruction decoding into a panic in release too; across 4 release runs each of
   the JavaScript benchmark, its cost was below the run-to-run spread (#95).
 - The sandbox now wipes a module's memory when a run fails (trap, fuel, time, output limit,

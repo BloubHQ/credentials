@@ -328,13 +328,19 @@ fn run_observed(
         memory.data_mut(&mut store).zeroize();
     }
     observe(memory.map(|memory| memory.data(&store)));
+    let late = started.elapsed() > time;
     let host = store.data_mut();
     if let Some(fault) = host.fault {
         return Err(fault);
     }
-    called?;
+    match called {
+        // Between host calls only fuel stops a run: one that ran out of fuel after its time
+        // was up is reported as over its time.
+        Err(Error::Fuel) if late => return Err(Error::Time),
+        other => other?,
+    }
     // A run that finished within its fuel but past its time is refused too.
-    if started.elapsed() > time {
+    if late {
         return Err(Error::Time);
     }
     Ok(Ran {
