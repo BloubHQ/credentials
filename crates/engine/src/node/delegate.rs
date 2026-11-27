@@ -143,7 +143,7 @@ impl<S: LogSink, C: Clock> Node<S, C> {
         let Some(id) = auth.delegation else {
             return Ok(None);
         };
-        self.lock()
+        self.lock()?
             .delegations
             .get(&(record.owner.clone(), id))
             .map(|slot| Some(slot.delegated.clone()))
@@ -174,7 +174,7 @@ impl<S: LogSink, C: Clock> Node<S, C> {
             return Err(invalid("the delegation has ended"));
         }
         let owner = delegation.owner.as_str();
-        let devices = self.lock().devices(owner);
+        let devices = self.lock()?.devices(owner);
         if !devices.contains(&delegation.device) {
             return Err(Error::GrantDenied);
         }
@@ -189,7 +189,7 @@ impl<S: LogSink, C: Clock> Node<S, C> {
         let sealed = self
             .state_key
             .seal(owner, &delegation.record_id, DELEGATION, delegation)?;
-        let mut state = self.lock();
+        let mut state = self.lock()?;
         state.check_issued(owner, delegation.issued_ms, now)?;
         let key = (owner.to_string(), delegation.id);
         if state.delegations.contains_key(&key) {
@@ -249,7 +249,7 @@ impl<S: LogSink, C: Clock> Node<S, C> {
             return Err(invalid("issued too long ago or in the future"));
         }
         let owner = change.owner.as_str();
-        let mut state = self.lock();
+        let mut state = self.lock()?;
         if !state.devices(owner).contains(&change.device) {
             return Err(Error::GrantDenied);
         }

@@ -145,7 +145,12 @@ dbg_macro = "deny"
 [profile.release]
 codegen-units = 1
 lto = true
+# Unwind, not abort: a panic in one connection (the DTLS transport runs under
+# `catch_unwind`) ends only that connection; a panic with the node state locked halts the
+# node (`engine::Error::StateLost`).
 panic = "unwind"
+# Integer overflow panics in release as in debug builds, instead of wrapping silently.
+overflow-checks = true
 
 # Dependencies (crypto) optimized in debug builds: tests make many signatures.
 [profile.dev.package."*"]

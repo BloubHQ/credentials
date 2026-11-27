@@ -1935,6 +1935,51 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::indexing_slicing)]
     use super::*;
 
+    /// 64 KiB of the smallest frames that carry a body (a header and 2 bytes), in one read.
+    fn small_frames() -> (usize, Vec<u8>) {
+        let one = frame(FRAME_AMQP, 0, &[0x00, 0x40]).unwrap();
+        let count = 64 * 1024 / one.len();
+        let mut bytes = Vec::with_capacity(count * one.len());
+        for _ in 0..count {
+            bytes.extend_from_slice(&one);
+        }
+        (count, bytes)
+    }
+
+    /// Reads every frame of `bytes` as `next_frame` does; the bytes the buffer moved.
+    fn read_all(count: usize, bytes: &[u8]) -> u64 {
+        use crate::proto::io::testing::{Fed, wide};
+        let mut stream = Fed(std::collections::VecDeque::from([bytes.to_vec()]));
+        let mut io = Io::new(&mut stream, wide());
+        io.poll(WAIT).unwrap();
+        for _ in 0..count {
+            let (n, frame) = parse_frame(io.buffered(), MAX_FRAME).unwrap().unwrap();
+            io.take(n).unwrap();
+            assert_eq!(frame.body.len(), 2);
+        }
+        assert!(io.buffered().is_empty());
+        io.copied
+    }
+
+    #[test]
+    fn frames_parse_in_linear_copies() {
+        let (count, bytes) = small_frames();
+        let copied = read_all(count, &bytes);
+        assert!(copied <= 2 * bytes.len() as u64, "copied {copied} bytes");
+    }
+
+    /// `cargo test --release -p engine --lib -- --ignored --nocapture measure_`
+    #[test]
+    #[ignore = "a measurement, run in release"]
+    fn measure_amqp1_small_frames() {
+        let (count, bytes) = small_frames();
+        let (us, copied) = crate::proto::io::testing::median_us(9, || read_all(count, &bytes));
+        println!(
+            "amqp1: {count} frames in {} bytes: median {us} us, {copied} bytes copied",
+            bytes.len()
+        );
+    }
+
     #[test]
     fn values_encode_as_the_standard_writes_them() {
         let mut out = Vec::new();

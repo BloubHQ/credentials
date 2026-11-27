@@ -990,7 +990,7 @@ impl<S: LogSink, C: Clock> Node<S, C> {
             generation: run.record.generation,
             detail: detail.seal(&run.user_key, &run.record.owner, &run.record.id)?,
         };
-        let (seq, confirmed) = self.lock().commit(now, who, event)?;
+        let (seq, confirmed) = self.lock()?.commit(now, who, event)?;
         run.log_seqs.push(seq);
         let meter = Meter::new(open.limits.as_ref());
         let bounds = bounds_of(open);
@@ -1172,6 +1172,7 @@ impl<S: LogSink, C: Clock> Node<S, C> {
         host: &str,
         history: &mut Zeroizing<Vec<u8>>,
     ) -> Result<CommandResult> {
+        self.alive()?;
         if self.is_handed_over() {
             return Err(Error::HandedOver);
         }
@@ -1328,6 +1329,7 @@ impl<S: LogSink, C: Clock> Node<S, C> {
             if let Some(reason) = client.io().reached() {
                 return Ok(End::of(reason, false));
             }
+            self.alive()?;
             if self.is_handed_over() {
                 return Ok(End::of("handed_over", false));
             }
@@ -1388,6 +1390,7 @@ impl<S: LogSink, C: Clock> Node<S, C> {
         loop {
             match client.poll_event(POLL)? {
                 Some(ssh::Event::Forwarded { originator, port }) => {
+                    self.alive()?;
                     if self.is_handed_over() {
                         client.refuse_forwarded()?;
                         return Ok(End::of("handed_over", false));
@@ -1439,6 +1442,7 @@ impl<S: LogSink, C: Clock> Node<S, C> {
             if let Some(reason) = client.io().reached() {
                 return Ok(End::of(reason, false));
             }
+            self.alive()?;
             if self.is_handed_over() {
                 return Ok(End::of("handed_over", false));
             }
@@ -1459,6 +1463,7 @@ impl<S: LogSink, C: Clock> Node<S, C> {
                         &frame.signature,
                     )?;
                     expected += 1;
+                    self.alive()?;
                     if self.is_handed_over() {
                         return Ok(End::of("handed_over", false));
                     }
