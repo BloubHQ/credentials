@@ -14,10 +14,15 @@ use getrandom::rand_core::{Rng as _, UnwrapErr};
 use sha1::{Digest, Sha1};
 use zeroize::{Zeroize, Zeroizing};
 
+use crate::readbuf::ReadBuf;
+
 /// The GUID of RFC 6455, 1.3.
 const GUID: &[u8] = b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 /// Longest payload of a control frame.
 pub const MAX_CONTROL: usize = 125;
+/// Most empty fragments (not the last) one message may have. They carry nothing, so a
+/// server that sends more is only making the node work.
+pub const MAX_EMPTY_FRAGMENTS: usize = 64;
 
 const CONTINUATION: u8 = 0x0;
 const TEXT: u8 = 0x1;
@@ -112,9 +117,11 @@ type Frame = (bool, u8, Zeroizing<Vec<u8>>);
 
 /// Reads the frames of a server out of the bytes that arrive.
 pub struct Decoder {
-    buf: Zeroizing<Vec<u8>>,
+    buf: ReadBuf,
     /// The opcode and the payload of a message in fragments.
     partial: Option<(u8, Zeroizing<Vec<u8>>)>,
+    /// Empty fragments of the message in `partial` so far.
+    empty: usize,
     max: usize,
 }
 
@@ -122,8 +129,9 @@ impl Decoder {
     /// A decoder of messages of at most `max` bytes.
     pub fn new(max: usize) -> Self {
         Self {
-            buf: Zeroizing::new(Vec::new()),
+            buf: ReadBuf::new(),
             partial: None,
+            empty: 0,
             max,
         }
     }
@@ -132,10 +140,11 @@ impl Decoder {
     pub fn push(&mut self, bytes: &[u8]) -> Result<(), FrameError> {
         // A frame header is at most 14 bytes: more buffered than a message and a header
         // cannot be one frame of the limit.
-        if self.buf.len().saturating_add(bytes.len()) > self.max.saturating_add(14 + 1024) {
+        let held = self.buf.pending().len();
+        if held.saturating_add(bytes.len()) > self.max.saturating_add(14 + 1024) {
             return Err(FrameError::TooLarge);
         }
-        self.buf.extend_from_slice(bytes);
+        self.buf.push(bytes);
         Ok(())
     }
 
@@ -145,6 +154,7 @@ impl Decoder {
             let Some((fin, opcode, payload)) = self.frame()? else {
                 return Ok(None);
             };
+            let empty = payload.is_empty();
             let control = opcode & 0x8 != 0;
             if control {
                 if !fin || payload.len() > MAX_CONTROL {
@@ -176,9 +186,17 @@ impl Decoder {
                 return Err(FrameError::TooLarge);
             }
             if !fin {
+                if empty {
+                    self.empty += 1;
+                    if self.empty > MAX_EMPTY_FRAGMENTS {
+                        data.zeroize();
+                        return Err(FrameError::Protocol("too many empty fragments"));
+                    }
+                }
                 self.partial = Some((kind, data));
                 continue;
             }
+            self.empty = 0;
             return Ok(Some(if kind == TEXT {
                 if core::str::from_utf8(&data).is_err() {
                     return Err(FrameError::Protocol("text that is not UTF-8"));
@@ -192,7 +210,8 @@ impl Decoder {
 
     /// The next frame: FIN, opcode, payload.
     fn frame(&mut self) -> Result<Option<Frame>, FrameError> {
-        let (Some(&first), Some(&second)) = (self.buf.first(), self.buf.get(1)) else {
+        let buf = self.buf.pending();
+        let (Some(&first), Some(&second)) = (buf.first(), buf.get(1)) else {
             return Ok(None);
         };
         if first & 0x70 != 0 {
@@ -203,10 +222,9 @@ impl Decoder {
         if second & 0x80 != 0 {
             return Err(FrameError::Protocol("a server frame is masked"));
         }
-        let (len, at) = match second & 0x7f {
+        let (len, at): (u64, usize) = match second & 0x7f {
             126 => {
-                let Some(bytes) = self.buf.get(2..4).and_then(|b| <[u8; 2]>::try_from(b).ok())
-                else {
+                let Some(bytes) = buf.get(2..4).and_then(|b| <[u8; 2]>::try_from(b).ok()) else {
                     return Ok(None);
                 };
                 let len = u16::from_be_bytes(bytes);
@@ -216,11 +234,7 @@ impl Decoder {
                 (u64::from(len), 4)
             }
             127 => {
-                let Some(bytes) = self
-                    .buf
-                    .get(2..10)
-                    .and_then(|b| <[u8; 8]>::try_from(b).ok())
-                else {
+                let Some(bytes) = buf.get(2..10).and_then(|b| <[u8; 8]>::try_from(b).ok()) else {
                     return Ok(None);
                 };
                 let len = u64::from_be_bytes(bytes);
@@ -235,12 +249,11 @@ impl Decoder {
         if len > self.max {
             return Err(FrameError::TooLarge);
         }
-        let Some(payload) = self.buf.get(at..at + len) else {
+        let Some(payload) = buf.get(at..at.saturating_add(len)) else {
             return Ok(None);
         };
         let payload = Zeroizing::new(payload.to_vec());
-        let rest = Zeroizing::new(self.buf.get(at + len..).unwrap_or_default().to_vec());
-        self.buf = rest;
+        self.buf.skip(at.saturating_add(len));
         Ok(Some((first & 0x80 != 0, first & 0x0f, payload)))
     }
 }
@@ -355,6 +368,48 @@ mod tests {
         d.push(&server(false, BINARY, b"123")).unwrap();
         d.push(&server(true, CONTINUATION, b"45")).unwrap();
         assert_eq!(d.message(), Err(FrameError::TooLarge));
+    }
+
+    #[test]
+    fn empty_fragments_are_capped() {
+        let mut bytes = server(false, TEXT, b"");
+        for _ in 0..MAX_EMPTY_FRAGMENTS - 1 {
+            bytes.extend(server(false, CONTINUATION, b""));
+        }
+        bytes.extend(server(true, CONTINUATION, b"ok"));
+        let mut d = Decoder::new(1024);
+        d.push(&bytes).unwrap();
+        assert_eq!(
+            d.message().unwrap(),
+            Some(Message::Text(Zeroizing::new(b"ok".to_vec())))
+        );
+        let mut bytes = server(false, TEXT, b"");
+        for _ in 0..MAX_EMPTY_FRAGMENTS {
+            bytes.extend(server(false, CONTINUATION, b""));
+        }
+        let mut d = Decoder::new(1024);
+        d.push(&bytes).unwrap();
+        assert_eq!(
+            d.message(),
+            Err(FrameError::Protocol("too many empty fragments"))
+        );
+    }
+
+    #[test]
+    fn tiny_frames_decode_in_linear_copies() {
+        // One-byte fragments in 16 KiB pushes, as a TLS read delivers them (#52): each byte
+        // is moved at most once per push and copied out once, not once per frame.
+        let mut bytes = server(false, BINARY, b"a");
+        while bytes.len() < 1 << 20 {
+            bytes.extend(server(false, CONTINUATION, b"a"));
+        }
+        let mut d = Decoder::new(1 << 20);
+        for chunk in bytes.chunks(16 * 1024) {
+            d.push(chunk).unwrap();
+            assert_eq!(d.message().unwrap(), None);
+        }
+        let copied = d.buf.copied;
+        assert!(copied <= 2 * bytes.len() as u64, "copied {copied} bytes");
     }
 
     #[test]

@@ -21,3 +21,13 @@ pub mod sftp;
 pub mod smtp;
 pub mod ssh;
 pub mod wire;
+
+/// Most elements reserved ahead for a count a server announced. A count is a claim, not
+/// elements: a vector sized by it grows as the elements arrive, which the bytes pay for, so
+/// nested headers cannot reserve memory nothing sent (#52).
+pub(crate) const MAX_PREALLOC: usize = 1024;
+
+/// An empty vector for `announced` elements a server said will follow; see [`MAX_PREALLOC`].
+pub(crate) fn announced<T>(announced: usize) -> Vec<T> {
+    Vec::with_capacity(announced.min(MAX_PREALLOC))
+}

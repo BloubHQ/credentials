@@ -25,6 +25,9 @@ use crate::{Error, Result};
 
 /// Longest message of the server, in bytes.
 const MAX_MESSAGE: usize = 16 * 1024 * 1024;
+/// Most columns of a result: PostgreSQL itself returns no more (`MaxTupleAttributeNumber`
+/// for a target list), so a server that announces more is not one.
+pub const MAX_COLUMNS: usize = 1664;
 /// Fewest PBKDF2 iterations a server may ask for.
 pub const MIN_ITERATIONS: u32 = 4096;
 /// Most PBKDF2 iterations a server may ask for.
@@ -341,7 +344,8 @@ impl<'s> Client<'s> {
     }
 
     /// Runs `sql` with `params` bound as text; keeps only `columns` (all when empty). At most
-    /// `max` bytes of values.
+    /// `max` bytes of values, and at most `max` bytes of JSON rows: the JSON is written as
+    /// the rows arrive, so a NULL is charged its `null` and the node holds no more than that.
     pub fn query(
         &mut self,
         sql: &[u8],
@@ -380,7 +384,8 @@ impl<'s> Client<'s> {
 
         let mut names: Vec<String> = Vec::new();
         let mut keep: Vec<usize> = Vec::new();
-        let mut rows: Vec<serde_json::Value> = Vec::new();
+        // The rows as JSON, without the brackets around them.
+        let mut rows = Zeroizing::new(Vec::new());
         let mut raw = Zeroizing::new(Vec::new());
         let mut tag = String::new();
         let mut error: Option<(String, String)> = None;
@@ -391,6 +396,9 @@ impl<'s> Client<'s> {
                 b'T' => {
                     let mut p = Parse::new(&m.body);
                     let n = p.u16()?;
+                    if usize::from(n) > MAX_COLUMNS {
+                        return Err(untrusted("more columns than PostgreSQL returns"));
+                    }
                     names.clear();
                     for _ in 0..n {
                         let rest = p.rest();
@@ -407,6 +415,9 @@ impl<'s> Client<'s> {
                 b'D' => {
                     let mut p = Parse::new(&m.body);
                     let n = usize::from(p.u16()?);
+                    if n > MAX_COLUMNS {
+                        return Err(untrusted("more columns than PostgreSQL returns"));
+                    }
                     let mut values = Vec::with_capacity(n);
                     for _ in 0..n {
                         let len = p.u32()?;
@@ -419,22 +430,29 @@ impl<'s> Client<'s> {
                             values.push(Some(v));
                         }
                     }
-                    if raw.len() > max {
+                    if !rows.is_empty() {
+                        rows.push(b',');
+                    }
+                    rows.push(b'[');
+                    for (at, i) in keep.iter().enumerate() {
+                        if at > 0 {
+                            rows.push(b',');
+                        }
+                        match values.get(*i) {
+                            Some(Some(v)) => {
+                                serde_json::to_writer(&mut *rows, &String::from_utf8_lossy(v))
+                                    .map_err(|_| Error::Encoding)?;
+                            }
+                            _ => rows.extend_from_slice(b"null"),
+                        }
+                    }
+                    rows.push(b']');
+                    if raw.len() > max || rows.len() > max {
                         return Err(Error::transport(
                             crate::error::TransportKind::TooLarge,
                             true,
                         ));
                     }
-                    let row: Vec<serde_json::Value> = keep
-                        .iter()
-                        .map(|i| match values.get(*i) {
-                            Some(Some(v)) => {
-                                serde_json::Value::String(String::from_utf8_lossy(v).into_owned())
-                            }
-                            _ => serde_json::Value::Null,
-                        })
-                        .collect();
-                    rows.push(serde_json::Value::Array(row));
                 }
                 b'C' => {
                     tag = String::from_utf8_lossy(
@@ -451,16 +469,26 @@ impl<'s> Client<'s> {
             }
         }
         let json = match &error {
-            Some((code, text)) => serde_json::json!({"error": {"code": code, "message": text}}),
-            None => serde_json::json!({
-                "columns": keep.iter().filter_map(|i| names.get(*i)).collect::<Vec<_>>(),
-                "rows": rows,
-                "tag": tag,
-            }),
+            Some((code, text)) => Zeroizing::new(
+                serde_json::to_vec(&serde_json::json!({"error": {"code": code, "message": text}}))
+                    .map_err(|_| Error::Encoding)?,
+            ),
+            None => {
+                // `{"columns": [...], "rows": [...], "tag": "..."}`, as `serde_json` writes it.
+                let kept: Vec<&String> = keep.iter().filter_map(|i| names.get(*i)).collect();
+                let mut out = Zeroizing::new(Vec::with_capacity(rows.len().saturating_add(64)));
+                out.extend_from_slice(b"{\"columns\":");
+                serde_json::to_writer(&mut *out, &kept).map_err(|_| Error::Encoding)?;
+                out.extend_from_slice(b",\"rows\":[");
+                out.extend_from_slice(&rows);
+                out.extend_from_slice(b"],\"tag\":");
+                serde_json::to_writer(&mut *out, &tag).map_err(|_| Error::Encoding)?;
+                out.push(b'}');
+                out
+            }
         };
-        let json = serde_json::to_vec(&json).map_err(|_| Error::Encoding)?;
         Ok(Rows {
-            json: Zeroizing::new(json),
+            json,
             failed: error.is_some(),
             raw,
         })
@@ -479,6 +507,113 @@ impl<'s> Client<'s> {
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
     use super::*;
+
+    /// A signed-in client that reads `answer` (the server's messages after the query).
+    fn answered(stream: &mut super::super::io::testing::Fed) -> Client<'_> {
+        Client {
+            io: Io::new(stream, super::super::io::testing::wide()),
+        }
+    }
+
+    fn server_message(kind: u8, body: &[u8]) -> Vec<u8> {
+        let mut out = vec![kind];
+        out.extend(((body.len() + 4) as u32).to_be_bytes());
+        out.extend_from_slice(body);
+        out
+    }
+
+    fn description(columns: u16) -> Vec<u8> {
+        let mut desc = columns.to_be_bytes().to_vec();
+        for i in 0..columns {
+            desc.extend_from_slice(format!("c{i}\0").as_bytes());
+            desc.extend([0u8; 18]);
+        }
+        server_message(b'T', &desc)
+    }
+
+    fn null_row(columns: u16) -> Vec<u8> {
+        let mut data = columns.to_be_bytes().to_vec();
+        for _ in 0..columns {
+            data.extend(u32::MAX.to_be_bytes());
+        }
+        server_message(b'D', &data)
+    }
+
+    fn answer(parts: Vec<Vec<u8>>) -> super::super::io::testing::Fed {
+        let mut all = server_message(b'1', b"");
+        all.extend(server_message(b'2', b""));
+        for part in parts {
+            all.extend(part);
+        }
+        all.extend(server_message(b'C', b"SELECT 1\0"));
+        all.extend(server_message(b'Z', b"I"));
+        super::super::io::testing::Fed(std::collections::VecDeque::from([all]))
+    }
+
+    #[test]
+    fn rows_are_written_as_serde_json_writes_them() {
+        let mut row = 3u16.to_be_bytes().to_vec();
+        row.extend(2u32.to_be_bytes());
+        row.extend(b"a\"");
+        row.extend(u32::MAX.to_be_bytes());
+        row.extend(2u32.to_be_bytes());
+        row.extend([0xff, b'\n']);
+        let mut stream = answer(vec![
+            description(3),
+            server_message(b'D', &row),
+            null_row(3),
+        ]);
+        let rows = answered(&mut stream).query(b"q", &[], &[], 1024).unwrap();
+        let expected = serde_json::json!({
+            "columns": ["c0", "c1", "c2"],
+            "rows": [["a\"", null, "\u{fffd}\n"], [null, null, null]],
+            "tag": "SELECT 1",
+        });
+        assert_eq!(rows.json.as_slice(), serde_json::to_vec(&expected).unwrap());
+        let mut stream = answer(vec![description(2)]);
+        let rows = answered(&mut stream)
+            .query(b"q", &[], &["c1".to_string()], 1024)
+            .unwrap();
+        assert_eq!(
+            rows.json.as_slice(),
+            br#"{"columns":["c1"],"rows":[],"tag":"SELECT 1"}"#
+        );
+    }
+
+    #[test]
+    fn nulls_count_against_the_limit() {
+        // Ten rows of 3 NULLs are `[null,null,null]` each: 16 bytes and a comma (#52).
+        let rows = || (0..10).map(|_| null_row(3));
+        let mut parts = vec![description(3)];
+        parts.extend(rows());
+        let mut stream = answer(parts.clone());
+        assert!(answered(&mut stream).query(b"q", &[], &[], 169).is_ok());
+        let mut stream = answer(parts);
+        assert_eq!(
+            answered(&mut stream).query(b"q", &[], &[], 168).err(),
+            Some(Error::transport(
+                crate::error::TransportKind::TooLarge,
+                true
+            ))
+        );
+    }
+
+    #[test]
+    fn more_columns_than_postgres_returns_are_refused() {
+        let columns = u16::try_from(MAX_COLUMNS).unwrap();
+        let mut stream = answer(vec![description(columns), null_row(columns)]);
+        assert!(answered(&mut stream).query(b"q", &[], &[], 1 << 20).is_ok());
+        let mut stream = answer(vec![description(columns + 1)]);
+        assert_eq!(
+            answered(&mut stream).query(b"q", &[], &[], 1 << 20).err(),
+            Some(untrusted("more columns than PostgreSQL returns"))
+        );
+        let mut stream = answer(vec![description(1), null_row(columns + 1)]);
+        assert_eq!(
+            answered(&mut stream).query(b"q", &[], &[], 1 << 20).err(),
+            Some(untrusted("more columns than PostgreSQL returns"))
+        );
+    }
 
     #[test]
     fn scram_matches_rfc_7677() {

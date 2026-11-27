@@ -657,7 +657,7 @@ impl<'s> Session<'s> {
                 let reply = client.command(&rendered.text, &rendered.params, MAX_RESPONSE)?;
                 let mut raw = Zeroizing::new(Vec::new());
                 reply.raw(&mut raw);
-                let json = serde_json::to_vec(&reply.json()).map_err(|_| Error::Encoding)?;
+                let json = reply.json_bytes(MAX_RESPONSE)?.to_vec();
                 Ok(Ran {
                     result: CommandResult {
                         name: String::new(),

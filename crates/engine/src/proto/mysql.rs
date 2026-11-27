@@ -790,7 +790,7 @@ mod tests {
             assert_eq!(payload.len(), 6);
         }
         assert!(io.buffered().is_empty());
-        io.copied
+        io.copied()
     }
 
     #[test]
