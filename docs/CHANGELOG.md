@@ -22,6 +22,13 @@ before 1.0, minor versions may break formats and APIs.
   a panic in a connection still ends only that connection. Measured (`cargo build --release
   -p cli --locked`, Windows x86-64): `credentials.exe` 17,839,104 bytes before, 18,059,264
   after (+220,160, +1.2%).
+- MQTT 3.1.1: a token or password without a user name now goes with a user name of zero
+  length, as [MQTT-3.1.2-22] requires (strict brokers closed the connection). MQTT 5: the
+  Server Keep Alive of the CONNACK sets the ping interval ([MQTT-3.2.2-21]); before, 60
+  seconds were fixed and a broker with a lower limit disconnected. SMTP says
+  `EHLO [127.0.0.1]` (an address literal) instead of `EHLO localhost`, which strict HELO
+  checks refuse.
+
 - A response to `HEAD`, and any `204` or `304`, has no body whatever its length headers say
   (RFC 9112 section 6.3, RFC 9113 section 8.1.1), over HTTP/1.1 and HTTP/2; before, one that
   carried `Content-Length: N` (as static file servers send on `HEAD`) failed with "body

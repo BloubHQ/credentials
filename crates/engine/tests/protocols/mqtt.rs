@@ -37,6 +37,9 @@ pub struct Broker {
     pub subscribed: Vec<(String, u8)>,
     pub unsubscribed: Vec<String>,
     pub connected: bool,
+    /// The Server Keep Alive a version 5 CONNACK names, in seconds; the pings it got.
+    pub server_keep_alive: Option<u16>,
+    pub pings: usize,
     closed: bool,
     inbuf: Vec<u8>,
     outbuf: Vec<u8>,
@@ -104,6 +107,8 @@ impl Broker {
             subscribed: Vec::new(),
             unsubscribed: Vec::new(),
             connected: false,
+            server_keep_alive: None,
+            pings: 0,
             closed: false,
             inbuf: Vec::new(),
             outbuf: Vec::new(),
@@ -143,7 +148,9 @@ impl Broker {
                 if flags & 0x40 != 0 {
                     self.got_password = Some(r.string().to_vec());
                 }
-                let ok = self.got_password.as_deref() == Some(self.password.as_slice());
+                // [MQTT-3.1.2-22]: in 3.1.1 a password needs the user name flag.
+                let ok = self.got_password.as_deref() == Some(self.password.as_slice())
+                    && (self.level != 4 || flags & 0x80 != 0);
                 let code = match (ok, self.level) {
                     (true, _) => 0,
                     (false, 5) => 0x86,
@@ -151,7 +158,13 @@ impl Broker {
                 };
                 self.connected = ok;
                 let ack = if self.level == 5 {
-                    vec![0, code, 0]
+                    match self.server_keep_alive {
+                        Some(seconds) => {
+                            let [high, low] = seconds.to_be_bytes();
+                            vec![0, code, 3, 0x13, high, low]
+                        }
+                        None => vec![0, code, 0],
+                    }
                 } else {
                     vec![0, code]
                 };
@@ -218,7 +231,10 @@ impl Broker {
                 self.outbuf.extend(frame(0xb0, &ack));
             }
             4 => {}
-            12 => self.outbuf.extend([0xd0, 0]),
+            12 => {
+                self.pings += 1;
+                self.outbuf.extend([0xd0, 0]);
+            }
             14 => self.closed = true,
             other => panic!("packet type {other}"),
         }
@@ -365,6 +381,54 @@ fn version_5_with_a_token() {
     assert_eq!(
         read,
         json!([{"topic": "sensors/a", "payload": {"base64": "/wA="}, "qos": 1, "retain": false}])
+    );
+}
+
+#[test]
+fn a_token_without_a_user_name_on_3_1_1_sends_an_empty_user_name() {
+    let s = setup(
+        &[(FieldSpec::secret("token"), b"tok-eyJhbGciOi.x.y")],
+        vec![operation(json!({"name": "sensors", "steps": [
+            {"do": "open", "connection": "mqtt", "version": "3.1.1",
+             "destinations": [{"host": "broker.example.com", "port": 8883}],
+             "login": {"user": "", "token": "{{token}}"}},
+            {"do": "return", "relay": {"commands": [
+                {"name": "all", "text": "subscribe", "wait_ms": 100,
+                 "params": [{"template": "sensors/+"}]}
+            ]}}
+        ]}))],
+    );
+    let mut fake = Fake::new(Broker::new(b"tok-eyJhbGciOi.x.y"));
+    let out = session_output(run(&s, &mut fake, vec![command("all", &[])]));
+    assert!(out.error.is_none(), "{:?}", out.error);
+    assert_eq!(fake.peer.level, 4);
+    assert_eq!(fake.peer.user, Some(Vec::new()));
+}
+
+#[test]
+fn the_server_keep_alive_of_version_5_sets_the_ping_interval() {
+    // The broker allows 1 second without a packet; the node pings within half of it while it
+    // waits for messages, not after the 60 seconds it asked for.
+    let s = setup(
+        &[(FieldSpec::secret("token"), b"tok-eyJhbGciOi.x.y")],
+        vec![operation(json!({"name": "sensors", "steps": [
+            {"do": "open", "connection": "mqtt", "version": "5",
+             "destinations": [{"host": "broker.example.com", "port": 8883}],
+             "login": {"user": "", "token": "{{token}}"}},
+            {"do": "return", "relay": {"commands": [
+                {"name": "all", "text": "subscribe", "wait_ms": 1500,
+                 "params": [{"template": "sensors/+"}]}
+            ]}}
+        ]}))],
+    );
+    let mut broker = Broker::new(b"tok-eyJhbGciOi.x.y");
+    broker.server_keep_alive = Some(1);
+    let mut fake = Fake::new(broker);
+    let out = session_output(run(&s, &mut fake, vec![command("all", &[])]));
+    assert!(out.error.is_none(), "{:?}", out.error);
+    assert!(
+        fake.peer.pings >= 1,
+        "no ping within the server's keep-alive"
     );
 }
 
