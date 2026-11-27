@@ -256,7 +256,10 @@ impl DtlsStream {
         let end = start
             .checked_add(HANDSHAKE_WAIT)
             .map_or(deadline, |end| end.min(deadline));
-        let config = config(end.saturating_duration_since(start))?;
+        // `dimpl` gets a second more than the handshake has, so the stream's own deadline
+        // ends a silent handshake first and it fails as a timeout: with the same instant the
+        // two raced, and `dimpl`'s give-up came back as a handshake failure.
+        let config = config(end.saturating_duration_since(start) + Duration::from_secs(1))?;
         // The client presents no certificate: the key provider loads an empty key as one
         // that refuses to sign, so a server that asks for a certificate fails the handshake.
         let identity = DtlsCertificate {
