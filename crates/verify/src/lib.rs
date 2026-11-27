@@ -131,6 +131,15 @@ impl Failure {
 }
 
 /// Parses the arguments; `Ok(None)` asks for the help.
+/// True for the shape of a key on the command line: 32 bytes in URL-safe base64 without
+/// padding, 43 characters. No option name has that shape.
+fn is_key(arg: &str) -> bool {
+    arg.len() == 43
+        && arg
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
 fn parse(args: &[String]) -> Result<Option<Options>, String> {
     if args.iter().any(|a| a == "-h" || a == "--help") {
         return Ok(None);
@@ -143,8 +152,9 @@ fn parse(args: &[String]) -> Result<Option<Options>, String> {
             positional.extend(rest.by_ref().cloned());
             break;
         }
-        // Only `--name` is an option: keys are URL-safe base64 and may start with `-`.
-        if !arg.starts_with("--") {
+        // Only `--name` is an option: keys are URL-safe base64 and may start with `-`, or
+        // with `--` (one key in 4,096), which no option name has the shape of (#99).
+        if !arg.starts_with("--") || is_key(arg) {
             positional.push(arg.clone());
             continue;
         }
@@ -170,7 +180,7 @@ fn parse(args: &[String]) -> Result<Option<Options>, String> {
         let value = match inline {
             Some(value) => value,
             None => match rest.next() {
-                Some(value) if !value.starts_with("--") => value.clone(),
+                Some(value) if !value.starts_with("--") || is_key(value) => value.clone(),
                 _ => return Err(format!("{name} needs a value")),
             },
         };
@@ -564,6 +574,42 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(b.next, ["n1", "n2"]);
+    }
+
+    /// #99: one key in 4,096 starts with `--` in URL-safe base64; it is still a key, as a
+    /// positional argument and as the value of an option.
+    #[test]
+    fn a_key_that_starts_with_two_dashes_is_a_key() {
+        let key = format!("--{}", "A".repeat(41));
+        let a = parse(&args(&["log", &key, "--next", "n1"]))
+            .unwrap()
+            .unwrap();
+        assert_eq!(a.node_key, key);
+        assert_eq!(a.next, ["n1"]);
+        let b = parse(&args(&[
+            "log",
+            "key",
+            "--owner",
+            "alice",
+            "--user-key",
+            &key,
+        ]))
+        .unwrap()
+        .unwrap();
+        assert_eq!(b.user_key.as_deref(), Some(key.as_str()));
+        // A real node key with that start goes through the whole command.
+        let node = loop {
+            let k = engine::keys::NodeKey::generate();
+            if k.public().to_b64().starts_with("--") {
+                break k;
+            }
+        };
+        let a = parse(&args(&["log", &node.public().to_b64()]))
+            .unwrap()
+            .unwrap();
+        assert!(NodePublicKey::from_b64(&a.node_key).is_ok());
+        // An unknown option of another shape is still refused.
+        assert!(parse(&args(&["log", "key", "--nope"])).is_err());
     }
 
     #[test]

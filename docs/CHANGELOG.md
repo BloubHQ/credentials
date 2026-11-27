@@ -7,6 +7,11 @@ before 1.0, minor versions may break formats and APIs.
 
 ### Changed
 
+- `credentials verify` takes a node key or user key that starts with `--` (one key in 4,096
+  in URL-safe base64) as a key; before, it failed as an unknown option with exit code 2,
+  unless it came after `--`. An argument of a key's shape (43 URL-safe base64 characters)
+  is never an option (#99).
+
 - **Protocol reads are linear.** `proto::io::Io::take` copied every byte left in the read
   buffer on each take; MySQL packets and AMQP 1.0 frames are read take by take, so 64 KiB of
   small ones cost a copy of the buffer per packet. The buffer now keeps a read offset and is

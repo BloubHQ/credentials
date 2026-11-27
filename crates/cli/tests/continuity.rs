@@ -123,61 +123,65 @@ fn one_chain_runs_across_a_hand_over() {
 fn logs_that_do_not_continue_the_chain_are_refused() {
     let (dir, old_key) = handed_over("fork");
     let path = |file: &str| dir.join(file).to_string_lossy().into_owned();
-    let code = |args: &[&str]| verify(args).status.code();
+    // The exit code, with stderr in the message so that a failure says why (#99).
+    let exits = |args: &[&str], want: i32| {
+        let out = verify(args);
+        assert_eq!(out.status.code(), Some(want), "{}", text(&out.stderr));
+    };
     // A log that does not continue the old one.
-    assert_eq!(
-        code(&[
+    exits(
+        &[
             &path("old.jsonl"),
             &old_key,
             "--next",
-            &path("stranger.jsonl")
-        ]),
-        Some(1)
+            &path("stranger.jsonl"),
+        ],
+        1,
     );
     // The new log alone, under the old key.
-    assert_eq!(code(&[&path("new.jsonl"), &old_key]), Some(1));
+    exits(&[&path("new.jsonl"), &old_key], 1);
     // A log that did not hand over, followed by another.
-    assert_eq!(
-        code(&[
+    exits(
+        &[
             &path("stranger.jsonl"),
             &old_key,
             "--next",
-            &path("new.jsonl")
-        ]),
-        Some(1)
+            &path("new.jsonl"),
+        ],
+        1,
     );
     // The new log twice: it did not hand over.
-    assert_eq!(
-        code(&[
+    exits(
+        &[
             &path("old.jsonl"),
             &old_key,
             "--next",
             &path("new.jsonl"),
             "--next",
             &path("new.jsonl"),
-        ]),
-        Some(1)
+        ],
+        1,
     );
     // The old log's tail cut off (its hand-over entry): the next log does not follow.
     let old = std::fs::read_to_string(dir.join("old.jsonl")).unwrap();
     let mut lines: Vec<&str> = old.lines().collect();
     lines.pop();
     std::fs::write(dir.join("cut.jsonl"), lines.join("\n") + "\n").unwrap();
-    assert_eq!(
-        code(&[&path("cut.jsonl"), &old_key, "--next", &path("new.jsonl")]),
-        Some(1)
+    exits(
+        &[&path("cut.jsonl"), &old_key, "--next", &path("new.jsonl")],
+        1,
     );
     // With --owner, --next is a usage error.
-    assert_eq!(
-        code(&[
+    exits(
+        &[
             &path("old.jsonl"),
             &old_key,
             "--owner",
             "alice",
             "--next",
-            "x"
-        ]),
-        Some(2)
+            "x",
+        ],
+        2,
     );
     std::fs::remove_dir_all(&dir).unwrap();
 }
