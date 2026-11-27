@@ -110,7 +110,10 @@ fn openssh_rekeys_while_a_command_prints_and_nothing_is_lost() {
     let io = Io::new(&mut tcp, Bounds::new(30_000, 120_000, 64 << 20));
     let mut client = Client::connect(io, &[host_key]).expect("key exchange");
     eprintln!("agreed: {:?}", client.agreed);
-    assert!(client.agreed.strict, "OpenSSH agrees on strict key exchange");
+    assert!(
+        client.agreed.strict,
+        "OpenSSH agrees on strict key exchange"
+    );
     client
         .authenticate(user.as_bytes(), &Auth::Key(&client_key))
         .expect("sign-in");
@@ -119,8 +122,15 @@ fn openssh_rekeys_while_a_command_prints_and_nothing_is_lost() {
     let out = client.exec(b"seq 1 20000", 1 << 20).expect("exec");
     let want: String = (1..=20_000).map(|i| format!("{i}\n")).collect();
     assert_eq!(out.exit, Some(0));
-    assert_eq!(out.stdout.len(), want.len(), "every byte of the output came");
-    assert!(out.stdout.as_slice() == want.as_bytes(), "the output is intact");
+    assert_eq!(
+        out.stdout.len(),
+        want.len(),
+        "every byte of the output came"
+    );
+    assert!(
+        out.stdout.as_slice() == want.as_bytes(),
+        "the output is intact"
+    );
     let after_first = client.rekeys;
     eprintln!("rekeys during the first command: {after_first}");
     assert!(after_first >= 2, "the server rekeyed: {after_first}");
