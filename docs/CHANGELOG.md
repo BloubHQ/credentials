@@ -777,6 +777,18 @@ before 1.0, minor versions may break formats and APIs.
 
 ### Security
 
+- The sandbox now wipes a module's memory when a run fails (trap, fuel, time, output limit,
+  a start function that traps, an entry it refuses), not only when it succeeds: the memory
+  handle is kept outside the run, by the instance or by the first host call, so a lost
+  instance no longer leaves inputs and derived values in freed memory for binaries without
+  the zeroing allocator (tested on each path).
+- An SSH write that waited for the server's window dropped what the server sent meanwhile:
+  shell output, error output, the exit status (a failed command could end as a success) and
+  a forwarded channel, which was then never accepted or refused. These events are now kept
+  in order, at most 2 MiB of output and 256 events, and every read takes them before it
+  reads the connection again; closing a channel refuses a forwarded channel still waiting
+  (tested with a server that sends output and `exit-status` while the window is 0).
+
 - An approved operation on a protocol connection (SSH and SFTP, PostgreSQL, MySQL, Redis,
   SMTP, IMAP, POP3, FTP, MQTT, AMQP 0-9-1 and 1.0) never went on: the caller's commands and
   messages were not kept with the waiting operation, so the resume failed

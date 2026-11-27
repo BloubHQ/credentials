@@ -21,6 +21,7 @@
 //! channel is open: then the caller of the client decides ([`Event::Forwarded`]). More than
 //! [`MAX_REFUSED_OPENS`] refused opens end the connection.
 
+use std::collections::VecDeque;
 use std::time::Duration;
 
 use ring::rand::SystemRandom;
@@ -105,6 +106,11 @@ const MAX_ROUNDS: usize = 8;
 const WAIT: Duration = Duration::from_millis(50);
 /// Most channels the server may open that the node refuses before the connection ends.
 pub const MAX_REFUSED_OPENS: usize = 16;
+/// Most bytes of output kept for later reads while a write waits for the server's window.
+const MAX_QUEUED_BYTES: usize = WINDOW as usize;
+/// Most events kept for later reads while a write waits for the server's window (output of
+/// one kind that follows output of the same kind joins it).
+const MAX_QUEUED_EVENTS: usize = 256;
 /// Longest originator address of a `forwarded-tcpip` channel the node takes.
 const MAX_ORIGINATOR: usize = 255;
 
@@ -859,6 +865,9 @@ pub struct Client<'s> {
     forward_used: bool,
     pending: Option<PendingOpen>,
     refused_opens: usize,
+    /// Events that came while a write waited for the server's window, in order: every read
+    /// ([`Client::poll_event`]) takes them before it reads the connection again.
+    queued: VecDeque<Event>,
     /// Bytes of channel data each way: to the server, from it.
     pub data: (u64, u64),
 }
@@ -888,6 +897,7 @@ impl<'s> Client<'s> {
             forward_used: false,
             pending: None,
             refused_opens: 0,
+            queued: VecDeque::new(),
             data: (0, 0),
         };
         client.io.write(VERSION)?;
@@ -1547,8 +1557,49 @@ impl<'s> Client<'s> {
         self.send(put.bytes())
     }
 
-    /// The next channel event, within `wait`; `None` when nothing came.
+    /// The next channel event, within `wait`; `None` when nothing came. Events that came
+    /// while a write waited for window come first, in the order they came.
     pub fn poll_event(&mut self, wait: Duration) -> Result<Option<Event>> {
+        if let Some(event) = self.queued.pop_front() {
+            return Ok(Some(event));
+        }
+        self.read_event(wait)
+    }
+
+    /// Keeps an event for the next reads. Output of the same kind as the last event kept
+    /// joins it; past [`MAX_QUEUED_BYTES`] of output or [`MAX_QUEUED_EVENTS`] events the
+    /// channel fails rather than drop what the server sent.
+    fn queue(&mut self, event: Event) -> Result<()> {
+        let held: usize = self
+            .queued
+            .iter()
+            .map(|e| match e {
+                Event::Data(d) | Event::Stderr(d) => d.len(),
+                _ => 0,
+            })
+            .fold(0, usize::saturating_add);
+        let adds = match &event {
+            Event::Data(d) | Event::Stderr(d) => d.len(),
+            _ => 0,
+        };
+        if held.saturating_add(adds) > MAX_QUEUED_BYTES {
+            return Err(Error::transport(TransportKind::TooLarge, true));
+        }
+        if let (Some(Event::Data(last)), Event::Data(more))
+        | (Some(Event::Stderr(last)), Event::Stderr(more)) = (self.queued.back_mut(), &event)
+        {
+            last.extend_from_slice(more);
+            return Ok(());
+        }
+        if self.queued.len() >= MAX_QUEUED_EVENTS {
+            return Err(Error::transport(TransportKind::TooLarge, true));
+        }
+        self.queued.push_back(event);
+        Ok(())
+    }
+
+    /// The next channel event read from the connection, within `wait`.
+    fn read_event(&mut self, wait: Duration) -> Result<Option<Event>> {
         loop {
             if let Some(pending) = self.pending.as_mut().filter(|p| !p.reported) {
                 pending.reported = true;
@@ -1589,14 +1640,18 @@ impl<'s> Client<'s> {
                 (channel.theirs, room)
             };
             if room == 0 {
-                // Wait for the server to open its window; other output is kept for later
-                // reads by being handled as it comes.
-                match self.poll_event(WAIT)? {
+                // Wait for the server to open its window. What comes meanwhile (output, an
+                // exit status, a forwarded channel the caller must accept or refuse, the
+                // close) is kept for the next reads.
+                match self.read_event(WAIT)? {
                     Some(Event::Closed) => {
+                        self.queue(Event::Closed)?;
                         return Err(Error::transport(TransportKind::Closed, true));
                     }
-                    Some(_) | None => continue,
+                    Some(event) => self.queue(event)?,
+                    None => {}
                 }
+                continue;
             }
             let (chunk, rest) = data.split_at(room.min(data.len()));
             let mut put = Put::message(CHANNEL_DATA);
@@ -1632,9 +1687,20 @@ impl<'s> Client<'s> {
         // number is still its, and what it sends on it belongs to this channel. The wait is
         // within the connection's bounds.
         if wait && !closed {
-            while !matches!(self.poll_event(WAIT)?, Some(Event::Closed)) {}
+            loop {
+                match self.poll_event(WAIT)? {
+                    Some(Event::Closed) => break,
+                    // A forwarded channel is answered, never left waiting.
+                    Some(Event::Forwarded { .. }) => self.refuse_forwarded()?,
+                    _ => {}
+                }
+            }
         }
         self.channel = None;
+        // What was kept belongs to the channel that ended, except a forwarded channel the
+        // caller still has to accept or refuse.
+        self.queued
+            .retain(|event| matches!(event, Event::Forwarded { .. }));
         Ok(())
     }
 
