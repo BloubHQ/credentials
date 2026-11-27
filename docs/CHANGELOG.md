@@ -22,6 +22,12 @@ before 1.0, minor versions may break formats and APIs.
   a panic in a connection still ends only that connection. Measured (`cargo build --release
   -p cli --locked`, Windows x86-64): `credentials.exe` 17,839,104 bytes before, 18,059,264
   after (+220,160, +1.2%).
+- The CLI names where in a JSON document a field fails, in the path style of the semantic
+  checks (``policy.json: operations[0].steps[0]: missing field `port` ``, `callers[0].key:
+  invalid base64 array`), through `serde_path_to_error` (MIT or Apache-2.0); before, the
+  message named no place. A template that does not parse says at which byte
+  (`policy invalid at operations[0].steps[0].template (byte 2): template syntax`).
+
 - Tests that failed under load wait for a signal instead of a fixed pause: the SSH slot
   tests wait until each held connection reached the fake server (and hold it for 5 s, not
   1.5 s), the TLS idle-timeout test expects `sent: true` only when the server read the

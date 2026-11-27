@@ -604,6 +604,33 @@ fn policy_check_names_the_rule() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+#[test]
+fn policy_errors_name_the_place_in_the_document() {
+    let dir = temp_dir("where");
+    let policy = dir.join("bad.json");
+    let check = |text: &str| {
+        std::fs::write(&policy, text).unwrap();
+        let out = run(&["policy", "check", s(&policy)]);
+        assert_eq!(out.status.code(), Some(1));
+        String::from_utf8_lossy(&out.stderr).into_owned()
+    };
+    // A caller key of 4 bytes: the message names the key.
+    let stderr = check(
+        r#"{"fields": [], "callers": [{"name": "app", "key": "AAAAAA", "operations": ["d"]}],
+            "operations": [{"name": "d", "steps": [{"do": "return", "template": "x"}]}]}"#,
+    );
+    assert!(stderr.contains("callers[0].key"), "{stderr}");
+    // A template that does not parse: the message says where in it.
+    let stderr = check(
+        r#"{"fields": [{"name": "k", "secret": true}], "callers": [],
+            "operations": [{"name": "d", "steps": [{"do": "return",
+                                                    "template": "ab{{ hex(sha257(k)) "}]}]}"#,
+    );
+    assert!(stderr.contains("template syntax"), "{stderr}");
+    assert!(stderr.contains("byte 2"), "{stderr}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A GET of /identity on a raw connection; the status, or None when no answer came in time.
 fn get_identity(port: u16, timeout: Duration) -> Option<u16> {
     let mut stream = TcpStream::connect(("127.0.0.1", port)).ok()?;

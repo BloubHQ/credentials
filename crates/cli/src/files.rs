@@ -162,8 +162,21 @@ pub fn write_secret_file(path: &Path, contents: &[u8]) -> Res<()> {
 
 /// Reads a JSON document.
 pub fn read_json<T: DeserializeOwned>(path: &Path) -> Res<T> {
-    let value = read_json_value(path)?;
-    serde_json::from_value(value).map_err(|e| Failure::from(format!("{}: {e}", path.display())))
+    from_json_value(path, read_json_value(path)?)
+}
+
+/// A JSON value of the document at `path` as `T`. An error names where in the document it is
+/// (`operations[0].steps[0]: missing field ...`), in the path style of the semantic checks.
+pub fn from_json_value<T: DeserializeOwned>(path: &Path, value: serde_json::Value) -> Res<T> {
+    serde_path_to_error::deserialize(value).map_err(|e| {
+        let at = e.path().to_string();
+        let inner = e.into_inner();
+        if at == "." {
+            Failure::from(format!("{}: {inner}", path.display()))
+        } else {
+            Failure::from(format!("{}: {at}: {inner}", path.display()))
+        }
+    })
 }
 
 /// Reads a JSON document as a value.

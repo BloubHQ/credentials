@@ -565,12 +565,11 @@ fn read_policy_file(path: &Path) -> Res<PolicyFile> {
     let signed = value
         .as_object()
         .is_some_and(|o| o.contains_key("policy") && o.contains_key("signature"));
-    let parsed = if signed {
-        serde_json::from_value(value).map(PolicyFile::Signed)
+    if signed {
+        files::from_json_value(path, value).map(PolicyFile::Signed)
     } else {
-        serde_json::from_value(value).map(PolicyFile::Unsigned)
-    };
-    parsed.map_err(|e| Failure::from(format!("{}: {e}", path.display())))
+        files::from_json_value(path, value).map(PolicyFile::Unsigned)
+    }
 }
 
 /// An unsigned policy, validated; a signed one is refused with what to do instead.
